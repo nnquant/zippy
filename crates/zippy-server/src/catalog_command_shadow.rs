@@ -188,17 +188,57 @@ pub(crate) struct LegacyCatalogShadowWorkerConfig {
 pub(crate) struct LegacyCatalogShadowWorker {
     status: Arc<Mutex<LegacyCatalogShadowStatus>>,
     metrics: LegacyCatalogCommitPublisherMetrics,
+    initial_attempt: Option<Receiver<Result<(), ServerError>>>,
     completion: Option<Receiver<Result<(), ServerError>>>,
     thread: Option<JoinHandle<()>>,
     final_shutdown: Option<LegacyCatalogShadowShutdownOutcome>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyCatalogShadowTestFault {
+    None,
+    InitialRecoverableOnce,
+    ExitBeforeInitialAttempt,
+    DelayBeforeInitialAttempt(Duration),
+    DisconnectBeforeFinalSeal,
+}
+
 impl LegacyCatalogShadowWorker {
+    #[cfg(not(test))]
     pub(crate) fn install_and_start(
         master: &MasterServer,
         catalog_read: SqliteCatalogReadHandle,
         catalog_reconcile: SqliteCatalogLegacyReconcileHandle,
         config: LegacyCatalogShadowWorkerConfig,
+    ) -> Result<Self, ServerError> {
+        Self::install_and_start_inner(
+            master,
+            catalog_read,
+            catalog_reconcile,
+            config,
+            #[cfg(test)]
+            LegacyCatalogShadowTestFault::None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_and_start_with_test_fault(
+        master: &MasterServer,
+        catalog_read: SqliteCatalogReadHandle,
+        catalog_reconcile: SqliteCatalogLegacyReconcileHandle,
+        config: LegacyCatalogShadowWorkerConfig,
+        test_fault: LegacyCatalogShadowTestFault,
+    ) -> Result<Self, ServerError> {
+        Self::install_and_start_inner(master, catalog_read, catalog_reconcile, config, test_fault)
+    }
+
+    fn install_and_start_inner(
+        master: &MasterServer,
+        catalog_read: SqliteCatalogReadHandle,
+        catalog_reconcile: SqliteCatalogLegacyReconcileHandle,
+        config: LegacyCatalogShadowWorkerConfig,
+        #[cfg(test)] test_fault: LegacyCatalogShadowTestFault,
     ) -> Result<Self, ServerError> {
         let capacity = NonZeroUsize::new(config.queue_capacity).ok_or_else(|| {
             ServerError::new(
@@ -225,13 +265,20 @@ impl LegacyCatalogShadowWorker {
         // Thread creation can fail, while the Master publisher slot is irreversible. Start the
         // thread first but hold reconciliation until installation has seeded its exact baseline.
         let (activation_tx, activation_rx) = mpsc::sync_channel(1);
+        let (initial_attempt_tx, initial_attempt_rx) = mpsc::sync_channel(1);
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name(WORKER_THREAD_NAME.to_owned())
             .spawn(move || {
                 let result = match activation_rx.recv() {
-                    Ok(engine) => run_worker(receiver, engine),
-                    Err(_) => Ok(()),
+                    Ok(engine) => run_worker(
+                        receiver,
+                        engine,
+                        initial_attempt_tx,
+                        #[cfg(test)]
+                        test_fault,
+                    ),
+                    Err(_) => Err(worker_stopped()),
                 };
                 let _ = completion_tx.send(result);
             })
@@ -267,7 +314,7 @@ impl LegacyCatalogShadowWorker {
             max_files_per_table: config.max_files_per_table,
             max_metadata_bytes_per_table: config.max_metadata_bytes_per_table,
             verified: BTreeMap::new(),
-            unsupported_latched: false,
+            unsupported_latched: None,
         };
         if activation_tx.send(engine).is_err() {
             let _ = thread.join();
@@ -279,10 +326,26 @@ impl LegacyCatalogShadowWorker {
         Ok(Self {
             status,
             metrics,
+            initial_attempt: Some(initial_attempt_rx),
             completion: Some(completion_rx),
             thread: Some(thread),
             final_shutdown: None,
         })
+    }
+
+    /// Waits for the first semantic reconcile attempt before listeners may accept mutations.
+    ///
+    /// Physical Parquet verification currently uses non-cancellable blocking work. Consequently,
+    /// this barrier deliberately owns the worker until that first attempt ends; the server startup
+    /// deadline is checked immediately afterwards and is a soft limit across this stage.
+    pub(crate) fn wait_for_initial_attempt(&mut self) -> Result<(), ServerError> {
+        let Some(initial_attempt) = self.initial_attempt.take() else {
+            return Err(worker_stopped());
+        };
+        match initial_attempt.recv() {
+            Ok(result) => result,
+            Err(_) => Err(worker_stopped()),
+        }
     }
 
     pub(crate) fn status(&self) -> LegacyCatalogShadowStatus {
@@ -311,6 +374,20 @@ impl LegacyCatalogShadowWorker {
         &mut self,
         deadline: Instant,
     ) -> LegacyCatalogShadowShutdownOutcome {
+        self.shutdown_with_wait(Some(deadline))
+    }
+
+    /// Drains and joins without a deadline during startup rollback.
+    ///
+    /// Startup rollback must not detach a verifier that outlived the soft startup deadline.
+    pub(crate) fn shutdown_and_join(&mut self) -> LegacyCatalogShadowShutdownOutcome {
+        self.shutdown_with_wait(None)
+    }
+
+    fn shutdown_with_wait(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> LegacyCatalogShadowShutdownOutcome {
         if let Some(outcome) = &self.final_shutdown {
             return outcome.clone();
         }
@@ -319,14 +396,20 @@ impl LegacyCatalogShadowWorker {
             self.final_shutdown = Some(outcome.clone());
             return outcome;
         };
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let mut outcome = match completion.recv_timeout(wait) {
+        let received = match deadline {
+            Some(deadline) => completion
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => None,
+                    mpsc::RecvTimeoutError::Disconnected => Some(worker_stopped()),
+                }),
+            None => completion.recv().map_err(|_| Some(worker_stopped())),
+        };
+        let mut outcome = match received {
             Ok(Ok(())) => LegacyCatalogShadowShutdownOutcome::Complete,
             Ok(Err(error)) => LegacyCatalogShadowShutdownOutcome::Failed(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => LegacyCatalogShadowShutdownOutcome::TimedOut,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                LegacyCatalogShadowShutdownOutcome::Failed(worker_stopped())
-            }
+            Err(None) => LegacyCatalogShadowShutdownOutcome::TimedOut,
+            Err(Some(error)) => LegacyCatalogShadowShutdownOutcome::Failed(error),
         };
         if !matches!(outcome, LegacyCatalogShadowShutdownOutcome::TimedOut) {
             self.completion.take();
@@ -374,7 +457,7 @@ struct ShadowEngine {
     max_files_per_table: usize,
     max_metadata_bytes_per_table: usize,
     verified: BTreeMap<TableId, BTreeMap<String, VerifiedLegacyCatalogFileCacheEntry>>,
-    unsupported_latched: bool,
+    unsupported_latched: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -385,10 +468,44 @@ enum ShadowFailure {
     Catalog(&'static str, ServerError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FullReconcileEvidence {
+    revision: u64,
+    loss_epoch: u64,
+    exact_diffs: u64,
+    v3_reconciles: u64,
+}
+
+impl ShadowFailure {
+    fn final_server_error(&self) -> ServerError {
+        match self {
+            Self::Recoverable(reason) => ServerError::new(
+                ErrorCode::Unavailable,
+                format!("final legacy Catalog shadow reconcile failed reason=[{reason}]"),
+            )
+            .with_retryable(true),
+            Self::Unsupported(reason) => ServerError::new(
+                ErrorCode::Conflict,
+                format!("final legacy Catalog shadow reconcile unsupported reason=[{reason}]"),
+            )
+            .with_retryable(false),
+            Self::Timeout(operation) => ServerError::new(
+                ErrorCode::DeadlineExceeded,
+                format!("final legacy Catalog shadow reconcile timed out operation=[{operation}]"),
+            )
+            .with_retryable(true),
+            Self::Catalog(operation, error) => error.clone().with_message(format!(
+                "final legacy Catalog shadow reconcile failed operation=[{operation}] code=[{}]",
+                error.code()
+            )),
+        }
+    }
+}
+
 impl ShadowEngine {
     fn apply_events(&mut self, events: &[LegacyCatalogCommitEvent]) -> bool {
         let publisher = self.metrics.snapshot();
-        let mut latch_unsupported = false;
+        let mut latch_unsupported = None;
         let mut status = self
             .status
             .lock()
@@ -414,7 +531,7 @@ impl ShadowEngine {
                     status.unsupported_mutations_total.saturating_add(1);
                 status.state = LegacyCatalogShadowState::BlockedUnsupported;
                 status.last_error = Some(unsupported_reason(event.mutation_kind()).to_owned());
-                latch_unsupported = true;
+                latch_unsupported = Some(unsupported_reason(event.mutation_kind()));
             } else if event.mutation_kind()
                 != LegacyCatalogCommitMutationKind::PersistEventWatermark
             {
@@ -426,47 +543,56 @@ impl ShadowEngine {
             status.last_error = Some("legacy_event_queue_continuity_lost".to_owned());
             requires_reconcile = true;
         }
-        if !requires_reconcile && !latch_unsupported {
+        if !requires_reconcile && latch_unsupported.is_none() {
             status.reconciled_catalog_revision = status.consumed_catalog_revision;
             status.state = LegacyCatalogShadowState::EligibleCandidate;
             status.last_error = None;
         }
         status.publisher = publisher.into();
         drop(status);
-        if latch_unsupported {
-            self.unsupported_latched = true;
+        if let Some(reason) = latch_unsupported {
+            self.unsupported_latched.get_or_insert(reason);
         }
         requires_reconcile
     }
 
-    async fn full_reconcile(&mut self) {
+    async fn full_reconcile(&mut self) -> Result<FullReconcileEvidence, ShadowFailure> {
         {
             let mut status = self.lock_status();
             status.full_reconciles_total = status.full_reconciles_total.saturating_add(1);
-            if !self.unsupported_latched {
+            if self.unsupported_latched.is_none() {
                 status.state = LegacyCatalogShadowState::CatchingUp;
             }
         }
-        if self.unsupported_latched {
-            return;
+        if let Some(reason) = self.unsupported_latched {
+            return Err(ShadowFailure::Unsupported(reason));
         }
-        match self.try_full_reconcile().await {
-            Ok((revision, loss_epoch, exact_diffs, v3_reconciles)) => {
-                let mut status = self.lock_status();
-                status.state = LegacyCatalogShadowState::EligibleCandidate;
-                status.consumed_catalog_revision = status.consumed_catalog_revision.max(revision);
-                status.reconciled_catalog_revision = revision;
-                status.recovered_continuity_loss_epoch = loss_epoch;
-                status.exact_diffs_total = status.exact_diffs_total.saturating_add(exact_diffs);
-                status.v3_reconciles_total =
-                    status.v3_reconciles_total.saturating_add(v3_reconciles);
-                status.last_error = None;
-            }
-            Err(failure) => self.record_failure(failure),
+        let evidence = self.try_full_reconcile().await?;
+        {
+            let mut status = self.lock_status();
+            status.state = LegacyCatalogShadowState::EligibleCandidate;
+            status.consumed_catalog_revision =
+                status.consumed_catalog_revision.max(evidence.revision);
+            status.reconciled_catalog_revision = evidence.revision;
+            status.recovered_continuity_loss_epoch = evidence.loss_epoch;
+            status.exact_diffs_total = status
+                .exact_diffs_total
+                .saturating_add(evidence.exact_diffs);
+            status.v3_reconciles_total = status
+                .v3_reconciles_total
+                .saturating_add(evidence.v3_reconciles);
+            status.last_error = None;
+        }
+        Ok(evidence)
+    }
+
+    async fn reconcile_and_record_failure(&mut self) {
+        if let Err(failure) = self.full_reconcile().await {
+            self.record_failure(&failure);
         }
     }
 
-    async fn try_full_reconcile(&mut self) -> Result<(u64, u64, u64, u64), ShadowFailure> {
+    async fn try_full_reconcile(&mut self) -> Result<FullReconcileEvidence, ShadowFailure> {
         let first = self.capture_snapshot()?;
         let native = self.list_migrated_tables().await?;
         let source_ids = first
@@ -504,12 +630,12 @@ impl ShadowEngine {
                 "legacy_snapshot_changed_during_full_reconcile",
             ));
         }
-        Ok((
-            second.source_catalog_revision(),
-            publisher.continuity_loss_epoch,
+        Ok(FullReconcileEvidence {
+            revision: second.source_catalog_revision(),
+            loss_epoch: publisher.continuity_loss_epoch,
             exact_diffs,
             v3_reconciles,
-        ))
+        })
     }
 
     fn capture_snapshot(&self) -> Result<LegacyCatalogMigrationSnapshot, ShadowFailure> {
@@ -803,8 +929,9 @@ impl ShadowEngine {
         }
     }
 
-    fn record_failure(&mut self, failure: ShadowFailure) {
-        let mut latch_unsupported = false;
+    fn record_failure(&mut self, failure: &ShadowFailure) {
+        let mut latch_unsupported = None;
+        let count_unsupported = self.unsupported_latched.is_none();
         let mut status = self
             .status
             .lock()
@@ -812,14 +939,16 @@ impl ShadowEngine {
         match failure {
             ShadowFailure::Recoverable(reason) => {
                 status.state = LegacyCatalogShadowState::BlockedRecoverable;
-                status.last_error = Some(reason.to_owned());
+                status.last_error = Some((*reason).to_owned());
             }
             ShadowFailure::Unsupported(reason) => {
                 status.state = LegacyCatalogShadowState::BlockedUnsupported;
-                status.unsupported_mutations_total =
-                    status.unsupported_mutations_total.saturating_add(1);
-                status.last_error = Some(reason.to_owned());
-                latch_unsupported = true;
+                if count_unsupported {
+                    status.unsupported_mutations_total =
+                        status.unsupported_mutations_total.saturating_add(1);
+                }
+                status.last_error = Some((*reason).to_owned());
+                latch_unsupported = Some(*reason);
             }
             ShadowFailure::Timeout(operation) => {
                 status.state = LegacyCatalogShadowState::BlockedRecoverable;
@@ -833,8 +962,8 @@ impl ShadowEngine {
             }
         }
         drop(status);
-        if latch_unsupported {
-            self.unsupported_latched = true;
+        if let Some(reason) = latch_unsupported {
+            self.unsupported_latched.get_or_insert(reason);
         }
     }
 
@@ -848,17 +977,63 @@ impl ShadowEngine {
 fn run_worker(
     receiver: Receiver<LegacyCatalogCommitEvent>,
     mut engine: ShadowEngine,
+    initial_attempt: mpsc::SyncSender<Result<(), ServerError>>,
+    #[cfg(test)] test_fault: LegacyCatalogShadowTestFault,
 ) -> Result<(), ServerError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| {
-            ServerError::new(
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let error = ServerError::new(
                 ErrorCode::Unavailable,
                 format!("build legacy Catalog shadow runtime error=[{error}]"),
-            )
-        })?;
-    runtime.block_on(engine.full_reconcile());
+            );
+            let _ = initial_attempt.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    #[cfg(test)]
+    match test_fault {
+        LegacyCatalogShadowTestFault::ExitBeforeInitialAttempt => {
+            let error = ServerError::new(
+                ErrorCode::Unavailable,
+                "legacy Catalog shadow worker exited before its initial reconcile attempt",
+            );
+            let _ = initial_attempt.send(Err(error.clone()));
+            return Err(error);
+        }
+        LegacyCatalogShadowTestFault::DelayBeforeInitialAttempt(delay) => thread::sleep(delay),
+        LegacyCatalogShadowTestFault::None
+        | LegacyCatalogShadowTestFault::InitialRecoverableOnce
+        | LegacyCatalogShadowTestFault::DisconnectBeforeFinalSeal => {}
+    }
+    #[cfg(test)]
+    if test_fault == LegacyCatalogShadowTestFault::InitialRecoverableOnce {
+        {
+            let mut status = engine.lock_status();
+            status.full_reconciles_total = status.full_reconciles_total.saturating_add(1);
+            status.state = LegacyCatalogShadowState::CatchingUp;
+        }
+        engine.record_failure(&ShadowFailure::Recoverable(
+            "injected_initial_reconcile_failure",
+        ));
+    } else {
+        runtime.block_on(engine.reconcile_and_record_failure());
+    }
+    #[cfg(not(test))]
+    runtime.block_on(engine.reconcile_and_record_failure());
+    initial_attempt.send(Ok(())).map_err(|_| {
+        ServerError::new(
+            ErrorCode::Unavailable,
+            "legacy Catalog shadow initial reconcile observer disconnected",
+        )
+    })?;
+    #[cfg(test)]
+    if test_fault == LegacyCatalogShadowTestFault::DisconnectBeforeFinalSeal {
+        return finish_worker(&runtime, &mut engine);
+    }
     let mut last_retry = Instant::now();
     loop {
         match receiver.recv_timeout(IDLE_POLL_INTERVAL) {
@@ -866,7 +1041,7 @@ fn run_worker(
                 let mut events = vec![first];
                 let disconnected = drain_events(&receiver, &mut events);
                 if engine.apply_events(&events) {
-                    runtime.block_on(engine.full_reconcile());
+                    runtime.block_on(engine.reconcile_and_record_failure());
                 }
                 last_retry = Instant::now();
                 if disconnected {
@@ -884,21 +1059,41 @@ fn run_worker(
                     || snapshot.continuity_loss_epoch > current.recovered_continuity_loss_epoch
                     || snapshot.latest_observed_revision > current.consumed_catalog_revision;
                 if retryable && last_retry.elapsed() >= RECOVERABLE_RETRY_INTERVAL {
-                    runtime.block_on(engine.full_reconcile());
+                    runtime.block_on(engine.reconcile_and_record_failure());
                     last_retry = Instant::now();
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    runtime.block_on(engine.full_reconcile());
-    let mut final_status = engine
-        .status
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    final_status.publisher = engine.metrics.snapshot().into();
-    final_status.state = LegacyCatalogShadowState::Closed;
-    Ok(())
+    finish_worker(&runtime, &mut engine)
+}
+
+fn finish_worker(
+    runtime: &tokio::runtime::Runtime,
+    engine: &mut ShadowEngine,
+) -> Result<(), ServerError> {
+    let publisher = engine.metrics.snapshot();
+    if !publisher.sealed {
+        let failure =
+            ShadowFailure::Recoverable("legacy_catalog_shadow_publisher_unsealed_at_worker_exit");
+        engine.record_failure(&failure);
+        engine.lock_status().publisher = publisher.into();
+        return Err(failure.final_server_error());
+    }
+    match runtime.block_on(engine.full_reconcile()) {
+        Ok(_) => {
+            let mut final_status = engine.lock_status();
+            final_status.publisher = engine.metrics.snapshot().into();
+            final_status.state = LegacyCatalogShadowState::Closed;
+            Ok(())
+        }
+        Err(failure) => {
+            engine.record_failure(&failure);
+            engine.lock_status().publisher = engine.metrics.snapshot().into();
+            Err(failure.final_server_error())
+        }
+    }
 }
 
 fn drain_events(

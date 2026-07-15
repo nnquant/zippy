@@ -607,21 +607,14 @@ fn sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker() {
     assert_eq!(shadow["config"]["metadata_budget_bytes"], 4096);
     assert_eq!(shadow["config"]["comparison_timeout_ms"], 250);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let command_shadow = loop {
-        let status = runtime
-            .health()
-            .legacy_catalog_shadow
-            .expect("SQLite shadow mode must expose command shadow status");
-        if status.state == LegacyCatalogShadowState::EligibleCandidate {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "command shadow did not become eligible: {status:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let command_shadow = runtime
+        .health()
+        .legacy_catalog_shadow
+        .expect("SQLite shadow mode must expose command shadow status after its initial attempt");
+    assert_eq!(
+        command_shadow.state,
+        LegacyCatalogShadowState::EligibleCandidate
+    );
     assert_eq!(command_shadow.reconciled_catalog_revision, 0);
     assert_eq!(command_shadow.publisher.baseline_revision, 0);
     assert_eq!(command_shadow.publisher.continuity_loss_epoch, 0);
@@ -698,21 +691,11 @@ async fn persisted_file_commit_reconciles_native_exact_snapshot_through_shadow_w
         ))
         .expect("start server with a migrated legacy append table");
 
-    let initial_deadline = Instant::now() + Duration::from_secs(3);
-    let initial = loop {
-        let status = runtime
-            .health()
-            .legacy_catalog_shadow
-            .expect("SQLite shadow mode must expose command shadow status");
-        if status.state == LegacyCatalogShadowState::EligibleCandidate {
-            break status;
-        }
-        assert!(
-            Instant::now() < initial_deadline,
-            "initial table reconcile did not become eligible: {status:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let initial = runtime
+        .health()
+        .legacy_catalog_shadow
+        .expect("SQLite shadow mode must expose command shadow status after its initial attempt");
+    assert_eq!(initial.state, LegacyCatalogShadowState::EligibleCandidate);
     assert_eq!(initial.reconciled_catalog_revision, 1);
     assert_eq!(initial.publisher.baseline_revision, 1);
     assert_eq!(initial.publisher.published_total, 0);
@@ -904,7 +887,14 @@ fn unsupported_online_table_creation_degrades_only_the_shadow_candidate() {
     }
 
     let shutdown = runtime.shutdown();
-    assert!(shutdown.is_clean(), "shutdown outcome: {shutdown:?}");
+    assert!(!shutdown.is_clean(), "shutdown outcome: {shutdown:?}");
+    let failure = shutdown
+        .legacy_catalog_shadow_outcome
+        .as_ref()
+        .and_then(LegacyCatalogShadowShutdownOutcome::error)
+        .expect("unsupported final reconcile must fail the shadow drain");
+    assert_eq!(failure.code(), ErrorCode::Conflict);
+    assert!(!failure.retryable());
     wait_until_bindable(gateway_addr);
 }
 

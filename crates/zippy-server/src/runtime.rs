@@ -36,6 +36,8 @@ use zippy_master::server::MasterServer;
 use zippy_storage::{PersistControllerConfig, MAX_PERSIST_PARALLEL_WRITERS};
 use zippy_types::{ErrorCode, ServerError};
 
+#[cfg(test)]
+use crate::catalog_command_shadow::LegacyCatalogShadowTestFault;
 use crate::legacy_catalog_migration::{
     plan_legacy_catalog_metadata_import, LegacyCatalogMetadataImportPlan,
     LegacyCatalogMigrationStartup,
@@ -507,6 +509,8 @@ pub struct LegacyServerRuntimeConfig {
     startup_timeout: Duration,
     ready_file: Option<PathBuf>,
     launch_nonce: Option<String>,
+    #[cfg(test)]
+    legacy_catalog_shadow_test_fault: LegacyCatalogShadowTestFault,
 }
 
 impl LegacyServerRuntimeConfig {
@@ -518,6 +522,8 @@ impl LegacyServerRuntimeConfig {
             startup_timeout: DEFAULT_SERVER_STARTUP_TIMEOUT,
             ready_file: None,
             launch_nonce: None,
+            #[cfg(test)]
+            legacy_catalog_shadow_test_fault: LegacyCatalogShadowTestFault::None,
         }
     }
 
@@ -550,6 +556,15 @@ impl LegacyServerRuntimeConfig {
     #[must_use]
     pub const fn startup_timeout(&self) -> Duration {
         self.startup_timeout
+    }
+
+    #[cfg(test)]
+    fn with_legacy_catalog_shadow_test_fault(
+        mut self,
+        fault: LegacyCatalogShadowTestFault,
+    ) -> Self {
+        self.legacy_catalog_shadow_test_fault = fault;
+        self
     }
 }
 
@@ -1027,6 +1042,8 @@ impl LegacyServerRuntime {
             config.startup_timeout,
             "server startup timeout exceeds monotonic clock range",
         )?;
+        #[cfg(test)]
+        let legacy_catalog_shadow_test_fault = config.legacy_catalog_shadow_test_fault;
 
         let prepared = prepare_master_runtime(config.master)
             .map_err(|error| map_core_error("prepare master runtime", error))?;
@@ -1042,11 +1059,63 @@ impl LegacyServerRuntime {
             startup_deadline,
             legacy_catalog_migration,
         )?;
-        let mut legacy_catalog_shadow = start_legacy_catalog_shadow_if_enabled(
+        let mut legacy_catalog_shadow = match start_legacy_catalog_shadow_if_enabled(
             &runtime_config,
             &master,
             native_storage.as_ref(),
-        );
+            #[cfg(test)]
+            legacy_catalog_shadow_test_fault,
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let mut no_listener = None;
+                let mut no_gateway = None;
+                let mut no_shadow = None;
+                let rollback = rollback_startup(
+                    &master,
+                    &mut no_listener,
+                    &mut no_gateway,
+                    &mut no_shadow,
+                    &mut native_storage,
+                    None,
+                    shutdown_timeout,
+                );
+                return Err(with_startup_rollback(error, rollback));
+            }
+        };
+        if let Some(shadow) = legacy_catalog_shadow.as_mut() {
+            if let Err(error) = shadow.wait_for_initial_attempt() {
+                let mut no_listener = None;
+                let mut no_gateway = None;
+                let rollback = rollback_startup(
+                    &master,
+                    &mut no_listener,
+                    &mut no_gateway,
+                    &mut legacy_catalog_shadow,
+                    &mut native_storage,
+                    None,
+                    shutdown_timeout,
+                );
+                return Err(with_startup_rollback(error, rollback));
+            }
+        }
+        // Initial physical verification may use non-cancellable blocking work. We deliberately
+        // own and wait for that attempt before applying the startup deadline, so rollback can join
+        // the worker instead of detaching it.
+        if let Err(error) = remaining_before(startup_deadline, "start master listener") {
+            let mut no_listener = None;
+            let mut no_gateway = None;
+            let rollback = rollback_startup(
+                &master,
+                &mut no_listener,
+                &mut no_gateway,
+                &mut legacy_catalog_shadow,
+                &mut native_storage,
+                None,
+                shutdown_timeout,
+            );
+            return Err(with_startup_rollback(error, rollback));
+        }
         let mut master_listener = match start_master_listener(
             &master,
             &control_endpoint,
@@ -1675,18 +1744,16 @@ fn start_legacy_catalog_shadow_if_enabled(
     runtime_config: &ZippyConfig,
     master: &MasterServer,
     native_storage: Option<&NativeStorageRuntime>,
-) -> Option<LegacyCatalogShadowWorker> {
+    #[cfg(test)] test_fault: LegacyCatalogShadowTestFault,
+) -> Result<Option<LegacyCatalogShadowWorker>, ServerError> {
     if runtime_config.catalog.backend != ZippyCatalogBackend::SqliteShadow {
-        return None;
+        return Ok(None);
     }
     let Some(native_storage) = native_storage else {
-        tracing::warn!(
-            component = "legacy_catalog_shadow",
-            event = "legacy_catalog_shadow_start_blocked",
-            reason = "native_storage_unavailable",
-            "legacy Catalog command shadow remains disabled"
-        );
-        return None;
+        return Err(ServerError::new(
+            ErrorCode::Unavailable,
+            "legacy Catalog command shadow requires native storage",
+        ));
     };
     let trusted_fallback_root =
         match resolve_legacy_fallback_root(&runtime_config.table.persist.data_dir) {
@@ -1709,23 +1776,22 @@ fn start_legacy_catalog_shadow_if_enabled(
         operation_timeout: Duration::from_millis(configured.comparison_timeout_ms),
         trusted_fallback_root,
     };
-    match LegacyCatalogShadowWorker::install_and_start(
+    #[cfg(not(test))]
+    let worker = LegacyCatalogShadowWorker::install_and_start(
         master,
         native_storage.catalog_read_handle(),
         native_storage.catalog_legacy_reconcile_handle(),
         config,
-    ) {
-        Ok(worker) => Some(worker),
-        Err(error) => {
-            tracing::warn!(
-                component = "legacy_catalog_shadow",
-                event = "legacy_catalog_shadow_start_failed",
-                error_code = %error.code(),
-                "legacy Catalog command shadow failed to start; primary legacy authority remains active"
-            );
-            None
-        }
-    }
+    )?;
+    #[cfg(test)]
+    let worker = LegacyCatalogShadowWorker::install_and_start_with_test_fault(
+        master,
+        native_storage.catalog_read_handle(),
+        native_storage.catalog_legacy_reconcile_handle(),
+        config,
+        test_fault,
+    )?;
+    Ok(Some(worker))
 }
 
 fn plan_legacy_catalog_migration(
@@ -1987,9 +2053,11 @@ fn rollback_startup(
                 format!("seal legacy Catalog commit events during rollback error=[{error}]"),
             )
         });
+    // Startup timeout is intentionally soft across the initial physical verifier: once the
+    // publisher is sealed, retain ownership and join instead of leaking a worker past rollback.
     let legacy_catalog_shadow_outcome = legacy_catalog_shadow
         .as_mut()
-        .map(|shadow| shadow.shutdown_until(deadline));
+        .map(LegacyCatalogShadowWorker::shutdown_and_join);
     if legacy_catalog_shadow_outcome
         .as_ref()
         .is_some_and(LegacyCatalogShadowShutdownOutcome::is_complete)
@@ -2210,6 +2278,8 @@ mod tests {
         FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
     };
 
+    use crate::LegacyCatalogShadowState;
+
     use super::*;
 
     const DAEMON_TEST_NAMESPACE_ID: u128 = 91;
@@ -2220,6 +2290,47 @@ mod tests {
             "zippy-server-runtime-unit-test-logs-{}",
             std::process::id()
         ))
+    }
+
+    #[cfg(unix)]
+    fn shadow_runtime_test_config(
+        temp: &tempfile::TempDir,
+        startup_timeout: Duration,
+        fault: LegacyCatalogShadowTestFault,
+    ) -> LegacyServerRuntimeConfig {
+        let data_dir = temp.path().join("database");
+        let persist_root = temp.path().join("persisted");
+        fs::create_dir_all(&persist_root).unwrap();
+        let config_path = temp.path().join("zippy-shadow-runtime-unit.toml");
+        fs::write(
+            &config_path,
+            format!(
+                concat!(
+                    "[server]\n",
+                    "data_dir = {:?}\n",
+                    "native_storage_enabled = true\n\n",
+                    "[table.persist]\n",
+                    "data_dir = {:?}\n\n",
+                    "[catalog]\n",
+                    "backend = \"sqlite_shadow\"\n\n",
+                    "[catalog.shadow]\n",
+                    "comparison_timeout_ms = 100\n\n",
+                    "[master]\n",
+                    "shutdown_timeout_ms = 1000\n"
+                ),
+                data_dir.display().to_string(),
+                persist_root.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let master = MasterDaemonConfig::new(ControlEndpoint::Unix(
+            temp.path().join("zippy-shadow-runtime-unit.sock"),
+        ))
+        .with_config_path(config_path)
+        .with_logging(runtime_test_log_dir(), "info", false);
+        LegacyServerRuntimeConfig::new(master)
+            .with_startup_timeout(startup_timeout)
+            .with_legacy_catalog_shadow_test_fault(fault)
     }
 
     fn daemon_test_namespace_id() -> NamespaceId {
@@ -2427,6 +2538,143 @@ mod tests {
         };
 
         assert!(readiness.is_ready());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_recoverable_shadow_failure_completes_barrier_and_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = LegacyServerRuntime::start(shadow_runtime_test_config(
+            &temp,
+            Duration::from_secs(3),
+            LegacyCatalogShadowTestFault::InitialRecoverableOnce,
+        ))
+        .expect("recoverable initial shadow reconcile must not block legacy startup");
+
+        let initial = runtime
+            .health()
+            .legacy_catalog_shadow
+            .expect("shadow status must be published after the first attempt");
+        assert_eq!(initial.state, LegacyCatalogShadowState::BlockedRecoverable);
+        assert_eq!(initial.full_reconciles_total, 1);
+        assert_eq!(
+            initial.last_error.as_deref(),
+            Some("injected_initial_reconcile_failure")
+        );
+        assert!(runtime.health().readiness.is_ready());
+
+        let retry_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = runtime
+                .health()
+                .legacy_catalog_shadow
+                .expect("shadow worker must remain observable while retrying");
+            if status.state == LegacyCatalogShadowState::EligibleCandidate {
+                assert!(status.full_reconciles_total >= 2);
+                break;
+            }
+            assert!(
+                Instant::now() < retry_deadline,
+                "recoverable initial reconcile was not retried: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime.shutdown().is_clean());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structural_shadow_failure_before_initial_barrier_rolls_back_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("database");
+        let socket_path = temp.path().join("zippy-shadow-runtime-unit.sock");
+        let error = LegacyServerRuntime::start(shadow_runtime_test_config(
+            &temp,
+            Duration::from_secs(3),
+            LegacyCatalogShadowTestFault::ExitBeforeInitialAttempt,
+        ))
+        .err()
+        .expect("structural shadow failure must fail server startup");
+
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert!(!socket_path.exists());
+        let ownership = OwnedDataDirectory::acquire_or_initialize(&data_dir)
+            .expect("startup rollback must release the data directory lease");
+        drop(ownership);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_unsealed_shadow_disconnect_cannot_complete_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = LegacyServerRuntime::start(shadow_runtime_test_config(
+            &temp,
+            Duration::from_secs(3),
+            LegacyCatalogShadowTestFault::DisconnectBeforeFinalSeal,
+        ))
+        .expect("initial shadow reconcile must finish before injected receiver disconnect");
+
+        let status_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = runtime
+                .health()
+                .legacy_catalog_shadow
+                .expect("failed shadow worker status must remain observable");
+            if status.last_error.as_deref()
+                == Some("legacy_catalog_shadow_publisher_unsealed_at_worker_exit")
+            {
+                assert_eq!(status.state, LegacyCatalogShadowState::BlockedRecoverable);
+                break;
+            }
+            assert!(
+                Instant::now() < status_deadline,
+                "unsealed worker exit was not recorded: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let shutdown = runtime.shutdown();
+        assert!(!shutdown.is_clean(), "shutdown outcome: {shutdown:?}");
+        let failure = shutdown
+            .legacy_catalog_shadow_outcome
+            .as_ref()
+            .and_then(LegacyCatalogShadowShutdownOutcome::error)
+            .expect("unsealed receiver disconnect must fail the shadow drain");
+        assert_eq!(failure.code(), ErrorCode::Unavailable);
+        assert_eq!(
+            runtime
+                .health()
+                .legacy_catalog_shadow
+                .expect("failed final shadow status must be retained")
+                .state,
+            LegacyCatalogShadowState::BlockedRecoverable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_barrier_uses_soft_deadline_and_joins_before_rollback_returns() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("database");
+        let socket_path = temp.path().join("zippy-shadow-runtime-unit.sock");
+        let started = Instant::now();
+        let error = LegacyServerRuntime::start(shadow_runtime_test_config(
+            &temp,
+            Duration::from_secs(2),
+            LegacyCatalogShadowTestFault::DelayBeforeInitialAttempt(Duration::from_millis(2_500)),
+        ))
+        .err()
+        .expect("expired soft startup deadline must roll back after the initial attempt");
+
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert!(
+            started.elapsed() >= Duration::from_millis(2_300),
+            "initial barrier must retain ownership until the attempt completes"
+        );
+        assert!(!socket_path.exists());
+        let ownership = OwnedDataDirectory::acquire_or_initialize(&data_dir)
+            .expect("soft-deadline rollback must join workers and release the data directory");
+        drop(ownership);
     }
 
     #[test]
