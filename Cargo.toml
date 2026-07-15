@@ -25,6 +25,7 @@ version = "0.5.0"
 
 [workspace.dependencies]
 arrow = "53.3.0"
+bytes = "1.11.1"
 crossbeam-channel = "0.5.15"
 datafusion = { version = "=44.0.0", default-features = false, features = [
     "parquet",

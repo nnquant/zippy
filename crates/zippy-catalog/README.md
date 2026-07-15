@@ -73,7 +73,11 @@ Implemented:
   must not open the same external legacy file once per parallel worker because each open performs a
   full checksum pass. Every task and every `PinnedDataFileReader` shares one `Arc` owner that
   retains all pins and the owned data-root capability until the final task or reader drops. Managed
-  files are opened component by component relative to the stable data-root descriptor with
+  readers expose bounded positioned `read_at`/`read_exact_at` operations implemented with Unix
+  descriptor reads; they do not expose a path, raw `File`, or descriptor clone, and positioned
+  reads do not mutate the reader's existing sequential cursor. Query-layer cursors can therefore
+  read independent ranges while retaining the same pin.
+  Managed files are opened component by component relative to the stable data-root descriptor with
   `NOFOLLOW`, then checked for regular-file type, exact Catalog size, owner, link count, and
   owner-only permissions. External legacy files are reopened with `NOFOLLOW|NONBLOCK`, hashed on
   the same descriptor, compared with the Catalog checksum, and rewound before scanning. This

@@ -25,7 +25,16 @@ Current scope:
 
 - isolated per-session `SessionContext` creation;
 - explicit optimizer target-partition policy, which is not a hard resource limit;
-- Arrow ABI and SQL execution compatibility gates.
+- Arrow ABI and SQL execution compatibility gates;
+- a path-free `AdmittedRandomAccessFile` contract and Parquet `ChunkReader` adapter whose source
+  and every derived cursor share one owner. The server implementation places the complete
+  QueryService task permit behind that owner, so a cursor cannot continue physical I/O after CPU,
+  concurrency, or snapshot-pin accounting has been released. Every materialized Parquet range
+  first obtains a separate exact memory permit; `Bytes::from_owner` retains that permit through all
+  zero-copy clones and releases it only with the final clone.
 
-Next scope is a snapshot-bound `TableProvider` over Catalog-issued `PinnedDataFile` readers, followed
-by QueryService cancellation, memory-pool, result-stream, and spill integration.
+The current synchronous adapter is for the first bounded-blocking persisted scan slice. DataFusion
+44's stock `ParquetExec` uses an asynchronous file-reader factory, so the next scope is a
+permit-owned async reader and snapshot-bound `ZippyTableProvider`, followed by multi-file bounded
+scheduling, result-stream, memory-pool, and spill integration. Neither adapter may receive a raw
+path or a file handle detached from its QueryService permit.

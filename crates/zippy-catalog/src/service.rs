@@ -4994,6 +4994,21 @@ mod tests {
         let mut second_reader = second_worker_file
             .open_reader()
             .expect("open independent controlled reader");
+        let mut first_range = [u8::MAX; 4];
+        let mut second_range = [u8::MAX; 3];
+        reader
+            .read_exact_at(10, &mut first_range)
+            .expect("read first positioned range");
+        second_reader
+            .read_exact_at(64, &mut second_range)
+            .expect("read second positioned range");
+        assert_eq!(first_range, [10, 11, 12, 13]);
+        assert_eq!(second_range, [64, 65, 66]);
+        let range_error = reader
+            .read_exact_at(127, &mut [0_u8; 2])
+            .expect_err("positioned range beyond verified length must fail");
+        assert_eq!(range_error.kind(), std::io::ErrorKind::UnexpectedEof);
+
         let mut first_byte = [u8::MAX];
         let mut second_first_byte = [u8::MAX];
         reader

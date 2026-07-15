@@ -8,9 +8,164 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+use std::io::{self, Read};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::reader::{ChunkReader, Length};
+
+const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;
+
+/// A path-free random-access file whose lifetime owns query admission and snapshot protection.
+///
+/// Implementations must retain the complete task reservation and storage lease for as long as
+/// the value exists. Returning a detached file handle or reader violates this contract because a
+/// Parquet cursor can outlive the source object that created it.
+pub trait AdmittedRandomAccessFile: Send + Sync + 'static {
+    /// A mutable range buffer that retains its query memory reservation until final drop.
+    type RangeBuffer: AsRef<[u8]> + AsMut<[u8]> + Send + 'static;
+
+    /// Returns the immutable, storage-verified file length.
+    fn file_size_bytes(&self) -> u64;
+
+    /// Reserves and allocates one query-accounted buffer of the exact requested length.
+    ///
+    /// The returned owner must keep its memory reservation through clones of any zero-copy view
+    /// created from it. Allocation must happen only after admission succeeds.
+    fn reserve_range_buffer(&self, length: usize) -> io::Result<Self::RangeBuffer>;
+
+    /// Reads from an absolute byte offset without changing another cursor's position.
+    ///
+    /// Implementations should check query cancellation before each physical read and return a
+    /// permanent I/O error for cancellation rather than [`io::ErrorKind::Interrupted`].
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize>;
+}
+
+/// A Parquet [`ChunkReader`] backed by one admitted random-access query file.
+///
+/// Every cursor holds the same reference-counted admitted file, so dropping this outer source
+/// cannot release its query task reservation or snapshot lease while physical reads remain.
+pub struct AdmittedParquetSource<R: AdmittedRandomAccessFile> {
+    inner: Arc<R>,
+}
+
+impl<R: AdmittedRandomAccessFile> AdmittedParquetSource<R> {
+    /// Wraps a random-access file that already owns query admission and snapshot protection.
+    #[must_use]
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: Arc::new(reader),
+        }
+    }
+}
+
+impl<R: AdmittedRandomAccessFile> Clone for AdmittedParquetSource<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<R: AdmittedRandomAccessFile> Length for AdmittedParquetSource<R> {
+    fn len(&self) -> u64 {
+        self.inner.file_size_bytes()
+    }
+}
+
+impl<R: AdmittedRandomAccessFile> ChunkReader for AdmittedParquetSource<R> {
+    type T = AdmittedParquetCursor<R>;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        if start > self.len() {
+            return Err(ParquetError::EOF(
+                "Parquet cursor starts beyond admitted file length".to_owned(),
+            ));
+        }
+        Ok(AdmittedParquetCursor {
+            inner: Arc::clone(&self.inner),
+            position: start,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        let length_u64 = u64::try_from(length)
+            .map_err(|_| ParquetError::EOF("Parquet range length does not fit u64".to_owned()))?;
+        if start
+            .checked_add(length_u64)
+            .is_none_or(|end| end > self.len())
+        {
+            return Err(ParquetError::EOF(
+                "Parquet range exceeds admitted file length".to_owned(),
+            ));
+        }
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let mut buffer = self.inner.reserve_range_buffer(length)?;
+        if buffer.as_ref().len() != length || buffer.as_mut().len() != length {
+            return Err(ParquetError::General(
+                "admitted Parquet range reservation returned the wrong length".to_owned(),
+            ));
+        }
+        let mut cursor = AdmittedParquetCursor {
+            inner: Arc::clone(&self.inner),
+            position: start,
+        };
+        cursor.read_exact(buffer.as_mut())?;
+        Ok(Bytes::from_owner(buffer))
+    }
+}
+
+/// A sequential Parquet cursor that keeps its admitted file and task lease alive.
+pub struct AdmittedParquetCursor<R: AdmittedRandomAccessFile> {
+    inner: Arc<R>,
+    position: u64,
+}
+
+impl<R: AdmittedRandomAccessFile> Read for AdmittedParquetCursor<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.position == self.inner.file_size_bytes() {
+            return Ok(0);
+        }
+        if self.position > self.inner.file_size_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Parquet cursor moved beyond admitted file length",
+            ));
+        }
+        let remaining = self.inner.file_size_bytes() - self.position;
+        let read_length = buffer
+            .len()
+            .min(MAX_POSITIONED_READ_BYTES)
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let read = self
+            .inner
+            .read_at(self.position, &mut buffer[..read_length])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "admitted Parquet file ended before its verified length",
+            ));
+        }
+        if read > read_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "admitted Parquet reader returned more bytes than requested",
+            ));
+        }
+        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Parquet cursor offset overflowed",
+            )
+        })?;
+        Ok(read)
+    }
+}
 
 /// Immutable policy used to create one query session context.
 ///
@@ -44,15 +199,138 @@ impl QuerySessionPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Read};
     use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use arrow::array::{Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+    use parquet::file::reader::ChunkReader;
 
-    use super::QuerySessionPolicy;
+    use super::{
+        AdmittedParquetSource, AdmittedRandomAccessFile, QuerySessionPolicy,
+        MAX_POSITIONED_READ_BYTES,
+    };
+
+    struct TestAdmittedFile {
+        contents: Arc<[u8]>,
+        logical_length: u64,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl TestAdmittedFile {
+        fn new(contents: &[u8], logical_length: u64, drops: Arc<AtomicUsize>) -> Self {
+            Self {
+                contents: Arc::from(contents),
+                logical_length,
+                drops,
+            }
+        }
+    }
+
+    impl AdmittedRandomAccessFile for TestAdmittedFile {
+        type RangeBuffer = Vec<u8>;
+
+        fn file_size_bytes(&self) -> u64 {
+            self.logical_length
+        }
+
+        fn reserve_range_buffer(&self, length: usize) -> io::Result<Self::RangeBuffer> {
+            Ok(vec![0_u8; length])
+        }
+
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+            let Ok(offset) = usize::try_from(offset) else {
+                return Ok(0);
+            };
+            if offset >= self.contents.len() || buffer.is_empty() {
+                return Ok(0);
+            }
+            let read = buffer.len().min(self.contents.len() - offset);
+            buffer[..read].copy_from_slice(&self.contents[offset..offset + read]);
+            Ok(read)
+        }
+    }
+
+    impl Drop for TestAdmittedFile {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct ObservedRangeFile {
+        length: u64,
+        reads: Arc<AtomicUsize>,
+        largest_read: Arc<AtomicUsize>,
+    }
+
+    impl AdmittedRandomAccessFile for ObservedRangeFile {
+        type RangeBuffer = Vec<u8>;
+
+        fn file_size_bytes(&self) -> u64 {
+            self.length
+        }
+
+        fn reserve_range_buffer(&self, length: usize) -> io::Result<Self::RangeBuffer> {
+            Ok(vec![0_u8; length])
+        }
+
+        fn read_at(&self, _offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.largest_read.fetch_max(buffer.len(), Ordering::Relaxed);
+            buffer.fill(0x5a);
+            Ok(buffer.len())
+        }
+    }
+
+    struct DropTrackedRangeBuffer {
+        bytes: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for DropTrackedRangeBuffer {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl AsMut<[u8]> for DropTrackedRangeBuffer {
+        fn as_mut(&mut self) -> &mut [u8] {
+            &mut self.bytes
+        }
+    }
+
+    impl Drop for DropTrackedRangeBuffer {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct FailingRangeFile {
+        buffer_drops: Arc<AtomicUsize>,
+    }
+
+    impl AdmittedRandomAccessFile for FailingRangeFile {
+        type RangeBuffer = DropTrackedRangeBuffer;
+
+        fn file_size_bytes(&self) -> u64 {
+            10
+        }
+
+        fn reserve_range_buffer(&self, length: usize) -> io::Result<Self::RangeBuffer> {
+            Ok(DropTrackedRangeBuffer {
+                bytes: vec![0_u8; length],
+                drops: Arc::clone(&self.buffer_drops),
+            })
+        }
+
+        fn read_at(&self, _offset: u64, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
 
     #[test]
     fn workspace_and_datafusion_record_batches_share_one_arrow_abi() {
@@ -114,6 +392,90 @@ mod tests {
                 .unwrap()
                 .values(),
             &[2, 3]
+        );
+    }
+
+    #[test]
+    fn parquet_cursors_retain_admission_and_have_independent_positions() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source = AdmittedParquetSource::new(TestAdmittedFile::new(
+            b"0123456789",
+            10,
+            Arc::clone(&drops),
+        ));
+        let mut first = source.get_read(1).expect("open first cursor");
+        let mut second = source.get_read(6).expect("open second cursor");
+        drop(source);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        let mut first_bytes = [0_u8; 3];
+        let mut second_bytes = [0_u8; 2];
+        first
+            .read_exact(&mut first_bytes)
+            .expect("read first range");
+        second
+            .read_exact(&mut second_bytes)
+            .expect("read second range");
+        assert_eq!(&first_bytes, b"123");
+        assert_eq!(&second_bytes, b"67");
+
+        drop(first);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(second);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn parquet_ranges_fail_closed_on_bounds_overflow_and_premature_eof() {
+        let source = AdmittedParquetSource::new(TestAdmittedFile::new(
+            b"0123456789",
+            10,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        assert_eq!(
+            source.get_bytes(2, 4).expect("read valid range").as_ref(),
+            b"2345"
+        );
+        let mut eof = source.get_read(10).expect("cursor at logical EOF");
+        assert_eq!(eof.read(&mut [0_u8; 1]).expect("read logical EOF"), 0);
+        assert!(source.get_read(11).is_err());
+        assert!(source.get_bytes(9, 2).is_err());
+        assert!(source.get_bytes(u64::MAX, 1).is_err());
+
+        let truncated = AdmittedParquetSource::new(TestAdmittedFile::new(
+            b"short",
+            10,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        assert!(truncated.get_bytes(0, 10).is_err());
+
+        let buffer_drops = Arc::new(AtomicUsize::new(0));
+        let failed_read = AdmittedParquetSource::new(FailingRangeFile {
+            buffer_drops: Arc::clone(&buffer_drops),
+        });
+        assert!(failed_read.get_bytes(0, 10).is_err());
+        assert_eq!(buffer_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn large_parquet_ranges_are_split_into_cancellable_positioned_reads() {
+        let length = MAX_POSITIONED_READ_BYTES * 2 + 1;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let largest_read = Arc::new(AtomicUsize::new(0));
+        let source = AdmittedParquetSource::new(ObservedRangeFile {
+            length: length as u64,
+            reads: Arc::clone(&reads),
+            largest_read: Arc::clone(&largest_read),
+        });
+
+        let bytes = source
+            .get_bytes(0, length)
+            .expect("read a chunked admitted Parquet range");
+        assert_eq!(bytes.len(), length);
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            largest_read.load(Ordering::Relaxed),
+            MAX_POSITIONED_READ_BYTES
         );
     }
 }

@@ -2191,6 +2191,27 @@ draft 也不能保存 `PinnedDataFile`、reader、路径或其他 lease capabili
 撤销 snapshot root 后不会有隐藏的文件 pin。下一小步是在 execution 开始后先取得 QueryService task
 permit，再从 snapshot 派生单文件 capability，并让 Parquet source/range readers 共同持有该 permit。
 
+Stage 5.3 permit-owned pinned Parquet source 已完成（2026-07-15）：Catalog 的
+`PinnedDataFileReader` 新增 positioned range read，但仍不暴露 path、裸 `File`、descriptor clone 或可脱离
+lease 的 reader。`NativeQuerySnapshotCoordinator::admit_file_task` 严格先向 QueryService 预留 task/CPU/
+memory，再从 exact snapshot 派生 `PinnedDataFile`；`QueryTaskPermit::try_map_resource` 在 bounded blocking
+worker 打开文件时保留同一 reservation，错误或 panic 通过 RAII 完整回滚。
+
+`zippy-query::AdmittedParquetSource` 及其每个 `ChunkReader` cursor 共同持有 server 提供的完整 permit owner，
+因此 outer source、execution scope 或 logical query 提前结束，都不能让仍在读盘的 cursor 脱离资源账本或
+Catalog pin。真实 Parquet 测试覆盖 persisted write、exact snapshot、文件准入、解码、取消和 final-cursor
+释放；取消后不再返回字节，最后一个 cursor drop 后 task/CPU/memory/pin 才同时归零。
+
+每次 `ChunkReader::get_bytes` 还必须先取得 exact-size QueryService result-memory permit，再分配和填充 range
+buffer；返回值使用 `Bytes::from_owner(QueryResultPermit<Vec<u8>>)`，所以所有 zero-copy `Bytes` clone 共享
+同一 reservation，只有最终 clone drop 才释放 result permit 和字节额度。大 range 的 positioned I/O 按
+1 MiB 分块，在块间重新检查取消；分块只负责取消响应，动态 result permit 才是内存硬边界。
+
+这一小步仍只提供 bounded-blocking 同步 scan primitive。DataFusion 44 的标准 `ParquetExec` 使用
+`ParquetFileReaderFactory/AsyncFileReader`；后续 `ZippyTableProvider` 必须给异步 reader 复用同一 permit
+ownership 规则，并以 opaque table/file identity 代替真实路径。多文件调度、filter/projection physical
+plan、result stream 和 authority switch 尚未完成。
+
 任务：
 
 1. 完成 DataFusion/Arrow version spike。（已完成）

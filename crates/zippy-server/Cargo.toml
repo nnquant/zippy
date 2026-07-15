@@ -16,6 +16,7 @@ zippy-catalog = { path = "../zippy-catalog" }
 zippy-gateway = { path = "../zippy-gateway" }
 zippy-ingest = { path = "../zippy-ingest" }
 zippy-master = { path = "../zippy-master" }
+zippy-query = { path = "../zippy-query" }
 zippy-storage = { path = "../zippy-storage" }
 zippy-types = { path = "../zippy-types" }
 

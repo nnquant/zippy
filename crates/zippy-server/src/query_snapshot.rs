@@ -10,8 +10,8 @@ use std::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use zippy_catalog::{
-    PinnedTableManifest, SqliteCatalogPinnedQuerySnapshot, SqliteCatalogQuerySnapshotPinRequest,
-    SqliteCatalogReadHandle,
+    PinnedDataFile, PinnedTableManifest, SqliteCatalogPinnedQuerySnapshot,
+    SqliteCatalogQuerySnapshotPinRequest, SqliteCatalogReadHandle,
 };
 use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
 use zippy_types::catalog::{CatalogRead, CatalogSnapshotSelector};
@@ -261,6 +261,39 @@ impl NativeQuerySnapshotCoordinator {
                         "native query snapshot table index is out of bounds",
                     )
                     .with_query_id(execution.query_id())
+                    .with_retryable(false)
+                })
+            },
+        )
+    }
+
+    /// Admits one physical file task before deriving its capability from the pinned snapshot.
+    pub(crate) fn admit_file_task(
+        &self,
+        execution: &QueryExecutionScope,
+        charge: QueryTaskCharge,
+        table_index: usize,
+        file_index: usize,
+    ) -> Result<QueryTaskPermit<PinnedDataFile>> {
+        execution.admit_snapshot_task::<NativeQueryReadSnapshot, PinnedDataFile>(
+            charge,
+            |snapshot| {
+                self.validate_origin(snapshot)?;
+                let table = snapshot.pinned.table(table_index).ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::InvalidArgument,
+                        "native query snapshot table index is out of bounds",
+                    )
+                    .with_query_id(execution.query_id())
+                    .with_retryable(false)
+                })?;
+                table.file(file_index).ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::InvalidArgument,
+                        "native query snapshot file index is out of bounds",
+                    )
+                    .with_query_id(execution.query_id())
+                    .with_table_id(table.selector().table_id)
                     .with_retryable(false)
                 })
             },
@@ -623,28 +656,40 @@ fn corruption(query_id: QueryId, message: impl Into<String>) -> ServerError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Read;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::ChunkReader;
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::OwnedDataDirectory;
+    use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1,
         CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, CreateTableCommand,
     };
     use zippy_types::table::{
-        AppendTableDefinition, CatalogName, SchemaIpcPayload, TableDefinition, TableRef,
+        AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance,
+        SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages,
+        TableDefinition, TableRef,
     };
-    use zippy_types::{NamespaceId, QueryId, RequestId, SessionId, TableId};
+    use zippy_types::{
+        FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, QueryId, RequestId,
+        SessionId, TableId,
+    };
 
     use super::{NativeQuerySnapshotCoordinator, TestPinStage};
     use crate::legacy_catalog_migration::LEGACY_STREAM_NAME_CONFIG_KEY;
     use crate::native_storage::{
         NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
     };
+    use crate::query_physical::AdmittedPinnedParquetFile;
     use crate::query_service::{
         QueryResourceBudget, QueryServiceRegistryConfig, QuerySubmissionMetadata, QueryTaskCharge,
     };
@@ -709,6 +754,60 @@ mod tests {
         writer.finish().expect("finish IPC stream");
         drop(writer);
         SchemaIpcPayload::new(bytes).expect("nonempty schema IPC")
+    }
+
+    fn arrow_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Int64,
+            false,
+        )]))
+    }
+
+    fn persist_request() -> PersistRequest {
+        let offset = LogOffset::new(0);
+        let offsets = OffsetRange::new(offset, offset).expect("single offset range");
+        let provenance = NativeDataFileProvenance::new(
+            offsets,
+            SourceSegmentLineages::new(vec![SourceSegmentLineage {
+                source: SourceSegmentIdentity {
+                    segment_id: 1,
+                    generation: 1,
+                    writer_epoch: 0,
+                },
+                offsets,
+            }])
+            .expect("one source segment lineage"),
+        )
+        .expect("valid native provenance");
+        let schema = arrow_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42_i64]))],
+        )
+        .expect("build persisted query batch");
+        let candidate = PersistCandidateInput::new(
+            ParquetCandidateSpec {
+                file_id: FileId::from_u128(100).expect("nonzero file ID"),
+                table_id: table_id(NATIVE_TABLE),
+                schema_version: 1,
+                schema,
+                provenance,
+                partition: MetadataMap::new(),
+                metadata: MetadataMap::new(),
+                created_at_ns: 1_752_492_600_000_000_100,
+            },
+            vec![batch],
+        )
+        .expect("build persisted query candidate");
+        PersistRequest::new(
+            request_id(100),
+            table_id(NATIVE_TABLE),
+            1,
+            vec![candidate],
+            OffsetWatermark::Known(offset),
+        )
+        .expect("build persist request")
     }
 
     fn actor() -> CatalogActor {
@@ -910,6 +1009,27 @@ mod tests {
         );
         assert_eq!(resources.status().active_tasks, 0);
 
+        let foreign_file_error = match foreign.admit_file_task(&execution, charge(), 0, 0) {
+            Ok(_) => panic!("foreign coordinator file task must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            foreign_file_error.code(),
+            zippy_types::ErrorCode::InvalidArgument
+        );
+        assert_eq!(resources.status().active_tasks, 0);
+
+        let missing_file_error =
+            match snapshot_coordinator.admit_file_task(&execution, charge(), 0, 0) {
+                Ok(_) => panic!("empty snapshot table must reject a file task"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            missing_file_error.code(),
+            zippy_types::ErrorCode::InvalidArgument
+        );
+        assert_eq!(resources.status().active_tasks, 0);
+
         let task = snapshot_coordinator
             .admit_table_task(&execution, charge(), 0)
             .expect("admit lease-bound table task");
@@ -937,6 +1057,144 @@ mod tests {
             .runtime_query_snapshot_pins()
             .expect("query pins released")
             .is_empty());
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_parquet_cursor_retains_task_and_pin_until_final_drop() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        runtime
+            .table_actor(table_id(NATIVE_TABLE))
+            .expect("native table actor")
+            .persist(persist_request())
+            .await
+            .expect("persist one native Parquet file");
+
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let query = query_id(109);
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register native Parquet query");
+        let snapshot = snapshot_coordinator
+            .pin_persisted(
+                &planning,
+                &[TableRef::Id {
+                    table_id: table_id(NATIVE_TABLE),
+                }],
+            )
+            .await
+            .expect("pin persisted Parquet snapshot");
+        let draft = snapshot.plan_draft();
+        let token = resources
+            .complete_planning_at_for_test(planning, draft, snapshot.into_opaque(), 10)
+            .expect("complete native Parquet plan");
+        let execution = resources
+            .begin_execution(token, 11)
+            .expect("begin native Parquet execution");
+        let file_task = snapshot_coordinator
+            .admit_file_task(&execution, charge(), 0, 0)
+            .expect("admit exact pinned file task");
+        let source =
+            tokio::task::spawn_blocking(move || AdmittedPinnedParquetFile::open(file_task))
+                .await
+                .expect("join bounded file opener")
+                .expect("open admitted Parquet source");
+        assert_eq!(resources.status().active_tasks, 1);
+        assert_eq!(resources.status().active_result_permits, 0);
+
+        let range = source
+            .get_bytes(0, 4)
+            .expect("read one query-accounted Parquet range");
+        assert_eq!(range.as_ref(), b"PAR1");
+        assert_eq!(resources.status().active_result_permits, 1);
+        assert_eq!(resources.status().active_result_memory_bytes, 4);
+        let cloned_range = range.clone();
+        let second_range = source
+            .get_bytes(0, 4)
+            .expect("reserve a second independent Parquet range");
+        assert_eq!(resources.status().active_result_permits, 2);
+        assert_eq!(resources.status().active_result_memory_bytes, 8);
+        assert!(source.get_bytes(0, 4).is_err());
+        assert_eq!(resources.status().active_result_permits, 2);
+        drop(range);
+        assert_eq!(resources.status().active_result_permits, 2);
+        drop(second_range);
+        assert_eq!(resources.status().active_result_permits, 1);
+        assert_eq!(resources.status().active_result_memory_bytes, 4);
+        drop(cloned_range);
+        assert_eq!(resources.status().active_result_permits, 0);
+        assert_eq!(resources.status().active_result_memory_bytes, 0);
+
+        let scan_source = source.clone();
+        let batch = tokio::task::spawn_blocking(move || {
+            let mut reader = ParquetRecordBatchReaderBuilder::try_new(scan_source)
+                .expect("read admitted Parquet metadata")
+                .build()
+                .expect("build admitted Parquet reader");
+            reader
+                .next()
+                .expect("one admitted Parquet batch")
+                .expect("decode admitted Parquet batch")
+        })
+        .await
+        .expect("join bounded Parquet scan");
+        assert_eq!(resources.status().active_result_permits, 0);
+        assert_eq!(resources.status().active_result_memory_bytes, 0);
+        let prices = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("retain Int64 price column");
+        assert_eq!(prices.len(), 1);
+        assert_eq!(prices.value(0), 42);
+
+        let mut cursor = source.get_read(0).expect("open lease-bound Parquet cursor");
+        let mut magic = [0_u8; 4];
+        cursor
+            .read_exact(&mut magic)
+            .expect("read Parquet magic through admitted cursor");
+        assert_eq!(&magic, b"PAR1");
+        drop(source);
+        assert_eq!(resources.status().active_tasks, 1);
+
+        resources
+            .cancel_current_for_test(query)
+            .expect("cancel native Parquet query");
+        drop(execution);
+        assert_eq!(resources.status().active_tasks, 1);
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("cursor retains Catalog pin")
+                .active_query_pins,
+            1
+        );
+        let cancellation = cursor
+            .read(&mut [0_u8; 1])
+            .expect_err("cancelled cursor must stop producing bytes");
+        assert_eq!(cancellation.kind(), std::io::ErrorKind::ConnectionAborted);
+
+        drop(cursor);
+        assert_eq!(resources.status().active_tasks, 0);
+        assert_eq!(resources.status().active_cpu_slots, 0);
+        assert_eq!(resources.status().active_memory_bytes, 0);
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("final cursor releases Catalog pin")
+                .active_query_pins,
+            0
+        );
         assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
     }
 

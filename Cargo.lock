@@ -3599,7 +3599,9 @@ name = "zippy-query"
 version = "0.5.0"
 dependencies = [
  "arrow",
+ "bytes",
  "datafusion",
+ "parquet",
  "tokio",
 ]
 
@@ -3636,6 +3638,7 @@ dependencies = [
  "zippy-gateway",
  "zippy-ingest",
  "zippy-master",
+ "zippy-query",
  "zippy-storage",
  "zippy-types",
 ]

@@ -18,6 +18,9 @@ mod native_storage;
 // Remove this allowance when the native planner constructs the coordinator directly.
 #[allow(dead_code)]
 mod query_service;
+// Remove this allowance when the native executor opens admitted Parquet sources directly.
+#[allow(dead_code)]
+mod query_physical;
 #[allow(dead_code)]
 mod query_snapshot;
 mod runtime;

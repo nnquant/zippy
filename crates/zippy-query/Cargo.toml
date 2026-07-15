@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bytes.workspace = true
 datafusion.workspace = true
+parquet.workspace = true
 
 [dev-dependencies]
 arrow.workspace = true

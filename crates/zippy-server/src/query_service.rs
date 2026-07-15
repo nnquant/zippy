@@ -2748,7 +2748,6 @@ pub(crate) struct QueryTaskPermit<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> QueryTaskPermit<R> {
-    #[cfg(test)]
     pub(crate) fn resource(&self) -> &R {
         self.resource
             .as_ref()
@@ -2777,6 +2776,51 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
             .expect("live task permit retains its resource reservation")
             .control
             .cancellation()
+    }
+
+    /// Replaces a task resource without releasing its snapshot owner or resource reservation.
+    ///
+    /// This is used after admission to perform fallible physical setup such as opening a pinned
+    /// file. If the conversion fails or panics, the original task charge and snapshot ownership
+    /// are released by normal unwinding rather than escaping as an unaccounted resource.
+    pub(crate) fn try_map_resource<T: Send + 'static>(
+        mut self,
+        convert: impl FnOnce(R) -> Result<T>,
+    ) -> Result<QueryTaskPermit<T>> {
+        let resource = self
+            .resource
+            .take()
+            .expect("live task permit retains its physical resource");
+        let resource = convert(resource)?;
+        Ok(QueryTaskPermit {
+            resource: Some(resource),
+            ownership: self.ownership.take(),
+            reservation: self.reservation.take(),
+        })
+    }
+
+    /// Admits an independently owned result buffer while this physical task remains active.
+    ///
+    /// The returned permit may outlive the task and releases its exact result-memory charge only
+    /// after the final downstream owner drops it.
+    pub(crate) fn admit_result<T: Send + 'static>(
+        &self,
+        charge: QueryResultCharge,
+        result: T,
+    ) -> Result<QueryResultPermit<T>> {
+        let task = self
+            .reservation
+            .as_ref()
+            .expect("live task permit retains its resource reservation");
+        let owner = task
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(task.control.query_id))?;
+        let reservation = owner.reserve_result(&task.control, charge)?;
+        Ok(QueryResultPermit {
+            result: Some(result),
+            reservation: Some(reservation),
+        })
     }
 
     /// Converts a task-owned buffer and atomically reclassifies its charge for result delivery.
@@ -2819,6 +2863,12 @@ pub(crate) struct QueryResultPermit<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> QueryResultPermit<R> {
+    pub(crate) fn resource_mut(&mut self) -> &mut R {
+        self.result
+            .as_mut()
+            .expect("live result permit retains its result buffer")
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         self.reservation
             .as_ref()
@@ -2841,6 +2891,22 @@ impl<R: Send + 'static> AsRef<R> for QueryResultPermit<R> {
     fn as_ref(&self) -> &R {
         self.result
             .as_ref()
+            .expect("live result permit retains its result buffer")
+    }
+}
+
+impl AsRef<[u8]> for QueryResultPermit<Vec<u8>> {
+    fn as_ref(&self) -> &[u8] {
+        self.result
+            .as_deref()
+            .expect("live result permit retains its result buffer")
+    }
+}
+
+impl AsMut<[u8]> for QueryResultPermit<Vec<u8>> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.result
+            .as_deref_mut()
             .expect("live result permit retains its result buffer")
     }
 }
@@ -4182,6 +4248,68 @@ mod tests {
             .unwrap();
         assert_eq!(query.active_tasks, 0);
         assert_eq!(query.active_task_memory_bytes, 0);
+        drop(execution);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn task_resource_mapping_keeps_one_reservation_and_rolls_back_failures() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+
+        let successful_drops = Arc::new(AtomicUsize::new(0));
+        let successful = execution
+            .admit_task(charge(1, 20), DropProbe(Arc::clone(&successful_drops)))
+            .unwrap()
+            .try_map_resource(|resource| Ok((resource, "opened")))
+            .expect("map admitted task resource");
+        assert_eq!(coordinator.status().active_tasks, 1);
+        assert_eq!(coordinator.status().active_memory_bytes, 20);
+        assert_eq!(successful_drops.load(Ordering::Relaxed), 0);
+        drop(successful);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(successful_drops.load(Ordering::Relaxed), 1);
+
+        let failed_drops = Arc::new(AtomicUsize::new(0));
+        let failed = execution
+            .admit_task(charge(1, 20), DropProbe(Arc::clone(&failed_drops)))
+            .unwrap()
+            .try_map_resource::<()>(|_| {
+                Err(ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "test task resource conversion failed",
+                ))
+            })
+            .err()
+            .expect("mapping error must be returned");
+        assert_eq!(failed.code(), ErrorCode::InvalidArgument);
+        assert_eq!(failed_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 0);
+
+        let panic_drops = Arc::new(AtomicUsize::new(0));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let task = execution
+                .admit_task(charge(1, 20), DropProbe(Arc::clone(&panic_drops)))
+                .unwrap();
+            let _ = task.try_map_resource::<()>(|_| panic!("test task resource mapping panic"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(panic_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_cpu_slots, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+
         drop(execution);
         assert_eq!(coordinator.status().tracked_sessions, 0);
     }

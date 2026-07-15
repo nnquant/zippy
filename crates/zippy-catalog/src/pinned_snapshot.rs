@@ -437,6 +437,82 @@ impl PinnedDataFileReader {
     pub const fn file_size_bytes(&self) -> u64 {
         self.file_size_bytes
     }
+
+    /// Reads from an absolute byte offset without changing this reader's sequential cursor.
+    ///
+    /// The request is capped at the Catalog-verified file length even if the physical descriptor
+    /// later observes a larger object. This method does not clone or expose the descriptor, so
+    /// concurrent Parquet range readers continue to retain the same opaque snapshot owner.
+    pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || offset >= self.file_size_bytes {
+            return Ok(0);
+        }
+        let remaining = self.file_size_bytes - offset;
+        let read_length = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        read_file_at(&self.file, &mut buffer[..read_length], offset)
+    }
+
+    /// Fills the complete buffer from an absolute byte offset.
+    ///
+    /// Requests outside the Catalog-verified range fail with [`io::ErrorKind::UnexpectedEof`]
+    /// before physical I/O begins. Interrupted reads are retried without changing another
+    /// cursor's position.
+    pub fn read_exact_at(&self, mut offset: u64, mut buffer: &mut [u8]) -> io::Result<()> {
+        let requested = u64::try_from(buffer.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pinned data-file range length does not fit u64",
+            )
+        })?;
+        if offset
+            .checked_add(requested)
+            .is_none_or(|end| end > self.file_size_bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pinned data-file range exceeds verified length",
+            ));
+        }
+        while !buffer.is_empty() {
+            match self.read_at(offset, buffer) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "pinned data-file descriptor ended before verified length",
+                    ));
+                }
+                Ok(read) => {
+                    offset = offset.checked_add(read as u64).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "pinned data-file range offset overflowed",
+                        )
+                    })?;
+                    buffer = &mut buffer[read..];
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+
+    file.read_at(buffer, offset)
+}
+
+#[cfg(not(unix))]
+fn read_file_at(_file: &File, _buffer: &mut [u8], _offset: u64) -> io::Result<usize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pinned data-file random access is unsupported on this platform",
+    ))
 }
 
 impl fmt::Debug for PinnedDataFileReader {
