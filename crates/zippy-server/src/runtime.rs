@@ -1770,8 +1770,42 @@ fn prepare_legacy_catalog_migration(
             );
         }
     };
+    let projection_snapshot = match master
+        .legacy_catalog_adapter()
+        .capture_projection_snapshot_v4()
+    {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            tracing::warn!(
+                component = "legacy_catalog_migration",
+                event = "legacy_catalog_projection_snapshot_reuse_unavailable",
+                error_code = %error.code(),
+                retryable = error.retryable(),
+                "v4 projection snapshot could not be captured; the startup importer remains active"
+            );
+            None
+        }
+    };
     match plan_legacy_catalog_migration(runtime_config, &snapshot) {
-        Ok(plan) => LegacyCatalogMigrationStartup::Planned(plan),
+        Ok(plan) => {
+            let plan = match projection_snapshot.as_ref() {
+                Some(snapshot) if snapshot.catalog_revision() == plan.source_catalog_revision() => {
+                    plan.with_projection_snapshot_v4(snapshot)
+                }
+                Some(snapshot) => {
+                    tracing::warn!(
+                        component = "legacy_catalog_migration",
+                        event = "legacy_catalog_projection_snapshot_revision_mismatch",
+                        migration_revision = plan.source_catalog_revision(),
+                        projection_revision = snapshot.catalog_revision(),
+                        "v4 projection snapshot does not cover the migration snapshot; the startup importer remains active"
+                    );
+                    plan
+                }
+                None => plan,
+            };
+            LegacyCatalogMigrationStartup::Planned(plan)
+        }
         Err(error) => {
             LegacyCatalogMigrationStartup::Degraded(LegacyCatalogMigrationDegradation::from_error(
                 LegacyCatalogMigrationDegradedReason::PlanningFailed,

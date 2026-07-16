@@ -29,9 +29,9 @@ use zippy_types::table::TableDescriptor;
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
 
 use crate::legacy_catalog_migration::{
-    execute_legacy_catalog_metadata_import, LegacyCatalogMigrationDegradation,
-    LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationStartup,
-    LegacyCatalogMigrationStatus, LEGACY_STREAM_NAME_CONFIG_KEY,
+    exact_v4_checkpoint_supersedes_import, execute_legacy_catalog_metadata_import,
+    LegacyCatalogMigrationDegradation, LegacyCatalogMigrationDegradedReason,
+    LegacyCatalogMigrationStartup, LegacyCatalogMigrationStatus, LEGACY_STREAM_NAME_CONFIG_KEY,
 };
 
 const SUPERVISOR_THREAD_NAME: &str = "zippy-native-storage";
@@ -1093,6 +1093,37 @@ async fn run_legacy_catalog_migration(
             ))
         }
         LegacyCatalogMigrationStartup::Planned(plan) => {
+            let superseded = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return Err(startup_cancelled());
+                }
+                result = exact_v4_checkpoint_supersedes_import(&plan, catalog.as_ref()) => result,
+            };
+            let superseded = match superseded {
+                Ok(superseded) => superseded,
+                Err(error) => {
+                    tracing::warn!(
+                        component = "legacy_catalog_migration",
+                        event = "legacy_catalog_v4_checkpoint_reuse_unavailable",
+                        error_code = %error.code(),
+                        "v4 checkpoint could not supersede the startup importer"
+                    );
+                    false
+                }
+            };
+            if superseded {
+                let session = catalog.begin_legacy_import_session()?;
+                session.seal();
+                tracing::info!(
+                    component = "legacy_catalog_migration",
+                    event = "legacy_catalog_metadata_import_superseded_by_v4",
+                    source_catalog_revision = plan.source_catalog_revision(),
+                    "exact v4 projection checkpoint superseded the startup V1/V2 importer"
+                );
+                return Ok(LegacyCatalogMigrationStatus::completed_by_v4_checkpoint());
+            }
             let result = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
