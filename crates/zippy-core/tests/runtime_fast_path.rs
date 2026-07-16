@@ -15,6 +15,16 @@ use zippy_segment_store::{
     compile_schema, ColumnSpec, ColumnType, SegmentStore, SegmentStoreConfig,
 };
 
+const TEST_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+// Xfast workers busy-spin by design; serialize their ordering tests on small CI runners.
+static XFAST_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_xfast_test() -> std::sync::MutexGuard<'static, ()> {
+    XFAST_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct BlockingEngine {
     schema: Arc<Schema>,
     state: Arc<BlockingEngineState>,
@@ -277,7 +287,7 @@ impl TestPipelineRuntime {
     }
 
     fn wait_until_first_data_started(&self) {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + TEST_PROGRESS_TIMEOUT;
         while Instant::now() < deadline {
             if *self.engine_state.first_data_started.lock().unwrap() {
                 return;
@@ -289,7 +299,7 @@ impl TestPipelineRuntime {
     }
 
     fn wait_for_records_len(&self, expected_len: usize) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + TEST_PROGRESS_TIMEOUT;
         while Instant::now() < deadline {
             let snapshot = self.engine_state.records.lock().unwrap().clone();
             if snapshot.len() >= expected_len {
@@ -306,7 +316,7 @@ impl TestPipelineRuntime {
     }
 
     fn wait_until_stopped(&self) {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + TEST_PROGRESS_TIMEOUT;
         while Instant::now() < deadline {
             if self.handle.as_ref().unwrap().status() == EngineStatus::Stopped {
                 return;
@@ -322,7 +332,7 @@ impl TestPipelineRuntime {
     }
 
     fn wait_until_failed(&self) {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + TEST_PROGRESS_TIMEOUT;
         while Instant::now() < deadline {
             if self.handle.as_ref().unwrap().status() == EngineStatus::Failed {
                 return;
@@ -538,7 +548,7 @@ fn source_pipeline_fast_path_keeps_control_events_on_control_queue() {
         .is_err());
 
     first_data_release_tx.send(()).unwrap();
-    match stop_result.recv_timeout(Duration::from_secs(1)) {
+    match stop_result.recv_timeout(TEST_PROGRESS_TIMEOUT) {
         Ok(Ok(())) => {}
         Ok(Err(err)) => panic!("stop send failed unexpectedly: {err}"),
         Err(_) => panic!("stop send did not complete after control queue drained"),
@@ -551,6 +561,7 @@ fn source_pipeline_fast_path_keeps_control_events_on_control_queue() {
 
 #[test]
 fn source_pipeline_block_mode_with_xfast_keeps_control_ordering() {
+    let _xfast_test_guard = lock_xfast_test();
     let (runtime, first_data_release_tx) =
         spawn_test_runtime_with_behavior(SourceMode::Pipeline, OverflowPolicy::Block, true, false);
     runtime.source_emit_data(single_row_batch(1)).unwrap();
@@ -564,7 +575,7 @@ fn source_pipeline_block_mode_with_xfast_keeps_control_ordering() {
 
     first_data_release_tx.send(()).unwrap();
     assert!(matches!(
-        stop_result.recv_timeout(Duration::from_secs(1)),
+        stop_result.recv_timeout(TEST_PROGRESS_TIMEOUT),
         Ok(Ok(()))
     ));
 
@@ -575,6 +586,7 @@ fn source_pipeline_block_mode_with_xfast_keeps_control_ordering() {
 
 #[test]
 fn engine_handle_flush_with_xfast_does_not_overtake_fast_queue_data() {
+    let _xfast_test_guard = lock_xfast_test();
     let (mut runtime, first_data_release_tx) =
         spawn_test_runtime_with_behavior(SourceMode::Pipeline, OverflowPolicy::Block, true, false);
     runtime.source_emit_data(single_row_batch(1)).unwrap();
@@ -598,7 +610,7 @@ fn engine_handle_flush_with_xfast_does_not_overtake_fast_queue_data() {
 
         first_data_release_tx.send(()).unwrap();
 
-        match flush_rx.recv_timeout(Duration::from_secs(1)) {
+        match flush_rx.recv_timeout(TEST_PROGRESS_TIMEOUT) {
             Ok(Ok(outputs)) => assert!(outputs.is_empty()),
             Ok(Err(err)) => panic!("flush failed unexpectedly: {err}"),
             Err(_) => panic!("flush did not complete after fast data drained"),
@@ -613,6 +625,7 @@ fn engine_handle_flush_with_xfast_does_not_overtake_fast_queue_data() {
 
 #[test]
 fn engine_handle_stop_with_xfast_does_not_overtake_fast_queue_data() {
+    let _xfast_test_guard = lock_xfast_test();
     let (mut runtime, first_data_release_tx) =
         spawn_test_runtime_with_behavior(SourceMode::Pipeline, OverflowPolicy::Block, true, false);
     runtime.source_emit_data(single_row_batch(1)).unwrap();
@@ -636,7 +649,7 @@ fn engine_handle_stop_with_xfast_does_not_overtake_fast_queue_data() {
 
         first_data_release_tx.send(()).unwrap();
 
-        match stop_rx.recv_timeout(Duration::from_secs(1)) {
+        match stop_rx.recv_timeout(TEST_PROGRESS_TIMEOUT) {
             Ok(Ok(())) => {}
             Ok(Err(err)) => panic!("stop failed unexpectedly: {err}"),
             Err(_) => panic!("stop did not complete after fast data drained"),
@@ -685,7 +698,7 @@ fn source_consumer_block_mode_keeps_data_on_control_queue() {
         .is_err());
 
     first_data_release_tx.send(()).unwrap();
-    match second_data_result.recv_timeout(Duration::from_secs(1)) {
+    match second_data_result.recv_timeout(TEST_PROGRESS_TIMEOUT) {
         Ok(Ok(())) => {}
         Ok(Err(err)) => panic!("second data send failed unexpectedly: {err}"),
         Err(_) => panic!("second data send did not complete after control queue drained"),
