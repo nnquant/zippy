@@ -52,9 +52,11 @@ impl DataDirectoryOwner {
 
 /// Exclusive process ownership of a validated data directory.
 ///
-/// Dropping this value closes the lock descriptor and releases the kernel
-/// lock. The lock file itself is deliberately retained to prevent an
-/// unlink-and-recreate race during ordinary lifecycle cleanup.
+/// Dropping this value explicitly releases the kernel lock before closing its
+/// descriptor. The explicit unlock prevents a transient fork-inherited
+/// descriptor from extending ownership until the child calls `exec`. The lock
+/// file itself is deliberately retained to prevent an unlink-and-recreate race
+/// during ordinary lifecycle cleanup.
 #[derive(Debug)]
 pub struct OwnedDataDirectory {
     directory: DataDirectory,
@@ -63,6 +65,12 @@ pub struct OwnedDataDirectory {
     _lock_file: File,
     _root_directory: File,
     catalog_runtime_owned: Arc<AtomicBool>,
+}
+
+impl Drop for OwnedDataDirectory {
+    fn drop(&mut self) {
+        release_exclusive_lock(&self._lock_file, &self.lock_path);
+    }
 }
 
 impl OwnedDataDirectory {
@@ -331,10 +339,24 @@ fn acquire_exclusive_lock(file: &File, path: &Path) -> Result<(), DataDirectoryE
     }
 }
 
+#[cfg(unix)]
+fn release_exclusive_lock(file: &File, path: &Path) {
+    if let Err(error) = rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock) {
+        tracing::error!(
+            path = %path.display(),
+            error = %error,
+            "failed to release data directory ownership lock"
+        );
+    }
+}
+
 #[cfg(not(unix))]
 fn acquire_exclusive_lock(_file: &File, _path: &Path) -> Result<(), DataDirectoryError> {
     Err(DataDirectoryError::UnsupportedPlatformSecurity)
 }
+
+#[cfg(not(unix))]
+fn release_exclusive_lock(_file: &File, _path: &Path) {}
 
 fn current_owner(path: &Path) -> Result<DataDirectoryOwner, DataDirectoryError> {
     let elapsed = SystemTime::now()
@@ -378,4 +400,32 @@ fn write_owner_record(
     file.write_all(&encoded)
         .map_err(|error| io_error(path, error))?;
     file.sync_all().map_err(|error| io_error(path, error))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn owner_drop_unlocks_a_fork_inherited_file_description() {
+        let directory = TempDir::new().expect("create temp directory");
+        let owner = OwnedDataDirectory::acquire_or_initialize(directory.path().join("data"))
+            .expect("acquire initialized data root");
+        let root = owner.directory().root().to_path_buf();
+        let inherited_lock = owner
+            ._lock_file
+            .try_clone()
+            .expect("clone the process lock file description");
+
+        drop(owner);
+        let reacquired = DataDirectory::open(root)
+            .expect("open data root after owner drop")
+            .acquire_process_ownership()
+            .expect("explicit unlock must release a fork-inherited description");
+
+        drop(reacquired);
+        drop(inherited_lock);
+    }
 }

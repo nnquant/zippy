@@ -20,7 +20,7 @@ use zippy_catalog::{
 };
 use zippy_master::legacy_catalog::{
     LegacyCatalogActivePublicTableV4, LegacyCatalogMigrationSnapshot, LegacyCatalogMigrationTable,
-    LegacyMigrationFile,
+    LegacyCatalogProjectionSnapshotV4, LegacyMigrationFile,
 };
 use zippy_storage::{verify_legacy_parquet_import, LegacyParquetImportSpec};
 use zippy_types::catalog::{
@@ -28,7 +28,8 @@ use zippy_types::catalog::{
     CatalogCommandV1, CatalogIdempotencyRead, CatalogOutcomeV1, CatalogRead, CatalogWrite,
     CreateNamespaceCommand, CreateTableCommand, LegacyCatalogImportCommandV2,
     LegacyCatalogImportEnvelopeV2, LegacyCatalogImportFileV2, LegacyCatalogImportReplayProbeV2,
-    LegacyCatalogImportResponseV2, VersionedCatalogCommand, VersionedCatalogResponse,
+    LegacyCatalogImportResponseV2, LegacyCatalogProjectionCheckpointV4,
+    LegacyCatalogProjectionPhaseV4, VersionedCatalogCommand, VersionedCatalogResponse,
     LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY, LEGACY_REGISTRY_INDEX_METADATA_KEY,
 };
 use zippy_types::table::{
@@ -147,6 +148,7 @@ pub struct LegacyCatalogMetadataImportPlan {
     migration_version: u32,
     source_snapshot_hash: String,
     source_catalog_revision: u64,
+    source_projection_digest_v4: Option<String>,
     commands: Vec<PlannedCommand>,
     v2_imports: Vec<PlannedLegacyTableImportV2>,
     tables: Vec<LegacyCatalogTablePlan>,
@@ -169,6 +171,16 @@ impl LegacyCatalogMetadataImportPlan {
     #[must_use]
     pub const fn source_catalog_revision(&self) -> u64 {
         self.source_catalog_revision
+    }
+
+    pub(crate) fn with_projection_snapshot_v4(
+        mut self,
+        snapshot: &LegacyCatalogProjectionSnapshotV4,
+    ) -> Self {
+        if snapshot.catalog_revision() == self.source_catalog_revision {
+            self.source_projection_digest_v4 = Some(snapshot.global_projection_digest().to_owned());
+        }
+        self
     }
 
     /// Returns table decisions in stable table-id order.
@@ -385,7 +397,7 @@ pub struct LegacyCatalogMetadataMigrationReport {
 pub enum LegacyCatalogMigrationState {
     /// The effective configuration does not request shadow migration.
     Disabled,
-    /// Every source table is represented by a completed V1 or V2 import.
+    /// Every source table is represented by V1/V2 import or an exact, stronger V4 checkpoint.
     Complete,
     /// Legacy remains authoritative while the shadow migration requires operator attention.
     Degraded,
@@ -459,7 +471,7 @@ fn sanitized_migration_error(error: &ServerError) -> String {
 pub struct LegacyCatalogMigrationStatus {
     /// Stable lifecycle state.
     pub state: LegacyCatalogMigrationState,
-    /// Auditable import report when SQLite execution completed.
+    /// Auditable V1/V2 report, absent when an exact V4 checkpoint superseded the importer.
     pub report: Option<LegacyCatalogMetadataMigrationReport>,
     /// Structured diagnostics when the migration is degraded.
     pub degradation: Option<LegacyCatalogMigrationDegradation>,
@@ -500,10 +512,20 @@ impl LegacyCatalogMigrationStatus {
         }
     }
 
+    pub(crate) const fn completed_by_v4_checkpoint() -> Self {
+        Self {
+            state: LegacyCatalogMigrationState::Complete,
+            report: None,
+            degradation: None,
+        }
+    }
+
     /// Returns a bounded, label-safe metrics snapshot without the diagnostic error message.
     #[must_use]
     pub fn metrics(&self) -> serde_json::Value {
         let report = self.report.as_ref();
+        let checkpoint_reused =
+            self.state == LegacyCatalogMigrationState::Complete && self.report.is_none();
         let attempted = report.is_some()
             || self.degradation.as_ref().is_some_and(|degradation| {
                 degradation.reason == LegacyCatalogMigrationDegradedReason::ExecutionFailed
@@ -517,6 +539,14 @@ impl LegacyCatalogMigrationStatus {
             },
             "attempts": usize::from(attempted),
             "completed_attempts": usize::from(report.is_some()),
+            "completion_mode": if checkpoint_reused {
+                Some("v4_checkpoint")
+            } else if report.is_some() {
+                Some("legacy_import")
+            } else {
+                None
+            },
+            "checkpoint_reuses": usize::from(checkpoint_reused),
             "degraded": usize::from(self.state == LegacyCatalogMigrationState::Degraded),
             "source_catalog_revision": report.map(|report| report.source_catalog_revision),
             "target_revision_after": report.map(|report| report.target_revision_after),
@@ -718,6 +748,7 @@ fn build_frozen_v1_metadata_plan(
         migration_version: LEGACY_CATALOG_METADATA_MIGRATION_VERSION,
         source_snapshot_hash: snapshot.source_snapshot_hash().to_owned(),
         source_catalog_revision: snapshot.source_catalog_revision(),
+        source_projection_digest_v4: None,
         commands,
         v2_imports: Vec::new(),
         tables: table_plans,
@@ -1297,6 +1328,38 @@ fn canonical_absolute_path_components(
         components.push(component);
     }
     Ok(components)
+}
+
+pub(crate) async fn exact_v4_checkpoint_supersedes_import(
+    plan: &LegacyCatalogMetadataImportPlan,
+    catalog: &SqliteCatalog,
+) -> Result<bool> {
+    if plan.source_projection_digest_v4.is_none() {
+        return Ok(false);
+    }
+    let checkpoint = catalog
+        .read_handle()?
+        .read_legacy_projection_checkpoint_v4()
+        .await?;
+    Ok(v4_checkpoint_supersedes_import(plan, &checkpoint))
+}
+
+fn v4_checkpoint_supersedes_import(
+    plan: &LegacyCatalogMetadataImportPlan,
+    checkpoint: &LegacyCatalogProjectionCheckpointV4,
+) -> bool {
+    let Some(expected_digest) = plan.source_projection_digest_v4.as_deref() else {
+        return false;
+    };
+    checkpoint.checkpoint_generation > 0
+        && matches!(
+            checkpoint.phase,
+            LegacyCatalogProjectionPhaseV4::FullShadow
+                | LegacyCatalogProjectionPhaseV4::ReadCutoverReady
+        )
+        && checkpoint.source_catalog_revision == plan.source_catalog_revision
+        && checkpoint.source_projection_hash == expected_digest
+        && checkpoint.projection_digest == expected_digest
 }
 
 /// Executes an immutable V1/V2 plan through Catalog idempotency and revision guards.
@@ -1911,7 +1974,8 @@ mod tests {
     use zippy_master::server::MasterServer;
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1,
-        CatalogRead, CatalogWrite, CreateNamespaceCommand, ListTablesRequest,
+        CatalogRead, CatalogWrite, CreateNamespaceCommand, LegacyCatalogCheckpointModeV4,
+        LegacyCatalogProjectionCheckpointV4, LegacyCatalogProjectionPhaseV4, ListTablesRequest,
         VersionedCatalogCommand, LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY,
         LEGACY_REGISTRY_INDEX_METADATA_KEY,
     };
@@ -1920,12 +1984,13 @@ mod tests {
 
     use super::{
         execute_legacy_catalog_metadata_import, plan_legacy_catalog_metadata_import,
-        LegacyCatalogCommandDisposition, LegacyCatalogMetadataImportPlan,
-        LegacyCatalogTableMigrationOutcome, LegacyCatalogTablePlanStatus,
-        LegacyCatalogV2ImportRequirement, LEGACY_CATALOG_PHYSICAL_MIGRATION_VERSION,
-        LEGACY_EMPTY_NATIVE_SNAPSHOT_BASE, LEGACY_IMPORTED_NATIVE_SNAPSHOT_BASE,
-        LEGACY_MIGRATION_VERSION_CONFIG_KEY, LEGACY_REVISION_BASE_CONFIG_KEY,
-        LEGACY_STREAM_NAME_CONFIG_KEY, NATIVE_SNAPSHOT_BASE_CONFIG_KEY,
+        v4_checkpoint_supersedes_import, LegacyCatalogCommandDisposition,
+        LegacyCatalogMetadataImportPlan, LegacyCatalogTableMigrationOutcome,
+        LegacyCatalogTablePlanStatus, LegacyCatalogV2ImportRequirement,
+        LEGACY_CATALOG_PHYSICAL_MIGRATION_VERSION, LEGACY_EMPTY_NATIVE_SNAPSHOT_BASE,
+        LEGACY_IMPORTED_NATIVE_SNAPSHOT_BASE, LEGACY_MIGRATION_VERSION_CONFIG_KEY,
+        LEGACY_REVISION_BASE_CONFIG_KEY, LEGACY_STREAM_NAME_CONFIG_KEY,
+        NATIVE_SNAPSHOT_BASE_CONFIG_KEY,
     };
 
     fn open_catalog(directory: &TempDir) -> SqliteCatalog {
@@ -1933,6 +1998,54 @@ mod tests {
             OwnedDataDirectory::acquire_or_initialize(directory.path().join("data")).unwrap(),
         );
         SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap()
+    }
+
+    #[test]
+    fn exact_v4_checkpoint_is_the_only_state_that_supersedes_the_importer() {
+        let (_master, snapshot) = snapshot_with_tables(Vec::new());
+        let mut plan = plan_legacy_catalog_metadata_import(&snapshot).unwrap();
+        let digest = "sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        plan.source_projection_digest_v4 = Some(digest.to_owned());
+        let checkpoint = LegacyCatalogProjectionCheckpointV4 {
+            checkpoint_generation: 1,
+            shadow_epoch: 2,
+            phase: LegacyCatalogProjectionPhaseV4::FullShadow,
+            source_catalog_revision: plan.source_catalog_revision,
+            source_projection_hash: digest.to_owned(),
+            projection_digest: digest.to_owned(),
+            mode: LegacyCatalogCheckpointModeV4::Contiguous,
+            resolved_continuity_loss_epoch: 0,
+            updated_at_ns: 1,
+        };
+        assert!(v4_checkpoint_supersedes_import(&plan, &checkpoint));
+
+        let mut wrong_source_digest = checkpoint.clone();
+        wrong_source_digest.source_projection_hash =
+            "sha256-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        assert!(!v4_checkpoint_supersedes_import(
+            &plan,
+            &wrong_source_digest
+        ));
+
+        let mut wrong_native_digest = checkpoint.clone();
+        wrong_native_digest.projection_digest =
+            "sha256-v1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned();
+        assert!(!v4_checkpoint_supersedes_import(
+            &plan,
+            &wrong_native_digest
+        ));
+
+        let mut stale = checkpoint.clone();
+        stale.source_catalog_revision = stale.source_catalog_revision.saturating_add(1);
+        assert!(!v4_checkpoint_supersedes_import(&plan, &stale));
+
+        let mut foundation = checkpoint.clone();
+        foundation.phase = LegacyCatalogProjectionPhaseV4::FoundationOnly;
+        assert!(!v4_checkpoint_supersedes_import(&plan, &foundation));
+
+        let mut uncommitted = checkpoint;
+        uncommitted.checkpoint_generation = 0;
+        assert!(!v4_checkpoint_supersedes_import(&plan, &uncommitted));
     }
 
     fn append_schema(custom_metadata: bool) -> Arc<Schema> {

@@ -673,6 +673,8 @@ async fn sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker() {
     let migration_metrics = runtime.legacy_catalog_migration_metrics();
     assert_eq!(migration_metrics["configured"], true);
     assert_eq!(migration_metrics["state"], "complete");
+    assert_eq!(migration_metrics["completion_mode"], "legacy_import");
+    assert_eq!(migration_metrics["checkpoint_reuses"], 0);
     assert_eq!(migration_metrics["submitted_commands"], 1);
 
     let shutdown = runtime.shutdown();
@@ -733,15 +735,15 @@ async fn sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker() {
         gateway_addr,
     ))
     .expect("restart server with the same SQLite Catalog shadow");
-    let replay = restarted
-        .legacy_catalog_migration_status()
-        .report
-        .as_ref()
-        .expect("restart must retain migration replay evidence");
-    assert_eq!(replay.submitted_commands, 0);
-    assert_eq!(replay.replayed_commands, 1);
-    assert_eq!(replay.target_revision_before, 3);
-    assert_eq!(replay.target_revision_after, 3);
+    let migration = restarted.legacy_catalog_migration_status();
+    assert_eq!(migration.state, LegacyCatalogMigrationState::Complete);
+    assert!(migration.report.is_none());
+    assert!(migration.degradation.is_none());
+    let metrics = restarted.legacy_catalog_migration_metrics();
+    assert_eq!(metrics["completion_mode"], "v4_checkpoint");
+    assert_eq!(metrics["checkpoint_reuses"], 1);
+    assert_eq!(metrics["attempts"], 0);
+    assert_eq!(metrics["completed_attempts"], 0);
     let restarted_shadow = restarted
         .health()
         .legacy_catalog_shadow
@@ -928,6 +930,7 @@ async fn persisted_file_commit_reconciles_native_exact_snapshot_through_shadow_w
     assert_eq!(reconciled.unsupported_mutations_total, 0);
     assert_eq!(reconciled.last_error, None);
     client.unregister_process().unwrap();
+    drop(client);
 
     let shutdown = runtime.shutdown();
     assert!(shutdown.is_clean(), "shutdown outcome: {shutdown:?}");
@@ -1015,6 +1018,57 @@ async fn persisted_file_commit_reconciles_native_exact_snapshot_through_shadow_w
     drop(read);
     catalog.close().unwrap();
     drop(ownership);
+
+    let mut restarted =
+        LegacyServerRuntime::start(runtime_config_with_shadow_catalog_and_persist_root(
+            &temp,
+            &data_dir,
+            gateway_addr,
+            Some(&persist_root),
+        ))
+        .expect("restart server after reconciling multiple persisted writer outputs");
+    let restarted_shadow = restarted
+        .health()
+        .legacy_catalog_shadow
+        .expect("restarted SQLite shadow status must remain observable");
+    assert_eq!(
+        restarted_shadow.state,
+        LegacyCatalogShadowState::EligibleCandidate
+    );
+    assert_eq!(restarted_shadow.reconciled_catalog_revision, 2);
+    assert_eq!(restarted_shadow.last_error, None);
+    let migration = restarted.legacy_catalog_migration_status();
+    assert_eq!(migration.state, LegacyCatalogMigrationState::Complete);
+    assert!(migration.report.is_none());
+    assert!(migration.degradation.is_none());
+    let migration_metrics = restarted.legacy_catalog_migration_metrics();
+    assert_eq!(migration_metrics["completion_mode"], "v4_checkpoint");
+    assert_eq!(migration_metrics["checkpoint_reuses"], 1);
+
+    let restarted_client =
+        MasterClient::connect_endpoint(restarted.control_endpoint().clone()).unwrap();
+    let restarted_stream = restarted_client.get_stream("events").unwrap();
+    assert_eq!(restarted_stream.persisted_files_revision, 2);
+    assert_eq!(restarted_stream.persisted_files.len(), 2);
+    let mut persisted_file_ids = restarted_stream
+        .persisted_files
+        .iter()
+        .map(|file| file["persist_file_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    persisted_file_ids.sort_unstable();
+    assert_eq!(persisted_file_ids, vec!["events-0", "events-1"]);
+    drop(restarted_client);
+
+    let restarted_shutdown = restarted.shutdown();
+    assert!(
+        restarted_shutdown.is_clean(),
+        "restart shutdown outcome: {restarted_shutdown:?}"
+    );
+    assert_eq!(
+        restarted_shutdown.legacy_catalog_shadow_outcome,
+        Some(LegacyCatalogShadowShutdownOutcome::Complete)
+    );
+    wait_until_bindable(gateway_addr);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1456,6 +1510,8 @@ async fn sqlite_shadow_migration_failure_is_degraded_without_closing_legacy_auth
     }));
     let metrics = runtime.legacy_catalog_migration_metrics();
     assert_eq!(metrics["state"], "degraded");
+    assert!(metrics["completion_mode"].is_null());
+    assert_eq!(metrics["checkpoint_reuses"], 0);
     assert_eq!(metrics["degraded_reason"], "execution_failed");
     assert_eq!(metrics["error_code"], "CONFLICT");
 

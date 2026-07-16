@@ -139,6 +139,10 @@ Gateway Arrow buffer。`max_concurrent_queries` 默认 `64`、上限 `4096`；
 23. 如果 Windows 侧还不能构建 native `_internal` 扩展，但能访问 `python/zippy`
     源码目录，可设置 `ZIPPY_FORCE_PURE_PYTHON=1` 先验证 remote-only 的
     `connect()` / `get_writer()` / `read_table().collect()` 高层 API。
+24. 对已经运行的 LDC/TGW 生产流执行只读验收时，运行
+    `08_remote_gateway/07_ldc_tgw_read_acceptance.py`。它覆盖远程查询下推、流式
+    collect、快照语义、Arrow 批回调、CTA 逐行回调和 writer epoch 连续性；完整的
+    Windows 操作步骤与边界见 `docs/ldc_tgw_windows_manual_acceptance.md`。
 
 ## API 分层
 

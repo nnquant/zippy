@@ -2633,27 +2633,29 @@ fn write_persist_rows_parquet(
             ),
         })?;
 
-        let file_name = if partition.values.raw.is_empty() {
-            format!(
-                "{}-segment-{:020}.parquet",
-                sanitize_persist_file_component(stream_name),
-                segment_id
-            )
-        } else {
-            format!(
-                "{}-segment-{:020}-generation-{:020}-part-{:05}.parquet",
-                sanitize_persist_file_component(stream_name),
-                segment_id,
-                generation,
-                part_index
-            )
-        };
+        let file_name = format!(
+            concat!(
+                "{}-segment-{:020}-generation-{:020}-writer-epoch-{:020}",
+                "-part-{:05}.parquet"
+            ),
+            sanitize_persist_file_component(stream_name),
+            segment_id,
+            generation,
+            writer_epoch,
+            part_index
+        );
         let target_path = target_dir.join(file_name);
         write_record_batch_parquet(&target_path, &partition.batch)?;
 
         files.push(serde_json::json!({
             "stream_name": stream_name,
-            "persist_file_id": persist_file_id(stream_name, segment_id, generation, part_index),
+            "persist_file_id": persist_file_id(
+                stream_name,
+                segment_id,
+                generation,
+                writer_epoch,
+                part_index,
+            ),
             "file_path": target_path.to_string_lossy().to_string(),
             "row_count": partition.batch.num_rows(),
             "source_segment_id": segment_id,
@@ -2725,9 +2727,10 @@ fn persist_file_id(
     stream_name: &str,
     segment_id: u64,
     generation: u64,
+    writer_epoch: u64,
     part_index: usize,
 ) -> String {
-    format!("{stream_name}:{segment_id}:{generation}:{part_index}")
+    format!("{stream_name}:{segment_id}:{generation}:{writer_epoch}:{part_index}")
 }
 
 fn persist_failure_event(
@@ -2739,7 +2742,10 @@ fn persist_failure_event(
 ) -> serde_json::Value {
     serde_json::json!({
         "stream_name": stream_name,
-        "persist_event_id": format!("{}:{}:{}:failed", stream_name, identity.0, identity.1),
+        "persist_event_id": format!(
+            "{}:{}:{}:{}:failed",
+            stream_name, identity.0, identity.1, writer_epoch,
+        ),
         "persist_event_type": "persist_failed",
         "source_segment_id": identity.0,
         "source_generation": identity.1,
@@ -2759,7 +2765,10 @@ fn persist_metadata_sync_failure_event(
 ) -> serde_json::Value {
     serde_json::json!({
         "stream_name": stream_name,
-        "persist_event_id": format!("{}:{}:{}:metadata_sync_failed", stream_name, identity.0, identity.1),
+        "persist_event_id": format!(
+            "{}:{}:{}:{}:metadata_sync_failed",
+            stream_name, identity.0, identity.1, writer_epoch,
+        ),
         "persist_event_type": "persist_metadata_sync_failed",
         "source_segment_id": identity.0,
         "source_generation": identity.1,
@@ -2819,43 +2828,77 @@ fn write_persist_metadata_sidecars(
 
 fn write_record_batch_parquet(target_path: &Path, batch: &RecordBatch) -> Result<()> {
     let temp_path = temp_parquet_path_for_target(target_path);
-    let file = File::create(&temp_path).map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to create stream table persist file path=[{}] error=[{}]",
-            temp_path.display(),
-            error
-        ),
-    })?;
-    let mut writer =
-        ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| ZippyError::Io {
+    let file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| ZippyError::Io {
             reason: format!(
-                "failed to create stream table persist writer error=[{}]",
+                "failed to create stream table persist file path=[{}] error=[{}]",
+                temp_path.display(),
                 error
             ),
         })?;
-    writer.write(batch).map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to write stream table persist batch error=[{}]",
-            error
-        ),
-    })?;
-    writer.close().map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to close stream table persist writer error=[{}]",
-            error
-        ),
-    })?;
-    fs::rename(&temp_path, target_path).map_err(|error| {
-        let _ = fs::remove_file(&temp_path);
-        ZippyError::Io {
+    let write_result = (|| {
+        let mut writer =
+            ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to create stream table persist writer error=[{}]",
+                    error
+                ),
+            })?;
+        writer.write(batch).map_err(|error| ZippyError::Io {
             reason: format!(
-                "failed to commit stream table persist file path=[{}] error=[{}]",
-                target_path.display(),
+                "failed to write stream table persist batch error=[{}]",
                 error
             ),
-        }
-    })?;
+        })?;
+        writer.close().map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to close stream table persist writer error=[{}]",
+                error
+            ),
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    commit_parquet_without_replace(&temp_path, target_path)?;
     Ok(())
+}
+
+fn commit_parquet_without_replace(temp_path: &Path, target_path: &Path) -> Result<()> {
+    match fs::hard_link(temp_path, target_path) {
+        Ok(()) => {
+            if let Err(error) = fs::remove_file(temp_path) {
+                tracing::warn!(
+                    event = "stream_table_persist_temp_cleanup_failed",
+                    path = %temp_path.display(),
+                    error = %error,
+                    "stream_table_persist_temp_cleanup_failed"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temp_path);
+            let reason = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "refusing to overwrite existing stream table persist file path=[{}]",
+                    target_path.display()
+                )
+            } else {
+                format!(
+                    "failed to commit stream table persist file without replacement path=[{}] error=[{}]",
+                    target_path.display(),
+                    error
+                )
+            };
+            Err(ZippyError::Io { reason })
+        }
+    }
 }
 
 fn temp_parquet_path_for_target(target_path: &Path) -> PathBuf {

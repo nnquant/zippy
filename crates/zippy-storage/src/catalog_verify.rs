@@ -503,6 +503,25 @@ fn validate_import_summary(
     rows: u64,
     bytes: u64,
 ) -> Result<()> {
+    match snapshot.snapshot_version {
+        2 => validate_initial_import_summary(table_id, snapshot, file_count, rows, bytes),
+        version if version > 2 => {
+            validate_reconcile_import_summary(table_id, snapshot, file_count, rows, bytes)
+        }
+        _ => Err(table_corruption(
+            table_id,
+            "catalog import snapshot has an invalid version",
+        )),
+    }
+}
+
+fn validate_initial_import_summary(
+    table_id: TableId,
+    snapshot: &TableSnapshot,
+    file_count: u64,
+    rows: u64,
+    bytes: u64,
+) -> Result<()> {
     const ADDED_FILES: &str = "added_files";
     const ADDED_ROWS: &str = "added_rows";
     const ADDED_BYTES: &str = "added_bytes";
@@ -532,6 +551,63 @@ fn validate_import_summary(
         return Err(table_corruption(
             table_id,
             "catalog import snapshot summary does not match its visible manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reconcile_import_summary(
+    table_id: TableId,
+    snapshot: &TableSnapshot,
+    file_count: u64,
+    rows: u64,
+    bytes: u64,
+) -> Result<()> {
+    let value = |key: &str| match snapshot.summary.get(key) {
+        Some(MetadataScalar::UInt64(value)) => Some(*value),
+        _ => None,
+    };
+    let values = (
+        value("target_files"),
+        value("target_rows"),
+        value("target_bytes"),
+        value("retained_files"),
+        value("added_files"),
+        value("removed_files"),
+        value("previous_legacy_files_revision"),
+        value("legacy_files_revision"),
+        value("continuity_gap"),
+    );
+    let (
+        Some(target_files),
+        Some(target_rows),
+        Some(target_bytes),
+        Some(retained_files),
+        Some(added_files),
+        Some(removed_files),
+        Some(previous_revision),
+        Some(legacy_revision),
+        Some(continuity_gap),
+    ) = values
+    else {
+        return Err(table_corruption(
+            table_id,
+            "catalog reconcile snapshot has an invalid summary",
+        ));
+    };
+
+    if snapshot.summary.len() != 9
+        || target_files != file_count
+        || target_rows != rows
+        || target_bytes != bytes
+        || retained_files.checked_add(added_files) != Some(target_files)
+        || removed_files > u64::try_from(MAX_FILES).expect("file bound fits u64")
+        || legacy_revision <= previous_revision
+        || continuity_gap != u64::from(previous_revision.checked_add(1) != Some(legacy_revision))
+    {
+        return Err(table_corruption(
+            table_id,
+            "catalog reconcile snapshot summary does not match its visible manifest",
         ));
     }
     Ok(())
@@ -772,6 +848,39 @@ mod tests {
         ])
     }
 
+    fn reconcile_snapshot(summary: MetadataMap) -> TableSnapshot {
+        TableSnapshot {
+            table_id: table_id(),
+            snapshot_version: 3,
+            parent_snapshot_version: Some(2),
+            operation: SnapshotOperation::Import,
+            commit_lsn: 3,
+            committed_log_offset: OffsetWatermark::LegacyUnknown,
+            created_at_ns: 2,
+            summary,
+        }
+    }
+
+    fn valid_reconcile_summary() -> MetadataMap {
+        MetadataMap::from([
+            ("target_files".to_owned(), MetadataScalar::UInt64(2)),
+            ("target_rows".to_owned(), MetadataScalar::UInt64(5)),
+            ("target_bytes".to_owned(), MetadataScalar::UInt64(13)),
+            ("retained_files".to_owned(), MetadataScalar::UInt64(1)),
+            ("added_files".to_owned(), MetadataScalar::UInt64(1)),
+            ("removed_files".to_owned(), MetadataScalar::UInt64(0)),
+            (
+                "previous_legacy_files_revision".to_owned(),
+                MetadataScalar::UInt64(7),
+            ),
+            (
+                "legacy_files_revision".to_owned(),
+                MetadataScalar::UInt64(8),
+            ),
+            ("continuity_gap".to_owned(), MetadataScalar::UInt64(0)),
+        ])
+    }
+
     #[test]
     fn import_summary_requires_exact_manifest_aggregates() {
         validate_import_summary(table_id(), &import_snapshot(valid_summary()), 2, 5, 13)
@@ -805,6 +914,34 @@ mod tests {
         for summary in [extra, wrong_type, zero_revision] {
             let error = validate_import_summary(table_id(), &import_snapshot(summary), 2, 5, 13)
                 .expect_err("noncanonical import summary must fail closed");
+            assert_eq!(error.code(), ErrorCode::DataCorruption);
+            assert!(!error.retryable());
+        }
+    }
+
+    #[test]
+    fn reconcile_import_summary_accepts_exact_target_manifest() {
+        validate_import_summary(
+            table_id(),
+            &reconcile_snapshot(valid_reconcile_summary()),
+            2,
+            5,
+            13,
+        )
+        .expect("exact reconcile summary");
+    }
+
+    #[test]
+    fn reconcile_import_summary_rejects_target_manifest_mismatch() {
+        for (files, rows, bytes) in [(3, 5, 13), (2, 6, 13), (2, 5, 14)] {
+            let error = validate_import_summary(
+                table_id(),
+                &reconcile_snapshot(valid_reconcile_summary()),
+                files,
+                rows,
+                bytes,
+            )
+            .expect_err("mismatched reconcile aggregate must fail closed");
             assert_eq!(error.code(), ErrorCode::DataCorruption);
             assert!(!error.retryable());
         }

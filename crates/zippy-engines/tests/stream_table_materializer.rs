@@ -1694,6 +1694,126 @@ fn stream_table_persist_metadata_carries_writer_epoch() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["stream_name"], "ticks");
     assert_eq!(files[0]["writer_epoch"], 42);
+    assert_eq!(files[0]["persist_file_id"], "ticks:1:0:42:0");
+    assert!(files[0]["file_path"]
+        .as_str()
+        .unwrap()
+        .contains("writer-epoch-00000000000000000042"));
+
+    let _ = fs::remove_dir_all(persist_root);
+}
+
+#[test]
+fn stream_table_writer_restart_keeps_both_epochs_physical_and_queryable() {
+    let persist_root = temp_persist_root("writer-epoch-restart");
+    let persist_publisher = Arc::new(RecordingPersistPublisher::default());
+
+    for (writer_epoch, rows) in [(1_u64, 2_usize), (2_u64, 3_usize)] {
+        let mut materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+            "ticks",
+            input_schema(),
+            32,
+            Some(writer_epoch),
+        )
+        .unwrap()
+        .with_parquet_persist(StreamTablePersistConfig::new(&persist_root))
+        .with_persist_publisher(persist_publisher.clone());
+        materializer
+            .on_data(SegmentTableView::from_record_batch(input_batch_with_rows(
+                rows,
+            )))
+            .unwrap();
+        materializer.on_stop().unwrap();
+    }
+
+    let mut files = persist_publisher.files.lock().unwrap().clone();
+    files.sort_by_key(|file| file["writer_epoch"].as_u64().unwrap());
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|file| file["source_segment_id"] == 1));
+    assert!(files.iter().all(|file| file["source_generation"] == 0));
+    assert_eq!(files[0]["persist_file_id"], "ticks:1:0:1:0");
+    assert_eq!(files[1]["persist_file_id"], "ticks:1:0:2:0");
+    assert_ne!(files[0]["file_path"], files[1]["file_path"]);
+
+    for (file, expected_rows) in files.iter().zip([2_usize, 3_usize]) {
+        let path = PathBuf::from(file["file_path"].as_str().unwrap());
+        assert!(path.exists());
+        let rows = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum::<usize>();
+        assert_eq!(rows, expected_rows);
+    }
+    assert_eq!(
+        fs::read_dir(persist_root.join("_zippy_persist_metadata"))
+            .unwrap()
+            .count(),
+        2
+    );
+
+    let _ = fs::remove_dir_all(persist_root);
+}
+
+#[test]
+fn stream_table_persist_collision_fails_without_replacing_existing_parquet() {
+    let persist_root = temp_persist_root("persist-no-clobber");
+    let persist_publisher = Arc::new(RecordingPersistPublisher::default());
+
+    {
+        let mut first = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+            "ticks",
+            input_schema(),
+            32,
+            Some(7),
+        )
+        .unwrap()
+        .with_parquet_persist(StreamTablePersistConfig::new(&persist_root))
+        .with_persist_publisher(persist_publisher.clone());
+        first
+            .on_data(SegmentTableView::from_record_batch(input_batch_with_rows(
+                2,
+            )))
+            .unwrap();
+        first.on_stop().unwrap();
+    }
+
+    let first_path = PathBuf::from(
+        persist_publisher.files.lock().unwrap()[0]["file_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let first_bytes = fs::read(&first_path).unwrap();
+    let mut colliding = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+        "ticks",
+        input_schema(),
+        32,
+        Some(7),
+    )
+    .unwrap()
+    .with_parquet_persist(StreamTablePersistConfig::new(&persist_root))
+    .with_persist_publisher(persist_publisher.clone());
+    colliding
+        .on_data(SegmentTableView::from_record_batch(input_batch_with_rows(
+            3,
+        )))
+        .unwrap();
+    let error = colliding
+        .on_stop()
+        .expect_err("same persisted identity must fail closed");
+    assert!(error
+        .to_string()
+        .contains("refusing to overwrite existing stream table persist file"));
+    assert_eq!(fs::read(&first_path).unwrap(), first_bytes);
+    assert_eq!(persist_publisher.files.lock().unwrap().len(), 1);
+    let rows = ParquetRecordBatchReaderBuilder::try_new(File::open(first_path).unwrap())
+        .unwrap()
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 2);
 
     let _ = fs::remove_dir_all(persist_root);
 }
@@ -1788,11 +1908,15 @@ fn stream_table_materializer_partitions_persisted_parquet_by_dt_part_and_id() {
     .unwrap();
     let persist_config =
         StreamTablePersistConfig::new(&persist_root).with_partition_spec(partition_spec);
-    let mut materializer =
-        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 4)
-            .unwrap()
-            .with_parquet_persist(persist_config)
-            .with_persist_publisher(persist_publisher.clone());
+    let mut materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+        "ticks",
+        input_schema(),
+        4,
+        Some(42),
+    )
+    .unwrap()
+    .with_parquet_persist(persist_config)
+    .with_persist_publisher(persist_publisher.clone());
 
     materializer
         .on_data(SegmentTableView::from_record_batch(
@@ -1818,7 +1942,11 @@ fn stream_table_materializer_partitions_persisted_parquet_by_dt_part_and_id() {
     assert!(files.iter().all(|file| file["persist_file_id"]
         .as_str()
         .unwrap()
-        .starts_with("ticks:1:0:")));
+        .starts_with("ticks:1:0:42:")));
+    assert!(files.iter().all(|file| file["file_path"]
+        .as_str()
+        .unwrap()
+        .contains("writer-epoch-00000000000000000042")));
     assert!(files.iter().any(|file| {
         file["partition"]["dt_part"] == "202604"
             && file["partition"]["instrument_id"] == "A/B"
@@ -1995,11 +2123,15 @@ fn stream_table_metadata_publish_failure_publishes_queryable_error_event() {
         .with_max_attempts(2)
         .unwrap()
         .with_retry_delay(Duration::from_millis(0));
-    let mut materializer =
-        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 2)
-            .unwrap()
-            .with_parquet_persist(persist_config)
-            .with_persist_publisher(persist_publisher.clone());
+    let mut materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+        "ticks",
+        input_schema(),
+        2,
+        Some(42),
+    )
+    .unwrap()
+    .with_parquet_persist(persist_config)
+    .with_persist_publisher(persist_publisher.clone());
 
     materializer
         .on_data(SegmentTableView::from_record_batch(input_batch_with_rows(
@@ -2023,7 +2155,7 @@ fn stream_table_metadata_publish_failure_publishes_queryable_error_event() {
     assert!(events[0]["persist_event_id"]
         .as_str()
         .unwrap()
-        .starts_with("ticks:1:0:metadata_sync_failed"));
+        .starts_with("ticks:1:0:42:metadata_sync_failed"));
     assert!(events[0]["error"]
         .as_str()
         .unwrap()

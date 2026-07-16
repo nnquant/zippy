@@ -2,6 +2,8 @@ name: ci
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 jobs:
@@ -20,10 +22,23 @@ jobs:
 
   verify:
     runs-on: ubuntu-latest
+    env:
+      PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
 
     steps:
       - name: checkout
         uses: actions/checkout@v4
+
+      - name: checkout rspm python dependency
+        uses: actions/checkout@v4
+        with:
+          repository: nnquant/rspm
+          ref: 520d3d6c497afd05b8e3d965ef6d04f7422c023e
+          path: .ci-deps/rspm
+          persist-credentials: false
+
+      - name: expose rspm sibling source
+        run: ln -s "$GITHUB_WORKSPACE/.ci-deps/rspm" "$GITHUB_WORKSPACE/../rspm"
 
       - name: setup rust
         uses: dtolnay/rust-toolchain@stable
@@ -37,7 +52,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: sync python dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev --no-install-project
 
       - name: run rust tests
         run: cargo test --workspace

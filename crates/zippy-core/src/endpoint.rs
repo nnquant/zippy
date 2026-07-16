@@ -242,18 +242,28 @@ fn home_dir() -> PathBuf {
 fn parse_tcp_endpoint(original_uri: &str, addr: &str) -> Result<ControlEndpoint> {
     let socket_addr = addr
         .parse::<SocketAddr>()
-        .or_else(|_| {
-            addr.to_socket_addrs()?.next().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "no socket address resolved",
-                )
-            })
-        })
+        .or_else(|_| resolve_named_socket_addr(addr))
         .map_err(|error| ZippyError::InvalidConfig {
             reason: format!("invalid tcp control endpoint uri=[{original_uri}] error=[{error}]"),
         })?;
     Ok(ControlEndpoint::Tcp(socket_addr))
+}
+
+fn resolve_named_socket_addr(addr: &str) -> std::io::Result<SocketAddr> {
+    let mut resolved = addr.to_socket_addrs()?;
+    let first = resolved.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no socket address resolved",
+        )
+    })?;
+    let is_localhost = addr
+        .rsplit_once(':')
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"));
+    if is_localhost && first.is_ipv6() {
+        return Ok(resolved.find(SocketAddr::is_ipv4).unwrap_or(first));
+    }
+    Ok(first)
 }
 
 #[cfg(test)]

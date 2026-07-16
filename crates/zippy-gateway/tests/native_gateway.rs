@@ -7,7 +7,7 @@ use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -3643,6 +3643,8 @@ fn native_gateway_slow_subscribe_client_does_not_block_writes_or_metrics() {
 
 #[test]
 fn native_gateway_slow_subscribe_client_times_out_and_reports_reason() {
+    const PAYLOAD_COLUMNS: usize = 8;
+
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
     let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
@@ -3660,18 +3662,20 @@ fn native_gateway_slow_subscribe_client_times_out_and_reports_reason() {
     .start()
     .unwrap();
 
-    let schema = std::sync::Arc::new(Schema::new(vec![
-        Field::new("instrument_id", DataType::Utf8, false),
-        Field::new("payload", DataType::Utf8, false),
-    ]));
-    let initial_batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
-            std::sync::Arc::new(StringArray::from(vec!["seed"])),
-        ],
-    )
-    .unwrap();
+    let mut fields = Vec::with_capacity(PAYLOAD_COLUMNS + 1);
+    fields.push(Field::new("instrument_id", DataType::Utf8, false));
+    fields.extend(
+        (0..PAYLOAD_COLUMNS)
+            .map(|column| Field::new(format!("payload_{column}"), DataType::Utf8, false)),
+    );
+    let schema = std::sync::Arc::new(Schema::new(fields));
+    let mut initial_columns: Vec<ArrayRef> =
+        vec![std::sync::Arc::new(StringArray::from(vec!["IF2606"]))];
+    initial_columns.extend(
+        (0..PAYLOAD_COLUMNS)
+            .map(|_| std::sync::Arc::new(StringArray::from(vec!["seed"])) as ArrayRef),
+    );
+    let initial_batch = RecordBatch::try_new(schema.clone(), initial_columns).unwrap();
     let write_response = send_gateway_frame(
         gateway.endpoint(),
         json!({
@@ -3691,7 +3695,7 @@ fn native_gateway_slow_subscribe_client_times_out_and_reports_reason() {
     write_gateway_stream_request(
         &mut slow_subscriber,
         json!({
-            "kind": "subscribe_table",
+            "kind": "subscribe_rows",
             "source": "slow_timeout_ticks",
             "token": "dev-token"
         }),
@@ -3701,21 +3705,35 @@ fn native_gateway_slow_subscribe_client_times_out_and_reports_reason() {
     assert_eq!(subscribed.0["status"], "ok");
     assert_eq!(subscribed.0["kind"], "subscribed");
 
-    let payload = "x".repeat(512);
-    for batch_index in 0..128 {
+    for _ in 0..100 {
+        if gateway.metrics()["subscribe_rows_delivered_total"] == json!(1) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        gateway.metrics()["subscribe_rows_delivered_total"],
+        json!(1),
+        "initial row must reach the socket before the backpressure batches"
+    );
+
+    let payload = "\0".repeat(512);
+    let mut timed_out = false;
+    'write_batches: for batch_index in 0..4 {
         let rows = 256;
         let instruments = (0..rows)
             .map(|row| format!("IF{:04}", 2600 + row))
             .collect::<Vec<_>>();
         let payloads = vec![payload.clone(); rows];
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                std::sync::Arc::new(StringArray::from(instruments)),
-                std::sync::Arc::new(StringArray::from(payloads)),
-            ],
-        )
-        .unwrap();
+        let mut columns: Vec<ArrayRef> = vec![std::sync::Arc::new(StringArray::from(instruments))];
+        columns.extend(
+            (0..PAYLOAD_COLUMNS)
+                .map(|_| std::sync::Arc::new(StringArray::from(payloads.clone())) as ArrayRef),
+        );
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let delivered_before = gateway.metrics()["subscribe_rows_delivered_total"]
+            .as_u64()
+            .unwrap();
         let response = send_gateway_frame_with_read_timeout(
             gateway.endpoint(),
             json!({
@@ -3730,11 +3748,30 @@ fn native_gateway_slow_subscribe_client_times_out_and_reports_reason() {
         );
         assert_eq!(response["status"], "ok", "response={}", response);
 
-        let metrics = gateway.metrics();
-        if metrics["subscribe_write_timeouts_total"] == json!(1) {
-            break;
+        for _ in 0..1000 {
+            let metrics = gateway.metrics();
+            if metrics["subscribe_write_timeouts_total"] == json!(1) {
+                timed_out = true;
+                break 'write_batches;
+            }
+            if metrics["subscribe_rows_delivered_total"].as_u64().unwrap()
+                >= delivered_before + rows as u64
+            {
+                continue 'write_batches;
+            }
+            thread::sleep(Duration::from_millis(2));
         }
+        panic!(
+            "subscriber made no progress after write batch_index=[{}] metrics=[{}]",
+            batch_index,
+            gateway.metrics()
+        );
     }
+    assert!(
+        timed_out,
+        "slow subscriber did not exhaust its socket before test batches completed metrics=[{}]",
+        gateway.metrics()
+    );
 
     for _ in 0..100 {
         let metrics = gateway.metrics();
