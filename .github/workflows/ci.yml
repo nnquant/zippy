@@ -22,6 +22,8 @@ jobs:
 
   verify:
     runs-on: ubuntu-latest
+    env:
+      PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
 
     steps:
       - name: checkout
