@@ -1980,6 +1980,51 @@ struct SnapshotReadResponse {
     memory_lease: Option<CatalogSnapshotMemoryLease>,
 }
 
+struct LeasedReadCompletion<T> {
+    memory_lease: Option<CatalogSnapshotMemoryLease>,
+    response: Option<oneshot::Sender<Result<T>>>,
+}
+
+impl<T> LeasedReadCompletion<T> {
+    fn new(
+        memory_lease: Option<CatalogSnapshotMemoryLease>,
+        response: oneshot::Sender<Result<T>>,
+    ) -> Self {
+        Self {
+            memory_lease,
+            response: Some(response),
+        }
+    }
+
+    fn response_is_closed(&self) -> bool {
+        self.response
+            .as_ref()
+            .is_none_or(oneshot::Sender::is_closed)
+    }
+
+    fn send_success(mut self, build: impl FnOnce(Option<CatalogSnapshotMemoryLease>) -> T) {
+        let value = build(self.memory_lease.take());
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Ok(value));
+        }
+    }
+
+    fn send_error(mut self, error: ServerError) {
+        drop(self.memory_lease.take());
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(error));
+        }
+    }
+}
+
+impl<T> Drop for LeasedReadCompletion<T> {
+    fn drop(&mut self) {
+        // A closed response wakes the async caller, so release the budget before exposing it.
+        drop(self.memory_lease.take());
+        drop(self.response.take());
+    }
+}
+
 struct CatalogReadEndpoint {
     accepting: AtomicBool,
     control_sender: Sender<ControlReadMessage>,
@@ -2281,20 +2326,19 @@ fn control_read_loop(
                     memory_lease,
                     response,
                 } = request;
-                if response.is_closed() {
-                    drop(memory_lease);
+                let completion = LeasedReadCompletion::new(memory_lease, response);
+                if completion.response_is_closed() {
                     continue;
                 }
                 match backend.resolve_tables(&mut connection, &tables) {
                     Ok(tables) => {
-                        let _ = response.send(Ok(ResolveTablesResponse {
+                        completion.send_success(|memory_lease| ResolveTablesResponse {
                             tables,
                             memory_lease,
-                        }));
+                        });
                     }
                     Err(error) => {
-                        drop(memory_lease);
-                        let _ = response.send(Err(error));
+                        completion.send_error(error);
                     }
                 }
             }
@@ -2392,18 +2436,19 @@ fn snapshot_read_loop(
                     memory_lease,
                     response,
                 } = request;
-                if !response.is_closed() {
-                    match backend.read_snapshot(&mut connection, &selectors, limits) {
-                        Ok(snapshot) => {
-                            let _ = response.send(Ok(SnapshotReadResponse {
-                                snapshot,
-                                memory_lease,
-                            }));
-                        }
-                        Err(error) => {
-                            drop(memory_lease);
-                            let _ = response.send(Err(error));
-                        }
+                let completion = LeasedReadCompletion::new(memory_lease, response);
+                if completion.response_is_closed() {
+                    continue;
+                }
+                match backend.read_snapshot(&mut connection, &selectors, limits) {
+                    Ok(snapshot) => {
+                        completion.send_success(|memory_lease| SnapshotReadResponse {
+                            snapshot,
+                            memory_lease,
+                        });
+                    }
+                    Err(error) => {
+                        completion.send_error(error);
                     }
                 }
             }
