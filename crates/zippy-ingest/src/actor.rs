@@ -1,6 +1,6 @@
 //! Bounded per-table serialization and lifecycle ownership.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,14 +9,15 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
+use zippy_segment_store::{ActiveSegmentDescriptor, RowSpanView};
 use zippy_storage::{
     CommitDataFilesReceipt, PersistCompletionFailure, PersistCompletionResult,
     PersistControllerHandle, PersistMode, PersistRequest, PersistTicket,
 };
-use zippy_types::table::{SnapshotOperation, TableSnapshot};
+use zippy_types::table::{SnapshotOperation, SourceSegmentIdentity, TableKind, TableSnapshot};
 use zippy_types::{
-    ErrorCode, LogOffset, OffsetWatermark, RequestId, Result, ServerError, ServerErrorDetails,
-    TableId,
+    ErrorCode, LogOffset, OffsetRange, OffsetWatermark, RequestId, Result, ServerError,
+    ServerErrorDetails, TableId,
 };
 
 use crate::{TableRuntime, TableRuntimeRegistry};
@@ -25,6 +26,7 @@ const DEFAULT_PER_TABLE_MAILBOX_CAPACITY: usize = 64;
 const DEFAULT_MAX_OUTSTANDING_COMMANDS: usize = 4_096;
 const MAX_PER_TABLE_MAILBOX_CAPACITY: usize = 65_536;
 const MAX_OUTSTANDING_COMMANDS: usize = 1_048_576;
+const MAX_LIVE_SEGMENTS_PER_TABLE: usize = 1_024;
 
 /// Bounded admission policy shared by all table actors in one server runtime.
 #[derive(Debug, Clone)]
@@ -70,7 +72,7 @@ impl TableActorRegistryConfig {
 }
 
 /// A compact observation taken in one table actor turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TableActorSnapshot {
     /// The observed table identity.
     pub table_id: TableId,
@@ -86,6 +88,121 @@ pub struct TableActorSnapshot {
     pub actor_command_sequence: u64,
     /// The actor-owned persistence state observed in the same serialized turn.
     pub persistence_status: TablePersistenceStatus,
+    /// Snapshot-pinned live segments after removing the current persisted prefix.
+    pub live_segments: Arc<[TableActorLiveSegmentSnapshot]>,
+    /// Greatest logical offset visible across the persisted and live snapshot sources.
+    pub max_log_offset: OffsetWatermark,
+}
+
+/// Role of one shared-memory segment in an actor-owned live publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableActorLiveSegmentRole {
+    /// A sealed segment still retained because persistence has not covered its full range.
+    RetainedSealed,
+    /// The current append-only segment whose committed prefix may continue growing.
+    Active,
+}
+
+/// One immutable, capability-bearing live segment inside a table actor snapshot.
+///
+/// Query planning must project only its scalar identity and range fields. The underlying
+/// [`RowSpanView`] is a server-local lease and must remain behind the execution authority.
+#[derive(Debug, Clone)]
+pub struct TableActorLiveSegmentSnapshot {
+    role: TableActorLiveSegmentRole,
+    identity: SourceSegmentIdentity,
+    schema_version: u64,
+    offsets: OffsetRange,
+    span: RowSpanView,
+}
+
+impl TableActorLiveSegmentSnapshot {
+    /// Returns whether this is retained sealed data or the current active prefix.
+    #[must_use]
+    pub const fn role(&self) -> TableActorLiveSegmentRole {
+        self.role
+    }
+
+    /// Returns the exact producer segment identity.
+    #[must_use]
+    pub const fn identity(&self) -> SourceSegmentIdentity {
+        self.identity
+    }
+
+    /// Returns the schema version encoded by the shared-memory segment.
+    #[must_use]
+    pub const fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
+    /// Returns the contiguous logical offsets represented by the fixed row span.
+    #[must_use]
+    pub const fn offsets(&self) -> OffsetRange {
+        self.offsets
+    }
+
+    /// Borrows the server-local snapshot capability.
+    #[must_use]
+    pub const fn span(&self) -> &RowSpanView {
+        &self.span
+    }
+}
+
+/// One shared-memory segment supplied to the actor by the native append writer.
+#[derive(Debug)]
+pub struct TableActorLiveSegmentPublication {
+    role: TableActorLiveSegmentRole,
+    identity: SourceSegmentIdentity,
+    schema_version: u64,
+    offsets: OffsetRange,
+    descriptor: ActiveSegmentDescriptor,
+    start_row: usize,
+    end_row: usize,
+}
+
+impl TableActorLiveSegmentPublication {
+    /// Creates one publication item whose full identity is revalidated in actor order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        role: TableActorLiveSegmentRole,
+        identity: SourceSegmentIdentity,
+        schema_version: u64,
+        offsets: OffsetRange,
+        descriptor: ActiveSegmentDescriptor,
+        start_row: usize,
+        end_row: usize,
+    ) -> Self {
+        Self {
+            role,
+            identity,
+            schema_version,
+            offsets,
+            descriptor,
+            start_row,
+            end_row,
+        }
+    }
+}
+
+/// Atomic replacement of every not-yet-persisted live segment for one append table.
+#[derive(Debug)]
+pub struct TableActorLiveSegmentsPublication {
+    table_id: TableId,
+    segments: Vec<TableActorLiveSegmentPublication>,
+}
+
+impl TableActorLiveSegmentsPublication {
+    /// Creates a full actor publication. An empty vector explicitly clears live state.
+    #[must_use]
+    pub fn new(table_id: TableId, segments: Vec<TableActorLiveSegmentPublication>) -> Self {
+        Self { table_id, segments }
+    }
+
+    /// Returns the target table identity.
+    #[must_use]
+    pub const fn table_id(&self) -> TableId {
+        self.table_id
+    }
 }
 
 /// Observable state of one table's serialized native persistence pipeline.
@@ -126,6 +243,27 @@ impl TableActorSnapshotRequest {
             Err(ServerError::new(
                 ErrorCode::Internal,
                 "table actor stopped before returning an accepted snapshot request",
+            )
+            .with_table_id(self.table_id)
+            .with_retryable(false))
+        })
+    }
+}
+
+/// One accepted live-segment replacement awaiting its serialized actor turn.
+#[derive(Debug)]
+pub struct TableActorLiveSegmentsPublishRequest {
+    table_id: TableId,
+    response: oneshot::Receiver<Result<()>>,
+}
+
+impl TableActorLiveSegmentsPublishRequest {
+    /// Waits until the actor has attached, validated, and atomically installed the publication.
+    pub async fn wait(self) -> Result<()> {
+        self.response.await.unwrap_or_else(|_| {
+            Err(ServerError::new(
+                ErrorCode::Internal,
+                "table actor stopped before returning an accepted live segment publication",
             )
             .with_table_id(self.table_id)
             .with_retryable(false))
@@ -210,6 +348,52 @@ impl TableActorHandle {
     /// Admits and waits for one serialized actor observation.
     pub async fn snapshot(&self) -> Result<TableActorSnapshot> {
         self.try_snapshot()?.wait().await
+    }
+
+    /// Attempts to atomically replace this append table's complete live segment set.
+    ///
+    /// The actor reopens every descriptor and pins its payload version before publishing any
+    /// segment. Malformed or partially attachable replacements leave the previous set unchanged.
+    pub fn try_publish_live_segments(
+        &self,
+        publication: TableActorLiveSegmentsPublication,
+    ) -> Result<TableActorLiveSegmentsPublishRequest> {
+        if publication.table_id() != self.table_id {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "live segment publication targets another table actor",
+            )
+            .with_table_id(self.table_id)
+            .with_retryable(false));
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(actor_closed(self.table_id));
+        }
+        let permit = Arc::clone(&self.global_budget)
+            .try_acquire_owned()
+            .map_err(|_| actor_global_budget_exhausted(self.table_id))?;
+        let (response_sender, response) = oneshot::channel();
+        let command = TableActorCommand::PublishLiveSegments {
+            publication,
+            response: response_sender,
+            _permit: permit,
+        };
+        match self.sender.try_send(command) {
+            Ok(()) => Ok(TableActorLiveSegmentsPublishRequest {
+                table_id: self.table_id,
+                response,
+            }),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(actor_mailbox_full(self.table_id)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(actor_closed(self.table_id)),
+        }
+    }
+
+    /// Publishes and waits for one actor-validated live segment replacement.
+    pub async fn publish_live_segments(
+        &self,
+        publication: TableActorLiveSegmentsPublication,
+    ) -> Result<()> {
+        self.try_publish_live_segments(publication)?.wait().await
     }
 
     /// Attempts immediate admission of one atomic native persist operation.
@@ -532,6 +716,11 @@ enum TableActorCommand {
         _persist_permit: OwnedSemaphorePermit,
         _global_permit: OwnedSemaphorePermit,
     },
+    PublishLiveSegments {
+        publication: TableActorLiveSegmentsPublication,
+        response: oneshot::Sender<Result<()>>,
+        _permit: OwnedSemaphorePermit,
+    },
     #[cfg(test)]
     Panic,
 }
@@ -593,6 +782,7 @@ enum ActorPersistenceState {
 
 struct TableActorState {
     table_id: TableId,
+    table_kind: TableKind,
     schema_version: u64,
     schema: SchemaRef,
     writer_epoch: u64,
@@ -600,12 +790,14 @@ struct TableActorState {
     persistence_enabled: bool,
     persistence: ActorPersistenceState,
     command_sequence: u64,
+    live_segments: Arc<[TableActorLiveSegmentSnapshot]>,
 }
 
 impl TableActorState {
     fn new(runtime: &TableRuntime, persistence_enabled: bool) -> Self {
         Self {
             table_id: runtime.table_id(),
+            table_kind: runtime.table().kind(),
             schema_version: runtime.schema_descriptor().schema_version,
             schema: Arc::clone(runtime.schema()),
             writer_epoch: runtime.writer_epoch(),
@@ -613,6 +805,7 @@ impl TableActorState {
             persistence_enabled,
             persistence: ActorPersistenceState::Idle,
             command_sequence: 0,
+            live_segments: Arc::from([]),
         }
     }
 
@@ -625,6 +818,7 @@ impl TableActorState {
             .with_table_id(self.table_id)
             .with_retryable(false)
         })?;
+        let (live_segments, max_log_offset) = self.visible_live_segments()?;
         Ok(TableActorSnapshot {
             table_id: self.table_id,
             schema_version: self.schema_version,
@@ -633,7 +827,277 @@ impl TableActorState {
             committed_log_offset: self.current_snapshot.committed_log_offset,
             actor_command_sequence: self.command_sequence,
             persistence_status: self.persistence_status(),
+            live_segments,
+            max_log_offset,
         })
+    }
+
+    fn visible_live_segments(
+        &self,
+    ) -> Result<(Arc<[TableActorLiveSegmentSnapshot]>, OffsetWatermark)> {
+        let persisted = self.current_snapshot.committed_log_offset;
+        if self.live_segments.is_empty() {
+            return Ok((Arc::from([]), persisted));
+        }
+        let persisted_offset = match persisted {
+            OffsetWatermark::Empty => None,
+            OffsetWatermark::Known(offset) => Some(offset),
+            OffsetWatermark::LegacyUnknown => {
+                return Err(ServerError::new(
+                    ErrorCode::DataCorruption,
+                    "live segments cannot follow a legacy-unknown persisted watermark",
+                )
+                .with_table_id(self.table_id)
+                .with_retryable(false));
+            }
+        };
+
+        let mut visible = Vec::with_capacity(self.live_segments.len());
+        for segment in self.live_segments.iter() {
+            let Some(persisted_offset) = persisted_offset else {
+                visible.push(segment.clone());
+                continue;
+            };
+            if segment.offsets.last().get() <= persisted_offset.get() {
+                continue;
+            }
+            if segment.offsets.first().get() > persisted_offset.get() {
+                visible.push(segment.clone());
+                continue;
+            }
+
+            let first_visible = persisted_offset.checked_next().ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "persisted watermark exhausted before a live segment suffix",
+                )
+                .with_table_id(self.table_id)
+                .with_retryable(false)
+            })?;
+            let skipped_rows_u64 = first_visible
+                .get()
+                .checked_sub(segment.offsets.first().get())
+                .ok_or_else(|| live_corruption(self.table_id, "live segment trim underflow"))?;
+            let skipped_rows = usize::try_from(skipped_rows_u64).map_err(|_| {
+                live_corruption(self.table_id, "live segment trim exceeds platform usize")
+            })?;
+            let span = segment
+                .span
+                .slice_rows(skipped_rows, segment.span.row_count())
+                .map_err(|error| {
+                    live_corruption(
+                        self.table_id,
+                        format!("live segment trim is invalid error=[{error}]"),
+                    )
+                })?;
+            let offsets =
+                OffsetRange::new(first_visible, segment.offsets.last()).map_err(|error| {
+                    live_corruption(
+                        self.table_id,
+                        format!("trimmed live offsets are invalid error=[{error}]"),
+                    )
+                })?;
+            visible.push(TableActorLiveSegmentSnapshot {
+                role: segment.role,
+                identity: segment.identity,
+                schema_version: segment.schema_version,
+                offsets,
+                span,
+            });
+        }
+        let max_log_offset = visible
+            .last()
+            .map(|segment| OffsetWatermark::Known(segment.offsets.last()))
+            .unwrap_or(persisted);
+        Ok((visible.into(), max_log_offset))
+    }
+
+    fn install_live_segments(
+        &mut self,
+        publication: TableActorLiveSegmentsPublication,
+    ) -> Result<()> {
+        let TableActorLiveSegmentsPublication { table_id, segments } = publication;
+        if table_id != self.table_id {
+            return Err(live_publication_error(
+                self.table_id,
+                ErrorCode::InvalidArgument,
+                "live segment publication table identity changed before actor validation",
+            ));
+        }
+        if self.table_kind != TableKind::Append {
+            return Err(live_publication_error(
+                self.table_id,
+                ErrorCode::UnsupportedPlan,
+                "live query snapshots currently support append tables only",
+            ));
+        }
+        if segments.len() > MAX_LIVE_SEGMENTS_PER_TABLE {
+            return Err(live_publication_error(
+                self.table_id,
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "live segment publication exceeds per-table limit actual=[{}] limit=[{}]",
+                    segments.len(),
+                    MAX_LIVE_SEGMENTS_PER_TABLE
+                ),
+            ));
+        }
+        if segments.is_empty() {
+            self.live_segments = Arc::from([]);
+            return Ok(());
+        }
+
+        let mut expected_offset = match self.current_snapshot.committed_log_offset {
+            OffsetWatermark::Empty => LogOffset::new(0),
+            OffsetWatermark::Known(offset) => offset.checked_next().ok_or_else(|| {
+                live_publication_error(
+                    self.table_id,
+                    ErrorCode::ResourceExhausted,
+                    "persisted watermark exhausted before live segment publication",
+                )
+            })?,
+            OffsetWatermark::LegacyUnknown => {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::DataCorruption,
+                    "cannot publish live segments after a legacy-unknown watermark",
+                ));
+            }
+        };
+        let segment_count = segments.len();
+        let mut identities = BTreeSet::new();
+        let mut installed = Vec::with_capacity(segment_count);
+
+        for (index, segment) in segments.into_iter().enumerate() {
+            if segment.role == TableActorLiveSegmentRole::Active && index + 1 != segment_count {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    "active segment must be the final live publication item",
+                ));
+            }
+            if !identities.insert(segment.identity) {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    "live segment publication contains duplicate source identity",
+                ));
+            }
+            if segment.schema_version != self.schema_version {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::SchemaMismatch,
+                    format!(
+                        "live segment schema version mismatch expected=[{}] actual=[{}]",
+                        self.schema_version, segment.schema_version
+                    ),
+                ));
+            }
+            if segment.identity.writer_epoch != self.writer_epoch
+                || segment.descriptor.writer_epoch() != self.writer_epoch
+            {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::StaleProducerEpoch,
+                    format!(
+                        "live segment writer epoch mismatch expected=[{}] identity=[{}] descriptor=[{}]",
+                        self.writer_epoch,
+                        segment.identity.writer_epoch,
+                        segment.descriptor.writer_epoch()
+                    ),
+                ));
+            }
+            if segment.identity.segment_id != segment.descriptor.segment_id()
+                || segment.identity.generation != segment.descriptor.generation()
+            {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    "live segment source identity differs from its shared-memory descriptor",
+                ));
+            }
+            if segment.start_row >= segment.end_row {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    "live segment publication must contain at least one row",
+                ));
+            }
+            let row_count = segment.end_row - segment.start_row;
+            if row_count as u128 != segment.offsets.len() {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    "live segment row count differs from its logical offset range",
+                ));
+            }
+            if segment.offsets.first() != expected_offset {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::SequenceGap,
+                    format!(
+                        "live segment offsets are not contiguous expected=[{}] actual=[{}]",
+                        expected_offset,
+                        segment.offsets.first()
+                    ),
+                ));
+            }
+
+            let span = RowSpanView::snapshot_from_active_descriptor(
+                segment.descriptor,
+                segment.start_row,
+                segment.end_row,
+            )
+            .map_err(|error| {
+                live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    format!("failed to pin live segment snapshot error=[{error}]"),
+                )
+            })?;
+            if span.schema_ref().as_ref() != self.schema.as_ref() {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::SchemaMismatch,
+                    "live segment Arrow schema differs from the actor schema",
+                ));
+            }
+            let sealed = span.active_segment_is_sealed().map_err(|error| {
+                live_publication_error(
+                    self.table_id,
+                    ErrorCode::DataCorruption,
+                    format!("failed to read live segment seal state error=[{error}]"),
+                )
+            })?;
+            let expected_sealed = segment.role == TableActorLiveSegmentRole::RetainedSealed;
+            if sealed != Some(expected_sealed) {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::Conflict,
+                    "live segment seal state differs from its publication role",
+                ));
+            }
+
+            if index + 1 != segment_count {
+                expected_offset = segment.offsets.last().checked_next().ok_or_else(|| {
+                    live_publication_error(
+                        self.table_id,
+                        ErrorCode::ResourceExhausted,
+                        "live segment offset domain exhausted before final segment",
+                    )
+                })?;
+            }
+            installed.push(TableActorLiveSegmentSnapshot {
+                role: segment.role,
+                identity: segment.identity,
+                schema_version: segment.schema_version,
+                offsets: segment.offsets,
+                span,
+            });
+        }
+
+        self.live_segments = installed.into();
+        Ok(())
     }
 
     fn advance_command(&mut self) -> Result<()> {
@@ -670,6 +1134,20 @@ impl TableActorState {
             ActorPersistenceState::Idle | ActorPersistenceState::InFlight(_) => None,
         }
     }
+}
+
+fn live_publication_error(
+    table_id: TableId,
+    code: ErrorCode,
+    message: impl Into<String>,
+) -> ServerError {
+    ServerError::new(code, message)
+        .with_table_id(table_id)
+        .with_retryable(false)
+}
+
+fn live_corruption(table_id: TableId, message: impl Into<String>) -> ServerError {
+    live_publication_error(table_id, ErrorCode::DataCorruption, message)
 }
 
 struct TableActorTaskGuard {
@@ -910,6 +1388,18 @@ fn process_command(
                     None
                 }
             }
+        }
+        TableActorCommand::PublishLiveSegments {
+            publication,
+            response,
+            _permit,
+        } => {
+            let result = state
+                .advance_command()
+                .and_then(|()| state.install_live_segments(publication));
+            drop(_permit);
+            let _ = response.send(result);
+            None
         }
         #[cfg(test)]
         TableActorCommand::Panic => panic!("injected table actor panic"),
@@ -1346,6 +1836,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use tokio::sync::{mpsc, oneshot};
+    use zippy_segment_store::{
+        compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan, SegmentStore,
+        SegmentStoreConfig,
+    };
     use zippy_storage::{
         CommitDataFilesReceipt, ParquetCandidateSpec, PersistCandidateInput,
         PersistCompletionFailure, PersistCompletionResult, PersistMode, PersistRequest,
@@ -1365,7 +1859,9 @@ mod tests {
 
     use super::{
         validate_persist_request, PersistSubmissionResult, PersistSubmitter, TableActorCommand,
-        TableActorRegistry, TableActorRegistryConfig, TableActorState, TablePersistenceStatus,
+        TableActorLiveSegmentPublication, TableActorLiveSegmentRole,
+        TableActorLiveSegmentsPublication, TableActorRegistry, TableActorRegistryConfig,
+        TableActorState, TablePersistenceStatus,
     };
 
     fn table_id(value: u128) -> TableId {
@@ -1634,6 +2130,210 @@ mod tests {
             actor.snapshot().await.unwrap_err().code(),
             ErrorCode::Unavailable
         );
+    }
+
+    #[tokio::test]
+    async fn actor_publishes_fixed_active_prefix_and_rejects_rewrite() {
+        let registry =
+            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
+                .unwrap();
+        let actor = registry.handle().table(table_id(10)).unwrap();
+        let segment_schema =
+            compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
+        let layout = LayoutPlan::for_schema(&segment_schema, 4).unwrap();
+        let mut writer =
+            ActiveSegmentWriter::new_for_runtime_with_epoch(segment_schema, layout, 11, 2, 7, 1)
+                .unwrap();
+        for value in [101_i64, 102_i64] {
+            writer.begin_row().unwrap();
+            writer.write_i64("price", value).unwrap();
+            writer.commit_row().unwrap();
+        }
+        let identity = SourceSegmentIdentity {
+            segment_id: 11,
+            generation: 2,
+            writer_epoch: 7,
+        };
+        let offsets = OffsetRange::new(LogOffset::new(0), LogOffset::new(1)).unwrap();
+        actor
+            .publish_live_segments(TableActorLiveSegmentsPublication::new(
+                table_id(10),
+                vec![TableActorLiveSegmentPublication::new(
+                    TableActorLiveSegmentRole::Active,
+                    identity,
+                    1,
+                    offsets,
+                    writer.active_descriptor(),
+                    0,
+                    2,
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let pinned = actor.snapshot().await.unwrap();
+        assert_eq!(pinned.live_segments.len(), 1);
+        assert_eq!(pinned.live_segments[0].offsets(), offsets);
+        assert_eq!(pinned.live_segments[0].span().row_count(), 2);
+        assert_eq!(
+            pinned.max_log_offset,
+            OffsetWatermark::Known(LogOffset::new(1))
+        );
+
+        writer.begin_row().unwrap();
+        writer.write_i64("price", 103).unwrap();
+        writer.commit_row().unwrap();
+        assert_eq!(
+            pinned.live_segments[0]
+                .span()
+                .as_record_batch()
+                .unwrap()
+                .num_rows(),
+            2
+        );
+
+        writer.begin_payload_mutation_for_test().unwrap();
+        writer.finish_payload_mutation_for_test().unwrap();
+        let error = pinned.live_segments[0]
+            .span()
+            .as_record_batch()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active payload version differs from pinned snapshot"));
+        registry.drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_publishes_retained_sealed_then_active_segments_in_offset_order() {
+        let registry =
+            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
+                .unwrap();
+        let actor = registry.handle().table(table_id(10)).unwrap();
+        let segment_schema =
+            compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+        let handle = store
+            .open_partition_with_schema_and_writer_epoch("prices", "all", segment_schema, 7)
+            .unwrap();
+        let writer = handle.writer();
+
+        writer.write_row(|row| row.write_i64("price", 101)).unwrap();
+        let retained_descriptor = handle.active_descriptor_for_test();
+        writer.rollover_without_persistence().unwrap();
+        writer.write_row(|row| row.write_i64("price", 102)).unwrap();
+        let active_descriptor = handle.active_descriptor_for_test();
+
+        actor
+            .publish_live_segments(TableActorLiveSegmentsPublication::new(
+                table_id(10),
+                vec![
+                    TableActorLiveSegmentPublication::new(
+                        TableActorLiveSegmentRole::RetainedSealed,
+                        SourceSegmentIdentity {
+                            segment_id: retained_descriptor.segment_id(),
+                            generation: retained_descriptor.generation(),
+                            writer_epoch: retained_descriptor.writer_epoch(),
+                        },
+                        1,
+                        OffsetRange::new(LogOffset::new(0), LogOffset::new(0)).unwrap(),
+                        retained_descriptor,
+                        0,
+                        1,
+                    ),
+                    TableActorLiveSegmentPublication::new(
+                        TableActorLiveSegmentRole::Active,
+                        SourceSegmentIdentity {
+                            segment_id: active_descriptor.segment_id(),
+                            generation: active_descriptor.generation(),
+                            writer_epoch: active_descriptor.writer_epoch(),
+                        },
+                        1,
+                        OffsetRange::new(LogOffset::new(1), LogOffset::new(1)).unwrap(),
+                        active_descriptor,
+                        0,
+                        1,
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let snapshot = actor.snapshot().await.unwrap();
+        assert_eq!(snapshot.live_segments.len(), 2);
+        assert_eq!(
+            snapshot.live_segments[0].role(),
+            TableActorLiveSegmentRole::RetainedSealed
+        );
+        assert_eq!(
+            snapshot.live_segments[1].role(),
+            TableActorLiveSegmentRole::Active
+        );
+        let values = snapshot
+            .live_segments
+            .iter()
+            .map(|segment| {
+                let batch = segment.span().as_record_batch().unwrap();
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![101, 102]);
+        assert_eq!(
+            snapshot.max_log_offset,
+            OffsetWatermark::Known(LogOffset::new(1))
+        );
+
+        registry.drain().await.unwrap();
+    }
+
+    #[test]
+    fn actor_snapshot_removes_persisted_prefix_without_copying_live_rows() {
+        let runtimes = runtime_registry(&[10]);
+        let runtime = runtimes.get(table_id(10)).unwrap();
+        let mut state = TableActorState::new(&runtime, true);
+        let segment_schema =
+            compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
+        let layout = LayoutPlan::for_schema(&segment_schema, 4).unwrap();
+        let mut writer =
+            ActiveSegmentWriter::new_for_runtime_with_epoch(segment_schema, layout, 11, 2, 7, 1)
+                .unwrap();
+        for value in [101_i64, 102_i64, 103_i64] {
+            writer.begin_row().unwrap();
+            writer.write_i64("price", value).unwrap();
+            writer.commit_row().unwrap();
+        }
+        state
+            .install_live_segments(TableActorLiveSegmentsPublication::new(
+                table_id(10),
+                vec![TableActorLiveSegmentPublication::new(
+                    TableActorLiveSegmentRole::Active,
+                    SourceSegmentIdentity {
+                        segment_id: 11,
+                        generation: 2,
+                        writer_epoch: 7,
+                    },
+                    1,
+                    OffsetRange::new(LogOffset::new(0), LogOffset::new(2)).unwrap(),
+                    writer.active_descriptor(),
+                    0,
+                    3,
+                )],
+            ))
+            .unwrap();
+        state.current_snapshot.committed_log_offset = OffsetWatermark::Known(LogOffset::new(0));
+
+        let snapshot = state.snapshot().unwrap();
+        let live = &snapshot.live_segments[0];
+        assert_eq!(live.offsets().first(), LogOffset::new(1));
+        assert_eq!(live.offsets().last(), LogOffset::new(2));
+        assert_eq!(live.span().start_row(), 1);
+        assert_eq!(live.span().row_count(), 2);
+        assert_eq!(live.span().pinned_payload_version(), Some(0));
     }
 
     #[test]

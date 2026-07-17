@@ -1038,10 +1038,10 @@ pub struct ZippyTableProvider {
 `scan()` 生成：
 
 ```text
-ParquetExec(persisted files)
-UNION ALL
-ActiveSegmentExec(retained sealed + active high watermark)
--> projection/filter
+PersistedAndActiveExec(one output partition)
+  -> ParquetExec(persisted files; drain first)
+  -> ActiveSegmentExec(retained sealed + active high watermark; open after persisted EOF)
+-> exact projection/filter/limit
 ```
 
 文件列表只能来自 `TableReadSnapshot`，不能在 operator 执行中重新读取 current catalog。
@@ -2432,13 +2432,38 @@ filter + projection + limit 执行、Catalog row count 校验、metadata 足额�
 该边界只覆盖 persisted streaming 子集；ActiveSegmentExec、复杂算子的 process-wide pool 与 spill/temp quota、transport
 backpressure，以及公开调用方 batch ownership contract 仍未完成。
 
+Stage 5.4j snapshot-bound active segment execution 已完成（2026-07-18）：append table actor 现在接受一次完整替换的
+live publication，内容由零个或多个 retained sealed segment 加最多一个 active segment 组成。actor 在同一个串行 turn 内
+核验 table/schema/writer epoch、source identity、共享内存 seal 状态、row count 与逻辑 offset 连续性，再 attach 全部
+segment；任一项失败都不会替换旧 publication。查询 snapshot 会先按 durable committed watermark 去除已被 persisted file
+覆盖的 live 前缀，并同时固定剩余 segment 的 row end 与偶数 payload version。快照之后的正常 append 不可见；对已固定
+payload 的原地改写会以 `DATA_CORRUPTION` fail closed，不能返回混合版本 batch。
+
+规划层只持有 path-free `ActiveSegmentDescription`，不携带 shm locator、descriptor 或 mapping capability。绑定后的
+`ActiveSegmentExec` 也只持有 weak opener；复制 DataFusion plan 不能延长 query authority 或共享内存 lease。
+`PersistedAndActiveExec` 暴露一个 output partition，并严格先耗尽 persisted child，随后才向 Server opener 申请 active task，
+因此不会同时保有 Parquet reader task 和 active decode task，也不会依赖通用 `UnionExec` 的并发调度顺序。Server 在克隆
+actor-owned `RowSpanView` 前再次逐字段对照 pinned manifest，并为 fixed-width decoded batch、每段控制块、一个 task 和一个
+CPU slot 预先准入；task permit 覆盖整个 active stream 寿命。
+
+固定宽度 projection/filter/limit/offset 现在可对 persisted-only、active-only 和 persisted + live snapshot 使用同一 exact
+DataFusion 语义。自动化覆盖真实 segment-store rollover 后的 retained-sealed + active 顺序、快照后 append 不可见、
+persisted/live 边界无重叠、filter + projection + limit、弱 authority 过期、payload rewrite 失败，以及终态后 query task、
+result permit 和 snapshot mapping 排空。该实现不引入 row-level dedup；互斥性由 Catalog durable watermark 与 actor 连续
+offset publication 在 snapshot projection 时证明。
+
+本阶段只完成 Server 进程内 native query 的读取能力和 RAII shm lease。native writer/rollover 尚未自动把生产 live
+publication 接入 table actor，跨进程长 lease registry 也不在本阶段；Gateway query capability 继续保持关闭。复杂算子的
+process-wide pool、受配额 spill/temp、transport backpressure、公开 batch ownership contract，以及依赖 sort 的 tail 仍按
+后续任务推进。
+
 任务：
 
 1. 完成 DataFusion/Arrow version spike。（已完成）
 2. 新建 `zippy-query` 和 per-session `SessionContext` policy。（persisted planning 已完成）
 3. 实现 `ZippyTableProvider`。（persisted-only 已完成）
-4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。
-5. 先迁移 projection/filter/head/tail/slice。（persisted fixed-width streaming 子集已完成；active segment 待完成）
+4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。（已完成；生产 writer publication 接线待后续）
+5. 先迁移 projection/filter/head/tail/slice。（fixed-width projection/filter/head/slice 已覆盖 persisted + active；tail 随 sort 迁移）
 6. 迁移 sort/aggregate/join/window。
 7. 实现 query registry、cancel、deadline。（registry/lifecycle 与内部 persisted result stream 已完成）
 8. 接入全局 memory pool、spill 和 temp quota。

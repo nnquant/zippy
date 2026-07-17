@@ -22,13 +22,16 @@ use datafusion::sql::sqlparser::ast::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::persisted_plan::{bind_persisted_snapshot_plan, is_exact_planning_parquet};
+use crate::active_plan::ActiveSegmentExec;
+use crate::persisted_plan::{
+    bind_persisted_snapshot_plan, is_exact_planning_active, is_exact_planning_parquet,
+};
 use crate::{
-    BoundPersistedPlan, PersistedFileOpener, PersistedSnapshotDescription,
+    ActiveSegmentOpener, BoundPersistedPlan, PersistedFileOpener, PersistedSnapshotDescription,
     PersistedTableDescription, QuerySessionPolicy, ZippyTableProvider,
 };
 
-const PROFILE_FORMAT_VERSION: u32 = 8;
+const PROFILE_FORMAT_VERSION: u32 = 9;
 const PREFLIGHT_FIXED_TRANSIENT_BYTES: u64 = 2 * 1024 * 1024;
 const PREFLIGHT_BYTES_PER_SQL_BYTE: u64 = 1024;
 const PREFLIGHT_BYTES_PER_BINDING: u64 = 64 * 1024;
@@ -317,6 +320,7 @@ pub struct PreparedPersistedPlan {
     expression_node_count: usize,
     physical_node_count: usize,
     planning_scan_count: usize,
+    planning_active_scan_count: usize,
 }
 
 impl fmt::Debug for PreparedPersistedPlan {
@@ -328,6 +332,10 @@ impl fmt::Debug for PreparedPersistedPlan {
             .field("expression_node_count", &self.expression_node_count)
             .field("physical_node_count", &self.physical_node_count)
             .field("planning_scan_count", &self.planning_scan_count)
+            .field(
+                "planning_active_scan_count",
+                &self.planning_active_scan_count,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -347,7 +355,21 @@ impl PreparedPersistedPlan {
 
     /// Consumes the planning-only plan and binds every remaining persisted scan to one opener.
     pub fn bind(self, opener: &Arc<dyn PersistedFileOpener>) -> Result<BoundPersistedPlan> {
-        bind_persisted_snapshot_plan(self.plan, &self.expected_snapshot, opener)
+        bind_persisted_snapshot_plan(self.plan, &self.expected_snapshot, opener, None)
+    }
+
+    /// Consumes the planning-only plan and binds persisted and active scan capabilities.
+    pub fn bind_with_active(
+        self,
+        opener: &Arc<dyn PersistedFileOpener>,
+        active_opener: &Arc<dyn ActiveSegmentOpener>,
+    ) -> Result<BoundPersistedPlan> {
+        bind_persisted_snapshot_plan(
+            self.plan,
+            &self.expected_snapshot,
+            opener,
+            Some(active_opener),
+        )
     }
 }
 
@@ -380,9 +402,17 @@ pub fn profile_persisted_plan(
         .relation_occurrence_count
         .checked_sub(bindings.len())
         .ok_or_else(|| plan_error("SQL relation count is below the admitted binding count"))?;
+    let max_inputs_per_table = snapshot
+        .max_files_per_table()
+        .checked_add(snapshot.max_active_segments_per_table())
+        .ok_or_else(|| exhausted("maximum per-table input count overflowed usize"))?;
+    let base_input_count = snapshot
+        .total_file_count()
+        .checked_add(snapshot.total_active_segment_count())
+        .ok_or_else(|| exhausted("snapshot input count overflowed usize"))?;
     let expanded_file_count = extra_occurrences
-        .checked_mul(snapshot.max_files_per_table())
-        .and_then(|extra| snapshot.total_file_count().checked_add(extra))
+        .checked_mul(max_inputs_per_table)
+        .and_then(|extra| base_input_count.checked_add(extra))
         .ok_or_else(|| exhausted("expanded persisted file count overflowed usize"))?;
     let expanded_input_schema_bytes = u64::try_from(extra_occurrences)
         .ok()
@@ -503,7 +533,7 @@ pub async fn prepare_persisted_plan(
         .query_planner()
         .create_physical_plan(&optimized, &state)
         .await?;
-    let (physical_node_count, planning_scan_count) =
+    let (physical_node_count, planning_scan_count, planning_active_scan_count) =
         validate_physical_plan(&plan, admitted.limits)?;
     drop(state);
     drop(context);
@@ -519,6 +549,7 @@ pub async fn prepare_persisted_plan(
             .max(optimized_stats.expression_node_count),
         physical_node_count,
         planning_scan_count,
+        planning_active_scan_count,
     })
 }
 
@@ -642,9 +673,10 @@ fn is_allowed_logical_node(plan: &LogicalPlan) -> bool {
 fn validate_physical_plan(
     plan: &Arc<dyn ExecutionPlan>,
     limits: PersistedPlanLimits,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let mut node_count = 0_usize;
     let mut planning_scan_count = 0_usize;
+    let mut planning_active_scan_count = 0_usize;
     plan.apply(|node| {
         node_count =
             checked_increment(node_count, limits.max_physical_nodes, "physical plan nodes")?;
@@ -657,10 +689,19 @@ fn validate_physical_plan(
             planning_scan_count = planning_scan_count
                 .checked_add(1)
                 .ok_or_else(|| exhausted("planning Parquet scan count overflowed usize"))?;
+        } else if let Some(active) = node.as_any().downcast_ref::<ActiveSegmentExec>() {
+            if !is_exact_planning_active(active) {
+                return Err(plan_error(
+                    "prepared persisted plan contains an already-bound active segment scan",
+                ));
+            }
+            planning_active_scan_count = planning_active_scan_count
+                .checked_add(1)
+                .ok_or_else(|| exhausted("planning active scan count overflowed usize"))?;
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    Ok((node_count, planning_scan_count))
+    Ok((node_count, planning_scan_count, planning_active_scan_count))
 }
 
 fn register_bindings(

@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 arrow.workspace = true
+datafusion.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -17,6 +19,7 @@ zippy-gateway = { path = "../zippy-gateway" }
 zippy-ingest = { path = "../zippy-ingest" }
 zippy-master = { path = "../zippy-master" }
 zippy-query = { path = "../zippy-query" }
+zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-storage = { path = "../zippy-storage" }
 zippy-types = { path = "../zippy-types" }
 

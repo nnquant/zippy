@@ -3716,14 +3716,12 @@ pub(crate) struct QueryTaskPermit<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> QueryTaskPermit<R> {
-    #[cfg(test)]
     pub(crate) fn resource(&self) -> &R {
         self.resource
             .as_ref()
             .expect("live task permit retains its physical resource")
     }
 
-    #[cfg(test)]
     pub(crate) fn resource_mut(&mut self) -> &mut R {
         self.resource
             .as_mut()

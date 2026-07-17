@@ -442,6 +442,63 @@ fn active_record_batch_read_rejects_odd_payload_version() {
 }
 
 #[test]
+fn active_query_snapshot_fixes_row_prefix_across_later_appends() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+
+    let snapshot =
+        RowSpanView::snapshot_from_active_descriptor(writer.active_descriptor(), 0, 1).unwrap();
+    assert_eq!(snapshot.pinned_payload_version(), Some(0));
+    writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+
+    let batch = snapshot.as_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let instruments = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(instruments.value(0), "rb2501");
+}
+
+#[test]
+fn active_query_snapshot_rejects_payload_rewrite_after_pin() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    let snapshot =
+        RowSpanView::snapshot_from_active_descriptor(writer.active_descriptor(), 0, 1).unwrap();
+
+    writer.begin_payload_mutation_for_test().unwrap();
+    writer.finish_payload_mutation_for_test().unwrap();
+    let error = snapshot.as_record_batch().unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("active payload version differs from pinned snapshot"));
+}
+
+#[test]
+fn active_query_snapshot_slice_retains_version_and_bounds() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+    let snapshot =
+        RowSpanView::snapshot_from_active_descriptor(writer.active_descriptor(), 0, 2).unwrap();
+
+    let second = snapshot.slice_rows(1, 2).unwrap();
+    assert_eq!(
+        second.pinned_payload_version(),
+        snapshot.pinned_payload_version()
+    );
+    assert_eq!(second.start_row(), 1);
+    assert_eq!(second.end_row(), 2);
+    assert!(snapshot.slice_rows(1, 3).is_err());
+}
+
+#[test]
 fn active_descriptor_envelope_rejects_schema_id_mismatch() {
     let schema = compile_schema(&[
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),

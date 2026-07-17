@@ -22,11 +22,14 @@ use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::ParquetMetaData;
 use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
 
+use crate::active_plan::{ActiveSegmentExec, PersistedAndActiveExec};
+
 const OUTPUT_ADMISSION_FORMAT_VERSION: u32 = 1;
 const ARROW_BATCH_FIXED_MEMORY_BYTES: u64 = 64 * 1024;
 const ARROW_ARRAY_CONTROL_MEMORY_BYTES: u64 = 1024;
 const PARQUET_DECODER_FIXED_MEMORY_BYTES: u64 = 256 * 1024;
 const PARQUET_ROW_GROUP_DECODE_COPIES: u64 = 2;
+const ACTIVE_SEGMENT_READER_FIXED_MEMORY_BYTES: u64 = 64 * 1024;
 
 /// A versioned memory envelope for one fixed-width persisted streaming scan.
 ///
@@ -172,6 +175,15 @@ impl PersistedDecodedOutputAdmission {
             })?;
         Ok(memory_bytes)
     }
+
+    /// Computes the task reservation retained while one active span stream produces batches.
+    pub fn active_decode_memory_bytes(self) -> Result<NonZeroU64> {
+        self.batch_peak_memory_bytes
+            .get()
+            .checked_add(ACTIVE_SEGMENT_READER_FIXED_MEMORY_BYTES)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| exhausted("active segment decoded output memory charge overflowed"))
+    }
 }
 
 pub(crate) fn profile_streaming_output_plan(
@@ -188,6 +200,7 @@ pub(crate) fn profile_streaming_output_plan(
     let mut expression_node_count = 0_usize;
     let mut scan_schema = None;
     let mut scan_count = 0_usize;
+    let mut active_scan_count = 0_usize;
     plan.apply(|node| {
         physical_node_count = physical_node_count
             .checked_add(1)
@@ -198,7 +211,7 @@ pub(crate) fn profile_streaming_output_plan(
             scan_count = scan_count
                 .checked_add(1)
                 .ok_or_else(|| exhausted("bounded output scan count overflowed"))?;
-            scan_schema = Some(parquet.schema());
+            merge_scan_schema(&mut scan_schema, parquet.schema())?;
             if let Some(predicate) = parquet.predicate() {
                 profile_bounded_filter_expression(
                     predicate,
@@ -206,6 +219,16 @@ pub(crate) fn profile_streaming_output_plan(
                     &mut expression_node_count,
                 )?;
             }
+        } else if let Some(active) = node.as_any().downcast_ref::<ActiveSegmentExec>() {
+            active_scan_count = active_scan_count
+                .checked_add(1)
+                .ok_or_else(|| exhausted("bounded output active scan count overflowed"))?;
+            if active.batch_size() != batch_size {
+                return Err(unsupported(
+                    "active segment batch size differs from output admission policy",
+                ));
+            }
+            merge_scan_schema(&mut scan_schema, active.schema())?;
         } else if let Some(projection) = node.as_any().downcast_ref::<ProjectionExec>() {
             for (expression, _) in projection.expr() {
                 if expression.as_any().downcast_ref::<Column>().is_none() {
@@ -224,6 +247,7 @@ pub(crate) fn profile_streaming_output_plan(
         } else if !(node.as_any().is::<GlobalLimitExec>()
             || node.as_any().is::<LocalLimitExec>()
             || node.as_any().is::<CoalescePartitionsExec>()
+            || node.as_any().is::<PersistedAndActiveExec>()
             || node.as_any().is::<EmptyExec>())
         {
             return Err(unsupported(format!(
@@ -239,6 +263,11 @@ pub(crate) fn profile_streaming_output_plan(
             "bounded persisted output supports at most one Parquet scan actual=[{scan_count}]"
         )));
     }
+    if active_scan_count > 1 {
+        return Err(unsupported(format!(
+            "bounded persisted output supports at most one active scan actual=[{active_scan_count}]"
+        )));
+    }
     let concurrent_batch_copies = physical_node_count
         .checked_add(expression_node_count)
         .and_then(|count| count.checked_add(2))
@@ -250,6 +279,19 @@ pub(crate) fn profile_streaming_output_plan(
         admission_schema.as_ref(),
         concurrent_batch_copies,
     )
+}
+
+fn merge_scan_schema(slot: &mut Option<Arc<Schema>>, schema: Arc<Schema>) -> Result<()> {
+    if slot
+        .as_ref()
+        .is_some_and(|existing| existing.as_ref() != schema.as_ref())
+    {
+        return Err(unsupported(
+            "persisted and active scan schemas differ inside bounded output plan",
+        ));
+    }
+    *slot = Some(schema);
+    Ok(())
 }
 
 fn profile_bounded_filter_expression(

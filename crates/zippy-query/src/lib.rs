@@ -35,10 +35,15 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use zippy_types::{ErrorCode, ServerError};
 
+mod active_plan;
 mod output_admission;
 mod persisted_plan;
 mod prepared_plan;
 
+pub use active_plan::{
+    ActiveSegmentDescription, ActiveSegmentKey, ActiveSegmentOpenRequest, ActiveSegmentOpener,
+    ActiveSegmentRole,
+};
 pub use output_admission::PersistedDecodedOutputAdmission;
 pub use persisted_plan::{
     BoundPersistedPlan, PersistedFileDescription, PersistedFileKey, PersistedFileOpenRequest,
