@@ -1,0 +1,23 @@
+[package]
+name = "zippy-client-py"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "zippy_client_shm"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+arrow = { workspace = true, features = ["pyarrow"] }
+pyo3 = "0.22"
+serde_json.workspace = true
+zippy-segment-store = { path = "../zippy-segment-store" }
+
+[build-dependencies]
+pyo3-build-config = "0.22"
+
+[lints]
+workspace = true

@@ -4,8 +4,12 @@ dist/
 build/
 __pycache__/
 .pytest_cache/
+.coverage
+.coverage.*
 .codex
 python/zippy/*.so
+clients/python/src/zippy_client/*.so
+clients/python/src/zippy_client/*.pyd
 /plugins/zippy-openctp/
 /plugins/zippy-openctp-rereview-*/
 logs/

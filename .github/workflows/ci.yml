@@ -17,8 +17,29 @@ jobs:
       - name: setup rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: setup uv
+        uses: astral-sh/setup-uv@v4
+
       - name: run windows cargo check
         run: cargo check --workspace
+
+      - name: install windows lightweight client extension
+        working-directory: clients/python
+        run: uv run --extra dev maturin develop
+
+      - name: run windows lightweight client contracts
+        working-directory: clients/python
+        run: >-
+          uv run --extra dev pytest
+          tests/test_endpoints_router.py
+          tests/test_expressions_protocol.py
+          tests/test_unit_contracts.py
+          --no-cov -v
 
   verify:
     runs-on: ubuntu-latest
@@ -69,6 +90,10 @@ jobs:
       - name: install python extension
         run: uv run maturin develop --manifest-path crates/zippy-python/Cargo.toml
 
+      - name: install lightweight client extension
+        working-directory: clients/python
+        run: uv run --extra dev maturin develop
+
       - name: check python formatting
         run: uv run --extra dev black --check python pytests
 
@@ -80,3 +105,15 @@ jobs:
 
       - name: run python tests
         run: uv run --extra dev pytest pytests -v
+
+      - name: check lightweight client formatting
+        run: uv run --project clients/python --extra dev black --check clients/python/src clients/python/tests
+
+      - name: run lightweight client ruff
+        run: uv run --project clients/python --extra dev ruff check clients/python/src clients/python/tests
+
+      - name: run lightweight client mypy
+        run: uv run --project clients/python --extra dev mypy clients/python/src/zippy_client clients/python/tests
+
+      - name: run lightweight client tests
+        run: uv run --project clients/python --extra dev pytest clients/python/tests -v

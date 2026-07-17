@@ -40,6 +40,9 @@ include = [
 [tool.uv.sources]
 rspm = { path = "../rspm/python", editable = true }
 
+[tool.uv.workspace]
+members = ["clients/python"]
+
 [tool.black]
 line-length = 100
 target-version = ["py311"]

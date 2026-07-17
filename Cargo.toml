@@ -17,6 +17,7 @@ members = [
     "crates/zippy-query",
     "crates/zippy-protocol",
     "crates/zippy-server",
+    "crates/zippy-client-py",
 ]
 resolver = "2"
 

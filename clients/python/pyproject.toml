@@ -1,0 +1,62 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zippy-client"
+version = "0.1.0"
+description = "Lightweight local and remote Python client for Zippy"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "loguru>=0.7.0",
+    "pyarrow>=18.0.0",
+    "tzdata>=2025.2; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.10.0",
+    "maturin>=1.7,<2.0",
+    "mypy>=1.13.0",
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+]
+
+[tool.maturin]
+module-name = "zippy_client._shm"
+python-source = "src"
+manifest-path = "../../crates/zippy-client-py/Cargo.toml"
+features = ["extension-module"]
+exclude = [
+    "src/**/__pycache__/**",
+    "src/**/*.pyc",
+    "src/**/*.pyo",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/zippy_client", "tests"]
+ignore_missing_imports = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--cov=zippy_client",
+    "--cov-report=term-missing",
+    "--cov-fail-under=80",
+]
