@@ -2344,9 +2344,9 @@ bound plan 通过 DataFusion 单流执行接口按需拉取 batch，不做全量
 `Finished`。stream drop 则先发布 `Cancelled`，随后释放 DataFusion、operator 和 reader 资源。terminal query 的
 snapshot root 在最后一个 file task 离开后即可撤销，已经物化的批次只保留内存账，不阻塞 compaction。
 
-当前 Arrow batch 由 DataFusion 产出后才立即申请 result permit：生产过程受 `OperatorArena` 硬上限覆盖，但尚不存在
-batch-specific 的产出前 reservation。这是 Gateway capability 继续保持关闭的主要原因之一；后续需要为 decoded output
-增加产出前额度或可原子转移的 operator-to-result charge，并接入进程级 pool、受配额 spill/temp 目录与 transport
+Stage 5.4g 完成时，Arrow batch 仍由 DataFusion 产出后才立即申请 result permit：生产过程只有
+`OperatorArena` 的间接边界，尚不存在 batch-specific 的产出前 reservation。该缺口由 Stage 5.4i 针对首批
+persisted fixed-width streaming 子集关闭；复杂算子仍需后续进程级 pool、受配额 spill/temp 与 transport
 backpressure。ActiveSegmentExec 也尚未进入这条流。
 
 本阶段故障矩阵：
@@ -2362,16 +2362,17 @@ backpressure。ActiveSegmentExec 也尚未进入这条流。
 | reader 已准入后 fail/drop | 保留 `Failed`/`Cancelled`，旧 task/pin 随 reader drop 归零 | `real_reader_fail_and_drop_keep_task_pin_until_reader_drop` |
 | admin cancel 先于 finish | finish 返回已发布的 `Cancelled`，不改写为 `Conflict` | `cancelled_lease_with_reader_finish_returns_first_terminal_error` |
 | 合法 footer task 扩充 | 三层 task memory 精确等于计算 charge | `admitted_parquet_cursor_retains_task_and_pin_until_final_drop` |
-| 真实 footer task 扩充超预算 | sticky `RESOURCE_EXHAUSTED`，无部分增长或重复 open | `real_footer_growth_rejection_is_sticky_and_releases_task_and_pin` |
+| metadata 足额但 decoded window 超预算 | sticky `RESOURCE_EXHAUSTED`，reader 不发布且无重复 open | `decoded_output_growth_rejection_is_sticky_and_releases_task_and_pin` |
 | footer grow 与 admin cancel 竞争 | 只允许 grow-first 或 cancel-first，三层账本一致 | `task_memory_growth_and_admin_cancel_are_linearized_across_all_ledgers` |
 | page-index/bloom 被篡改 | planning/bind 双重拒绝 | `binder_rejects_tampered_manifest_metadata_before_opening` |
 | operator context 超预算 | runtime 构建前发布 `Failed`，plan/pin/账本归零 | `operator_context_budget_rejection_fails_and_releases_execution_lease` |
 | EOF 时下游仍持有 batch | operator/reader 先释放，最后一个 result drop 后进入 `Finished` | `native_stream_accounts_batches_and_finishes_after_delivery_drains` |
 | result stream 提前 drop | 先发布 `Cancelled`，batch 内存继续计费，snapshot pin 可撤销 | `dropping_native_stream_cancels_before_result_reservation_release` |
 
-该阶段已完成 persisted-only 的内部 native result stream，但尚未对外暴露 Gateway capability。decoded Arrow batch
-产出前准入、ActiveSegmentExec、DataFusion process-wide memory pool、spill/temp quota 和 transport backpressure 必须在
-执行入口开放前补齐，不能把 per-execution operator arena 误当成完整的进程级查询资源治理。
+Stage 5.4g 已完成 persisted-only 的内部 native result stream，但当时尚未对外暴露 Gateway capability。decoded Arrow
+batch 产出前准入、ActiveSegmentExec、DataFusion process-wide memory pool、spill/temp quota 和 transport backpressure
+仍需按后续阶段补齐，不能把 per-execution operator arena 误当成完整的进程级查询资源治理。Stage 5.4i 已关闭首批
+persisted fixed-width streaming 子集的 decoded-output 缺口，其余边界仍保持 fail closed。
 
 Stage 5.4h Server-owned persisted query canary 已完成（2026-07-17）：`[query.canary]` 默认关闭，且要求
 `server.native_storage_enabled=true`。Server runtime 在 native storage readiness 之后构造 canary service，shutdown
@@ -2400,9 +2401,36 @@ table ID，再映射到去重且按 table ID 排序的 canonical ordinal。Name/
 绑定到错误的 persisted manifest。当前 persisted planner 仍要求每个 canonical manifest table 恰好一个 binding，
 同表 self-join / 多 alias 不在本阶段能力内。
 
-该阶段仍不是查询 authority 切换。公开 `QueryEngine` 返回 cloneable 裸 `RecordBatch`，无法证明 native result permit
-覆盖调用方最终 batch drop；decoded output 产出前准入、ActiveSegmentExec、process-wide pool、受配额 spill/temp 和
-transport backpressure 也仍未完成。canary 只返回摘要报告，用于在这些前置条件完成前收集正确性与性能证据。
+Stage 5.4h 完成时仍不是查询 authority 切换。公开 `QueryEngine` 返回 cloneable 裸 `RecordBatch`，无法证明 native
+result permit 覆盖调用方最终 batch drop；decoded output 产出前准入、ActiveSegmentExec、process-wide pool、受配额
+spill/temp 和 transport backpressure 当时也仍未完成。canary 只返回摘要报告，用于在这些前置条件完成前收集正确性与
+性能证据。
+
+Stage 5.4i bounded decoded-output pre-admission 已完成（2026-07-17）：DataFusion 44 的 `MemoryPool` 文档明确说明
+`ParquetExec`、算子间流动的 `RecordBatch` 和其他小额中间分配不计入 pool，因此不能用扩大 per-execution
+`GreedyMemoryPool` 冒充 decoded-output 硬边界。本阶段把 persisted native execution 收窄为一个可证明有界的首批子集：
+最多一个 Parquet scan（空表允许优化成零 scan）、固定宽度 Arrow schema、直接列 projection、所有中间节点同样只产生
+固定宽度值且属于显式基础 allowlist（column/literal/binary/fixed-width cast/null/not/negative）的 filter，以及
+local/global limit/offset。exact `FilterExec` 与 Parquet pushed predicate 使用同一校验；`Utf8`/`Binary`、计算
+projection、`IN`/UDF predicate、`CoalesceBatchesExec`、sort、aggregate、join、union、window 或多 scan 在
+reader 创建前按 `UNSUPPORTED_PLAN` fail closed。
+
+`QuerySessionPolicy` 现在显式固定默认 8192 行 batch，并关闭 DataFusion batch coalesce。后者会缓存任意数量的小 batch；
+只按目标行数或物理节点数无法覆盖极端的一行一 batch 控制块，因此在有独立精确记账前不能进入 allowlist。完整物理树
+在 bind 后生成 version 1 `PersistedDecodedOutputAdmission`：按 scan fixed-width row size、validity/alignment、递归 schema、
+array/control margin，以及 pipeline physical/expression node 数计算同时存活 Arrow batch 峰值。
+
+每个文件仍先以 64 KiB task reservation 打开并按 `64 KiB + footer_bytes * 64` 扩充，随后在同一个 blocking open
+中只解析一次 metadata，校验 footer row count 与 Catalog commit row count 一致。Server 再按“两份最大 row group
+declared uncompressed bytes + 固定 decoder margin + admitted Arrow pipeline peak”原子扩充同一个 file task；只有成功后才
+把缓存 metadata 和 reader 交给 DataFusion。压缩 page/range `Bytes` 继续持有独立 exact result permit；batch 产出后仍
+申请 caller-lifetime result permit，因此生产窗口与交付窗口在 handoff 时刻保守重叠，而不是出现未记账空档。
+
+自动化覆盖固定宽度单 scan 接受、变长列/多 scan/coalesce/非 allowlist predicate 拒绝、pushed predicate 不能绕过、
+filter + projection + limit 执行、Catalog row count 校验、metadata 足额但 decoded window 不足时的 sticky
+`RESOURCE_EXHAUSTED`，以及失败/取消/EOF 后 task、result 和 snapshot pin 排空。Gateway capability 继续保持关闭：
+该边界只覆盖 persisted streaming 子集；ActiveSegmentExec、复杂算子的 process-wide pool 与 spill/temp quota、transport
+backpressure，以及公开调用方 batch ownership contract 仍未完成。
 
 任务：
 
@@ -2410,7 +2438,7 @@ transport backpressure 也仍未完成。canary 只返回摘要报告，用于�
 2. 新建 `zippy-query` 和 per-session `SessionContext` policy。（persisted planning 已完成）
 3. 实现 `ZippyTableProvider`。（persisted-only 已完成）
 4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。
-5. 先迁移 projection/filter/head/tail/slice。
+5. 先迁移 projection/filter/head/tail/slice。（persisted fixed-width streaming 子集已完成；active segment 待完成）
 6. 迁移 sort/aggregate/join/window。
 7. 实现 query registry、cancel、deadline。（registry/lifecycle 与内部 persisted result stream 已完成）
 8. 接入全局 memory pool、spill 和 temp quota。

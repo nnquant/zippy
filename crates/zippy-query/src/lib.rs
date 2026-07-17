@@ -27,16 +27,19 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+pub use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::FOOTER_SIZE;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use zippy_types::{ErrorCode, ServerError};
 
+mod output_admission;
 mod persisted_plan;
 mod prepared_plan;
 
+pub use output_admission::PersistedDecodedOutputAdmission;
 pub use persisted_plan::{
     BoundPersistedPlan, PersistedFileDescription, PersistedFileKey, PersistedFileOpenRequest,
     PersistedFileOpener, PersistedSnapshotDescription, PersistedTableDescription,
@@ -291,6 +294,31 @@ impl<R: AdmittedRandomAccessFile> AdmittedParquetSource<R> {
             blocking_operation_gate: Arc::new(Semaphore::new(1)),
         }
     }
+
+    /// Returns mutable access to the admitted owner while no cursor clone is alive.
+    ///
+    /// This is intended for the one-time blocking open path: parse metadata under its initial
+    /// reservation, compute a decoded-output envelope, then grow the same owner before publishing
+    /// the source. Once any cursor or async reader clones the source, this returns `None`.
+    pub fn admitted_file_mut(&mut self) -> Option<&mut R> {
+        Arc::get_mut(&mut self.inner)
+    }
+
+    /// Borrows the admitted owner without exposing or cloning its storage capability.
+    #[must_use]
+    pub fn admitted_file(&self) -> &R {
+        self.inner.as_ref()
+    }
+
+    /// Parses and retains this source's Parquet metadata on the current blocking worker.
+    ///
+    /// The admitted owner must already cover the metadata decoder charge. All temporary footer
+    /// ranges continue to use [`AdmittedRandomAccessFile::reserve_range_buffer`].
+    pub fn parse_metadata(&self) -> ParquetResult<Arc<ParquetMetaData>> {
+        ParquetMetaDataReader::new()
+            .parse_and_finish(self)
+            .map(Arc::new)
+    }
 }
 
 impl<R: AdmittedRandomAccessFile> Clone for AdmittedParquetSource<R> {
@@ -410,13 +438,29 @@ impl<R: AdmittedRandomAccessFile> Read for AdmittedParquetCursor<R> {
 /// async operation gate.
 pub struct AdmittedAsyncParquetReader<R: AdmittedRandomAccessFile> {
     source: AdmittedParquetSource<R>,
+    metadata: Option<Arc<ParquetMetaData>>,
 }
 
 impl<R: AdmittedRandomAccessFile> AdmittedAsyncParquetReader<R> {
     /// Creates an async reader over an already admitted Parquet source.
     #[must_use]
     pub fn new(source: AdmittedParquetSource<R>) -> Self {
-        Self { source }
+        Self {
+            source,
+            metadata: None,
+        }
+    }
+
+    /// Creates an async reader with metadata parsed under the same admitted source owner.
+    #[must_use]
+    pub fn new_with_metadata(
+        source: AdmittedParquetSource<R>,
+        metadata: Arc<ParquetMetaData>,
+    ) -> Self {
+        Self {
+            source,
+            metadata: Some(metadata),
+        }
     }
 }
 
@@ -450,6 +494,9 @@ impl<R: AdmittedRandomAccessFile> AsyncFileReader for AdmittedAsyncParquetReader
     fn get_metadata(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = ParquetResult<Arc<ParquetMetaData>>> + Send + '_>> {
+        if let Some(metadata) = self.metadata.as_ref().map(Arc::clone) {
+            return Box::pin(async move { Ok(metadata) });
+        }
         let source = self.source.clone();
         let operation_gate = Arc::clone(&source.blocking_operation_gate);
         Box::pin(async move {
@@ -475,19 +522,39 @@ impl<R: AdmittedRandomAccessFile> AsyncFileReader for AdmittedAsyncParquetReader
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuerySessionPolicy {
     target_partitions: NonZeroUsize,
+    batch_size: NonZeroUsize,
 }
+
+const DEFAULT_PERSISTED_QUERY_BATCH_SIZE: usize = 8192;
 
 impl QuerySessionPolicy {
     /// Creates a policy with an explicit optimizer target partition count.
     #[must_use]
     pub const fn new(target_partitions: NonZeroUsize) -> Self {
-        Self { target_partitions }
+        Self {
+            target_partitions,
+            batch_size: NonZeroUsize::new(DEFAULT_PERSISTED_QUERY_BATCH_SIZE)
+                .expect("default persisted query batch size is nonzero"),
+        }
+    }
+
+    /// Overrides the maximum rows decoded into one Arrow batch.
+    #[must_use]
+    pub const fn with_batch_size(mut self, batch_size: NonZeroUsize) -> Self {
+        self.batch_size = batch_size;
+        self
     }
 
     /// Returns the optimizer target partition count for this session.
     #[must_use]
     pub const fn target_partitions(self) -> NonZeroUsize {
         self.target_partitions
+    }
+
+    /// Returns the explicit maximum rows decoded into one Arrow batch.
+    #[must_use]
+    pub const fn batch_size(self) -> NonZeroUsize {
+        self.batch_size
     }
 
     /// Creates an isolated DataFusion session context using this policy.
@@ -536,6 +603,8 @@ impl QuerySessionPolicy {
 
     fn session_config(self) -> SessionConfig {
         SessionConfig::new()
+            .with_batch_size(self.batch_size.get())
+            .with_coalesce_batches(false)
             .with_target_partitions(self.target_partitions.get())
             .with_repartition_file_scans(false)
             .with_parquet_page_index_pruning(false)
@@ -576,8 +645,8 @@ mod tests {
         classify_persisted_execution_error, deferred_parquet_reader,
         parquet_metadata_memory_charge, structured_persisted_execution_error,
         AdmittedAsyncParquetReader, AdmittedParquetSource, AdmittedRandomAccessFile,
-        BoxedAsyncFileReader, PersistedExecutionErrorClass, QuerySessionPolicy,
-        MAX_POSITIONED_READ_BYTES, PARQUET_METADATA_DECODE_EXPANSION_FACTOR,
+        BoxedAsyncFileReader, PersistedDecodedOutputAdmission, PersistedExecutionErrorClass,
+        QuerySessionPolicy, MAX_POSITIONED_READ_BYTES, PARQUET_METADATA_DECODE_EXPANSION_FACTOR,
         PARQUET_METADATA_FIXED_MEMORY_BYTES, PARQUET_TRAILER_SIZE_BYTES,
     };
     use zippy_types::{ErrorCode, ServerError};
@@ -809,6 +878,43 @@ mod tests {
     }
 
     #[test]
+    fn decoded_output_admission_is_fixed_width_and_row_group_bounded() {
+        let bytes = parquet_fixture();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source = AdmittedParquetSource::new(TestAdmittedFile::new(
+            &bytes,
+            bytes.len() as u64,
+            Arc::clone(&drops),
+        ));
+        let metadata = source.parse_metadata().expect("parse admitted metadata");
+        let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+        let admission = PersistedDecodedOutputAdmission::try_for_fixed_width_schema(
+            NonZeroUsize::new(1024).expect("nonzero batch size"),
+            &schema,
+            NonZeroUsize::new(3).expect("nonzero batch copies"),
+        )
+        .expect("profile fixed-width decoded output");
+        let charge = admission
+            .file_decode_memory_bytes(&metadata)
+            .expect("charge decoded row group");
+        assert_eq!(admission.format_version(), 1);
+        assert_eq!(admission.batch_size().get(), 1024);
+        assert_eq!(admission.scan_column_count().get(), 1);
+        assert!(charge > admission.batch_peak_memory_bytes());
+
+        let variable = Schema::new(vec![Field::new("value", DataType::Utf8, false)]);
+        let error = PersistedDecodedOutputAdmission::try_for_fixed_width_schema(
+            NonZeroUsize::new(1024).expect("nonzero batch size"),
+            &variable,
+            NonZeroUsize::new(1).expect("nonzero batch copies"),
+        )
+        .expect_err("variable-width scan must not claim bounded output admission");
+        assert!(matches!(error, DataFusionError::NotImplemented(_)));
+        drop(source);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn workspace_and_datafusion_record_batches_share_one_arrow_abi() {
         let values = Int64Array::from(vec![1_i64, 2, 3]);
         let values_ptr = values.values().as_ptr();
@@ -889,6 +995,7 @@ mod tests {
         let policy = QuerySessionPolicy::new(NonZeroUsize::new(2).unwrap());
         let context = policy.create_context();
         assert_eq!(context.state().config().target_partitions(), 2);
+        assert!(!context.state().config().coalesce_batches());
         assert!(
             !context
                 .state()

@@ -657,6 +657,19 @@ impl BoundPersistedPlan {
         self.plan.schema()
     }
 
+    /// Profiles the first fail-closed streaming output subset before any file is decoded.
+    ///
+    /// The accepted plan contains at most one fixed-width Parquet scan (an empty table may optimize
+    /// to no scan) and only direct projection, fixed-width filtering, and limit/slice operators.
+    /// More general analytical operators remain unsupported until their decoded output
+    /// participates in the global memory pool and quota-enforced spill path.
+    pub fn streaming_output_admission(
+        &self,
+        batch_size: std::num::NonZeroUsize,
+    ) -> Result<crate::PersistedDecodedOutputAdmission> {
+        crate::output_admission::profile_streaming_output_plan(&self.plan, batch_size)
+    }
+
     /// Starts this snapshot-bound physical plan in the supplied bounded runtime.
     ///
     /// The returned stream owns DataFusion's execution tasks. Dropping it aborts execution and
@@ -1138,7 +1151,7 @@ impl ParquetFileReaderFactory for PlanningOnlyParquetReaderFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -1155,6 +1168,9 @@ mod tests {
     use datafusion::datasource::physical_plan::{FileMeta, FileScanConfig};
     use datafusion::datasource::TableProvider;
     use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::physical_expr::expressions::{Column, InListExpr, Literal};
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::physical_plan::union::UnionExec;
@@ -1248,6 +1264,33 @@ mod tests {
         .expect("build persisted test table")
     }
 
+    fn fixed_width_table(
+        table_index: usize,
+        id: u128,
+        snapshot_version: u64,
+        file_ids: &[u128],
+    ) -> PersistedTableDescription {
+        let table_id = table_id(id);
+        PersistedTableDescription::try_new(
+            table_index,
+            table_id,
+            nonzero(snapshot_version),
+            nonzero(2),
+            Arc::new(Schema::new(vec![
+                Field::new("price", DataType::Int64, false),
+                Field::new("volume", DataType::UInt32, true),
+            ])),
+            file_ids
+                .iter()
+                .enumerate()
+                .map(|(file_index, &id)| {
+                    file(table_index, file_index, table_id, snapshot_version, id)
+                })
+                .collect(),
+        )
+        .expect("build fixed-width persisted test table")
+    }
+
     fn recording_opener(
         tables: &[PersistedTableDescription],
     ) -> (
@@ -1296,6 +1339,17 @@ mod tests {
                 .with_enable_page_index(false)
                 .with_bloom_filter_on_read(false),
         )
+    }
+
+    fn fixed_width_in_list_predicate() -> Arc<dyn PhysicalExpr> {
+        Arc::new(InListExpr::new(
+            Arc::new(Column::new("price", 0)),
+            vec![Arc::new(Literal::new(
+                datafusion::common::ScalarValue::Int64(Some(42)),
+            ))],
+            false,
+            None,
+        ))
     }
 
     fn file_meta(partitioned: &PartitionedFile) -> FileMeta {
@@ -1944,5 +1998,108 @@ mod tests {
         let error = reader_error(factory, 0, file_meta(partitioned));
         assert!(error.contains("execution lease has expired"));
         assert_eq!(requests.lock().expect("request log lock").len(), 1);
+    }
+
+    #[test]
+    fn streaming_output_admission_accepts_only_bounded_plan_subset() {
+        let fixed = fixed_width_table(0, 1, 7, &[10]);
+        let (opener, _) = recording_opener(std::slice::from_ref(&fixed));
+        let bound = bind_persisted_snapshot_plan(
+            marked_plan(planning_config(&fixed)),
+            std::slice::from_ref(&fixed),
+            &opener,
+        )
+        .expect("bind one fixed-width persisted scan");
+        let admission = bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect("profile one fixed-width streaming scan");
+        assert_eq!(admission.batch_size().get(), 4096);
+        assert_eq!(admission.scan_column_count().get(), 2);
+
+        let variable = table(0, 2, 7, &[20]);
+        let (variable_opener, _) = recording_opener(std::slice::from_ref(&variable));
+        let variable_bound = bind_persisted_snapshot_plan(
+            marked_plan(planning_config(&variable)),
+            std::slice::from_ref(&variable),
+            &variable_opener,
+        )
+        .expect("binding remains independent from output admission");
+        let error = variable_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("variable-width scan must fail closed before reader creation");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let union_plan: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(vec![
+            marked_plan(planning_config(&fixed)),
+            marked_plan(planning_config(&fixed)),
+        ]));
+        let union_bound =
+            bind_persisted_snapshot_plan(union_plan, std::slice::from_ref(&fixed), &opener)
+                .expect("bind both self-scan markers before output validation");
+        let error = union_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("multi-scan union must remain outside the streaming subset");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let coalesce_plan: Arc<dyn ExecutionPlan> = Arc::new(CoalesceBatchesExec::new(
+            marked_plan(planning_config(&fixed)),
+            4096,
+        ));
+        let coalesce_bound =
+            bind_persisted_snapshot_plan(coalesce_plan, std::slice::from_ref(&fixed), &opener)
+                .expect("bind scan before coalesce output validation");
+        let error = coalesce_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("unbounded tiny-batch coalescing must fail closed");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let in_list_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(
+                fixed_width_in_list_predicate(),
+                marked_plan(planning_config(&fixed)),
+            )
+            .expect("build fixed-width IN-list filter"),
+        );
+        let in_list_bound =
+            bind_persisted_snapshot_plan(in_list_plan, std::slice::from_ref(&fixed), &opener)
+                .expect("bind scan before filter-expression output validation");
+        let error = in_list_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("fixed-width IN list has separately unaccounted runtime state");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let pushed_predicate_scan: Arc<dyn ExecutionPlan> = Arc::new(
+            ParquetExec::builder(planning_config(&fixed))
+                .with_predicate(fixed_width_in_list_predicate())
+                .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY))
+                .build()
+                .with_enable_page_index(false)
+                .with_bloom_filter_on_read(false),
+        );
+        let pushed_predicate_bound = bind_persisted_snapshot_plan(
+            pushed_predicate_scan,
+            std::slice::from_ref(&fixed),
+            &opener,
+        )
+        .expect("bind scan before pushed-predicate output validation");
+        let error = pushed_predicate_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("pushed fixed-width IN list cannot bypass expression admission");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
     }
 }

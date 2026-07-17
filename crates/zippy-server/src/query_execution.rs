@@ -8,11 +8,11 @@ use arrow::record_batch::RecordBatch;
 use zippy_query::{
     classify_persisted_execution_error, classify_persisted_plan_error, next_persisted_batch,
     prepare_persisted_plan, profile_persisted_plan, structured_persisted_execution_error,
-    BoundPersistedPlan, BoxedAsyncFileReader, PersistedExecutionContext, PersistedExecutionError,
-    PersistedExecutionErrorClass, PersistedFileDescription, PersistedFileOpenRequest,
-    PersistedFileOpener, PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile,
-    PersistedRecordBatchStream, PersistedSnapshotDescription, PersistedTableBinding,
-    PreparedPersistedPlan, QuerySessionPolicy,
+    BoundPersistedPlan, BoxedAsyncFileReader, PersistedDecodedOutputAdmission,
+    PersistedExecutionContext, PersistedExecutionError, PersistedExecutionErrorClass,
+    PersistedFileDescription, PersistedFileOpenRequest, PersistedFileOpener,
+    PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile, PersistedRecordBatchStream,
+    PersistedSnapshotDescription, PersistedTableBinding, PreparedPersistedPlan, QuerySessionPolicy,
 };
 use zippy_types::query::QueryInstanceId;
 use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
@@ -157,6 +157,7 @@ struct NativeExecutionAuthority {
     snapshot_coordinator: NativeQuerySnapshotCoordinator,
     accepting_readers: AtomicBool,
     execution: Mutex<Option<QueryExecutionScope>>,
+    output_admission: Mutex<Option<PersistedDecodedOutputAdmission>>,
     #[cfg(test)]
     reader_admission_pause: Mutex<Option<Arc<ReaderAdmissionPause>>>,
 }
@@ -188,6 +189,7 @@ impl NativeExecutionAuthority {
             snapshot_coordinator,
             accepting_readers: AtomicBool::new(true),
             execution: Mutex::new(Some(execution)),
+            output_admission: Mutex::new(None),
             #[cfg(test)]
             reader_admission_pause: Mutex::new(None),
         }
@@ -213,6 +215,39 @@ impl NativeExecutionAuthority {
             .as_ref()
             .map(QueryExecutionScope::cancellation)
             .ok_or_else(|| closed_execution(self.binding.instance_id))
+    }
+
+    fn install_output_admission(&self, admission: PersistedDecodedOutputAdmission) -> Result<()> {
+        let mut installed = self
+            .output_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if installed.is_some() {
+            return Err(ServerError::new(
+                ErrorCode::Internal,
+                "native persisted output admission was installed more than once",
+            )
+            .with_query_id(self.binding.instance_id.query_id())
+            .with_retryable(false));
+        }
+        *installed = Some(admission);
+        Ok(())
+    }
+
+    fn output_admission(&self) -> Result<PersistedDecodedOutputAdmission> {
+        self.output_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "native persisted reader has no decoded output admission",
+                )
+                .with_query_id(self.binding.instance_id.query_id())
+                .with_retryable(false)
+            })
     }
 
     fn admit_operator_context(
@@ -330,6 +365,7 @@ impl NativeExecutionAuthority {
                     .expect("persisted file memory charge is nonzero"),
             },
             description,
+            self.output_admission()?,
         )
     }
 
@@ -587,7 +623,7 @@ impl NativeExecutionLease {
             Ok(admitted) => admitted,
             Err(error) => return Err(publish_preparation_failure(execution, error)),
         };
-        Self::bind_admitted(snapshot_coordinator, execution, manifest, admitted)
+        Self::bind_admitted(snapshot_coordinator, execution, manifest, admitted, policy)
     }
 
     fn bind_admitted(
@@ -595,6 +631,7 @@ impl NativeExecutionLease {
         execution: QueryExecutionScope,
         manifest: QueryRetainedPermit<ProjectedSnapshotManifest>,
         admitted: AdmittedPreparedPersistedPlan,
+        policy: QuerySessionPolicy,
     ) -> Result<Self> {
         let instance_id = execution.instance_id();
         let catalog_revision = manifest.resource().catalog_revision();
@@ -663,6 +700,40 @@ impl NativeExecutionLease {
                 return Err(error);
             }
         };
+        let output_admission = match retained_plan
+            .resource()
+            .streaming_output_admission(policy.batch_size())
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                authority.close_reader_admission();
+                let error = plan_error(
+                    instance_id.query_id(),
+                    PersistedPlanStage::OutputAdmission,
+                    classify_persisted_plan_error(&error),
+                    &error,
+                );
+                let error = authority
+                    .take_execution()
+                    .map_or(error.clone(), |execution| {
+                        publish_preparation_failure(execution, error)
+                    });
+                drop(retained_plan);
+                drop(opener);
+                return Err(error);
+            }
+        };
+        if let Err(error) = authority.install_output_admission(output_admission) {
+            authority.close_reader_admission();
+            let error = authority
+                .take_execution()
+                .map_or(error.clone(), |execution| {
+                    publish_preparation_failure(execution, error)
+                });
+            drop(retained_plan);
+            drop(opener);
+            return Err(error);
+        }
         Ok(Self {
             authority,
             opener: Some(opener),
@@ -882,6 +953,7 @@ enum PersistedPlanStage {
     Profile,
     Prepare,
     Bind,
+    OutputAdmission,
 }
 
 impl PersistedPlanStage {
@@ -891,6 +963,7 @@ impl PersistedPlanStage {
             Self::Profile => "profile",
             Self::Prepare => "prepare",
             Self::Bind => "bind",
+            Self::OutputAdmission => "output admission",
         }
     }
 }
@@ -1253,13 +1326,17 @@ mod tests {
     }
 
     async fn prepare_lease(test: &TestRuntime, value: u128) -> NativeExecutionLease {
+        prepare_lease_sql(test, value, "select price from ticks").await
+    }
+
+    async fn prepare_lease_sql(test: &TestRuntime, value: u128, sql: &str) -> NativeExecutionLease {
         let (execution, manifest) = begin_query(test, value).await;
         NativeExecutionLease::prepare(
             test.runtime.query_snapshot_coordinator(),
             execution,
             manifest,
             policy(),
-            "select price from ticks",
+            sql,
             &bindings(),
             limits(),
         )
@@ -1495,7 +1572,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_stream_accounts_batches_and_finishes_after_delivery_drains() {
         let mut test = start_runtime_with_file().await;
-        let lease = prepare_lease(&test, 121).await;
+        let lease = prepare_lease_sql(
+            &test,
+            121,
+            "select price from ticks where price >= 42 limit 1 offset 0",
+        )
+        .await;
         let instance_id = lease.instance_id();
         let admin = test.runtime.query_resource_coordinator().admin_handle();
         let before_execute = admin
@@ -1862,12 +1944,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_footer_growth_rejection_is_sticky_and_releases_task_and_pin() {
+    async fn decoded_output_growth_rejection_is_sticky_and_releases_task_and_pin() {
         let mut test = start_runtime_with_file().await;
         let lease = prepare_lease(&test, 253).await;
         let instance_id = lease.instance_id();
         let authority = Arc::clone(&lease.authority);
         let description = persisted_description(&lease);
+
+        let mut probe = authority
+            .open_reader(description)
+            .expect("admit metadata charge probe reader");
+        let metadata = probe
+            .get_metadata()
+            .await
+            .expect("open one reader with its complete decoded output window");
+        let decoded_memory_bytes = authority
+            .output_admission()
+            .expect("bound lease owns decoded output admission")
+            .file_decode_memory_bytes(&metadata)
+            .expect("compute decoded output component");
+        let probe_status = test
+            .runtime
+            .query_resource_coordinator()
+            .admin_handle()
+            .status(instance_id)
+            .expect("read complete probe task charge");
+        let metadata_memory_bytes = probe_status
+            .active_task_memory_bytes
+            .checked_sub(decoded_memory_bytes.get())
+            .expect("complete file task charge contains decoded output component");
+        assert!(metadata_memory_bytes >= PERSISTED_FILE_TASK_MEMORY_BYTES);
+        drop(probe);
+
         let mut reader = authority
             .open_reader(description)
             .expect("admit one real persisted reader");
@@ -1879,10 +1987,17 @@ mod tests {
             before_fill.active_task_memory_bytes,
             PERSISTED_FILE_TASK_MEMORY_BYTES
         );
+        let metadata_growth_memory_bytes = metadata_memory_bytes
+            .checked_sub(PERSISTED_FILE_TASK_MEMORY_BYTES)
+            .expect("metadata target covers initial file task reservation");
+        let metadata_range_memory_bytes = description.file_size_bytes().get();
+        assert!(decoded_memory_bytes.get() > metadata_range_memory_bytes);
         let filler_memory = DEFAULT_QUERY_MAX_MEMORY_BYTES
             .checked_sub(before_fill.active_memory_bytes)
+            .and_then(|remaining| remaining.checked_sub(metadata_growth_memory_bytes))
+            .and_then(|remaining| remaining.checked_sub(metadata_range_memory_bytes))
             .and_then(NonZeroU64::new)
-            .expect("query has positive memory remaining after reader admission");
+            .expect("query has room for metadata ranges but not decoded output after filler");
         let filler = {
             let execution = authority
                 .execution
@@ -1895,38 +2010,40 @@ mod tests {
                     cpu_slots: NonZeroU32::new(1).expect("nonzero filler CPU charge"),
                     memory_bytes: filler_memory,
                 })
-                .expect("fill the query memory budget after reader admission")
+                .expect("leave exactly the metadata growth available after reader admission")
         };
         assert_eq!(
             admin
                 .status(instance_id)
-                .expect("read full query memory budget")
+                .expect("read query memory before decoded output growth")
                 .active_memory_bytes,
             DEFAULT_QUERY_MAX_MEMORY_BYTES
+                - metadata_growth_memory_bytes
+                - metadata_range_memory_bytes
         );
 
         let first_error = reader
             .get_metadata()
             .await
-            .expect_err("footer charge growth must be rejected at the full budget");
+            .expect_err("decoded output growth must be rejected after metadata admission");
         assert_eq!(
             deferred_open_server_error(&first_error).code(),
             ErrorCode::ResourceExhausted
         );
         let after_first = admin
             .status(instance_id)
-            .expect("failed deferred open remains query-visible");
+            .expect("failed decoded output admission remains query-visible");
         assert_eq!(after_first.active_tasks, 1);
         assert_eq!(after_first.active_task_memory_bytes, filler_memory.get());
         assert_eq!(
             after_first.active_memory_bytes,
-            DEFAULT_QUERY_MAX_MEMORY_BYTES - PERSISTED_FILE_TASK_MEMORY_BYTES
+            DEFAULT_QUERY_MAX_MEMORY_BYTES - metadata_memory_bytes - metadata_range_memory_bytes
         );
 
         let second_error = reader
             .get_metadata()
             .await
-            .expect_err("deferred footer growth failure remains sticky");
+            .expect_err("deferred decoded output growth failure remains sticky");
         assert_eq!(
             deferred_open_server_error(&second_error).code(),
             ErrorCode::ResourceExhausted
@@ -1943,7 +2060,7 @@ mod tests {
             .fail(
                 ServerError::new(
                     ErrorCode::ResourceExhausted,
-                    "persisted Parquet metadata exceeded the query memory budget",
+                    "persisted Parquet decoded output exceeded the query memory budget",
                 )
                 .with_query_id(instance_id.query_id()),
             )
@@ -2137,6 +2254,7 @@ mod tests {
             execution,
             manifest,
             admitted,
+            policy(),
         )
         .err()
         .expect("snapshot mismatch must reject physical binding");

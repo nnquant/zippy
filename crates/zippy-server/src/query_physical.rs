@@ -6,8 +6,8 @@ use std::num::NonZeroU64;
 use zippy_catalog::{PinnedDataFile, PinnedDataFileReader};
 use zippy_query::{
     deferred_parquet_reader, parquet_metadata_memory_charge, AdmittedAsyncParquetReader,
-    AdmittedParquetSource, AdmittedRandomAccessFile, BoxedAsyncFileReader,
-    PARQUET_TRAILER_SIZE_BYTES,
+    AdmittedParquetSource, AdmittedRandomAccessFile, BoxedAsyncFileReader, ParquetMetaData,
+    PersistedDecodedOutputAdmission, PARQUET_TRAILER_SIZE_BYTES,
 };
 use zippy_types::{ErrorCode, Result, ServerError};
 
@@ -25,11 +25,37 @@ impl AdmittedPinnedParquetFile {
     /// it on a bounded blocking scan worker, not a Tokio runtime worker.
     pub(crate) fn open(
         task: QueryTaskPermit<PinnedDataFile>,
-    ) -> Result<AdmittedParquetSource<Self>> {
+        output_admission: PersistedDecodedOutputAdmission,
+    ) -> Result<(AdmittedParquetSource<Self>, std::sync::Arc<ParquetMetaData>)> {
         let mut task = task.open_pinned_file()?;
         let metadata_memory_bytes = inspect_parquet_metadata_memory(&task)?;
         task.grow_memory_to(metadata_memory_bytes)?;
-        Ok(AdmittedParquetSource::new(Self { task }))
+        let mut source = AdmittedParquetSource::new(Self { task });
+        let metadata = source.parse_metadata().map_err(|error| {
+            invalid_parquet_metadata(&source, format!("metadata decode failed error=[{error}]"))
+        })?;
+        validate_parquet_row_count(&source, &metadata)?;
+        let decoded_memory_bytes = output_admission
+            .file_decode_memory_bytes(&metadata)
+            .map_err(|error| {
+                invalid_parquet_metadata(
+                    &source,
+                    format!("decoded output admission failed error=[{error}]"),
+                )
+            })?;
+        let required_memory_bytes = metadata_memory_bytes
+            .get()
+            .checked_add(decoded_memory_bytes.get())
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                invalid_parquet_metadata(&source, "combined decode memory charge overflowed")
+            })?;
+        source
+            .admitted_file_mut()
+            .expect("blocking metadata parse releases every temporary source cursor")
+            .task
+            .grow_memory_to(required_memory_bytes)?;
+        Ok((source, metadata))
     }
 
     /// Returns a lazy async reader that opens this admitted file on first physical read.
@@ -37,13 +63,53 @@ impl AdmittedPinnedParquetFile {
     /// The task permit moves into the blocking opener closure. Dropping an in-flight open future
     /// or the outer reader therefore cannot release task, memory, or snapshot ownership before
     /// synchronous descriptor and checksum work actually exits.
-    pub(crate) fn deferred(task: QueryTaskPermit<PinnedDataFile>) -> BoxedAsyncFileReader {
+    pub(crate) fn deferred(
+        task: QueryTaskPermit<PinnedDataFile>,
+        output_admission: PersistedDecodedOutputAdmission,
+    ) -> BoxedAsyncFileReader {
         deferred_parquet_reader(move || {
-            Self::open(task).map(|source| {
-                Box::new(AdmittedAsyncParquetReader::new(source)) as BoxedAsyncFileReader
+            Self::open(task, output_admission).map(|(source, metadata)| {
+                Box::new(AdmittedAsyncParquetReader::new_with_metadata(
+                    source, metadata,
+                )) as BoxedAsyncFileReader
             })
         })
     }
+}
+
+fn validate_parquet_row_count(
+    source: &AdmittedParquetSource<AdmittedPinnedParquetFile>,
+    metadata: &ParquetMetaData,
+) -> Result<()> {
+    let admitted = source.admitted_file().task.pinned_file_reader();
+    validate_committed_parquet_row_count(admitted.row_count(), metadata.file_metadata().num_rows())
+        .map_err(|message| invalid_parquet_metadata(source, message))
+}
+
+fn validate_committed_parquet_row_count(
+    expected: NonZeroU64,
+    actual: i64,
+) -> std::result::Result<(), String> {
+    let actual = u64::try_from(actual)
+        .map_err(|_| "Parquet metadata contains a negative row count".to_owned())?;
+    if actual != expected.get() {
+        return Err(format!(
+            "Parquet row count differs from Catalog actual=[{actual}] expected=[{expected}]"
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_parquet_metadata(
+    source: &AdmittedParquetSource<AdmittedPinnedParquetFile>,
+    message: impl Into<String>,
+) -> ServerError {
+    let admitted_file = source.admitted_file();
+    let admitted = admitted_file.task.pinned_file_reader();
+    ServerError::new(ErrorCode::DataCorruption, message)
+        .with_query_id(admitted_file.task.query_id())
+        .with_table_id(admitted.table_id())
+        .with_retryable(false)
 }
 
 fn inspect_parquet_metadata_memory(
@@ -141,5 +207,26 @@ impl AdmittedRandomAccessFile for AdmittedPinnedParquetFile {
             ));
         }
         self.task.pinned_file_reader().read_at(offset, buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_committed_parquet_row_count;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn committed_parquet_row_count_must_match_footer() {
+        let expected = NonZeroU64::new(7).expect("test row count is non-zero");
+
+        assert_eq!(validate_committed_parquet_row_count(expected, 7), Ok(()));
+        assert_eq!(
+            validate_committed_parquet_row_count(expected, 6),
+            Err("Parquet row count differs from Catalog actual=[6] expected=[7]".to_owned())
+        );
+        assert_eq!(
+            validate_committed_parquet_row_count(expected, -1),
+            Err("Parquet metadata contains a negative row count".to_owned())
+        );
     }
 }

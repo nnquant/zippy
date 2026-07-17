@@ -533,6 +533,7 @@ impl PinnedDataFile {
             table_id: self.table_id(),
             file_id: self.file_id(),
             file_size_bytes: self.file_size_bytes(),
+            row_count: self.row_count(),
         })
     }
 
@@ -564,6 +565,7 @@ pub struct PinnedDataFileReader {
     table_id: TableId,
     file_id: FileId,
     file_size_bytes: u64,
+    row_count: NonZeroU64,
 }
 
 impl PinnedDataFileReader {
@@ -583,6 +585,12 @@ impl PinnedDataFileReader {
     #[must_use]
     pub const fn file_size_bytes(&self) -> u64 {
         self.file_size_bytes
+    }
+
+    /// Returns the logical row count recorded when this immutable file was committed.
+    #[must_use]
+    pub const fn row_count(&self) -> NonZeroU64 {
+        self.row_count
     }
 
     /// Reads from an absolute byte offset without changing this reader's sequential cursor.

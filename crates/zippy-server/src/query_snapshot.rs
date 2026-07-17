@@ -21,8 +21,8 @@ use zippy_catalog::{
 };
 use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
 use zippy_query::{
-    BoxedAsyncFileReader, PersistedFileDescription, PersistedFileKey, PersistedSnapshotDescription,
-    PersistedTableDescription,
+    BoxedAsyncFileReader, PersistedDecodedOutputAdmission, PersistedFileDescription,
+    PersistedFileKey, PersistedSnapshotDescription, PersistedTableDescription,
 };
 use zippy_types::catalog::CatalogSnapshotSelector;
 use zippy_types::query::{QueryInstanceId, QueryTableVersion};
@@ -628,9 +628,10 @@ impl NativeQuerySnapshotCoordinator {
         execution: &QueryExecutionScope,
         charge: QueryTaskCharge,
         description: PersistedFileDescription,
+        output_admission: PersistedDecodedOutputAdmission,
     ) -> Result<BoxedAsyncFileReader> {
         let task = self.admit_described_file_task(execution, charge, description)?;
-        Ok(AdmittedPinnedParquetFile::deferred(task))
+        Ok(AdmittedPinnedParquetFile::deferred(task, output_admission))
     }
 
     /// Projects the exact pinned snapshot into capability-free persisted query metadata.
@@ -1364,7 +1365,7 @@ fn corruption(query_id: QueryId, message: impl Into<String>) -> ServerError {
 mod tests {
     use std::collections::BTreeMap;
     use std::io::Read;
-    use std::num::{NonZeroU32, NonZeroU64};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1378,8 +1379,9 @@ mod tests {
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::{OwnedDataDirectory, DEFAULT_QUERY_MAX_MEMORY_BYTES};
     use zippy_query::{
-        parquet_metadata_memory_charge, AdmittedAsyncParquetReader, PersistedFileDescription,
-        PersistedFileKey, PARQUET_TRAILER_SIZE_BYTES,
+        parquet_metadata_memory_charge, AdmittedAsyncParquetReader,
+        PersistedDecodedOutputAdmission, PersistedFileDescription, PersistedFileKey,
+        PARQUET_TRAILER_SIZE_BYTES,
     };
     use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
@@ -1471,6 +1473,15 @@ mod tests {
             DataType::Int64,
             false,
         )]))
+    }
+
+    fn output_admission() -> PersistedDecodedOutputAdmission {
+        PersistedDecodedOutputAdmission::try_for_fixed_width_schema(
+            NonZeroUsize::new(8192).expect("nonzero test batch size"),
+            arrow_schema().as_ref(),
+            NonZeroUsize::new(4).expect("nonzero test batch copies"),
+        )
+        .expect("build fixed-width test output admission")
     }
 
     fn persist_request() -> PersistRequest {
@@ -2036,7 +2047,12 @@ mod tests {
         ];
         for description in forged {
             let error = snapshot_coordinator
-                .deferred_described_file_reader(&execution, charge(), description)
+                .deferred_described_file_reader(
+                    &execution,
+                    charge(),
+                    description,
+                    output_admission(),
+                )
                 .err()
                 .expect("forged persisted file description must be rejected");
             assert_eq!(error.code(), zippy_types::ErrorCode::DataCorruption);
@@ -2044,7 +2060,7 @@ mod tests {
         }
 
         let mut reader = snapshot_coordinator
-            .deferred_described_file_reader(&execution, charge(), file)
+            .deferred_described_file_reader(&execution, charge(), file, output_admission())
             .expect("admit exact projected file description");
         assert_eq!(resources.status().active_tasks, 1);
         assert_eq!(
@@ -2068,7 +2084,7 @@ mod tests {
         assert_eq!(resources.status().active_tasks, 0);
 
         let mut cancelled_reader = snapshot_coordinator
-            .deferred_described_file_reader(&execution, charge(), file)
+            .deferred_described_file_reader(&execution, charge(), file, output_admission())
             .expect("admit exact file before cancellation");
         resources
             .cancel_current_for_test(query)
@@ -2357,11 +2373,13 @@ mod tests {
         let file_task = snapshot_coordinator
             .admit_file_task(&execution, charge(), 0, 0)
             .expect("admit exact pinned file task");
-        let source =
-            tokio::task::spawn_blocking(move || AdmittedPinnedParquetFile::open(file_task))
-                .await
-                .expect("join bounded file opener")
-                .expect("open admitted Parquet source");
+        let admission = output_admission();
+        let (source, parsed_metadata) = tokio::task::spawn_blocking(move || {
+            AdmittedPinnedParquetFile::open(file_task, admission)
+        })
+        .await
+        .expect("join bounded file opener")
+        .expect("open admitted Parquet source");
         assert_eq!(resources.status().active_tasks, 1);
         assert_eq!(resources.status().active_result_permits, 0);
 
@@ -2381,6 +2399,13 @@ mod tests {
         let expected_metadata_memory_bytes =
             parquet_metadata_memory_charge(file_size_bytes, &trailer)
                 .expect("compute admitted Parquet metadata charge");
+        let expected_decode_memory_bytes = output_admission()
+            .file_decode_memory_bytes(&parsed_metadata)
+            .expect("compute admitted decoded output charge");
+        let expected_file_task_memory_bytes = expected_metadata_memory_bytes
+            .get()
+            .checked_add(expected_decode_memory_bytes.get())
+            .expect("test file task memory charge fits u64");
         drop(trailer_bytes);
         assert_eq!(resources.status().active_result_permits, 0);
 
@@ -2407,7 +2432,8 @@ mod tests {
         assert_eq!(resources.status().active_result_permits, 0);
         assert_eq!(resources.status().active_result_memory_bytes, 0);
 
-        let mut async_reader = AdmittedAsyncParquetReader::new(source.clone());
+        let mut async_reader =
+            AdmittedAsyncParquetReader::new_with_metadata(source.clone(), parsed_metadata);
         let metadata = async_reader
             .get_metadata()
             .await
@@ -2416,7 +2442,7 @@ mod tests {
         assert_eq!(metadata.file_metadata().num_rows(), 1);
         assert_eq!(
             resources.status().active_task_memory_bytes,
-            expected_metadata_memory_bytes.get()
+            expected_file_task_memory_bytes
         );
         drop(async_reader);
         assert_eq!(resources.status().active_result_permits, 0);

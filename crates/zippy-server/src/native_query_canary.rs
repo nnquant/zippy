@@ -2403,12 +2403,14 @@ mod tests {
                 .expect("valid unused binding"),
             ],
         );
-        let reordered = canary
+        let reordered_error = canary
             .submit(reordered)
             .expect("submit request-order mapping canary")
             .execute()
             .await
-            .expect("execute request-order mapping canary");
+            .expect_err("cross join remains outside bounded output admission");
+        assert_eq!(reordered_error.code(), ErrorCode::UnsupportedPlan);
+        assert!(reordered_error.message().contains("CrossJoinExec"));
         let canonical_order = NativeQueryCanaryRequest::new(
             query_id(1003),
             session_id(7),
@@ -2430,37 +2432,34 @@ mod tests {
                 .expect("valid canonical target binding"),
             ],
         );
-        let canonical_order = canary
+        let canonical_order_error = canary
             .submit(canonical_order)
             .expect("submit canonical-order mapping canary")
             .execute()
             .await
-            .expect("execute canonical-order mapping canary");
-        assert_eq!(reordered.row_count(), 6);
-        assert_eq!(reordered.digest(), canonical_order.digest());
+            .expect_err("canonical binding order cannot bypass bounded output admission");
+        assert_eq!(canonical_order_error.code(), ErrorCode::UnsupportedPlan);
+        assert!(canonical_order_error.message().contains("CrossJoinExec"));
 
         let status = canary.status();
         assert!(status.accepting());
         assert_eq!(status.active_runs(), 0);
         assert_eq!(status.metrics().submissions_total, 4);
-        assert_eq!(status.metrics().succeeded_total, 4);
+        assert_eq!(status.metrics().succeeded_total, 2);
+        assert_eq!(status.metrics().failed_total, 2);
         assert_eq!(status.metrics().comparisons_matched_total, 1);
-        assert_eq!(status.metrics().rows_total, 18);
+        assert_eq!(status.metrics().rows_total, 6);
         assert_eq!(
             status.metrics().canonical_bytes_total,
             first
                 .canonical_bytes()
                 .saturating_add(second.canonical_bytes())
-                .saturating_add(reordered.canonical_bytes())
-                .saturating_add(canonical_order.canonical_bytes())
         );
         assert_eq!(
             status.metrics().total_elapsed_us_total,
             first
                 .total_elapsed_us()
                 .saturating_add(second.total_elapsed_us())
-                .saturating_add(reordered.total_elapsed_us())
-                .saturating_add(canonical_order.total_elapsed_us())
         );
         test.shutdown();
         assert!(!canary.status().accepting());

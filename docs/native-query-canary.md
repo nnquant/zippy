@@ -19,6 +19,13 @@ result permit 链路，但不会把裸 `RecordBatch` 返回给调用方。Server
 当前 persisted planner 要求每个 canonical manifest table 恰好一个 binding，因此同表 self-join / 多 alias
 也不属于本阶段的灰度范围。
 
+当前可执行的 decoded-output 子集进一步收紧为：单表 persisted scan（空表可优化为无 scan）、固定宽度
+Arrow 列、直接列投影、显式 allowlist 的基础定宽 filter（列、字面量、二元运算、定宽 cast、
+null/not/negative），以及 limit/offset slice。exact filter 和 Parquet pushed predicate 都执行同一校验；
+`Utf8`/`Binary` 等变长列、计算投影、`IN`/UDF predicate、batch coalesce、sort、aggregate、join、union 和
+window 会在打开 reader 前返回 `UNSUPPORTED_PLAN`。这与下文 golden 摘要支持字符串并不矛盾：摘要构造器
+可验证 legacy 结果，但 native 执行 authority 目前只开放已证明具有产出前内存上界的子集。
+
 ## 配置
 
 canary 默认关闭，并且只能在 native storage 已启用时开启：
@@ -56,6 +63,11 @@ ZIPPY_QUERY_CANARY_OPERATOR_MEMORY_BYTES
 
 CPU 并行度继续复用 `[query].parallelism`，未配置时继承 `ZIPPY_MAX_CPU_CORES`。canary 的单查询
 task/CPU/memory 上限不能超过 `[query.resources]` 的全局 QueryService 上限。
+
+native persisted session 当前显式使用 8192 行 batch，并关闭 DataFusion `CoalesceBatchesExec`。每个文件在
+DataFusion 解码前先解析一次 footer、校验 Catalog row count，再为最大 row group 的解压空间和完整
+fixed-width Arrow pipeline 申请 task memory。row group 过大时会在 reader 发布前返回
+`RESOURCE_EXHAUSTED`，因此生产灰度应同时观察 Parquet row-group 尺寸和 QueryService memory budget。
 
 `max_output_bytes` 约束累计 Arrow result charge 与 canonical scalar bytes 的和。每次只持有当前
 `NativeQueryBatch` 的 result permit，完成摘要后先释放该批次，再拉取下一批；它不是全结果 collect。
