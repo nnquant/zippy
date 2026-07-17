@@ -52,6 +52,7 @@ pub struct NativeStorageRuntimeConfig {
     table_actors: TableActorRegistryConfig,
     query_resources: crate::query_service::QueryServiceResourceConfig,
     query_registry: crate::query_service::QueryServiceRegistryConfig,
+    query_canary: Option<crate::native_query_canary::NativeQueryCanaryRuntimeConfig>,
     actor: CatalogActor,
     legacy_catalog_migration: LegacyCatalogMigrationStartup,
 }
@@ -70,6 +71,7 @@ impl NativeStorageRuntimeConfig {
             table_actors: TableActorRegistryConfig::new(),
             query_resources: crate::query_service::QueryServiceResourceConfig::default(),
             query_registry: crate::query_service::QueryServiceRegistryConfig::default(),
+            query_canary: None,
             actor: CatalogActor {
                 kind: CatalogActorKind::Server,
                 principal: DEFAULT_SERVER_ACTOR_PRINCIPAL.to_owned(),
@@ -146,6 +148,14 @@ impl NativeStorageRuntimeConfig {
         query_registry: crate::query_service::QueryServiceRegistryConfig,
     ) -> Self {
         self.query_registry = query_registry;
+        self
+    }
+
+    pub(crate) fn with_query_canary_config(
+        mut self,
+        query_canary: Option<crate::native_query_canary::NativeQueryCanaryRuntimeConfig>,
+    ) -> Self {
+        self.query_canary = query_canary;
         self
     }
 
@@ -349,6 +359,13 @@ impl NativeStorageStartup {
             ready.catalog_read_handle.clone(),
             ready.table_actors.clone(),
         );
+        let query_canary = ready.query_canary.map(|config| {
+            crate::native_query_canary::NativeQueryCanaryService::new(
+                config,
+                query_snapshot_coordinator.clone(),
+                ready.query_resources.clone(),
+            )
+        });
         NativeStorageRuntime {
             report: ready.reconciliation,
             catalog_file_verification: ready.catalog_file_verification,
@@ -360,6 +377,7 @@ impl NativeStorageStartup {
             table_actor_admission: ready.table_actor_admission,
             query_snapshot_coordinator,
             query_resources: ready.query_resources,
+            query_canary,
             healthy: ready.healthy,
             terminal_failure: Arc::clone(&self.terminal_failure),
             shutdown: self.shutdown.take(),
@@ -418,6 +436,7 @@ pub struct NativeStorageRuntime {
     table_actor_admission: TableActorAdmissionControl,
     query_snapshot_coordinator: crate::query_snapshot::NativeQuerySnapshotCoordinator,
     query_resources: crate::query_service::QueryResourceCoordinator,
+    query_canary: Option<crate::native_query_canary::NativeQueryCanaryService>,
     healthy: Arc<AtomicBool>,
     terminal_failure: Arc<Mutex<Option<ServerError>>>,
     shutdown: Option<watch::Sender<bool>>,
@@ -521,6 +540,18 @@ impl NativeStorageRuntime {
         self.query_resources.clone()
     }
 
+    /// Returns the internal persisted-only canary when it was explicitly configured.
+    #[must_use]
+    pub fn query_canary(&self) -> Option<crate::native_query_canary::NativeQueryCanaryService> {
+        self.query_canary.clone()
+    }
+
+    pub(crate) fn close_query_canary_admission(&self) {
+        if let Some(canary) = &self.query_canary {
+            canary.close_admission();
+        }
+    }
+
     /// Returns the number of active native table runtimes recovered before readiness.
     #[must_use]
     pub fn table_runtime_count(&self) -> usize {
@@ -561,6 +592,7 @@ impl NativeStorageRuntime {
     /// Irreversibly closes native work admission and requests ordered background cleanup.
     pub fn begin_shutdown(&mut self) {
         self.healthy.store(false, Ordering::Release);
+        self.close_query_canary_admission();
         if !self.shutdown_requested {
             self.shutdown_requested = true;
             self.query_snapshot_coordinator.close_admission();
@@ -688,6 +720,7 @@ struct SupervisorReady {
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
     query_resources: crate::query_service::QueryResourceCoordinator,
+    query_canary: Option<crate::native_query_canary::NativeQueryCanaryRuntimeConfig>,
 }
 
 fn spawn_supervisor(config: NativeStorageRuntimeConfig) -> Result<NativeStorageStartup> {
@@ -1033,6 +1066,7 @@ async fn supervise_storage(
             table_actor_admission,
             healthy: Arc::clone(&healthy),
             query_resources,
+            query_canary: config.query_canary,
         }))
         .is_err()
     {

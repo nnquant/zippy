@@ -1992,7 +1992,19 @@ impl CoordinatorInner {
         {
             return Err(exhausted(
                 control.query_id,
-                "per-query task resources are exhausted",
+                format!(
+                    concat!(
+                        "per-query task resources are exhausted ",
+                        "tasks_after=[{}] tasks_limit=[{}] cpu_after=[{}] cpu_limit=[{}] ",
+                        "memory_after=[{}] memory_limit=[{}]"
+                    ),
+                    query.active_tasks.saturating_add(1),
+                    control.budget.max_active_tasks,
+                    query_cpu_after.unwrap_or(u32::MAX),
+                    control.budget.max_cpu_slots,
+                    query_memory_after.unwrap_or(u64::MAX),
+                    control.budget.max_memory_bytes,
+                ),
             ));
         }
         let global_cpu_after = global.active_cpu_slots.checked_add(cpu_slots);
@@ -2007,7 +2019,19 @@ impl CoordinatorInner {
         {
             return Err(exhausted(
                 control.query_id,
-                "global task resources are exhausted",
+                format!(
+                    concat!(
+                        "global task resources are exhausted ",
+                        "tasks_after=[{}] tasks_limit=[{}] cpu_after=[{}] cpu_limit=[{}] ",
+                        "memory_after=[{}] memory_limit=[{}]"
+                    ),
+                    global.active_tasks.saturating_add(1),
+                    self.config.max_active_tasks,
+                    global_cpu_after.unwrap_or(u32::MAX),
+                    self.config.max_cpu_slots,
+                    global_memory_after.unwrap_or(u64::MAX),
+                    self.config.max_memory_bytes,
+                ),
             ));
         }
 

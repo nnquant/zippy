@@ -722,6 +722,13 @@ impl NativeQuerySnapshotCoordinator {
             .await?;
         let resolved = resolved_with_lease.0;
         snapshot_memory_lease = resolved_with_lease.1;
+        if resolved.len() != tables.len() {
+            return Err(corruption(
+                query_id,
+                "Catalog table resolution count does not match the requested reference count",
+            ));
+        }
+        let requested_table_ids = resolved.iter().map(|table| table.table_id).collect();
         let resolved = canonicalize_tables(resolved)?;
         let mut pending = Vec::with_capacity(resolved.len());
         for table in resolved.values() {
@@ -793,6 +800,7 @@ impl NativeQuerySnapshotCoordinator {
             descriptor,
             pinned,
             coordinator_nonce: self.inner.nonce,
+            requested_table_ids,
         })
     }
 
@@ -940,6 +948,7 @@ pub(crate) struct NativeQueryReadSnapshot {
     descriptor: QueryReadSnapshotDescriptor,
     pinned: SqliteCatalogPinnedQuerySnapshot,
     coordinator_nonce: u64,
+    requested_table_ids: Vec<TableId>,
 }
 
 impl NativeQueryReadSnapshot {
@@ -958,6 +967,31 @@ impl NativeQueryReadSnapshot {
                 })
                 .collect(),
         )
+    }
+
+    /// Maps each original table reference to its canonical snapshot ordinal.
+    pub(crate) fn requested_table_ordinals(&self) -> Result<Vec<usize>> {
+        let canonical = self
+            .descriptor
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(index, table)| (table.table_id, index))
+            .collect::<BTreeMap<_, _>>();
+        self.requested_table_ids
+            .iter()
+            .map(|table_id| {
+                canonical.get(table_id).copied().ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::DataCorruption,
+                        "resolved request table is absent from the canonical query snapshot",
+                    )
+                    .with_query_id(self.descriptor.query_id)
+                    .with_table_id(*table_id)
+                    .with_retryable(false)
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn into_opaque(self) -> OpaqueQueryReadSnapshot {
@@ -1656,6 +1690,12 @@ mod tests {
             .pin_persisted(&planning, &mixed_refs())
             .await
             .expect("pin mixed query snapshot");
+        assert_eq!(
+            snapshot
+                .requested_table_ordinals()
+                .expect("map request references to canonical ordinals"),
+            vec![1, 0, 0]
+        );
         let snapshot_memory_bytes = snapshot_peak_bytes(mixed_refs().len());
         let resource_status = resources.status();
         assert_eq!(resource_status.active_snapshot_memory_permits, 1);

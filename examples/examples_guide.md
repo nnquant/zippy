@@ -42,6 +42,14 @@ plan_ttl_ms = 30000
 max_concurrent_queries = 64
 max_active_tasks = 16
 max_memory_bytes = 536870912
+
+# 仅供 zippy server 内部 persisted-only 灰度验证，默认关闭
+[query.canary]
+enabled = false
+max_rows = 1000000
+max_batches = 4096
+max_output_bytes = 268435456
+# operator_memory_bytes = 67108864
 ```
 
 也可以用环境变量临时覆盖：
@@ -85,6 +93,13 @@ batch，也不包括已经编码的网络 payload。
 Gateway Arrow buffer。`max_concurrent_queries` 默认 `64`、上限 `4096`；
 省略 `max_active_tasks` 时按最终有效 `query.parallelism * 4` 派生，默认 CPU 配置下为
 `16`，显式值不得低于有效查询并行度。
+
+`[query.canary]` 只在 `[server].native_storage_enabled = true` 时可启用，用于 Server 内部对落盘
+数据执行 native golden 查询；它不会开放 Gateway SQL capability。`operator_memory_bytes` 省略时取
+`min(64 MiB, query.resources.max_memory_bytes / 2)`。行数、batch 数以及累计 Arrow charge 加 canonical
+bytes 都有硬上限；首版 golden 摘要只接受 flat scalar 结果列。对应环境变量以
+`ZIPPY_QUERY_CANARY_` 开头。完整用法见
+[`docs/native-query-canary.md`](../docs/native-query-canary.md)。
 
 多文件历史查询和逻辑分片查询通常能从更高并行度获益；单文件的 `head()`、`tail()`、
 `slice()` 主要依赖 row-group 和列裁剪，通常保留默认值即可。修改配置后需要重启 master；

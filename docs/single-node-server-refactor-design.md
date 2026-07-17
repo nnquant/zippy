@@ -2373,6 +2373,37 @@ backpressure。ActiveSegmentExec 也尚未进入这条流。
 产出前准入、ActiveSegmentExec、DataFusion process-wide memory pool、spill/temp quota 和 transport backpressure 必须在
 执行入口开放前补齐，不能把 per-execution operator arena 误当成完整的进程级查询资源治理。
 
+Stage 5.4h Server-owned persisted query canary 已完成（2026-07-17）：`[query.canary]` 默认关闭，且要求
+`server.native_storage_enabled=true`。Server runtime 在 native storage readiness 之后构造 canary service，shutdown
+时先关闭 canary admission，再关闭 snapshot admission，并等待 QueryService、reader 与 runtime pin 排空。canary 的
+公开 Rust handle 只允许操作自己签发且保留在有界 instance registry 中的 query，不能把内部 admin capability 用于
+其他 QueryService 工作。Gateway `query_sql` 和 `query_manifest_snapshot_pinning` capability 继续保持 `false`。
+
+一次 canary run 同步取得 `QueryInstanceId`，再异步执行 submit、persisted snapshot pin、plan completion、execution、
+manifest projection、physical prepare/bind 和 pull-based result digest 全链路。每个 `NativeQueryBatch` 的 result permit
+覆盖完整 digest 处理寿命，处理完成后先 drop 当前批次再拉下一批。max rows、batches 和“累计 Arrow charge +
+canonical bytes”任一超限都会通过 execution lease 发布 `Failed`；cancel、deadline 与 run drop 保留已有的
+`Cancelled`/`TimedOut` 终态。QueryService task 拒绝现在同时报告 task、CPU、memory 的 after 值与 limit，不再只给
+无法定位维度的笼统错误。
+
+golden 摘要格式为 `zippy-arrow-multiset-sha256-v1`，摘要字符串携带同名格式前缀。它固定内存地累计规范化
+flat scalar logical schema 与排序 metadata hash、row count、两个独立 256-bit row-hash wrapping sum 和 row
+hash XOR，因此忽略合法的 batch/行调度差异，同时保留重复行数量。primitive 值直接哈希位模式，变长 scalar
+流式哈希；暂不支持的 nested/dictionary/run-end 列会明确拒绝，而不是退化为可能碰撞的 pretty-display。公开的
+`NativeQueryCanaryDigestBuilder` 可直接逐批消费 legacy Arrow stream，生成 `NativeQueryCanaryExpected`，无需 collect
+完整结果。schema IPC 与 scalar canonical bytes 同样有界，batch schema 变化会明确返回 `SCHEMA_MISMATCH`。
+报告把 snapshot/plan、完整 execution、等待 DataFusion/Parquet batch 和 canonical digest 时间分别计为微秒，LDC
+灰度可据此区分存储/执行瓶颈与 golden 本身的 CPU 成本。
+
+多表 binding 不再假设请求顺序等于 snapshot 顺序：snapshot capability 保留每个原始 table reference 对应的已解析
+table ID，再映射到去重且按 table ID 排序的 canonical ordinal。Name/Id 混用和逆序多表请求因此不会把 SQL alias
+绑定到错误的 persisted manifest。当前 persisted planner 仍要求每个 canonical manifest table 恰好一个 binding，
+同表 self-join / 多 alias 不在本阶段能力内。
+
+该阶段仍不是查询 authority 切换。公开 `QueryEngine` 返回 cloneable 裸 `RecordBatch`，无法证明 native result permit
+覆盖调用方最终 batch drop；decoded output 产出前准入、ActiveSegmentExec、process-wide pool、受配额 spill/temp 和
+transport backpressure 也仍未完成。canary 只返回摘要报告，用于在这些前置条件完成前收集正确性与性能证据。
+
 任务：
 
 1. 完成 DataFusion/Arrow version spike。（已完成）

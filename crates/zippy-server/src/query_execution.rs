@@ -478,7 +478,7 @@ impl NativeQueryResultStream {
                     .admit_result_batch(batch);
                 match admitted {
                     Ok(batch) => Ok(Some(batch)),
-                    Err(error) => Err(self.fail_execution(error)),
+                    Err(error) => Err(self.fail(error)),
                 }
             }
             NativeBatchPoll::Batch(Ok(None)) => {
@@ -493,7 +493,7 @@ impl NativeQueryResultStream {
                     .instance_id()
                     .query_id();
                 let error = persisted_execution_error(query_id, &source);
-                Err(self.fail_execution(error))
+                Err(self.fail(error))
             }
         }
     }
@@ -509,7 +509,7 @@ impl NativeQueryResultStream {
             .finish()
     }
 
-    fn fail_execution(&mut self, error: ServerError) -> ServerError {
+    pub(crate) fn fail(&mut self, error: ServerError) -> ServerError {
         self.terminal = true;
         let terminal = match self.lease.take() {
             None => error,

@@ -32,6 +32,11 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_QUERY_MAX_MEMORY_BYTES",
     "ZIPPY_QUERY_PARALLELISM",
     "ZIPPY_QUERY_PLAN_TTL_MS",
+    "ZIPPY_QUERY_CANARY_ENABLED",
+    "ZIPPY_QUERY_CANARY_MAX_ROWS",
+    "ZIPPY_QUERY_CANARY_MAX_BATCHES",
+    "ZIPPY_QUERY_CANARY_MAX_OUTPUT_BYTES",
+    "ZIPPY_QUERY_CANARY_OPERATOR_MEMORY_BYTES",
     "ZIPPY_TABLE_ROW_CAPACITY",
     "ZIPPY_TABLE_RETENTION_SEGMENTS",
     "ZIPPY_TABLE_PERSIST",
@@ -224,6 +229,12 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     assert_eq!(config.query.resources.max_concurrent_queries, 64);
     assert_eq!(config.query.resources.max_active_tasks, 16);
     assert_eq!(config.query.resources.max_memory_bytes, 536870912);
+    assert!(!config.query.canary.enabled);
+    assert_eq!(config.query.canary.max_rows, 1_000_000);
+    assert_eq!(config.query.canary.max_batches, 4_096);
+    assert_eq!(config.query.canary.max_output_bytes, 268_435_456);
+    assert_eq!(config.query.canary.operator_memory_bytes, None);
+    assert_eq!(config.query_canary_operator_memory_bytes(), 67_108_864);
     assert_eq!(config.server.data_dir, None);
     assert!(!config.server.import_legacy_endpoint_snapshot);
     assert!(!config.server.native_storage_enabled);
@@ -1032,6 +1043,113 @@ fn zippy_config_rejects_zero_native_query_resource_limits() {
 
         assert!(error.to_string().contains(message), "field={field}");
     }
+}
+
+#[test]
+fn zippy_config_loads_native_query_canary_toml_and_env_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[query.canary]
+enabled = true
+max_rows = 1200
+max_batches = 12
+max_output_bytes = 1048576
+operator_memory_bytes = 2097152
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(
+        &[
+            ("ZIPPY_QUERY_CANARY_MAX_ROWS", "2400"),
+            ("ZIPPY_QUERY_CANARY_MAX_BATCHES", "24"),
+            ("ZIPPY_QUERY_CANARY_MAX_OUTPUT_BYTES", "2097152"),
+            ("ZIPPY_QUERY_CANARY_OPERATOR_MEMORY_BYTES", "4194304"),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap();
+
+    assert!(config.query.canary.enabled);
+    assert_eq!(config.query.canary.max_rows, 2400);
+    assert_eq!(config.query.canary.max_batches, 24);
+    assert_eq!(config.query.canary.max_output_bytes, 2097152);
+    assert_eq!(config.query.canary.operator_memory_bytes, Some(4194304));
+    assert_eq!(config.query_canary_operator_memory_bytes(), 4194304);
+}
+
+#[test]
+fn zippy_config_rejects_enabled_query_canary_without_native_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(&config_path, "[query.canary]\nenabled = true\n").unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("query canary requires server native_storage_enabled"));
+}
+
+#[test]
+fn zippy_config_rejects_invalid_query_canary_limits() {
+    let cases = [
+        (
+            "max_rows",
+            "query canary max_rows must be greater than zero",
+        ),
+        (
+            "max_batches",
+            "query canary max_batches must be greater than zero",
+        ),
+        (
+            "max_output_bytes",
+            "query canary max_output_bytes must be greater than zero",
+        ),
+        (
+            "operator_memory_bytes",
+            "query canary operator_memory_bytes must be greater than zero",
+        ),
+    ];
+
+    for (field, message) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, format!("[query.canary]\n{field} = 0\n")).unwrap();
+
+        let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+        assert!(error.to_string().contains(message), "field={field}");
+    }
+}
+
+#[test]
+fn zippy_config_rejects_canary_operator_memory_above_query_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[query.resources]
+max_memory_bytes = 1048576
+
+[query.canary]
+operator_memory_bytes = 2097152
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error.to_string().contains(
+        "operator_memory_bytes must not exceed query resources memory operator_memory_bytes=[2097152] max_memory_bytes=[1048576]"
+    ));
 }
 
 #[test]

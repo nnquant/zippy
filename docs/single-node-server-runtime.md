@@ -132,6 +132,18 @@ task peak that covered its construction. A query cannot enter `Finished` until r
 metadata and result delivery reservations are gone. This is usage accounting only; per-session
 quotas wait for a trusted connection/session authority. The native result permit is not yet attached
 to the public `RecordBatchStream`, so this does not make the native query frontend production-ready.
+An explicitly enabled `[query.canary]` now provides a Server-internal persisted-only execution
+entry point without weakening that boundary. It submits through the same QueryService, pins and
+projects one immutable native snapshot, prepares the bounded DataFusion plan, and consumes one
+accounted result batch at a time. The caller receives only a digest report, never a bare native
+batch. Row, batch, combined Arrow/canonical byte, operator, task, CPU, memory, cancellation, and
+deadline limits remain active through digest delivery. A fixed-memory multiset digest ignores
+batch and row scheduling while preserving schema and duplicate-row counts, so a legacy stream can
+build golden evidence incrementally. This first digest contract accepts flat scalar columns and
+rejects nested or encoded result types explicitly. Runtime health exposes canary admission and
+aggregate metrics,
+but the public Gateway `query_sql` capability remains false. See
+[`native-query-canary.md`](native-query-canary.md).
 Before any Catalog resolution or snapshot copy starts, native planning reserves one conservative
 peak from this ledger. It is the checked sum of Catalog table-resolution ownership, exact pinned
 snapshot ownership, and a bounded server coordination envelope. The initial exact-snapshot guardrail

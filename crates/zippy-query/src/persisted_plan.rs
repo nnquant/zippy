@@ -651,6 +651,12 @@ impl BoundPersistedPlan {
         self.bound_scan_count
     }
 
+    /// Returns the immutable output schema of the fully bound physical plan.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        self.plan.schema()
+    }
+
     /// Starts this snapshot-bound physical plan in the supplied bounded runtime.
     ///
     /// The returned stream owns DataFusion's execution tasks. Dropping it aborts execution and

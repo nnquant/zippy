@@ -901,6 +901,9 @@ pub struct LegacyServerRuntimeHealth {
     pub legacy_catalog_shadow: Option<LegacyCatalogShadowStatus>,
     /// Process-local snapshot pin admission state when native storage is configured.
     pub catalog_runtime_snapshot_pins: Option<SqliteCatalogRuntimeSnapshotPinStatus>,
+    /// Internal persisted-only native query canary state, when explicitly enabled.
+    #[serde(default)]
+    pub native_query_canary: Option<crate::NativeQueryCanaryStatus>,
 }
 
 /// Complete result of a server-owned shutdown attempt.
@@ -1447,6 +1450,14 @@ impl LegacyServerRuntime {
         self.services.query()
     }
 
+    /// Returns the internal persisted-only native canary without granting Gateway authority.
+    #[must_use]
+    pub fn native_query_canary(&self) -> Option<crate::NativeQueryCanaryService> {
+        self.native_storage
+            .as_ref()
+            .and_then(NativeStorageRuntime::query_canary)
+    }
+
     /// Returns the boot-scoped runtime registry adapter in both compatibility modes.
     #[must_use]
     pub fn runtime_registry(&self) -> Arc<LegacyRuntimeRegistryAdapter> {
@@ -1489,6 +1500,11 @@ impl LegacyServerRuntime {
                 .native_storage
                 .as_ref()
                 .and_then(|storage| storage.runtime_snapshot_pin_status().ok()),
+            native_query_canary: self
+                .native_storage
+                .as_ref()
+                .and_then(NativeStorageRuntime::query_canary)
+                .map(|canary| canary.status()),
         }
     }
 
@@ -1505,6 +1521,9 @@ impl LegacyServerRuntime {
         }
         self.readiness.admission_open = false;
         self.services.begin_shutdown();
+        if let Some(native_storage) = &self.native_storage {
+            native_storage.close_query_canary_admission();
+        }
     }
 
     /// Seals primary mutations, drains the shadow, then stops Master and native storage.
@@ -1683,6 +1702,7 @@ fn start_native_storage_if_enabled(
     let runtime_snapshot_pins = runtime_config.catalog.runtime_snapshot_pins;
     let query_resources = native_query_resource_config(runtime_config)?;
     let query_registry = native_query_registry_config(runtime_config);
+    let query_canary = native_query_canary_config(runtime_config, query_resources)?;
     let catalog = SqliteCatalogConfig::new(data_directory).with_runtime_snapshot_pin_limits(
         runtime_snapshot_pins.max_active_pins,
         runtime_snapshot_pins.max_active_tables,
@@ -1692,6 +1712,7 @@ fn start_native_storage_if_enabled(
         .with_persist_controller_config(persist_controller)
         .with_query_resource_config(query_resources)
         .with_query_registry_config(query_registry)
+        .with_query_canary_config(query_canary)
         .with_legacy_catalog_migration(legacy_catalog_migration);
     match NativeStorageRuntime::start_until(native_storage, startup_deadline) {
         NativeStorageStartOutcome::Ready(runtime) => Ok(Some(runtime)),
@@ -1740,6 +1761,20 @@ fn native_query_registry_config(
         plan_ttl: Duration::from_millis(runtime_config.query.plan_ttl_ms),
         ..crate::query_service::QueryServiceRegistryConfig::default()
     }
+}
+
+fn native_query_canary_config(
+    runtime_config: &ZippyConfig,
+    resources: crate::query_service::QueryServiceResourceConfig,
+) -> Result<Option<crate::native_query_canary::NativeQueryCanaryRuntimeConfig>, ServerError> {
+    crate::native_query_canary::NativeQueryCanaryRuntimeConfig::try_new(
+        runtime_config.query.canary,
+        runtime_config.query_parallelism(),
+        resources.max_active_tasks,
+        resources.max_cpu_slots,
+        resources.max_memory_bytes,
+        runtime_config.query_canary_operator_memory_bytes(),
+    )
 }
 
 fn legacy_query_engine_config(runtime_config: &ZippyConfig) -> crate::LegacyQueryEngineConfig {
@@ -2401,6 +2436,25 @@ mod tests {
             legacy_query_engine_config(&config).plan_ttl,
             Duration::from_millis(12_345)
         );
+    }
+
+    #[test]
+    fn native_query_canary_is_explicit_and_does_not_open_gateway_sql_capability() {
+        let disabled = ZippyConfig::default();
+        let resources = native_query_resource_config(&disabled).unwrap();
+        assert!(native_query_canary_config(&disabled, resources)
+            .unwrap()
+            .is_none());
+
+        let mut enabled = disabled;
+        enabled.server.native_storage_enabled = true;
+        enabled.query.canary.enabled = true;
+        let resources = native_query_resource_config(&enabled).unwrap();
+        assert!(native_query_canary_config(&enabled, resources)
+            .unwrap()
+            .is_some());
+        assert!(!crate::LegacyServerCapabilities::phase_one().query_sql);
+        assert!(!crate::LegacyServerCapabilities::phase_one().query_manifest_snapshot_pinning);
     }
 
     #[cfg(unix)]

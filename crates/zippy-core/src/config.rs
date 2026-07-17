@@ -40,6 +40,14 @@ pub const DEFAULT_QUERY_MAX_ACTIVE_TASKS: usize =
 ///
 /// This keeps the previous 512 MiB admission level while separating it from Gateway Arrow buffers.
 pub const DEFAULT_QUERY_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+/// Default maximum rows consumed by one persisted-only native query canary run.
+pub const DEFAULT_QUERY_CANARY_MAX_ROWS: u64 = 1_000_000;
+/// Default maximum Arrow batches consumed by one persisted-only native query canary run.
+pub const DEFAULT_QUERY_CANARY_MAX_BATCHES: usize = 4_096;
+/// Default cumulative encoded or accounted result bytes accepted by one canary run.
+pub const DEFAULT_QUERY_CANARY_MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
+/// Preferred DataFusion operator pool size when the global query budget permits it.
+pub const DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
 pub const DEFAULT_CATALOG_SHADOW_METADATA_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON: usize = 4_096;
@@ -226,6 +234,34 @@ pub struct ZippyQueryResourceConfig {
     pub max_memory_bytes: u64,
 }
 
+/// Explicitly opt-in limits for the persisted-only native query canary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyQueryCanaryConfig {
+    /// Enables internal canary submission; this does not grant Gateway query authority.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum rows consumed before the canary fails the query.
+    pub max_rows: u64,
+    /// Maximum result batches consumed before the canary fails the query.
+    pub max_batches: usize,
+    /// Maximum cumulative Arrow and canonical IPC bytes consumed by one run.
+    pub max_output_bytes: u64,
+    /// Optional hard DataFusion operator pool size; `None` derives a bounded value.
+    pub operator_memory_bytes: Option<u64>,
+}
+
+impl Default for ZippyQueryCanaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_rows: DEFAULT_QUERY_CANARY_MAX_ROWS,
+            max_batches: DEFAULT_QUERY_CANARY_MAX_BATCHES,
+            max_output_bytes: DEFAULT_QUERY_CANARY_MAX_OUTPUT_BYTES,
+            operator_memory_bytes: None,
+        }
+    }
+}
+
 impl Default for ZippyQueryResourceConfig {
     fn default() -> Self {
         Self {
@@ -245,6 +281,8 @@ pub struct ZippyQueryConfig {
     pub plan_ttl_ms: u64,
     #[serde(default)]
     pub resources: ZippyQueryResourceConfig,
+    #[serde(default)]
+    pub canary: ZippyQueryCanaryConfig,
 }
 
 impl Default for ZippyQueryConfig {
@@ -254,6 +292,7 @@ impl Default for ZippyQueryConfig {
             max_buffered_bytes: None,
             plan_ttl_ms: DEFAULT_QUERY_PLAN_TTL_MS,
             resources: ZippyQueryResourceConfig::default(),
+            canary: ZippyQueryCanaryConfig::default(),
         }
     }
 }
@@ -417,6 +456,7 @@ struct PartialQueryConfig {
     max_buffered_bytes: Option<usize>,
     plan_ttl_ms: Option<u64>,
     resources: Option<PartialQueryResourceConfig>,
+    canary: Option<PartialQueryCanaryConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +464,15 @@ struct PartialQueryResourceConfig {
     max_concurrent_queries: Option<usize>,
     max_active_tasks: Option<usize>,
     max_memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialQueryCanaryConfig {
+    enabled: Option<bool>,
+    max_rows: Option<u64>,
+    max_batches: Option<usize>,
+    max_output_bytes: Option<u64>,
+    operator_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -798,6 +847,23 @@ impl ZippyConfig {
                     self.query.resources.max_memory_bytes = max_memory_bytes;
                 }
             }
+            if let Some(canary) = query.canary {
+                if let Some(enabled) = canary.enabled {
+                    self.query.canary.enabled = enabled;
+                }
+                if let Some(max_rows) = canary.max_rows {
+                    self.query.canary.max_rows = max_rows;
+                }
+                if let Some(max_batches) = canary.max_batches {
+                    self.query.canary.max_batches = max_batches;
+                }
+                if let Some(max_output_bytes) = canary.max_output_bytes {
+                    self.query.canary.max_output_bytes = max_output_bytes;
+                }
+                if let Some(operator_memory_bytes) = canary.operator_memory_bytes {
+                    self.query.canary.operator_memory_bytes = Some(operator_memory_bytes);
+                }
+            }
         }
         Ok(())
     }
@@ -936,6 +1002,26 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_QUERY_MAX_MEMORY_BYTES") {
             self.query.resources.max_memory_bytes =
                 parse_u64_env("ZIPPY_QUERY_MAX_MEMORY_BYTES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_CANARY_ENABLED") {
+            self.query.canary.enabled = parse_bool_env("ZIPPY_QUERY_CANARY_ENABLED", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_CANARY_MAX_ROWS") {
+            self.query.canary.max_rows = parse_u64_env("ZIPPY_QUERY_CANARY_MAX_ROWS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_CANARY_MAX_BATCHES") {
+            self.query.canary.max_batches =
+                parse_usize_env("ZIPPY_QUERY_CANARY_MAX_BATCHES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_CANARY_MAX_OUTPUT_BYTES") {
+            self.query.canary.max_output_bytes =
+                parse_u64_env("ZIPPY_QUERY_CANARY_MAX_OUTPUT_BYTES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_CANARY_OPERATOR_MEMORY_BYTES") {
+            self.query.canary.operator_memory_bytes = Some(parse_u64_env(
+                "ZIPPY_QUERY_CANARY_OPERATOR_MEMORY_BYTES",
+                &value,
+            )?);
         }
         if let Some(value) = env_string("ZIPPY_TABLE_ROW_CAPACITY") {
             self.table.row_capacity =
@@ -1225,6 +1311,46 @@ impl ZippyConfig {
                 reason: "query resources max_memory_bytes must be greater than zero".to_string(),
             });
         }
+        if self.query.canary.max_rows == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query canary max_rows must be greater than zero".to_string(),
+            });
+        }
+        if self.query.canary.max_batches == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query canary max_batches must be greater than zero".to_string(),
+            });
+        }
+        if self.query.canary.max_output_bytes == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query canary max_output_bytes must be greater than zero".to_string(),
+            });
+        }
+        if self.query.canary.operator_memory_bytes == Some(0) {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query canary operator_memory_bytes must be greater than zero".to_string(),
+            });
+        }
+        if self
+            .query
+            .canary
+            .operator_memory_bytes
+            .is_some_and(|value| value > self.query.resources.max_memory_bytes)
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query canary operator_memory_bytes must not exceed query resources memory \
+                     operator_memory_bytes=[{}] max_memory_bytes=[{}]",
+                    self.query.canary.operator_memory_bytes.unwrap_or_default(),
+                    self.query.resources.max_memory_bytes
+                ),
+            });
+        }
+        if self.query.canary.enabled && !self.server.native_storage_enabled {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query canary requires server native_storage_enabled".to_string(),
+            });
+        }
         let query_parallelism = self.query_parallelism();
         if self.query.resources.max_active_tasks < query_parallelism {
             return Err(ZippyError::InvalidConfig {
@@ -1333,6 +1459,15 @@ impl ZippyConfig {
             .max_buffered_bytes
             .unwrap_or(DEFAULT_QUERY_MAX_BUFFERED_BYTES)
             .min(self.runtime.max_query_buffer_bytes)
+    }
+
+    /// Return the hard native canary operator pool derived inside the global query budget.
+    pub fn query_canary_operator_memory_bytes(&self) -> u64 {
+        self.query.canary.operator_memory_bytes.unwrap_or_else(|| {
+            DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES
+                .min(self.query.resources.max_memory_bytes.saturating_div(2))
+                .max(1)
+        })
     }
 }
 
