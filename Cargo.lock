@@ -3601,6 +3601,7 @@ dependencies = [
  "arrow",
  "bytes",
  "datafusion",
+ "futures",
  "parquet",
  "sha2",
  "tokio",

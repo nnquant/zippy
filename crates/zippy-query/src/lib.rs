@@ -16,7 +16,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::disk_manager::DiskManagerConfig;
+use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use futures::StreamExt;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
@@ -39,6 +47,71 @@ pub use prepared_plan::{
     PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile, PersistedTableBinding,
     PreparedPersistedPlan,
 };
+
+/// The DataFusion error type returned while executing a bound persisted plan.
+pub type PersistedExecutionError = DataFusionError;
+
+/// One DataFusion record-batch stream bound to a server-owned persisted snapshot.
+pub type PersistedRecordBatchStream = SendableRecordBatchStream;
+
+/// Stable execution-error classes used by the server protocol boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedExecutionErrorClass {
+    /// The physical operator exceeded its admitted memory or other resource limit.
+    ResourceExhausted,
+    /// A persisted Arrow, Parquet, object-store, or I/O input was corrupt or unreadable.
+    DataCorruption,
+    /// The requested operator is not implemented by the admitted native engine.
+    Unsupported,
+    /// The execution failed for an internal reason after planning and binding succeeded.
+    Internal,
+}
+
+/// Classifies an error raised after a persisted physical plan has started executing.
+#[must_use]
+pub fn classify_persisted_execution_error(
+    error: &PersistedExecutionError,
+) -> PersistedExecutionErrorClass {
+    match error {
+        DataFusionError::Context(_, source) => classify_persisted_execution_error(source),
+        DataFusionError::ResourcesExhausted(_) => PersistedExecutionErrorClass::ResourceExhausted,
+        DataFusionError::NotImplemented(_) => PersistedExecutionErrorClass::Unsupported,
+        DataFusionError::ArrowError(_, _)
+        | DataFusionError::ParquetError(_)
+        | DataFusionError::ObjectStore(_)
+        | DataFusionError::IoError(_) => PersistedExecutionErrorClass::DataCorruption,
+        DataFusionError::SQL(_, _)
+        | DataFusionError::Plan(_)
+        | DataFusionError::Configuration(_)
+        | DataFusionError::SchemaError(_, _)
+        | DataFusionError::Execution(_)
+        | DataFusionError::Internal(_)
+        | DataFusionError::ExecutionJoin(_)
+        | DataFusionError::External(_)
+        | DataFusionError::Substrait(_) => PersistedExecutionErrorClass::Internal,
+    }
+}
+
+/// Finds a structured Zippy error preserved inside a DataFusion execution error chain.
+#[must_use]
+pub fn structured_persisted_execution_error(
+    error: &PersistedExecutionError,
+) -> Option<ServerError> {
+    let mut current: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(error) = current.downcast_ref::<ServerError>() {
+            return Some(error.clone());
+        }
+        current = current.source()?;
+    }
+}
+
+/// Polls the next batch from a bound persisted query stream.
+pub async fn next_persisted_batch(
+    stream: &mut PersistedRecordBatchStream,
+) -> Result<Option<RecordBatch>, PersistedExecutionError> {
+    stream.next().await.transpose()
+}
 
 const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;
 const PARQUET_METADATA_FIXED_MEMORY_BYTES: u64 = 64 * 1024;
@@ -420,19 +493,71 @@ impl QuerySessionPolicy {
     /// Creates an isolated DataFusion session context using this policy.
     #[must_use]
     pub fn create_context(self) -> SessionContext {
-        let config = SessionConfig::new()
+        SessionContext::new_with_config(self.session_config())
+    }
+
+    /// Creates an execution context with a hard operator-memory pool and spilling disabled.
+    ///
+    /// The caller must reserve the same byte count in its external resource ledger for the
+    /// complete lifetime of this context. Disabling the disk manager keeps this first native
+    /// execution gate fail-closed until the server owns a quota-enforced spill directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a resource error when the byte limit does not fit the current platform, or an
+    /// internal error when DataFusion cannot construct the bounded runtime environment.
+    pub fn create_execution_context(
+        self,
+        operator_memory_bytes: NonZeroU64,
+    ) -> zippy_types::Result<PersistedExecutionContext> {
+        let pool_size = usize::try_from(operator_memory_bytes.get()).map_err(|_| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "native query operator memory limit does not fit this platform",
+            )
+            .with_retryable(false)
+        })?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_size)))
+            .with_disk_manager(DiskManagerConfig::Disabled)
+            .build()
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    format!("failed to build native query runtime error=[{error}]"),
+                )
+                .with_retryable(false)
+            })?;
+        let context = SessionContext::new_with_config_rt(self.session_config(), Arc::new(runtime));
+        Ok(PersistedExecutionContext {
+            task_context: context.task_ctx(),
+        })
+    }
+
+    fn session_config(self) -> SessionConfig {
+        SessionConfig::new()
             .with_target_partitions(self.target_partitions.get())
             .with_repartition_file_scans(false)
             .with_parquet_page_index_pruning(false)
-            .with_parquet_bloom_filter_pruning(false);
-        SessionContext::new_with_config(config)
+            .with_parquet_bloom_filter_pruning(false)
+    }
+}
+
+/// Bounded DataFusion runtime context retained by one native persisted execution.
+pub struct PersistedExecutionContext {
+    task_context: Arc<TaskContext>,
+}
+
+impl PersistedExecutionContext {
+    pub(crate) fn task_context(&self) -> Arc<TaskContext> {
+        Arc::clone(&self.task_context)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::{self, Read};
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
@@ -440,14 +565,18 @@ mod tests {
     use arrow::array::{Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion::common::DataFusionError;
     use datafusion::datasource::MemTable;
+    use datafusion::execution::memory_pool::MemoryConsumer;
     use parquet::arrow::async_reader::AsyncFileReader;
     use parquet::arrow::ArrowWriter;
     use parquet::file::reader::ChunkReader;
 
     use super::{
-        deferred_parquet_reader, parquet_metadata_memory_charge, AdmittedAsyncParquetReader,
-        AdmittedParquetSource, AdmittedRandomAccessFile, BoxedAsyncFileReader, QuerySessionPolicy,
+        classify_persisted_execution_error, deferred_parquet_reader,
+        parquet_metadata_memory_charge, structured_persisted_execution_error,
+        AdmittedAsyncParquetReader, AdmittedParquetSource, AdmittedRandomAccessFile,
+        BoxedAsyncFileReader, PersistedExecutionErrorClass, QuerySessionPolicy,
         MAX_POSITIONED_READ_BYTES, PARQUET_METADATA_DECODE_EXPANSION_FACTOR,
         PARQUET_METADATA_FIXED_MEMORY_BYTES, PARQUET_TRAILER_SIZE_BYTES,
     };
@@ -701,6 +830,58 @@ mod tests {
             .expect("retain workspace Arrow array type");
 
         assert_eq!(round_trip_values.values().as_ptr(), values_ptr);
+    }
+
+    #[test]
+    fn bounded_execution_context_enforces_memory_and_disables_temporary_files() {
+        let policy = QuerySessionPolicy::new(NonZeroUsize::new(1).unwrap());
+        let context = policy
+            .create_execution_context(NonZeroU64::new(64).unwrap())
+            .expect("create bounded execution context");
+        let task = context.task_context();
+        assert!(!task.runtime_env().disk_manager.tmp_files_enabled());
+
+        let mut reservation = MemoryConsumer::new("bounded-test").register(task.memory_pool());
+        reservation.try_grow(64).expect("fill bounded memory pool");
+        let error = reservation
+            .try_grow(1)
+            .expect_err("memory pool must reject one byte beyond its limit");
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        drop(reservation);
+        assert_eq!(task.memory_pool().reserved(), 0);
+    }
+
+    #[test]
+    fn execution_errors_keep_stable_classes_and_structured_server_errors() {
+        assert_eq!(
+            classify_persisted_execution_error(&DataFusionError::ResourcesExhausted(
+                "operator limit".to_owned()
+            )),
+            PersistedExecutionErrorClass::ResourceExhausted
+        );
+        assert_eq!(
+            classify_persisted_execution_error(&DataFusionError::NotImplemented(
+                "operator".to_owned()
+            )),
+            PersistedExecutionErrorClass::Unsupported
+        );
+        assert_eq!(
+            classify_persisted_execution_error(&DataFusionError::IoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt input",
+            ))),
+            PersistedExecutionErrorClass::DataCorruption
+        );
+
+        let structured = ServerError::new(ErrorCode::ResourceExhausted, "reader budget");
+        let wrapped = DataFusionError::Context(
+            "persisted scan".to_owned(),
+            Box::new(DataFusionError::External(Box::new(structured.clone()))),
+        );
+        assert_eq!(
+            structured_persisted_execution_error(&wrapped),
+            Some(structured)
+        );
     }
 
     #[tokio::test]

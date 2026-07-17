@@ -31,6 +31,7 @@ datafusion = { version = "=44.0.0", default-features = false, features = [
     "parquet",
     "recursive_protection",
 ] }
+futures = "0.3"
 parquet = "53.3.0"
 rusqlite = { version = "0.32.1", features = ["bundled", "hooks"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }

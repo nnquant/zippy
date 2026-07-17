@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 bytes.workspace = true
 datafusion.workspace = true
+futures.workspace = true
 parquet.workspace = true
 sha2.workspace = true
 tokio.workspace = true

@@ -2084,11 +2084,13 @@ charge 并取得 result charge，使已经占满预算的 operator 可以把同�
 双重计费或制造未计费窗口。payload、result 或 snapshot 析构 unwind 时，独立 scope guard 仍会归还
 reservation 和 snapshot-owner 计数。
 
-`Finished` 只允许在 task 和 result permit 都归零后进入；计算或传输错误、cancel、timeout 和 shutdown
-形成的 terminal query 在最后一个 task 离开后立即撤销 snapshot root，但只有 task 和 result permit 都
-归零后才进入 retention/eviction heap。shutdown 也会等待 result permit，因而不会把仍被发送的缓冲误报
-为已 drain。公开 `RecordBatchStream` 目前仍直接返回裸 `RecordBatch`，所以 result permit 只是后续
-native stream/Flight delivery 的内部原语，尚不能覆盖客户端取得 batch 后的长期持有。
+成功执行到 EOF 时，QueryService 先记录 `execution_complete=true`。若仍有 result permit，状态暂时保持
+`Running`，禁止再交付新结果；最后一个 result permit 释放时才原子进入 `Finished`。这样执行 scope 可以在
+算子与 reader 已全部释放后结束，而已经交给慢客户端的批次仍保持精确内存计费。计算或传输错误、cancel、
+timeout 和 shutdown 形成的 terminal query 在最后一个 task 离开后立即撤销 snapshot root，但只有 task、
+retained 和 result permit 都归零后才进入 retention/eviction heap。shutdown 也会等待 result permit，因而
+不会把仍被发送的缓冲误报为已 drain。内部 native persisted stream 已用 permit-owned batch 覆盖调用方取得
+批次后的长期持有；Legacy/Gateway 的公开 `RecordBatchStream` 仍未切换到这条路径。
 
 Stage 4.5 执行失败终态小步已完成（2026-07-15）：`QueryExecutionScope::fail(error)` 消费唯一执行
 scope，并在同一个 `global -> query` 临界区只允许 `Running -> Failed`。QueryService 会把真实 query ID
@@ -2106,9 +2108,9 @@ server runtime 将同一值注入当前 authoritative Legacy/Gateway adapter 和
 `expires_at_ns=min(request_deadline, completed_at_ns+plan_ttl)`；没有 request deadline 时只使用服务端
 TTL。request deadline 覆盖 Planned/Running；server plan TTL 只覆盖 Planned，开始执行后立即删除。
 
-这一小步仍是 native staging，不是 authority 切换。可信 session policy、完整外部 `QueryStatus`、
-DataFusion operator/result-stream 的实际取消传播仍未完成；当前 Python/Gateway `collect_stream` 也仍绕过
-native QueryService，因此不能据此宣称生产查询已经获得多租户隔离或统一资源治理。
+这一小步仍是 native staging，不是 authority 切换。可信 session policy、完整外部 `QueryStatus` 和 Gateway
+transport 背压仍未完成；内部 persisted result stream 已接入实际取消传播，但当前 Python/Gateway
+`collect_stream` 仍绕过 native QueryService，因此不能据此宣称生产查询已经获得多租户隔离或统一资源治理。
 
 任务：
 
@@ -2327,6 +2329,26 @@ admission；已发布终态优先于资源冲突返回，避免 admin cancel 已
 Parquet 文件由该公式覆盖；若未来允许不可信本地文件，恶意 Thrift collection length 仍需要 bounded decoder 或独立
 进程/allocator 硬限制。
 
+Stage 5.4g internal persisted result stream 已完成（2026-07-17）：`NativeExecutionLease::execute` 先用一个 build
+task 申请配置的 operator pool、execution-context retained margin 与构建瞬时余量，构建成功后原子收缩为 pool 加
+context margin 的 `OperatorArena` retained permit。每次执行创建隔离的 DataFusion runtime，使用与配置 pool 同额的
+`GreedyMemoryPool`，并显式关闭 disk manager；因此 sort/hash/aggregate 等算子超过准入额度时失败，不会写入未受
+配额管理的临时目录。执行期间另持有一个 execution-driver task permit，其 CPU slots 等于 session
+`target_partitions`，并计入固定 driver memory；persisted file task 在此基础上独立计费，形成保守的总并发边界。
+bound plan 通过 DataFusion 单流执行接口按需拉取 batch，不做全量 collect。
+
+每个向下游返回的 `NativeQueryBatch` 按 Arrow `get_array_memory_size()`、递归 schema retained charge 和固定控制块
+余量申请独立 result permit，permit 跟随 batch 到最终 owner drop。共享 schema 在各批次重复计费以保持单批次可独立
+存活的安全上界。EOF 路径先 drop DataFusion stream 和 `OperatorArena`，确认 reader/task/retained 已归零，
+再标记 execution complete；若下游还持有批次，查询保持不可继续产出的 `Running`，由最后一个 result drop 转为
+`Finished`。stream drop 则先发布 `Cancelled`，随后释放 DataFusion、operator 和 reader 资源。terminal query 的
+snapshot root 在最后一个 file task 离开后即可撤销，已经物化的批次只保留内存账，不阻塞 compaction。
+
+当前 Arrow batch 由 DataFusion 产出后才立即申请 result permit：生产过程受 `OperatorArena` 硬上限覆盖，但尚不存在
+batch-specific 的产出前 reservation。这是 Gateway capability 继续保持关闭的主要原因之一；后续需要为 decoded output
+增加产出前额度或可原子转移的 operator-to-result charge，并接入进程级 pool、受配额 spill/temp 目录与 transport
+backpressure。ActiveSegmentExec 也尚未进入这条流。
+
 本阶段故障矩阵：
 
 | 边界 | 必须结果 | 自动化证据 |
@@ -2343,10 +2365,13 @@ Parquet 文件由该公式覆盖；若未来允许不可信本地文件，恶意
 | 真实 footer task 扩充超预算 | sticky `RESOURCE_EXHAUSTED`，无部分增长或重复 open | `real_footer_growth_rejection_is_sticky_and_releases_task_and_pin` |
 | footer grow 与 admin cancel 竞争 | 只允许 grow-first 或 cancel-first，三层账本一致 | `task_memory_growth_and_admin_cancel_are_linearized_across_all_ledgers` |
 | page-index/bloom 被篡改 | planning/bind 双重拒绝 | `binder_rejects_tampered_manifest_metadata_before_opening` |
+| operator context 超预算 | runtime 构建前发布 `Failed`，plan/pin/账本归零 | `operator_context_budget_rejection_fails_and_releases_execution_lease` |
+| EOF 时下游仍持有 batch | operator/reader 先释放，最后一个 result drop 后进入 `Finished` | `native_stream_accounts_batches_and_finishes_after_delivery_drains` |
+| result stream 提前 drop | 先发布 `Cancelled`，batch 内存继续计费，snapshot pin 可撤销 | `dropping_native_stream_cancels_before_result_reservation_release` |
 
-该阶段只完成计划、存储 reader 与生命周期的安全边界，尚未对外暴露 native result stream。decoded Arrow batch、
-sort/hash/join/aggregate operator arena、result delivery、DataFusion global memory pool、spill 和 temp quota 必须在执行
-入口开放前分别准入，不能把当前物理计划预算误当成完整查询内存上限。
+该阶段已完成 persisted-only 的内部 native result stream，但尚未对外暴露 Gateway capability。decoded Arrow batch
+产出前准入、ActiveSegmentExec、DataFusion process-wide memory pool、spill/temp quota 和 transport backpressure 必须在
+执行入口开放前补齐，不能把 per-execution operator arena 误当成完整的进程级查询资源治理。
 
 任务：
 
@@ -2356,7 +2381,7 @@ sort/hash/join/aggregate operator arena、result delivery、DataFusion global me
 4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。
 5. 先迁移 projection/filter/head/tail/slice。
 6. 迁移 sort/aggregate/join/window。
-7. 实现 query registry、cancel、deadline。（registry/lifecycle 已完成，result stream 尚未接入）
+7. 实现 query registry、cancel、deadline。（registry/lifecycle 与内部 persisted result stream 已完成）
 8. 接入全局 memory pool、spill 和 temp quota。
 9. 实现 explain/profile/operator metrics。
 10. Python Table 改为发送完整 server plan，关闭 residual fallback。

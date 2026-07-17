@@ -650,6 +650,17 @@ impl BoundPersistedPlan {
     pub const fn bound_scan_count(&self) -> usize {
         self.bound_scan_count
     }
+
+    /// Starts this snapshot-bound physical plan in the supplied bounded runtime.
+    ///
+    /// The returned stream owns DataFusion's execution tasks. Dropping it aborts execution and
+    /// releases operator allocations from the runtime memory pool.
+    pub fn execute_stream(
+        &self,
+        context: &crate::PersistedExecutionContext,
+    ) -> Result<crate::PersistedRecordBatchStream> {
+        datafusion::physical_plan::execute_stream(Arc::clone(&self.plan), context.task_context())
+    }
 }
 
 /// Validates and atomically binds every persisted scan in a complete physical plan tree.

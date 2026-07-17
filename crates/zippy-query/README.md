@@ -85,8 +85,24 @@ parses metadata. A rejected growth leaves every ledger unchanged. Page indexes a
 remain disabled, which bounds this charge to the retained footer model while preserving row-group
 statistics pruning.
 
-This boundary does not yet expose a public native result stream. Decoded Arrow batches, execution
-operator arenas, result delivery, the global DataFusion memory pool, spill, and temporary-disk quota
-still require separate admission before native execution can replace the legacy query engine. The
-footer multiplier covers valid Zippy-managed Parquet files; treating arbitrary hostile local files
-as input would additionally require a bounded Thrift decoder or process/allocator isolation.
+The server now has an internal pull-based native persisted result stream. Each execution reserves a
+QueryService `OperatorArena` permit covering the configured pool plus execution-context overhead,
+and constructs it under an additional transient build allowance. DataFusion runs with a
+`GreedyMemoryPool` exactly matching the configured operator pool; spill is disabled, so an operator
+that exceeds the admitted pool fails instead of writing to an uncontrolled directory. The server
+also retains an execution-driver task permit whose CPU slots equal the session's target partition
+count. Every returned Arrow batch receives its own conservative array, schema,
+and control-memory permit and keeps that permit until the downstream owner drops the batch.
+Reaching EOF first drops
+the DataFusion stream and operator arena, then marks execution complete; the query becomes
+`Finished` only after already-delivered batches drain. Dropping the stream publishes cancellation
+before releasing execution resources.
+
+This result stream remains an internal canary and is not advertised by Gateway capabilities. An
+Arrow batch is currently materialized by DataFusion immediately before its result permit is
+admitted, so the operator arena bounds the production step but there is not yet a strict
+batch-specific pre-admission guarantee. Active-segment execution, a process-wide DataFusion memory
+pool, quota-enforced spill/temp storage, transport backpressure, and Gateway routing remain required
+before native execution can replace the legacy query engine. The footer multiplier covers valid
+Zippy-managed Parquet files; treating arbitrary hostile local files as input would additionally
+require a bounded Thrift decoder or process/allocator isolation.
