@@ -58,6 +58,11 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_GATEWAY_PORT",
     "ZIPPY_GATEWAY_TOKEN",
     "ZIPPY_GATEWAY_PROTOCOL_VERSION",
+    "ZIPPY_FLIGHT_ENABLED",
+    "ZIPPY_FLIGHT_ENDPOINT",
+    "ZIPPY_FLIGHT_PROTOCOL_VERSION",
+    "ZIPPY_FLIGHT_MAX_MESSAGE_BYTES",
+    "ZIPPY_FLIGHT_MAX_PENDING_TICKETS",
     "ZIPPY_MASTER_HOST",
     "ZIPPY_MASTER_PORT",
     "ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS",
@@ -1180,7 +1185,7 @@ backend = "sqlite_shadow"
 [query]
 native_enabled = true
 "#,
-            "native query frontend requires gateway enabled",
+            "native query frontend requires gateway or flight enabled",
         ),
         (
             r#"
@@ -1442,6 +1447,108 @@ enabled = true
     assert!(error
         .to_string()
         .contains("gateway endpoint must be set when enabled or derivable from master port"));
+}
+
+#[test]
+fn zippy_config_loads_loopback_flight_frontend_and_environment_limits() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+max_message_bytes = 1048576
+max_pending_tickets = 32
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(
+        &[
+            ("ZIPPY_FLIGHT_MAX_MESSAGE_BYTES", "2097152"),
+            ("ZIPPY_FLIGHT_MAX_PENDING_TICKETS", "16"),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap();
+
+    assert!(config.flight.enabled);
+    assert_eq!(config.flight.endpoint.as_deref(), Some("127.0.0.1:17692"));
+    assert_eq!(config.flight.max_message_bytes, 2_097_152);
+    assert_eq!(config.flight.max_pending_tickets, 16);
+    assert!(!config.gateway.enabled);
+}
+
+#[test]
+fn zippy_config_derives_flight_endpoint_from_master_port_plus_two() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[master]
+host = "127.0.0.1"
+port = 17690
+
+[query]
+native_enabled = true
+
+[flight]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(config.flight.endpoint.as_deref(), Some("127.0.0.1:17692"));
+}
+
+#[test]
+fn zippy_config_rejects_non_loopback_flight_before_tls() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[flight]
+enabled = true
+endpoint = "0.0.0.0:17692"
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("flight endpoint must be loopback until TLS and authentication are enabled"));
 }
 
 #[test]

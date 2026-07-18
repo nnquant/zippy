@@ -11,6 +11,7 @@
 mod catalog_command_shadow;
 mod catalog_shadow;
 mod composition;
+mod flight_query;
 mod gateway_query;
 mod health;
 mod legacy_catalog_migration;
@@ -36,6 +37,7 @@ pub use catalog_command_shadow::{
     LegacyCatalogShadowState, LegacyCatalogShadowStatus,
 };
 pub use composition::LegacyServerServices;
+pub use flight_query::NativeFlightQueryFrontend;
 pub use health::{LegacyServerCapabilities, LegacyServerHealth, ServiceHealth};
 pub use legacy_catalog_migration::{
     plan_legacy_catalog_metadata_import, LegacyCatalogCommandDisposition,
@@ -53,7 +55,9 @@ pub use legacy_query::{
     LegacyGatewayPlan, LegacyQueryEngineAdapter, LegacyQueryEngineConfig,
     LEGACY_GATEWAY_PLAN_FORMAT_VERSION,
 };
-pub use native_query::{NativeQueryBinding, NativeQueryEngine, NativeQueryExplanation};
+pub use native_query::{
+    NativePreparedQuery, NativeQueryBinding, NativeQueryEngine, NativeQueryExplanation,
+};
 pub use native_query_canary::{
     NativeQueryCanaryBinding, NativeQueryCanaryComparison, NativeQueryCanaryDigestBuilder,
     NativeQueryCanaryExpected, NativeQueryCanaryMetrics, NativeQueryCanaryQueryStatus,

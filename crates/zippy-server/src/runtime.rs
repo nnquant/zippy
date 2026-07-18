@@ -32,11 +32,14 @@ use zippy_master::daemon::{
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
 use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use zippy_master::server::MasterServer;
+use zippy_protocol::runtime::{FlightServerRuntime, FlightShutdownOutcome};
+use zippy_protocol::server::{FlightServiceConfig, FlightServiceStatus, ZippyFlightService};
 use zippy_storage::{PersistControllerConfig, MAX_PERSIST_PARALLEL_WRITERS};
 use zippy_types::{ErrorCode, ServerError};
 
 #[cfg(test)]
 use crate::catalog_command_shadow::LegacyCatalogShadowTestFault;
+use crate::flight_query::NativeFlightQueryFrontend;
 use crate::gateway_query::NativeGatewayQueryFrontend;
 use crate::legacy_catalog_migration::{
     plan_legacy_catalog_metadata_import, LegacyCatalogMetadataImportPlan,
@@ -54,7 +57,7 @@ use crate::{
 const DEFAULT_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SERVER_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-const SERVER_READY_SCHEMA_VERSION: u8 = 2;
+const SERVER_READY_SCHEMA_VERSION: u8 = 3;
 
 /// Runs the server-owned legacy runtime until shutdown or dynamic readiness loss.
 ///
@@ -129,6 +132,8 @@ fn runtime_failure(runtime: &LegacyServerRuntime) -> Option<ServerError> {
             "server runtime lost readiness admission_open=[{}] \
              master_listener_ready=[{}] gateway_configured=[{}] \
              gateway_listener_ready=[{}] gateway_master_reachable=[{}] \
+             flight_configured=[{}] flight_listener_ready=[{}] \
+             flight_protocol_ready=[{}] \
              native_storage_configured=[{}] native_catalog_ready=[{}] \
              native_current_snapshot_files_ready=[{}]",
             health.readiness.admission_open,
@@ -136,6 +141,9 @@ fn runtime_failure(runtime: &LegacyServerRuntime) -> Option<ServerError> {
             health.readiness.gateway_configured,
             health.readiness.gateway_listener_ready,
             health.readiness.gateway_master_reachable,
+            health.readiness.flight_configured,
+            health.readiness.flight_listener_ready,
+            health.readiness.flight_protocol_ready,
             health.readiness.native_storage_configured,
             health.readiness.native_catalog_ready,
             health.readiness.native_current_snapshot_files_ready,
@@ -427,6 +435,10 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
             .as_ref()
             .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
         || outcome
+            .flight_error
+            .as_ref()
+            .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
+        || outcome
             .master_error
             .as_ref()
             .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
@@ -454,6 +466,7 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
         outcome
             .gateway_error
             .as_ref()
+            .or(outcome.flight_error.as_ref())
             .or(outcome.master_error.as_ref())
             .or_else(|| {
                 outcome
@@ -473,7 +486,8 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
         code,
         format!(
             "server shutdown incomplete timed_out_processes=[{}] gateway_error=[{}] \
-             gateway_outcome=[{:?}] legacy_catalog_shadow_outcome=[{:?}] \
+             gateway_outcome=[{:?}] flight_error=[{}] flight_outcome=[{:?}] \
+             legacy_catalog_shadow_outcome=[{:?}] \
              native_storage_outcome=[{:?}] master_error=[{}]",
             outcome.timed_out_processes.join(","),
             outcome
@@ -482,6 +496,12 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
                 .map(ToString::to_string)
                 .unwrap_or_default(),
             outcome.gateway_outcome,
+            outcome
+                .flight_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            outcome.flight_outcome,
             outcome.legacy_catalog_shadow_outcome,
             outcome.native_storage_outcome,
             outcome
@@ -575,6 +595,13 @@ struct ServerReadyGateway<'a> {
     protocol_version: u16,
 }
 
+#[derive(Serialize)]
+struct ServerReadyFlight<'a> {
+    enabled: bool,
+    endpoint: Option<&'a str>,
+    protocol_version: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerLauncherProcessIdentity {
@@ -626,6 +653,7 @@ struct ServerReadyRecord<'a> {
     ready_at_unix_ns: u128,
     control_endpoint: String,
     gateway: ServerReadyGateway<'a>,
+    flight: ServerReadyFlight<'a>,
     mode: LegacyServerMode,
     health: LegacyServerRuntimeHealth,
     log_file: Option<String>,
@@ -790,6 +818,11 @@ fn publish_ready_record(
             endpoint: runtime.gateway_endpoint(),
             protocol_version: runtime.runtime_config().gateway.protocol_version,
         },
+        flight: ServerReadyFlight {
+            enabled: runtime.flight_endpoint().is_some(),
+            endpoint: runtime.flight_endpoint(),
+            protocol_version: runtime.runtime_config().flight.protocol_version,
+        },
         mode: runtime.mode(),
         health: runtime.health(),
         log_file,
@@ -858,6 +891,12 @@ pub struct LegacyServerReadiness {
     pub gateway_listener_ready: bool,
     /// Whether Gateway completed a real control request against its configured master.
     pub gateway_master_reachable: bool,
+    /// Whether the effective configuration enables Arrow Flight.
+    pub flight_configured: bool,
+    /// Whether Flight successfully crossed its listener bind barrier.
+    pub flight_listener_ready: bool,
+    /// Whether the versioned Flight service completed protocol construction.
+    pub flight_protocol_ready: bool,
     /// Whether configuration requires the server-owned native storage lifecycle.
     pub native_storage_configured: bool,
     /// Whether the SQLite Catalog passed migration and integrity checks.
@@ -883,6 +922,8 @@ impl LegacyServerReadiness {
                     && self.commit_recovery_complete))
             && (!self.gateway_configured
                 || (self.gateway_listener_ready && self.gateway_master_reachable))
+            && (!self.flight_configured
+                || (self.flight_listener_ready && self.flight_protocol_ready))
     }
 }
 
@@ -915,6 +956,10 @@ pub struct LegacyServerShutdownOutcome {
     pub gateway_error: Option<ServerError>,
     /// Structured Gateway cleanup facts when Gateway was configured.
     pub gateway_outcome: Option<GatewayShutdownOutcome>,
+    /// Flight cleanup failure after closing query and ticket admission.
+    pub flight_error: Option<ServerError>,
+    /// Structured Flight cleanup facts when the listener was configured.
+    pub flight_outcome: Option<FlightShutdownOutcome>,
     /// Master listener or final snapshot failure observed while joining.
     pub master_error: Option<ServerError>,
     /// Bounded event drain and final exact reconcile outcome, when shadowing was enabled.
@@ -933,6 +978,7 @@ impl LegacyServerShutdownOutcome {
                 .gateway_outcome
                 .as_ref()
                 .is_none_or(GatewayShutdownOutcome::is_clean)
+            && self.flight_error.is_none()
             && self.master_error.is_none()
             && self
                 .legacy_catalog_shadow_outcome
@@ -1023,6 +1069,8 @@ pub struct LegacyServerRuntime {
     master_listener: Option<MasterListenerRuntime>,
     gateway: Option<GatewayServer>,
     gateway_endpoint: Option<String>,
+    flight: Option<FlightServerRuntime>,
+    flight_endpoint: Option<String>,
     services: LegacyServiceSet,
     readiness: LegacyServerReadiness,
     shutdown_outcome: Option<LegacyServerShutdownOutcome>,
@@ -1310,7 +1358,32 @@ impl LegacyServerRuntime {
                 rollback,
             ));
         }
+        let mut flight = match start_flight_if_enabled(
+            &runtime_config,
+            native_storage.as_ref(),
+            startup_deadline,
+        ) {
+            Ok(flight) => flight,
+            Err(error) => {
+                let rollback = rollback_startup(
+                    &master,
+                    &mut master_listener,
+                    &mut gateway,
+                    &mut legacy_catalog_shadow,
+                    &mut native_storage,
+                    Some(&services),
+                    shutdown_timeout,
+                );
+                return Err(with_startup_rollback(
+                    with_stage("start Flight listener", error),
+                    rollback,
+                ));
+            }
+        };
+        let flight_configured = flight.is_some();
+        let flight_endpoint = flight.as_ref().map(|flight| flight.endpoint().to_string());
         if let Err(error) = remaining_before(startup_deadline, "publish server readiness") {
+            let flight_error = stop_flight_until(&mut flight, startup_deadline).err();
             let rollback = rollback_startup(
                 &master,
                 &mut master_listener,
@@ -1320,7 +1393,11 @@ impl LegacyServerRuntime {
                 Some(&services),
                 shutdown_timeout,
             );
-            return Err(with_startup_rollback(error, rollback));
+            return Err(with_startup_rollback(
+                combine_optional_errors(Some(error), flight_error)
+                    .expect("readiness timeout always supplies one error"),
+                rollback,
+            ));
         }
 
         let readiness = LegacyServerReadiness {
@@ -1329,6 +1406,9 @@ impl LegacyServerRuntime {
             gateway_configured,
             gateway_listener_ready: gateway_configured,
             gateway_master_reachable: gateway_configured,
+            flight_configured,
+            flight_listener_ready: flight_configured,
+            flight_protocol_ready: flight_configured,
             native_storage_configured,
             native_catalog_ready: native_storage_configured,
             native_current_snapshot_files_ready: native_storage_configured,
@@ -1341,7 +1421,8 @@ impl LegacyServerRuntime {
             status = "ready",
             control_endpoint = control_endpoint.display_string(),
             gateway_endpoint = gateway_endpoint.as_deref().unwrap_or("disabled"),
-            mode = if gateway_configured {
+            flight_endpoint = flight_endpoint.as_deref().unwrap_or("disabled"),
+            mode = if gateway_configured || flight_configured {
                 "catalog_and_query"
             } else {
                 "catalog_only"
@@ -1362,6 +1443,8 @@ impl LegacyServerRuntime {
             master_listener,
             gateway,
             gateway_endpoint,
+            flight,
+            flight_endpoint,
             services,
             readiness,
             shutdown_outcome: None,
@@ -1382,6 +1465,18 @@ impl LegacyServerRuntime {
     #[must_use]
     pub fn gateway_endpoint(&self) -> Option<&str> {
         self.gateway_endpoint.as_deref()
+    }
+
+    /// Returns the effective Arrow Flight listener endpoint when configured.
+    #[must_use]
+    pub fn flight_endpoint(&self) -> Option<&str> {
+        self.flight_endpoint.as_deref()
+    }
+
+    /// Returns bounded Flight ticket and transport counters when configured.
+    #[must_use]
+    pub fn flight_status(&self) -> Option<FlightServiceStatus> {
+        self.flight.as_ref().map(FlightServerRuntime::status)
     }
 
     /// Returns a point-in-time Gateway metrics snapshot when the listener is enabled.
@@ -1440,7 +1535,7 @@ impl LegacyServerRuntime {
     /// Returns the active compatibility mode.
     #[must_use]
     pub const fn mode(&self) -> LegacyServerMode {
-        if self.readiness.gateway_configured {
+        if self.readiness.gateway_configured || self.readiness.flight_configured {
             LegacyServerMode::CatalogAndQuery
         } else {
             LegacyServerMode::CatalogOnly
@@ -1489,6 +1584,14 @@ impl LegacyServerRuntime {
             .master_listener
             .as_ref()
             .is_some_and(|listener| !listener.is_finished());
+        if readiness.flight_configured {
+            let running = self
+                .flight
+                .as_ref()
+                .is_some_and(FlightServerRuntime::is_running);
+            readiness.flight_listener_ready &= running;
+            readiness.flight_protocol_ready &= running;
+        }
         apply_native_storage_runtime_health(
             &mut readiness,
             self.native_storage
@@ -1507,10 +1610,14 @@ impl LegacyServerRuntime {
         services.set_native_query_ready(
             readiness.is_ready()
                 && self.runtime_config.query.native_enabled
-                && self
+                && (self
                     .gateway
                     .as_ref()
-                    .is_some_and(GatewayServer::has_native_query_frontend),
+                    .is_some_and(GatewayServer::has_native_query_frontend)
+                    || self
+                        .flight
+                        .as_ref()
+                        .is_some_and(FlightServerRuntime::is_running)),
         );
         LegacyServerRuntimeHealth {
             mode: self.mode(),
@@ -1534,6 +1641,17 @@ impl LegacyServerRuntime {
     }
 
     fn terminal_failure(&self) -> Option<ServerError> {
+        if self.readiness.flight_configured
+            && !self
+                .flight
+                .as_ref()
+                .is_some_and(FlightServerRuntime::is_running)
+        {
+            return Some(ServerError::new(
+                ErrorCode::Unavailable,
+                "Flight listener exited while server admission remained open",
+            ));
+        }
         self.native_storage
             .as_ref()
             .and_then(NativeStorageRuntime::terminal_failure)
@@ -1546,6 +1664,9 @@ impl LegacyServerRuntime {
         }
         self.readiness.admission_open = false;
         self.services.begin_shutdown();
+        if let Some(flight) = &self.flight {
+            flight.close_admission();
+        }
         if let Some(native_storage) = &self.native_storage {
             native_storage.close_query_canary_admission();
         }
@@ -1568,6 +1689,18 @@ impl LegacyServerRuntime {
                 )),
             ),
         };
+
+        let (flight_outcome, flight_error) = match self.flight.take() {
+            Some(mut flight) => {
+                match flight.shutdown(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(outcome) => (Some(outcome), None),
+                    Err(error) => (None, Some(error)),
+                }
+            }
+            None => (None, None),
+        };
+        self.readiness.flight_listener_ready = false;
+        self.readiness.flight_protocol_ready = false;
 
         let (gateway_outcome, gateway_error) = match self.gateway.take() {
             Some(gateway) => match gateway
@@ -1639,6 +1772,8 @@ impl LegacyServerRuntime {
             timed_out_processes: graceful.timed_out_processes,
             gateway_error,
             gateway_outcome,
+            flight_error,
+            flight_outcome,
             master_error,
             legacy_catalog_shadow_outcome,
             native_storage_outcome,
@@ -1654,6 +1789,8 @@ impl LegacyServerRuntime {
             timed_out_processes = ?outcome.timed_out_processes,
             gateway_error = ?outcome.gateway_error,
             gateway_outcome = ?outcome.gateway_outcome,
+            flight_error = ?outcome.flight_error,
+            flight_outcome = ?outcome.flight_outcome,
             legacy_catalog_shadow_outcome = ?outcome.legacy_catalog_shadow_outcome,
             native_storage_outcome = ?outcome.native_storage_outcome,
             master_error = ?outcome.master_error,
@@ -1700,6 +1837,8 @@ impl Drop for LegacyServerRuntime {
                 timed_out_processes = ?outcome.timed_out_processes,
                 gateway_error = ?outcome.gateway_error,
                 gateway_outcome = ?outcome.gateway_outcome,
+                flight_error = ?outcome.flight_error,
+                flight_outcome = ?outcome.flight_outcome,
                 native_storage_outcome = ?outcome.native_storage_outcome,
                 master_error = ?outcome.master_error,
                 "zippy server runtime drop completed with cleanup errors"
@@ -2057,6 +2196,70 @@ fn gateway_persisted_read_snapshot_source(
     }
 }
 
+fn start_flight_if_enabled(
+    runtime_config: &ZippyConfig,
+    native_storage: Option<&NativeStorageRuntime>,
+    startup_deadline: Instant,
+) -> Result<Option<FlightServerRuntime>, ServerError> {
+    if !runtime_config.flight.enabled {
+        return Ok(None);
+    }
+    let native_storage = native_storage.ok_or_else(|| {
+        ServerError::new(
+            ErrorCode::Internal,
+            "validated Flight configuration did not start native storage",
+        )
+        .with_retryable(false)
+    })?;
+    let endpoint = runtime_config
+        .flight
+        .endpoint
+        .as_deref()
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Internal,
+                "validated Flight configuration has no endpoint",
+            )
+            .with_retryable(false)
+        })?
+        .parse()
+        .map_err(|error| {
+            ServerError::new(
+                ErrorCode::Internal,
+                format!("validated Flight endpoint could not be parsed error=[{error}]"),
+            )
+            .with_retryable(false)
+        })?;
+    let transport_buffer_bytes = runtime_config
+        .query
+        .max_buffered_bytes
+        .unwrap_or(runtime_config.runtime.max_query_buffer_bytes);
+    let config = FlightServiceConfig::try_new(
+        env!("CARGO_PKG_VERSION"),
+        runtime_config.flight.max_message_bytes,
+        runtime_config.flight.max_pending_tickets,
+        transport_buffer_bytes,
+    )?;
+    let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> = Arc::new(
+        NativeFlightQueryFrontend::new(native_storage.query_engine()),
+    );
+    let service = ZippyFlightService::try_new(config, frontend)?;
+    let startup_timeout = remaining_before(startup_deadline, "start Flight listener")?;
+    FlightServerRuntime::start(endpoint, service, startup_timeout).map(Some)
+}
+
+fn stop_flight_until(
+    flight: &mut Option<FlightServerRuntime>,
+    deadline: Instant,
+) -> Result<Option<FlightShutdownOutcome>, ServerError> {
+    let Some(mut runtime) = flight.take() else {
+        return Ok(None);
+    };
+    runtime
+        .shutdown(deadline.saturating_duration_since(Instant::now()))
+        .map(Some)
+}
+
 fn start_master_listener(
     master: &MasterServer,
     endpoint: &ControlEndpoint,
@@ -2262,6 +2465,8 @@ fn rollback_startup(
         timed_out_processes: graceful.timed_out_processes,
         gateway_error,
         gateway_outcome,
+        flight_error: None,
+        flight_outcome: None,
         master_error: combine_optional_errors(
             budget_error,
             combine_optional_errors(seal_error, listener_error),
@@ -2735,6 +2940,9 @@ mod tests {
             gateway_configured: false,
             gateway_listener_ready: false,
             gateway_master_reachable: false,
+            flight_configured: false,
+            flight_listener_ready: false,
+            flight_protocol_ready: false,
             native_storage_configured: false,
             native_catalog_ready: false,
             native_current_snapshot_files_ready: false,
@@ -2890,6 +3098,9 @@ mod tests {
             gateway_configured: true,
             gateway_listener_ready: true,
             gateway_master_reachable: false,
+            flight_configured: false,
+            flight_listener_ready: false,
+            flight_protocol_ready: false,
             native_storage_configured: false,
             native_catalog_ready: false,
             native_current_snapshot_files_ready: false,
@@ -2912,6 +3123,9 @@ mod tests {
             gateway_configured: false,
             gateway_listener_ready: false,
             gateway_master_reachable: false,
+            flight_configured: false,
+            flight_listener_ready: false,
+            flight_protocol_ready: false,
             native_storage_configured: true,
             native_catalog_ready: true,
             native_current_snapshot_files_ready: true,
@@ -2930,6 +3144,31 @@ mod tests {
     }
 
     #[test]
+    fn readiness_requires_both_flight_listener_and_protocol_barriers() {
+        let mut readiness = LegacyServerReadiness {
+            admission_open: true,
+            master_listener_ready: true,
+            gateway_configured: false,
+            gateway_listener_ready: false,
+            gateway_master_reachable: false,
+            flight_configured: true,
+            flight_listener_ready: true,
+            flight_protocol_ready: false,
+            native_storage_configured: false,
+            native_catalog_ready: false,
+            native_current_snapshot_files_ready: false,
+            storage_reconciliation_complete: false,
+            commit_recovery_complete: false,
+        };
+
+        assert!(!readiness.is_ready());
+        readiness.flight_protocol_ready = true;
+        assert!(readiness.is_ready());
+        readiness.flight_listener_ready = false;
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
     fn runtime_native_failure_revokes_dynamic_readiness() {
         let mut readiness = LegacyServerReadiness {
             admission_open: true,
@@ -2937,6 +3176,9 @@ mod tests {
             gateway_configured: false,
             gateway_listener_ready: false,
             gateway_master_reachable: false,
+            flight_configured: false,
+            flight_listener_ready: false,
+            flight_protocol_ready: false,
             native_storage_configured: true,
             native_catalog_ready: true,
             native_current_snapshot_files_ready: true,
@@ -3178,6 +3420,8 @@ token = "must-not-appear-in-ready-record"
             timed_out_processes: vec!["process-1".to_string()],
             gateway_error: None,
             gateway_outcome: None,
+            flight_error: None,
+            flight_outcome: None,
             master_error: None,
             legacy_catalog_shadow_outcome: None,
             native_storage_outcome: None,
@@ -3217,6 +3461,8 @@ token = "must-not-appear-in-ready-record"
             timed_out_processes: vec!["process-rollback".to_string()],
             gateway_error: None,
             gateway_outcome: None,
+            flight_error: None,
+            flight_outcome: None,
             master_error: None,
             legacy_catalog_shadow_outcome: None,
             native_storage_outcome: None,

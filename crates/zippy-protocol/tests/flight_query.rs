@@ -1,0 +1,550 @@
+use std::collections::VecDeque;
+use std::num::NonZeroU64;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use arrow_flight::error::FlightError;
+use arrow_flight::{Action, FlightClient};
+use futures::{StreamExt, TryStreamExt};
+use prost::Message;
+use zippy_protocol::error::status_to_server_error;
+use zippy_protocol::query::{
+    encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
+};
+use zippy_protocol::runtime::FlightServerRuntime;
+use zippy_protocol::server::{
+    FlightQueryFrontend, FlightServiceConfig, OpaquePreparedFlightQuery, PreparedFlightQuery,
+    ZippyFlightService,
+};
+use zippy_protocol::wire::CapabilitiesResponse;
+use zippy_protocol::{CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY};
+use zippy_types::query::{
+    QueryInput, QueryInstanceId, QueryPlanInfo, QueryPriority, QueryRequest, QueryResultBatch,
+    RecordBatchStream, SendableRecordBatchStream,
+};
+use zippy_types::table::{CatalogName, TableRef};
+use zippy_types::{BoxFuture, ErrorCode, QueryId, ResourceLimit, Result, SessionId};
+
+const TEST_MESSAGE_BYTES: usize = 64 * 1024;
+const TEST_TRANSPORT_BYTES: usize = 4 * TEST_MESSAGE_BYTES;
+
+struct FakeFrontend {
+    next_generation: AtomicU64,
+    lease_drops: Arc<AtomicUsize>,
+    expires_after: Duration,
+    hang_after_first: bool,
+    poll_block: Option<PollBlock>,
+}
+
+impl FakeFrontend {
+    fn new(lease_drops: Arc<AtomicUsize>, expires_after: Duration, hang_after_first: bool) -> Self {
+        Self {
+            next_generation: AtomicU64::new(1),
+            lease_drops,
+            expires_after,
+            hang_after_first,
+            poll_block: None,
+        }
+    }
+
+    fn with_poll_block(
+        mut self,
+        started: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    ) -> Self {
+        self.poll_block = Some(PollBlock { started, release });
+        self
+    }
+}
+
+#[derive(Clone)]
+struct PollBlock {
+    started: Arc<AtomicBool>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl FlightQueryFrontend for FakeFrontend {
+    fn prepare(
+        &self,
+        request: FlightQueryRequest,
+    ) -> BoxFuture<'_, Result<OpaquePreparedFlightQuery>> {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let lease_drops = Arc::clone(&self.lease_drops);
+        let expires_at_ns = unix_time_ns()
+            .saturating_add(u64::try_from(self.expires_after.as_nanos()).unwrap_or(u64::MAX));
+        let hang_after_first = self.hang_after_first;
+        let poll_block = self.poll_block.clone();
+        Box::pin(async move {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef],
+            )
+            .expect("build deterministic fake batch");
+            let generation = NonZeroU64::new(generation)
+                .expect("fake generation starts at one and does not wrap in tests");
+            Ok(Box::new(FakePreparedQuery {
+                instance_id: QueryInstanceId::new(request.request.query_id, generation),
+                plan: QueryPlanInfo {
+                    query_id: request.request.query_id,
+                    catalog_revision: 7,
+                    snapshots: Vec::new(),
+                    planned_at_ns: unix_time_ns(),
+                    expires_at_ns,
+                },
+                schema,
+                batches: Some(VecDeque::from([batch])),
+                lease: Some(DropCounter(lease_drops)),
+                hang_after_first,
+                poll_block,
+            }) as OpaquePreparedFlightQuery)
+        })
+    }
+}
+
+struct FakePreparedQuery {
+    instance_id: QueryInstanceId,
+    plan: QueryPlanInfo,
+    schema: SchemaRef,
+    batches: Option<VecDeque<RecordBatch>>,
+    lease: Option<DropCounter>,
+    hang_after_first: bool,
+    poll_block: Option<PollBlock>,
+}
+
+impl PreparedFlightQuery for FakePreparedQuery {
+    fn info(&self) -> &QueryPlanInfo {
+        &self.plan
+    }
+
+    fn instance_id(&self) -> QueryInstanceId {
+        self.instance_id
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn execute(mut self: Box<Self>) -> Result<SendableRecordBatchStream> {
+        Ok(Box::pin(FakeResultStream {
+            instance_id: self.instance_id,
+            schema: Arc::clone(&self.schema),
+            batches: self
+                .batches
+                .take()
+                .expect("fake prepared query executes at most once"),
+            _lease: self
+                .lease
+                .take()
+                .expect("fake prepared query transfers its lease once"),
+            hang_after_first: self.hang_after_first,
+            poll_block: self.poll_block.take(),
+            emitted: 0,
+        }))
+    }
+}
+
+struct DropCounter(Arc<AtomicUsize>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct FakeResultStream {
+    instance_id: QueryInstanceId,
+    schema: SchemaRef,
+    batches: VecDeque<RecordBatch>,
+    _lease: DropCounter,
+    hang_after_first: bool,
+    poll_block: Option<PollBlock>,
+    emitted: usize,
+}
+
+impl RecordBatchStream for FakeResultStream {
+    fn instance_id(&self) -> QueryInstanceId {
+        self.instance_id
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<QueryResultBatch>>> {
+        if let Some(block) = self.poll_block.take() {
+            block.started.store(true, Ordering::SeqCst);
+            let (release, condition) = block.release.as_ref();
+            let mut released = release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = condition
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        if let Some(batch) = self.batches.pop_front() {
+            self.emitted += 1;
+            return Poll::Ready(Some(Ok(QueryResultBatch::unaccounted(batch))));
+        }
+        if self.hang_after_first && self.emitted > 0 {
+            return Poll::Pending;
+        }
+        Poll::Ready(None)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flight_round_trip_is_snapshot_fixed_and_ticket_is_single_use() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let (service, mut runtime) =
+        start_service(Arc::clone(&lease_drops), Duration::from_secs(5), false, 4);
+    let session = SessionId::from_u128(11).unwrap();
+    let mut client = client(&runtime, session).await;
+
+    let info = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(12).unwrap()))
+        .await
+        .expect("GetFlightInfo succeeds");
+    assert_eq!(info.clone().try_decode_schema().unwrap().fields().len(), 1);
+    let ticket = info.endpoint[0]
+        .ticket
+        .clone()
+        .expect("query endpoint carries a ticket");
+    let batches: Vec<RecordBatch> = client
+        .do_get(ticket.clone())
+        .await
+        .expect("DoGet starts")
+        .try_collect()
+        .await
+        .expect("Flight batches decode");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 3);
+
+    let error = client
+        .do_get(ticket)
+        .await
+        .expect_err("ticket cannot execute twice");
+    assert_eq!(flight_error_code(error), ErrorCode::NotFound);
+    assert_eq!(service.status().pending_tickets, 0);
+    wait_for_count(&lease_drops, 1).await;
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_session_does_not_consume_ticket() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let (_service, mut runtime) =
+        start_service(Arc::clone(&lease_drops), Duration::from_secs(5), false, 4);
+    let owner = SessionId::from_u128(21).unwrap();
+    let mut owner_client = client(&runtime, owner).await;
+    let info = owner_client
+        .get_flight_info(descriptor(owner, QueryId::from_u128(22).unwrap()))
+        .await
+        .unwrap();
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    let mut foreign_client = client(&runtime, SessionId::from_u128(23).unwrap()).await;
+
+    let error = foreign_client
+        .do_get(ticket.clone())
+        .await
+        .expect_err("foreign session is rejected");
+    assert_eq!(flight_error_code(error), ErrorCode::PermissionDenied);
+    let batches: Vec<RecordBatch> = owner_client
+        .do_get(ticket)
+        .await
+        .expect("owner can still consume ticket")
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches[0].num_rows(), 3);
+    wait_for_count(&lease_drops, 1).await;
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unconsumed_ticket_expires_and_releases_prepared_query() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let (service, mut runtime) = start_service(
+        Arc::clone(&lease_drops),
+        Duration::from_millis(50),
+        false,
+        4,
+    );
+    let session = SessionId::from_u128(31).unwrap();
+    let mut client = client(&runtime, session).await;
+    let info = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(32).unwrap()))
+        .await
+        .unwrap();
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+
+    wait_for_count(&lease_drops, 1).await;
+    assert_eq!(service.status().pending_tickets, 0);
+    let error = client
+        .do_get(ticket)
+        .await
+        .expect_err("expired ticket is no longer retained");
+    assert_eq!(flight_error_code(error), ErrorCode::DeadlineExceeded);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_and_pending_ticket_capacity_are_enforced() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let (service, mut runtime) =
+        start_service(Arc::clone(&lease_drops), Duration::from_secs(5), false, 1);
+    let session = SessionId::from_u128(35).unwrap();
+    let mut client = client(&runtime, session).await;
+
+    let actions = client
+        .list_actions()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].r#type, CAPABILITIES_ACTION);
+    let bodies = client
+        .do_action(Action::new(CAPABILITIES_ACTION, Vec::<u8>::new()))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let capabilities = CapabilitiesResponse::decode(bodies[0].clone()).unwrap();
+    assert_eq!(capabilities.protocol_version, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(capabilities.max_pending_tickets, 1);
+    assert!(capabilities
+        .capabilities
+        .iter()
+        .any(|capability| capability == "query.single_use_ticket.v1"));
+
+    let first = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(36).unwrap()))
+        .await
+        .unwrap();
+    let error = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(37).unwrap()))
+        .await
+        .expect_err("one unconsumed ticket exhausts the configured capacity");
+    assert_eq!(flight_error_code(error), ErrorCode::ResourceExhausted);
+    assert_eq!(service.status().pending_tickets, 1);
+    assert_eq!(service.status().admission_rejections, 1);
+
+    client
+        .do_get(first.endpoint[0].ticket.clone().unwrap())
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap();
+    let second = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(37).unwrap()))
+        .await
+        .expect("consuming a ticket reopens one bounded slot");
+    assert_eq!(service.status().pending_tickets, 1);
+
+    drop(client);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+    drop(second);
+    wait_for_count(&lease_drops, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_client_stream_releases_hanging_query() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let (_service, mut runtime) =
+        start_service(Arc::clone(&lease_drops), Duration::from_secs(5), true, 4);
+    let session = SessionId::from_u128(41).unwrap();
+    let mut client = client(&runtime, session).await;
+    let info = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(42).unwrap()))
+        .await
+        .unwrap();
+    let mut stream = client
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first batch arrives")
+        .expect("stream has one batch")
+        .expect("first batch decodes");
+    assert_eq!(first.num_rows(), 3);
+
+    drop(stream);
+    drop(client);
+    wait_for_count(&lease_drops, 1).await;
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_timeout_and_drop_do_not_wait_for_a_blocked_stream_poll() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let poll_started = Arc::new(AtomicBool::new(false));
+    let poll_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let frontend = Arc::new(
+        FakeFrontend::new(Arc::clone(&lease_drops), Duration::from_secs(5), false)
+            .with_poll_block(Arc::clone(&poll_started), Arc::clone(&poll_release)),
+    );
+    let (service, mut runtime) = start_frontend(frontend, 4);
+    let session = SessionId::from_u128(51).unwrap();
+    let mut client = client(&runtime, session).await;
+    let info = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(52).unwrap()))
+        .await
+        .unwrap();
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    let poll = tokio::spawn(async move {
+        let mut stream = client.do_get(ticket).await.unwrap();
+        stream.next().await
+    });
+    wait_for_flag(&poll_started).await;
+
+    let shutdown_started = Instant::now();
+    let error = runtime
+        .shutdown(Duration::from_millis(20))
+        .expect_err("blocked worker exceeds the explicit shutdown deadline");
+    assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+    assert!(shutdown_started.elapsed() < Duration::from_millis(200));
+    assert!(!service.status().admission_open);
+
+    let drop_started = Instant::now();
+    drop(runtime);
+    assert!(drop_started.elapsed() < Duration::from_millis(200));
+    let (release, condition) = poll_release.as_ref();
+    *release
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    condition.notify_all();
+    let _ = tokio::time::timeout(Duration::from_secs(2), poll)
+        .await
+        .expect("detached listener cleanup completes after the blocked poll");
+    wait_for_count(&lease_drops, 1).await;
+}
+
+fn start_service(
+    lease_drops: Arc<AtomicUsize>,
+    expires_after: Duration,
+    hang_after_first: bool,
+    max_pending_tickets: usize,
+) -> (ZippyFlightService, FlightServerRuntime) {
+    let frontend = Arc::new(FakeFrontend::new(
+        lease_drops,
+        expires_after,
+        hang_after_first,
+    ));
+    start_frontend(frontend, max_pending_tickets)
+}
+
+fn start_frontend(
+    frontend: Arc<dyn FlightQueryFrontend>,
+    max_pending_tickets: usize,
+) -> (ZippyFlightService, FlightServerRuntime) {
+    let config = FlightServiceConfig::try_new(
+        "test-0.5.0",
+        TEST_MESSAGE_BYTES,
+        max_pending_tickets,
+        TEST_TRANSPORT_BYTES,
+    )
+    .unwrap();
+    let service = ZippyFlightService::try_new(config, frontend).unwrap();
+    let runtime = FlightServerRuntime::start(
+        "127.0.0.1:0".parse().unwrap(),
+        service.clone(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    (service, runtime)
+}
+
+async fn client(runtime: &FlightServerRuntime, session: SessionId) -> FlightClient {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", runtime.endpoint()))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightClient::new(channel);
+    client
+        .add_header(SESSION_METADATA_KEY, &session.to_string())
+        .unwrap();
+    client
+}
+
+fn descriptor(session: SessionId, query_id: QueryId) -> arrow_flight::FlightDescriptor {
+    let table = TableRef::Name {
+        namespace: CatalogName::new("default").unwrap(),
+        table: CatalogName::new("ticks").unwrap(),
+    };
+    let request = FlightQueryRequest {
+        request: QueryRequest {
+            query_id,
+            session_id: session,
+            input: QueryInput::Sql("select * from ticks".to_owned()),
+            tables: vec![table.clone()],
+            priority: QueryPriority::Interactive,
+            deadline_ns: None,
+            memory_limit_bytes: ResourceLimit::ServerDefault,
+            spill_limit_bytes: ResourceLimit::Disabled,
+            result_batch_rows: None,
+        },
+        bindings: vec![FlightTableBinding {
+            sql_name: "ticks".to_owned(),
+            table,
+        }],
+    };
+    encode_query_descriptor(&encode_query_request(&request).unwrap())
+}
+
+fn flight_error_code(error: FlightError) -> ErrorCode {
+    match error {
+        FlightError::Tonic(status) => status_to_server_error(&status).code(),
+        other => panic!("expected a structured tonic error, got {other}"),
+    }
+}
+
+async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if counter.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("resource owner is released within the cancellation deadline");
+}
+
+async fn wait_for_flag(flag: &AtomicBool) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !flag.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("blocking stream poll starts before the shutdown assertion");
+}
+
+fn unix_time_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}

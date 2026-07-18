@@ -48,6 +48,14 @@ pub const DEFAULT_QUERY_CANARY_MAX_BATCHES: usize = 4_096;
 pub const DEFAULT_QUERY_CANARY_MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
 /// Preferred per-query DataFusion operator pool size when the global query budget permits it.
 pub const DEFAULT_QUERY_OPERATOR_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Default approximate Arrow Flight gRPC message ceiling.
+pub const DEFAULT_FLIGHT_MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Default number of prepared Flight queries waiting for one `DoGet`.
+pub const DEFAULT_FLIGHT_MAX_PENDING_TICKETS: usize = DEFAULT_QUERY_MAX_CONCURRENT_QUERIES;
+/// Smallest supported Flight message ceiling.
+pub const MIN_FLIGHT_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Largest supported Flight message ceiling before TLS and WAN hardening.
+pub const MAX_FLIGHT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Backward-compatible canary default, independent from a configured production override.
 pub const DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES: u64 = DEFAULT_QUERY_OPERATOR_MEMORY_BYTES;
 pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
@@ -81,6 +89,8 @@ pub struct ZippyConfig {
     pub table: ZippyTableConfig,
     #[serde(default)]
     pub gateway: ZippyGatewayConfig,
+    #[serde(default)]
+    pub flight: ZippyFlightConfig,
     #[serde(default)]
     pub query: ZippyQueryConfig,
 }
@@ -410,6 +420,33 @@ impl Default for ZippyGatewayConfig {
     }
 }
 
+/// Arrow Flight query listener configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyFlightConfig {
+    /// Enables the independent Flight listener.
+    pub enabled: bool,
+    /// Explicit IP socket endpoint. When absent it derives from master port plus two.
+    pub endpoint: Option<String>,
+    /// Zippy Flight application protocol version.
+    pub protocol_version: u16,
+    /// Approximate maximum encoded gRPC message size.
+    pub max_message_bytes: usize,
+    /// Maximum physically prepared queries waiting for `DoGet`.
+    pub max_pending_tickets: usize,
+}
+
+impl Default for ZippyFlightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            protocol_version: 1,
+            max_message_bytes: DEFAULT_FLIGHT_MAX_MESSAGE_BYTES,
+            max_pending_tickets: DEFAULT_FLIGHT_MAX_PENDING_TICKETS,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PartialZippyConfig {
     server: Option<PartialServerConfig>,
@@ -419,6 +456,7 @@ struct PartialZippyConfig {
     log: Option<PartialLogConfig>,
     table: Option<PartialTableConfig>,
     gateway: Option<PartialGatewayConfig>,
+    flight: Option<PartialFlightConfig>,
     query: Option<PartialQueryConfig>,
 }
 
@@ -546,6 +584,15 @@ struct PartialGatewayConfig {
     protocol_version: Option<u16>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PartialFlightConfig {
+    enabled: Option<bool>,
+    endpoint: Option<String>,
+    protocol_version: Option<u16>,
+    max_message_bytes: Option<usize>,
+    max_pending_tickets: Option<usize>,
+}
+
 impl Default for ZippyConfig {
     fn default() -> Self {
         Self {
@@ -572,6 +619,7 @@ impl Default for ZippyConfig {
                 },
             },
             gateway: ZippyGatewayConfig::default(),
+            flight: ZippyFlightConfig::default(),
             query: ZippyQueryConfig::default(),
         }
     }
@@ -834,6 +882,23 @@ impl ZippyConfig {
             }
             if let Some(protocol_version) = gateway.protocol_version {
                 self.gateway.protocol_version = protocol_version;
+            }
+        }
+        if let Some(flight) = partial.flight {
+            if let Some(enabled) = flight.enabled {
+                self.flight.enabled = enabled;
+            }
+            if let Some(endpoint) = flight.endpoint {
+                self.flight.endpoint = Some(non_empty(endpoint, "flight.endpoint")?);
+            }
+            if let Some(protocol_version) = flight.protocol_version {
+                self.flight.protocol_version = protocol_version;
+            }
+            if let Some(max_message_bytes) = flight.max_message_bytes {
+                self.flight.max_message_bytes = max_message_bytes;
+            }
+            if let Some(max_pending_tickets) = flight.max_pending_tickets {
+                self.flight.max_pending_tickets = max_pending_tickets;
             }
         }
         if let Some(query) = partial.query {
@@ -1167,6 +1232,31 @@ impl ZippyConfig {
                     ),
                     })?;
         }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_ENABLED") {
+            self.flight.enabled = parse_bool_env("ZIPPY_FLIGHT_ENABLED", &value)?;
+        }
+        if let Some(endpoint) = env_string("ZIPPY_FLIGHT_ENDPOINT") {
+            self.flight.endpoint = Some(non_empty(endpoint, "ZIPPY_FLIGHT_ENDPOINT")?);
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_PROTOCOL_VERSION") {
+            self.flight.protocol_version =
+                value
+                    .parse::<u16>()
+                    .map_err(|error| ZippyError::InvalidConfig {
+                        reason: format!(
+                        "env var must parse as u16 name=[ZIPPY_FLIGHT_PROTOCOL_VERSION] error=[{}]",
+                        error
+                    ),
+                    })?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_MAX_MESSAGE_BYTES") {
+            self.flight.max_message_bytes =
+                parse_usize_env("ZIPPY_FLIGHT_MAX_MESSAGE_BYTES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_MAX_PENDING_TICKETS") {
+            self.flight.max_pending_tickets =
+                parse_usize_env("ZIPPY_FLIGHT_MAX_PENDING_TICKETS", &value)?;
+        }
         Ok(())
     }
 
@@ -1399,9 +1489,14 @@ impl ZippyConfig {
                 reason: "native query frontend requires server native_storage_enabled".to_string(),
             });
         }
-        if self.query.native_enabled && !self.gateway.enabled {
+        if self.query.native_enabled && !self.gateway.enabled && !self.flight.enabled {
             return Err(ZippyError::InvalidConfig {
-                reason: "native query frontend requires gateway enabled".to_string(),
+                reason: "native query frontend requires gateway or flight enabled".to_string(),
+            });
+        }
+        if self.flight.enabled && !self.query.native_enabled {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight query frontend requires query native_enabled".to_string(),
             });
         }
         if self.query.native_enabled && self.catalog.backend != ZippyCatalogBackend::SqliteShadow {
@@ -1475,6 +1570,7 @@ impl ZippyConfig {
         }
         validate_gateway_host_port(&self.gateway)?;
         validate_gateway(&self.gateway)?;
+        validate_flight(self)?;
         Ok(())
     }
 
@@ -1484,6 +1580,9 @@ impl ZippyConfig {
             self.gateway.enabled || self.gateway.host.is_some() || self.gateway.port.is_some();
         if should_derive_gateway && self.gateway.endpoint.is_none() {
             self.gateway.endpoint = self.gateway_endpoint();
+        }
+        if self.flight.enabled && self.flight.endpoint.is_none() {
+            self.flight.endpoint = self.flight_endpoint();
         }
         Ok(())
     }
@@ -1503,6 +1602,18 @@ impl ZippyConfig {
                     .port
                     .and_then(|master_port| master_port.checked_add(1))
             })?;
+            Some(format!("{host}:{port}"))
+        })
+    }
+
+    /// Returns the configured or master-derived Arrow Flight endpoint.
+    pub fn flight_endpoint(&self) -> Option<String> {
+        self.flight.endpoint.clone().or_else(|| {
+            let host = self.master.host.as_ref()?;
+            let port = self
+                .master
+                .port
+                .and_then(|master_port| master_port.checked_add(2))?;
             Some(format!("{host}:{port}"))
         })
     }
@@ -1784,6 +1895,87 @@ fn validate_gateway(gateway: &ZippyGatewayConfig) -> Result<()> {
                 });
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_flight(config: &ZippyConfig) -> Result<()> {
+    if config.flight.protocol_version != 1 {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight protocol_version must equal 1 value=[{}]",
+                config.flight.protocol_version
+            ),
+        });
+    }
+    if !(MIN_FLIGHT_MAX_MESSAGE_BYTES..=MAX_FLIGHT_MAX_MESSAGE_BYTES)
+        .contains(&config.flight.max_message_bytes)
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight max_message_bytes must be between {} and {} value=[{}]",
+                MIN_FLIGHT_MAX_MESSAGE_BYTES,
+                MAX_FLIGHT_MAX_MESSAGE_BYTES,
+                config.flight.max_message_bytes
+            ),
+        });
+    }
+    if config.flight.max_pending_tickets == 0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: "flight max_pending_tickets must be greater than zero".to_string(),
+        });
+    }
+    if !config.flight.enabled {
+        return Ok(());
+    }
+    let transport_budget = config
+        .query
+        .max_buffered_bytes
+        .unwrap_or(config.runtime.max_query_buffer_bytes);
+    if config.flight.max_message_bytes > transport_budget {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight max_message_bytes must not exceed the query transport budget value=[{}] budget=[{}]",
+                config.flight.max_message_bytes, transport_budget
+            ),
+        });
+    }
+    if config.flight.max_pending_tickets > config.query.resources.max_concurrent_queries {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight max_pending_tickets must not exceed query max_concurrent_queries value=[{}] maximum=[{}]",
+                config.flight.max_pending_tickets,
+                config.query.resources.max_concurrent_queries
+            ),
+        });
+    }
+    let endpoint = config
+        .flight
+        .endpoint
+        .as_deref()
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "flight endpoint must be set when enabled or derivable from master port"
+                .to_string(),
+        })?;
+    let endpoint =
+        endpoint
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| ZippyError::InvalidConfig {
+                reason: format!(
+                    "flight endpoint must be an IP socket address endpoint=[{}] error=[{}]",
+                    endpoint, error
+                ),
+            })?;
+    if endpoint.port() == 0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: "flight port must be greater than zero".to_string(),
+        });
+    }
+    if !endpoint.ip().is_loopback() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "flight endpoint must be loopback until TLS and authentication are enabled"
+                .to_string(),
+        });
     }
     Ok(())
 }

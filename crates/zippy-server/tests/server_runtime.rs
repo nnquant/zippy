@@ -16,7 +16,11 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::error::FlightError;
+use arrow_flight::FlightClient;
+use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
+use prost::Message;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::{
     canonical_schema_hash, schema_metadata, ControlEndpoint, DataDirectoryError,
@@ -27,6 +31,12 @@ use zippy_master::snapshot::{
     RegistrySnapshot, SnapshotDroppedTableRecord, SnapshotSourceRecord, SnapshotStore,
     SnapshotStreamRecord,
 };
+use zippy_protocol::error::status_to_server_error;
+use zippy_protocol::query::{
+    encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
+};
+use zippy_protocol::wire::QueryInfo;
+use zippy_protocol::SESSION_METADATA_KEY;
 use zippy_server::{
     LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationState,
     LegacyCatalogShadowShutdownOutcome, LegacyCatalogShadowState, LegacyServerMode,
@@ -40,9 +50,10 @@ use zippy_types::catalog::{
     LegacyCatalogProjectionOutcomeV4, LegacyCatalogProjectionPhaseV4,
     LegacyCatalogProjectionTableStateV4, LegacyFileViewContinuity, ListTablesRequest,
 };
+use zippy_types::query::{QueryInput, QueryPriority, QueryRequest};
 use zippy_types::runtime::RuntimeRegistry;
-use zippy_types::table::{CatalogName, DataFileLocation};
-use zippy_types::{ErrorCode, NamespaceId, QueryId, RequestId, SessionId};
+use zippy_types::table::{CatalogName, DataFileLocation, TableRef};
+use zippy_types::{ErrorCode, NamespaceId, QueryId, RequestId, ResourceLimit, SessionId};
 
 use support::{reserve_tcp_addr, wait_until_bindable};
 
@@ -274,6 +285,57 @@ fn runtime_config_with_native_query_frontend_and_persist_root(
     ));
     fs::write(config_path, source).unwrap();
     runtime
+}
+
+fn runtime_config_with_native_flight_frontend_and_persist_root(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+    flight_endpoint: std::net::SocketAddr,
+    persist_root: &Path,
+) -> LegacyServerRuntimeConfig {
+    let config_path = temp.path().join("zippy-native-flight.toml");
+    fs::write(
+        &config_path,
+        format!(
+            concat!(
+                "[server]\n",
+                "data_dir = {:?}\n",
+                "native_storage_enabled = true\n\n",
+                "[table.persist]\n",
+                "data_dir = {:?}\n\n",
+                "[catalog]\n",
+                "backend = \"sqlite_shadow\"\n\n",
+                "[master]\n",
+                "shutdown_timeout_ms = 3000\n\n",
+                "[query]\n",
+                "native_enabled = true\n",
+                "operator_memory_bytes = 268435456\n\n",
+                "[query.resources]\n",
+                "max_memory_bytes = 1073741824\n\n",
+                "[flight]\n",
+                "enabled = true\n",
+                "endpoint = {:?}\n",
+                "max_message_bytes = 2097152\n",
+                "max_pending_tickets = 16\n"
+            ),
+            data_dir.display().to_string(),
+            persist_root.display().to_string(),
+            flight_endpoint.to_string(),
+        ),
+    )
+    .unwrap();
+    let master =
+        MasterDaemonConfig::new(ControlEndpoint::Unix(temp.path().join("zippy-server.sock")))
+            .with_config_path(config_path)
+            .with_logging(
+                std::env::temp_dir().join(format!(
+                    "zippy-server-runtime-test-logs-{}",
+                    std::process::id()
+                )),
+                "info",
+                false,
+            );
+    LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(5))
 }
 
 fn runtime_config_with_shadow_catalog_and_persist_root(
@@ -854,6 +916,130 @@ async fn native_gateway_query_matches_legacy_and_releases_on_budget_or_disconnec
 
     assert!(runtime.shutdown().is_clean());
     wait_until_bindable(gateway_addr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flight_only_runtime_streams_real_native_snapshot_and_releases_ticket() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let parquet_path = persist_root.join("events.parquet");
+    let values = (0_i64..2_048).collect::<Vec<_>>();
+    write_test_parquet(&parquet_path, values.clone());
+    seed_legacy_append_table(&data_dir, &persist_root, &parquet_path, values.len());
+    let flight_addr = reserve_tcp_addr();
+    let mut runtime =
+        LegacyServerRuntime::start(runtime_config_with_native_flight_frontend_and_persist_root(
+            &temp,
+            &data_dir,
+            flight_addr,
+            &persist_root,
+        ))
+        .expect("start Flight-only native query runtime");
+
+    assert_eq!(runtime.mode(), LegacyServerMode::CatalogAndQuery);
+    assert!(runtime.gateway_endpoint().is_none());
+    assert!(
+        runtime.query().is_none(),
+        "legacy Gateway adapter stays disabled"
+    );
+    let flight_endpoint = flight_addr.to_string();
+    assert_eq!(runtime.flight_endpoint(), Some(flight_endpoint.as_str()));
+    let health = runtime.health();
+    assert!(health.readiness.flight_configured);
+    assert!(health.readiness.flight_listener_ready);
+    assert!(health.readiness.flight_protocol_ready);
+    assert_eq!(health.services.query, ServiceHealth::Ready);
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{flight_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let session_id = SessionId::from_u128(2_001).unwrap();
+    let query_id = QueryId::from_u128(2_002).unwrap();
+    let mut client = FlightClient::new(channel);
+    client
+        .add_header(SESSION_METADATA_KEY, &session_id.to_string())
+        .unwrap();
+    let table = TableRef::Name {
+        namespace: CatalogName::new("default").unwrap(),
+        table: CatalogName::new("events").unwrap(),
+    };
+    let request = FlightQueryRequest {
+        request: QueryRequest {
+            query_id,
+            session_id,
+            input: QueryInput::Sql("SELECT value FROM events".to_owned()),
+            tables: vec![table.clone()],
+            priority: QueryPriority::Interactive,
+            deadline_ns: None,
+            memory_limit_bytes: ResourceLimit::ServerDefault,
+            spill_limit_bytes: ResourceLimit::Disabled,
+            result_batch_rows: NonZeroU32::new(256),
+        },
+        bindings: vec![FlightTableBinding {
+            sql_name: "events".to_owned(),
+            table,
+        }],
+    };
+    let info = client
+        .get_flight_info(encode_query_descriptor(
+            &encode_query_request(&request).unwrap(),
+        ))
+        .await
+        .expect("Flight GetFlightInfo prepares the real native plan");
+    let query_info = QueryInfo::decode(info.app_metadata.clone()).unwrap();
+    assert_eq!(query_info.query_id.as_ref(), &query_id.into_bytes());
+    assert!(query_info.catalog_revision > 0);
+    assert_eq!(query_info.snapshots.len(), 1);
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    let batches: Vec<RecordBatch> = client
+        .do_get(ticket.clone())
+        .await
+        .expect("Flight DoGet starts native execution")
+        .try_collect()
+        .await
+        .expect("Flight native batches decode");
+    let actual = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, values);
+
+    let error = client
+        .do_get(ticket)
+        .await
+        .expect_err("Flight ticket is consumed exactly once");
+    let status = match error {
+        FlightError::Tonic(status) => status,
+        other => panic!("expected structured Flight status, got {other}"),
+    };
+    assert_eq!(status_to_server_error(&status).code(), ErrorCode::NotFound);
+    assert_eq!(runtime.flight_status().unwrap().pending_tickets, 0);
+    assert_eq!(runtime.flight_status().unwrap().consumed_tickets, 1);
+    assert_eq!(
+        runtime
+            .native_query_engine()
+            .unwrap()
+            .process_memory_status()
+            .reserved_bytes,
+        0
+    );
+
+    assert!(runtime.shutdown().is_clean());
+    wait_until_bindable(flight_addr);
 }
 
 #[test]

@@ -15,6 +15,7 @@ members = [
     "crates/zippy-segment-store",
     "crates/zippy-operator-runtime",
     "crates/zippy-query",
+    "crates/zippy-protocol",
     "crates/zippy-server",
 ]
 resolver = "2"
@@ -25,6 +26,7 @@ version = "0.5.0"
 
 [workspace.dependencies]
 arrow = "53.3.0"
+arrow-flight = "=53.4.1"
 bytes = "1.11.1"
 crossbeam-channel = "0.5.15"
 datafusion = { version = "=44.0.0", default-features = false, features = [
@@ -32,7 +34,10 @@ datafusion = { version = "=44.0.0", default-features = false, features = [
     "recursive_protection",
 ] }
 futures = "0.3"
+getrandom = "0.3.4"
 parquet = "53.3.0"
+prost = "=0.13.5"
+prost-types = "=0.13.5"
 rusqlite = { version = "0.32.1", features = ["bundled", "hooks"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -40,7 +45,9 @@ serde_json = { version = "1.0.140", features = ["raw_value"] }
 sha2 = "0.10.9"
 thiserror = "2.0.12"
 tokio = { version = "1.48", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
 toml = "0.8"
+tonic = "=0.12.3"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "json", "env-filter"] }
 

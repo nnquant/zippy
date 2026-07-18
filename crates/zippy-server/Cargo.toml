@@ -19,13 +19,17 @@ zippy-gateway = { path = "../zippy-gateway" }
 zippy-ingest = { path = "../zippy-ingest" }
 zippy-master = { path = "../zippy-master" }
 zippy-query = { path = "../zippy-query" }
+zippy-protocol = { path = "../zippy-protocol" }
 zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-storage = { path = "../zippy-storage" }
 zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
+arrow-flight.workspace = true
 parquet.workspace = true
+prost.workspace = true
 tempfile = "3"
+tonic.workspace = true
 
 [lints]
 workspace = true

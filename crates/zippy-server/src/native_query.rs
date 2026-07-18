@@ -80,6 +80,62 @@ pub struct NativeQueryExplanation {
     pub metrics: BTreeMap<String, u64>,
 }
 
+/// One non-cloneable native query whose snapshot, physical plan, and output
+/// schema are fixed but whose result operators have not started producing rows.
+///
+/// Dropping this value cancels the query and releases its snapshot and resource
+/// leases. [`NativePreparedQuery::into_stream`] is the only execution path.
+pub struct NativePreparedQuery {
+    instance_id: QueryInstanceId,
+    info: QueryPlanInfo,
+    schema: SchemaRef,
+    lease: NativeExecutionLease,
+    policy: QuerySessionPolicy,
+    execution: NativeQueryExecutionConfig,
+    process_memory: QueryProcessMemoryPool,
+}
+
+impl NativePreparedQuery {
+    /// Returns immutable metadata for the exact planned snapshot.
+    #[must_use]
+    pub const fn info(&self) -> &QueryPlanInfo {
+        &self.info
+    }
+
+    /// Returns the exact process-local query incarnation.
+    #[must_use]
+    pub const fn instance_id(&self) -> QueryInstanceId {
+        self.instance_id
+    }
+
+    /// Returns the output Arrow schema fixed by physical preparation.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    /// Consumes this one-use handle and starts the native result stream.
+    pub fn into_stream(self) -> Result<SendableRecordBatchStream> {
+        let Self {
+            instance_id,
+            info: _,
+            schema,
+            lease,
+            policy,
+            execution,
+            process_memory,
+        } = self;
+        let plan_metrics = lease.plan_metrics();
+        let stream = lease.execute_in(policy, execution, &process_memory)?;
+        Ok(Box::pin(NativeRecordBatchStream::new(
+            instance_id,
+            schema,
+            stream,
+            plan_metrics,
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NativeQueryEngineConfig {
     policy: QuerySessionPolicy,
@@ -177,6 +233,21 @@ impl NativeQueryEngine {
         bindings: Vec<NativeQueryBinding>,
     ) -> BoxFuture<'a, Result<OpaqueQueryExecutionToken>> {
         Box::pin(async move { self.plan_bound_inner(owner, request, bindings).await })
+    }
+
+    /// Plans and physically prepares SQL against one exact snapshot without
+    /// starting result operators.
+    pub fn prepare_bound<'a>(
+        &'a self,
+        owner: &'a dyn QueryOwnerCapability,
+        request: QueryRequest,
+        bindings: Vec<NativeQueryBinding>,
+    ) -> BoxFuture<'a, Result<NativePreparedQuery>> {
+        Box::pin(async move {
+            let token = self.plan_bound_inner(owner, request, bindings).await?;
+            let transferred = transfer_native_token(token)?;
+            self.prepare_token(transferred).await
+        })
     }
 
     /// Prepares and explains SQL using explicit bindings without executing result operators.
@@ -428,19 +499,34 @@ impl NativeQueryEngine {
         &self,
         transferred: NativeTransferredToken,
     ) -> Result<SendableRecordBatchStream> {
+        self.prepare_token(transferred).await?.into_stream()
+    }
+
+    async fn prepare_token(
+        &self,
+        transferred: NativeTransferredToken,
+    ) -> Result<NativePreparedQuery> {
         let instance_id = transferred.instance_id;
+        let info = transferred.info.clone();
         let policy = transferred.policy;
         let execution = transferred.execution;
         let lease = self.prepare_transferred(transferred).await?;
+        if lease.instance_id() != instance_id || lease.catalog_revision() != info.catalog_revision {
+            return Err(internal(
+                instance_id.query_id(),
+                "prepared native query identity differs from its fixed plan metadata",
+            ));
+        }
         let schema = lease.plan().schema();
-        let plan_metrics = lease.plan_metrics();
-        let stream = lease.execute_in(policy, execution, &self.inner.process_memory)?;
-        Ok(Box::pin(NativeRecordBatchStream::new(
+        Ok(NativePreparedQuery {
             instance_id,
+            info,
             schema,
-            stream,
-            plan_metrics,
-        )))
+            lease,
+            policy,
+            execution,
+            process_memory: self.inner.process_memory.clone(),
+        })
     }
 }
 
@@ -536,6 +622,7 @@ impl QueryExecutionToken for NativePlanToken {
         Box::new(NativeTransferredToken {
             engine_nonce: self.engine_nonce,
             instance_id: self.instance_id,
+            info: self.info.clone(),
             inner_token: self
                 .inner_token
                 .take()
@@ -551,6 +638,7 @@ impl QueryExecutionToken for NativePlanToken {
 struct NativeTransferredToken {
     engine_nonce: u64,
     instance_id: QueryInstanceId,
+    info: QueryPlanInfo,
     inner_token: OpaqueQueryExecutionToken,
     sql: String,
     bindings: Vec<PersistedTableBinding>,

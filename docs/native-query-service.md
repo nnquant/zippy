@@ -8,11 +8,13 @@ join 和 window 都在 Server 的 DataFusion 执行器中完成。native 模式�
 residual”这种隐式回退。
 
 该能力默认关闭，适合先在测试环境或指定查询流量上灰度。关闭后，现有 Gateway legacy collect 路径和
-本地共享内存订阅路径保持不变。
+本地共享内存订阅路径保持不变。native query frontend 至少需要 Gateway 或 Flight 之一；两者可同时启用，
+也可仅启用 Flight。Flight Stage 6.1 的边界见 [`flight-query-service.md`](flight-query-service.md)。
 
 ## 启用
 
-正式 native query frontend 依赖 native storage、SQLite shadow Catalog 和 Gateway：
+正式 native query frontend 依赖 native storage、SQLite shadow Catalog，以及 Gateway/Flight 中至少一个
+frontend。现有 Python 客户端仍使用 Gateway 时按以下方式配置：
 
 ```toml
 [server]
@@ -56,6 +58,21 @@ ZIPPY_QUERY_MAX_MEMORY_BYTES
 ZIPPY_MAX_CPU_CORES
 ZIPPY_MAX_QUERY_BUFFER_BYTES
 ```
+
+若只验证标准 Arrow Flight 查询，可关闭 `[gateway]`，增加：
+
+```toml
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17667"
+protocol_version = 1
+max_message_bytes = 2097152
+max_pending_tickets = 64
+```
+
+Stage 6.1 在 TLS/认证完成前强制 endpoint 为 loopback，因此不能把地址改成 `0.0.0.0`。现有 Python
+Table API 尚未切换到 Flight；这段配置用于 Rust/integration 验收以及后续客户端迁移，不替代当前远程
+Gateway 配置。
 
 `operator_memory_bytes` 未配置时取 `min(64 MiB, query.resources.max_memory_bytes / 2)`，且至少为
 1 byte。它是单查询 DataFusion buffering operator 上限；`query.resources.max_memory_bytes` 是全局

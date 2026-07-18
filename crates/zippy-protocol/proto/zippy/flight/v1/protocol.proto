@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package zippy.flight.v1;
+
+message QueryCommand {
+  uint32 protocol_version = 1;
+  bytes query_id = 2;
+  bytes session_id = 3;
+  string sql = 4;
+  repeated TableBinding bindings = 5;
+  QueryPriority priority = 6;
+  optional uint64 deadline_ns = 7;
+  ResourceLimit memory_limit = 8;
+  ResourceLimit spill_limit = 9;
+  optional uint32 result_batch_rows = 10;
+}
+
+message TableBinding {
+  string sql_name = 1;
+  oneof table {
+    TableName name = 2;
+    bytes table_id = 3;
+  }
+}
+
+message TableName {
+  string namespace = 1;
+  string table = 2;
+}
+
+enum QueryPriority {
+  QUERY_PRIORITY_UNSPECIFIED = 0;
+  QUERY_PRIORITY_INTERACTIVE = 1;
+  QUERY_PRIORITY_NORMAL = 2;
+  QUERY_PRIORITY_MAINTENANCE = 3;
+}
+
+message ResourceLimit {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_SERVER_DEFAULT = 1;
+    KIND_DISABLED = 2;
+    KIND_BYTES = 3;
+  }
+  Kind kind = 1;
+  uint64 bytes = 2;
+}
+
+message QueryTicket {
+  uint32 protocol_version = 1;
+  bytes server_instance_id = 2;
+  bytes ticket_id = 3;
+  bytes query_id = 4;
+  uint64 generation = 5;
+  uint64 expires_at_ns = 6;
+}
+
+message QueryInfo {
+  uint32 protocol_version = 1;
+  bytes query_id = 2;
+  uint64 generation = 3;
+  uint64 catalog_revision = 4;
+  uint64 planned_at_ns = 5;
+  uint64 expires_at_ns = 6;
+  repeated QueryTableVersion snapshots = 7;
+}
+
+message QueryTableVersion {
+  bytes table_id = 1;
+  uint64 snapshot_version = 2;
+  uint64 schema_version = 3;
+}
+
+message ErrorEnvelope {
+  uint32 protocol_version = 1;
+  string code = 2;
+  string message = 3;
+  bool retryable = 4;
+  optional bytes request_id = 5;
+  optional bytes query_id = 6;
+  optional bytes table_id = 7;
+  oneof details {
+    RevisionConflict revision_conflict = 10;
+    ExpectedActual producer_epoch = 11;
+    ExpectedActual sequence_gap = 12;
+    ExpectedActual schema_version = 13;
+    OffsetExpired offset_expired = 14;
+    ResourceLimitExceeded resource_limit = 15;
+    DataCorruption data_corruption = 16;
+    UnsupportedPlan unsupported_plan = 17;
+  }
+}
+
+message RevisionConflict {
+  uint64 expected = 1;
+  uint64 actual = 2;
+}
+
+message ExpectedActual {
+  uint64 expected = 1;
+  uint64 actual = 2;
+}
+
+message OffsetExpired {
+  OffsetWatermark requested = 1;
+  OffsetWatermark earliest = 2;
+  OffsetWatermark latest = 3;
+  bool snapshot_recovery_available = 4;
+}
+
+message OffsetWatermark {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_EMPTY = 1;
+    STATE_KNOWN = 2;
+    STATE_LEGACY_UNKNOWN = 3;
+  }
+  State state = 1;
+  uint64 offset = 2;
+}
+
+message ResourceLimitExceeded {
+  string resource = 1;
+  ResourceLimit limit = 2;
+  uint64 requested = 3;
+}
+
+message DataCorruption {
+  string object = 1;
+  optional string expected_checksum = 2;
+  optional string actual_checksum = 3;
+}
+
+message UnsupportedPlan {
+  string operator = 1;
+}
+
+message CapabilitiesRequest {
+  uint32 protocol_version = 1;
+}
+
+message CapabilitiesResponse {
+  uint32 protocol_version = 1;
+  string server_version = 2;
+  repeated string capabilities = 3;
+  uint64 max_message_bytes = 4;
+  uint64 max_pending_tickets = 5;
+}

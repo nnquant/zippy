@@ -112,8 +112,10 @@ ordered actor/controller/Catalog cleanup. Definitive Catalog rejections remain r
 an exact retained request ID can replay its original receipt after restart without rolling a newer
 actor snapshot backward. It then binds the master listener, waits for its
 readiness barrier, starts Gateway when `[gateway].enabled = true`, performs a real Gateway-to-master
-control probe, and only then opens service admission. With Gateway disabled it intentionally runs
-in catalog-only mode; it does not publish a query service that cannot execute.
+control probe, starts Arrow Flight when `[flight].enabled = true`, and only then opens service
+admission. With both Gateway and Flight disabled it intentionally runs in catalog-only mode; with a
+ready Flight listener it can publish native query service without installing the legacy Gateway
+adapter.
 
 The CPU value is a canonical process configuration ceiling consumed by each component, not yet one
 hard semaphore shared by every independent thread pool. The legacy `runtime.max_parallelism` and
@@ -144,10 +146,12 @@ deadline limits remain active through digest delivery. A fixed-memory multiset d
 batch and row scheduling while preserving schema and duplicate-row counts, so a legacy stream can
 build golden evidence incrementally. This first digest contract accepts flat scalar columns and
 rejects nested or encoded result types explicitly. Runtime health exposes canary admission and
-aggregate metrics. The separate `[query].native_enabled` gate now enables Gateway `query_sql` and
-`query_explain` only when native storage, SQLite shadow Catalog and Gateway are all ready. It remains
-disabled by default. See [`native-query-canary.md`](native-query-canary.md) and
-[`native-query-service.md`](native-query-service.md).
+aggregate metrics. The separate `[query].native_enabled` gate now enables Gateway
+`query_sql`/`query_explain` or Flight `GetFlightInfo`/`DoGet` only when native storage, SQLite shadow
+Catalog and the selected frontend are ready. It remains disabled by default. See
+[`native-query-canary.md`](native-query-canary.md),
+[`native-query-service.md`](native-query-service.md), and
+[`flight-query-service.md`](flight-query-service.md).
 Before any Catalog resolution or snapshot copy starts, native planning reserves one conservative
 peak from this ledger. It is the checked sum of Catalog table-resolution ownership, exact pinned
 snapshot ownership, and a bounded server coordination envelope. The initial exact-snapshot guardrail
@@ -265,6 +269,14 @@ dedup_capacity = 1024
 enabled = true
 endpoint = "0.0.0.0:17666"
 
+[flight]
+# Optional Stage 6.1 query frontend. Loopback-only until TLS/auth lands.
+enabled = false
+endpoint = "127.0.0.1:17667"
+protocol_version = 1
+max_message_bytes = 2097152
+max_pending_tickets = 64
+
 [query]
 # Explicit opt-in; requires all dependencies above.
 native_enabled = true
@@ -304,9 +316,11 @@ persistence probes the complete command before final publication, moves an affin
 into the Catalog actor, and takes an exclusive publication exclusion before rejected-candidate
 cleanup. Exact, conflicting, and missing historical replays therefore never publish final
 candidates. Snapshot leases, runtime pins, QueryService integration, safe-GC claims, and bounded
-Gateway transport are implemented. Physical GC, standard Flight transport, authentication/TLS and
-the final removal of legacy metadata authority remain later phases. Legacy live descriptors without
-exact logical-offset provenance are intentionally not promoted into native active snapshots.
+Gateway transport are implemented. Physical GC, Flight write/subscription/metadata,
+authentication/TLS and the final removal of legacy metadata authority remain later phases. Standard
+Flight `GetFlightInfo`/`DoGet` query transport is implemented behind the opt-in `[flight]` gate.
+Legacy live descriptors without exact logical-offset provenance are intentionally not promoted into
+native active snapshots.
 
 `catalog.backend=sqlite_shadow` keeps the legacy persisted-file view authoritative and installs a
 single bounded comparison worker behind Gateway. Query threads never wait for SQLite shadow reads;
