@@ -34,6 +34,7 @@ use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use zippy_master::server::MasterServer;
 use zippy_protocol::runtime::{FlightServerRuntime, FlightShutdownOutcome, FlightTlsStatus};
 use zippy_protocol::server::{FlightServiceConfig, FlightServiceStatus, ZippyFlightService};
+use zippy_protocol::sql::FlightSqlMetadataLimits;
 use zippy_storage::{PersistControllerConfig, MAX_PERSIST_PARALLEL_WRITERS};
 use zippy_types::{ErrorCode, ServerError};
 
@@ -58,7 +59,7 @@ use crate::{
 const DEFAULT_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SERVER_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-const SERVER_READY_SCHEMA_VERSION: u8 = 4;
+const SERVER_READY_SCHEMA_VERSION: u8 = 5;
 
 /// Runs the server-owned legacy runtime until shutdown or dynamic readiness loss.
 ///
@@ -603,6 +604,11 @@ struct ServerReadyFlight<'a> {
     protocol_version: u16,
     tls_enabled: bool,
     authentication_required: bool,
+    administrator_authentication_enabled: bool,
+    query_control_enabled: bool,
+    flight_sql_metadata_enabled: bool,
+    metadata_max_rows: usize,
+    metadata_max_bytes: usize,
     certificate_sha256: Option<&'a str>,
     client_certificate_required: bool,
 }
@@ -815,6 +821,8 @@ fn publish_ready_record(
         .as_ref()
         .and_then(FlightServerRuntime::tls_status);
     let flight_status = runtime.flight_status();
+    let flight_enabled = runtime.flight_endpoint().is_some();
+    let flight_config = &runtime.runtime_config().flight;
     let record = ServerReadyRecord {
         schema_version: SERVER_READY_SCHEMA_VERSION,
         status: "ready",
@@ -829,12 +837,28 @@ fn publish_ready_record(
             protocol_version: runtime.runtime_config().gateway.protocol_version,
         },
         flight: ServerReadyFlight {
-            enabled: runtime.flight_endpoint().is_some(),
+            enabled: flight_enabled,
             endpoint: runtime.flight_endpoint(),
             protocol_version: runtime.runtime_config().flight.protocol_version,
             tls_enabled: flight_tls.is_some(),
             authentication_required: flight_status
                 .is_some_and(|status| status.authentication_required),
+            administrator_authentication_enabled: flight_enabled
+                && flight_config.auth.enabled
+                && (flight_config.auth.admin_token_file.is_some()
+                    || flight_config.auth.admin_bootstrap_token().is_some()),
+            query_control_enabled: flight_enabled,
+            flight_sql_metadata_enabled: flight_enabled,
+            metadata_max_rows: if flight_enabled {
+                flight_config.metadata.max_rows
+            } else {
+                0
+            },
+            metadata_max_bytes: if flight_enabled {
+                flight_config.metadata.max_bytes
+            } else {
+                0
+            },
             certificate_sha256: flight_tls.map(|status| status.certificate_sha256()),
             client_certificate_required: flight_tls
                 .is_some_and(|status| status.client_certificate_required()),
@@ -2264,13 +2288,21 @@ fn start_flight_if_enabled(
         runtime_config.flight.max_message_bytes,
         runtime_config.flight.max_pending_tickets,
         transport_buffer_bytes,
-    )?;
+    )?
+    .with_query_control()
+    .with_sql_metadata(FlightSqlMetadataLimits::try_new(
+        runtime_config.flight.metadata.max_rows,
+        runtime_config.flight.metadata.max_bytes,
+        Duration::from_millis(runtime_config.flight.metadata.ticket_ttl_ms),
+    )?);
     if let Some(bearer_auth) = security.bearer_auth {
         config = config.with_bearer_auth(bearer_auth);
     }
-    let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> = Arc::new(
-        NativeFlightQueryFrontend::new(native_storage.query_engine()),
-    );
+    let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> =
+        Arc::new(NativeFlightQueryFrontend::new(
+            native_storage.query_engine(),
+            native_storage.catalog_read_handle(),
+        ));
     let service = ZippyFlightService::try_new(config, frontend)?;
     let startup_timeout = remaining_before(startup_deadline, "start Flight listener")?;
     match security.tls {
@@ -3296,6 +3328,14 @@ token = "must-not-appear-in-ready-record"
             assert_eq!(record["health"]["readiness"]["admission_open"], true);
             assert_eq!(record["flight"]["tls_enabled"], false);
             assert_eq!(record["flight"]["authentication_required"], false);
+            assert_eq!(
+                record["flight"]["administrator_authentication_enabled"],
+                false
+            );
+            assert_eq!(record["flight"]["query_control_enabled"], false);
+            assert_eq!(record["flight"]["flight_sql_metadata_enabled"], false);
+            assert_eq!(record["flight"]["metadata_max_rows"], 0);
+            assert_eq!(record["flight"]["metadata_max_bytes"], 0);
             assert!(record["flight"]["certificate_sha256"].is_null());
             assert_eq!(record["flight"]["client_certificate_required"], false);
             assert!(!payload.contains("must-not-appear-in-ready-record"));

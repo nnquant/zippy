@@ -41,7 +41,10 @@ pub use service::{
     SqliteCatalog, SqliteCatalogLegacyImportSession, SqliteCatalogLegacyReconcileHandle,
     SqliteCatalogReadHandle, SqliteCatalogRuntimeSnapshotPinAdmissionControl,
 };
-pub use snapshot_domain::SqliteCatalogSnapshotReadLimits;
+pub use snapshot_domain::{
+    SqliteCatalogSchemaReadLimits, SqliteCatalogSchemaSelector, SqliteCatalogSchemaSnapshot,
+    SqliteCatalogSnapshotReadLimits,
+};
 pub use storage_codec::{
     canonical_schema_hash, canonical_schema_hash_from_ipc, decode_persisted_schema,
     decode_persisted_table_schema, DecodedPersistedTableSchema,

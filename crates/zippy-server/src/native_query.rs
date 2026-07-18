@@ -284,6 +284,11 @@ impl NativeQueryEngine {
         self.inner.process_memory.status()
     }
 
+    /// Cancels one exact query with server-internal administrator authority.
+    pub fn cancel_administrator(&self, instance_id: QueryInstanceId) -> Result<()> {
+        self.inner.resources.admin_handle().cancel(instance_id)
+    }
+
     async fn plan_bound_inner(
         &self,
         owner: &dyn QueryOwnerCapability,

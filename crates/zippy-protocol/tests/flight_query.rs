@@ -11,7 +11,11 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient as RawFlightClient;
-use arrow_flight::{Action, FlightClient, HandshakeRequest};
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_flight::sql::{
+    CommandGetDbSchemas, CommandGetTableTypes, CommandGetTables, ProstMessageExt,
+};
+use arrow_flight::{Action, CancelFlightInfoRequest, CancelStatus, FlightClient, HandshakeRequest};
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
@@ -20,14 +24,20 @@ use tonic::transport::{Certificate as TonicCertificate, ClientTlsConfig, Identit
 use zippy_protocol::auth::FlightBearerAuthConfig;
 use zippy_protocol::error::status_to_server_error;
 use zippy_protocol::query::{
-    encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
+    decode_query_ticket, encode_query_descriptor, encode_query_request, encode_query_ticket,
+    FlightQueryRequest, FlightTableBinding,
 };
 use zippy_protocol::runtime::{FlightServerRuntime, FlightServerTlsConfig};
 use zippy_protocol::server::{
     FlightQueryFrontend, FlightServiceConfig, OpaquePreparedFlightQuery, PreparedFlightQuery,
     ZippyFlightService,
 };
-use zippy_protocol::wire::{CapabilitiesResponse, SessionOpenRequest, SessionOpenResponse};
+use zippy_protocol::sql::{
+    FlightSqlMetadataLimits, FlightSqlMetadataRequest, PreparedFlightSqlMetadata,
+};
+use zippy_protocol::wire::{
+    CapabilitiesResponse, MetadataInfo, SessionOpenRequest, SessionOpenResponse, SessionRole,
+};
 use zippy_protocol::{
     AUTHORIZATION_METADATA_KEY, CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY,
 };
@@ -36,11 +46,12 @@ use zippy_types::query::{
     RecordBatchStream, SendableRecordBatchStream,
 };
 use zippy_types::table::{CatalogName, TableRef};
-use zippy_types::{BoxFuture, ErrorCode, QueryId, ResourceLimit, Result, SessionId};
+use zippy_types::{BoxFuture, ErrorCode, QueryId, ResourceLimit, Result, ServerError, SessionId};
 
 const TEST_MESSAGE_BYTES: usize = 64 * 1024;
 const TEST_TRANSPORT_BYTES: usize = 4 * TEST_MESSAGE_BYTES;
 const TEST_BOOTSTRAP_TOKEN: &str = "test-only-flight-bootstrap-token-0001";
+const TEST_ADMIN_BOOTSTRAP_TOKEN: &str = "test-only-flight-admin-token-00000001";
 
 struct FakeFrontend {
     next_generation: AtomicU64,
@@ -48,6 +59,7 @@ struct FakeFrontend {
     expires_after: Duration,
     hang_after_first: bool,
     poll_block: Option<PollBlock>,
+    metadata_payload_bytes: usize,
 }
 
 impl FakeFrontend {
@@ -58,6 +70,7 @@ impl FakeFrontend {
             expires_after,
             hang_after_first,
             poll_block: None,
+            metadata_payload_bytes: 0,
         }
     }
 
@@ -67,6 +80,11 @@ impl FakeFrontend {
         release: Arc<(Mutex<bool>, Condvar)>,
     ) -> Self {
         self.poll_block = Some(PollBlock { started, release });
+        self
+    }
+
+    fn with_metadata_payload_bytes(mut self, metadata_payload_bytes: usize) -> Self {
+        self.metadata_payload_bytes = metadata_payload_bytes;
         self
     }
 }
@@ -118,6 +136,60 @@ impl FlightQueryFrontend for FakeFrontend {
             }) as OpaquePreparedFlightQuery)
         })
     }
+
+    fn prepare_metadata(
+        &self,
+        request: FlightSqlMetadataRequest,
+        limits: FlightSqlMetadataLimits,
+    ) -> BoxFuture<'_, Result<PreparedFlightSqlMetadata>> {
+        let metadata_payload_bytes = self.metadata_payload_bytes;
+        Box::pin(async move {
+            let batch = match request {
+                FlightSqlMetadataRequest::Catalogs(command) => {
+                    let mut builder = command.into_builder();
+                    builder.append("zippy");
+                    builder.build().map_err(metadata_build_error)?
+                }
+                FlightSqlMetadataRequest::DbSchemas(command) => {
+                    let mut builder = command.into_builder();
+                    builder.append("zippy", "default");
+                    builder.build().map_err(metadata_build_error)?
+                }
+                FlightSqlMetadataRequest::Tables(command) => {
+                    let mut builder = command.into_builder();
+                    builder
+                        .append(
+                            "zippy",
+                            "default",
+                            "ticks",
+                            "TABLE",
+                            &Schema::new(vec![Field::new("value", DataType::Int64, false)]),
+                        )
+                        .map_err(metadata_build_error)?;
+                    builder.build().map_err(metadata_build_error)?
+                }
+                FlightSqlMetadataRequest::TableTypes(command) => {
+                    let mut builder = command.into_builder();
+                    let table_type = if metadata_payload_bytes == 0 {
+                        "TABLE".to_owned()
+                    } else {
+                        "T".repeat(metadata_payload_bytes)
+                    };
+                    builder.append(table_type);
+                    builder.build().map_err(metadata_build_error)?
+                }
+            };
+            PreparedFlightSqlMetadata::try_new(7, batch, limits)
+        })
+    }
+}
+
+fn metadata_build_error(error: impl std::fmt::Display) -> ServerError {
+    ServerError::new(
+        ErrorCode::Internal,
+        format!("build test Flight SQL metadata failed error=[{error}]"),
+    )
+    .with_retryable(false)
 }
 
 struct FakePreparedQuery {
@@ -689,6 +761,267 @@ async fn capabilities_and_pending_ticket_capacity_are_enforced() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standard_cancel_is_owner_bound_and_fenced_by_exact_ticket_identity() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::clone(&lease_drops),
+        Duration::from_secs(5),
+        false,
+    ));
+    let config = service_config(4).with_query_control();
+    let (service, mut runtime) = start_frontend_with_config(frontend, config);
+    let owner = SessionId::from_u128(61).unwrap();
+    let mut owner_client = client(&runtime, owner).await;
+    let info = owner_client
+        .get_flight_info(descriptor(owner, QueryId::from_u128(62).unwrap()))
+        .await
+        .unwrap();
+
+    let mut foreign_client = client(&runtime, SessionId::from_u128(63).unwrap()).await;
+    let error = foreign_client
+        .cancel_flight_info(CancelFlightInfoRequest::new(info.clone()))
+        .await
+        .expect_err("a read session cannot cancel another session's query");
+    assert_eq!(flight_error_code(error), ErrorCode::PermissionDenied);
+    assert_eq!(service.status().pending_tickets, 1);
+
+    let mut stale_info = info.clone();
+    let stale_endpoint = &mut stale_info.endpoint[0];
+    let mut stale_ticket = decode_query_ticket(stale_endpoint.ticket.as_ref().unwrap()).unwrap();
+    let mut foreign_instance = stale_ticket.server_instance_id.to_vec();
+    foreign_instance[0] ^= 0xff;
+    stale_ticket.server_instance_id = foreign_instance.into();
+    stale_endpoint.ticket = Some(encode_query_ticket(&stale_ticket));
+    let error = owner_client
+        .cancel_flight_info(CancelFlightInfoRequest::new(stale_info))
+        .await
+        .expect_err("a ticket from another server incarnation is rejected");
+    assert_eq!(flight_error_code(error), ErrorCode::NotFound);
+    assert_eq!(service.status().pending_tickets, 1);
+
+    let mut stale_info = info.clone();
+    let stale_endpoint = &mut stale_info.endpoint[0];
+    let mut stale_ticket = decode_query_ticket(stale_endpoint.ticket.as_ref().unwrap()).unwrap();
+    stale_ticket.generation = stale_ticket.generation.saturating_add(1);
+    stale_endpoint.ticket = Some(encode_query_ticket(&stale_ticket));
+    let error = owner_client
+        .cancel_flight_info(CancelFlightInfoRequest::new(stale_info))
+        .await
+        .expect_err("a different query generation cannot be cancelled through a stale ticket");
+    assert_eq!(flight_error_code(error), ErrorCode::NotFound);
+    assert_eq!(service.status().pending_tickets, 1);
+
+    let result = owner_client
+        .cancel_flight_info(CancelFlightInfoRequest::new(info.clone()))
+        .await
+        .unwrap();
+    assert_eq!(result.status(), CancelStatus::Cancelled);
+    wait_for_count(&lease_drops, 1).await;
+    assert_eq!(service.status().pending_tickets, 0);
+    assert_eq!(service.status().owner_cancellations, 1);
+    let error = owner_client
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .expect_err("a cancelled pending ticket is no longer consumable");
+    assert_eq!(flight_error_code(error), ErrorCode::NotFound);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_administrator_session_can_cancel_an_exact_foreign_query() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::clone(&lease_drops),
+        Duration::from_secs(5),
+        false,
+    ));
+    let auth = FlightBearerAuthConfig::try_new(
+        TEST_BOOTSTRAP_TOKEN.as_bytes(),
+        Duration::from_secs(60),
+        4,
+    )
+    .unwrap()
+    .with_admin_token(TEST_ADMIN_BOOTSTRAP_TOKEN.as_bytes())
+    .unwrap();
+    let config = service_config(4)
+        .with_bearer_auth(auth)
+        .with_query_control();
+    let (service, mut runtime) = start_frontend_with_config(frontend, config);
+    let (mut owner_client, owner, _) = authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
+    let info = owner_client
+        .get_flight_info(descriptor(owner, QueryId::from_u128(72).unwrap()))
+        .await
+        .unwrap();
+    let (mut administrator, administrator_session, _, role) =
+        open_authenticated_client(&runtime, TEST_ADMIN_BOOTSTRAP_TOKEN).await;
+    assert_eq!(role, SessionRole::Administrator);
+    let error = administrator
+        .get_flight_info(descriptor(
+            administrator_session,
+            QueryId::from_u128(73).unwrap(),
+        ))
+        .await
+        .expect_err("administrator sessions are control-only");
+    assert_eq!(flight_error_code(error), ErrorCode::PermissionDenied);
+
+    let result = administrator
+        .cancel_flight_info(CancelFlightInfoRequest::new(info.clone()))
+        .await
+        .unwrap();
+    assert_eq!(result.status(), CancelStatus::Cancelled);
+    wait_for_count(&lease_drops, 1).await;
+    assert_eq!(service.status().active_administrator_sessions, 1);
+    assert_eq!(service.status().administrator_cancellations, 1);
+    assert_eq!(service.status().owner_cancellations, 0);
+    let error = owner_client
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .expect_err("administrator cancellation revokes the owner's pending ticket");
+    assert_eq!(flight_error_code(error), ErrorCode::NotFound);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standard_flight_sql_client_reads_all_supported_metadata_commands() {
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::new(AtomicUsize::new(0)),
+        Duration::from_secs(5),
+        false,
+    ));
+    let limits =
+        FlightSqlMetadataLimits::try_new(16, TEST_MESSAGE_BYTES, Duration::from_secs(5)).unwrap();
+    let config = service_config(8)
+        .with_query_control()
+        .with_sql_metadata(limits);
+    let (service, mut runtime) = start_frontend_with_config(frontend, config);
+    let session = SessionId::from_u128(81).unwrap();
+    let mut capability_client = client(&runtime, session).await;
+    let bodies = capability_client
+        .do_action(Action::new(CAPABILITIES_ACTION, Vec::<u8>::new()))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let capabilities = CapabilitiesResponse::decode(bodies[0].clone()).unwrap();
+    assert!(capabilities
+        .capabilities
+        .iter()
+        .any(|capability| capability == "query.cancel_flight_info.v1"));
+    assert!(capabilities
+        .capabilities
+        .iter()
+        .any(|capability| capability == "flight_sql.metadata.v1"));
+    assert_eq!(capabilities.metadata_max_rows, 16);
+    assert_eq!(
+        capabilities.metadata_max_bytes,
+        u64::try_from(TEST_MESSAGE_BYTES).unwrap()
+    );
+    assert!(!capabilities.administrator_authentication_enabled);
+    let mut sql_client = FlightSqlServiceClient::new(channel(&runtime).await);
+    sql_client.set_header(SESSION_METADATA_KEY, session.to_string());
+
+    let catalogs = sql_client.get_catalogs().await.unwrap();
+    let metadata = MetadataInfo::decode(catalogs.app_metadata.clone()).unwrap();
+    assert_eq!(metadata.catalog_revision, 7);
+    assert!(metadata.expires_at_ns > unix_time_ns());
+    let mut cancel_client = client(&runtime, session).await;
+    let result = cancel_client
+        .cancel_flight_info(CancelFlightInfoRequest::new(catalogs.clone()))
+        .await
+        .unwrap();
+    assert_eq!(result.status(), CancelStatus::NotCancellable);
+    let batches: Vec<RecordBatch> = sql_client
+        .do_get(catalogs.endpoint[0].ticket.clone().unwrap())
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+    let schemas = sql_client
+        .get_db_schemas(CommandGetDbSchemas {
+            catalog: Some("zippy".to_owned()),
+            db_schema_filter_pattern: Some("def%".to_owned()),
+        })
+        .await
+        .unwrap();
+    let tables = sql_client
+        .get_tables(CommandGetTables {
+            catalog: Some("zippy".to_owned()),
+            db_schema_filter_pattern: Some("default".to_owned()),
+            table_name_filter_pattern: Some("tick%".to_owned()),
+            table_types: vec!["TABLE".to_owned()],
+            include_schema: true,
+        })
+        .await
+        .unwrap();
+    let table_types = sql_client.get_table_types().await.unwrap();
+    for info in [schemas, tables, table_types] {
+        let batches: Vec<RecordBatch> = sql_client
+            .do_get(info.endpoint[0].ticket.clone().unwrap())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    }
+    let status = service.status();
+    assert_eq!(status.metadata_tickets_issued, 4);
+    assert_eq!(status.metadata_tickets_consumed, 4);
+    assert_eq!(status.pending_tickets, 0);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_metadata_tickets_share_the_transport_byte_budget() {
+    let frontend = Arc::new(
+        FakeFrontend::new(Arc::new(AtomicUsize::new(0)), Duration::from_secs(5), false)
+            .with_metadata_payload_bytes(40 * 1024),
+    );
+    let limits =
+        FlightSqlMetadataLimits::try_new(4, TEST_MESSAGE_BYTES, Duration::from_secs(5)).unwrap();
+    let config =
+        FlightServiceConfig::try_new("test-0.5.0", TEST_MESSAGE_BYTES, 4, TEST_MESSAGE_BYTES)
+            .unwrap()
+            .with_sql_metadata(limits);
+    let (service, mut runtime) = start_frontend_with_config(frontend, config);
+    let session = SessionId::from_u128(91).unwrap();
+    let mut client = client(&runtime, session).await;
+    let descriptor =
+        arrow_flight::FlightDescriptor::new_cmd(CommandGetTableTypes {}.as_any().encode_to_vec());
+    let first = client.get_flight_info(descriptor.clone()).await.unwrap();
+    assert_eq!(
+        service.status().transport_buffer_bytes_capacity,
+        TEST_MESSAGE_BYTES
+    );
+    assert!(service.status().transport_buffer_bytes_in_use > 0);
+    let error = client
+        .get_flight_info(descriptor.clone())
+        .await
+        .expect_err("two retained metadata batches exceed the shared byte budget");
+    assert_eq!(flight_error_code(error), ErrorCode::ResourceExhausted);
+
+    let batches: Vec<RecordBatch> = client
+        .do_get(first.endpoint[0].ticket.clone().unwrap())
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(service.status().transport_buffer_bytes_in_use, 0);
+    let reopened = client
+        .get_flight_info(descriptor)
+        .await
+        .expect("consuming metadata returns its retained byte permit");
+    assert_eq!(reopened.endpoint.len(), 1);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_client_stream_releases_hanging_query() {
     let lease_drops = Arc::new(AtomicUsize::new(0));
     let (_service, mut runtime) =
@@ -779,7 +1112,13 @@ fn start_frontend(
     frontend: Arc<dyn FlightQueryFrontend>,
     max_pending_tickets: usize,
 ) -> (ZippyFlightService, FlightServerRuntime) {
-    let config = service_config(max_pending_tickets);
+    start_frontend_with_config(frontend, service_config(max_pending_tickets))
+}
+
+fn start_frontend_with_config(
+    frontend: Arc<dyn FlightQueryFrontend>,
+    config: FlightServiceConfig,
+) -> (ZippyFlightService, FlightServerRuntime) {
     let service = ZippyFlightService::try_new(config, frontend).unwrap();
     let runtime = FlightServerRuntime::start(
         "127.0.0.1:0".parse().unwrap(),
@@ -931,6 +1270,16 @@ async fn authenticated_client(
     runtime: &FlightServerRuntime,
     bootstrap_token: &str,
 ) -> (FlightClient, SessionId, String) {
+    let (client, session_id, bearer_token, role) =
+        open_authenticated_client(runtime, bootstrap_token).await;
+    assert_eq!(role, SessionRole::Read);
+    (client, session_id, bearer_token)
+}
+
+async fn open_authenticated_client(
+    runtime: &FlightServerRuntime,
+    bootstrap_token: &str,
+) -> (FlightClient, SessionId, String, SessionRole) {
     let mut client = raw_client(runtime).await;
     client
         .add_header(
@@ -949,6 +1298,7 @@ async fn authenticated_client(
         .unwrap();
     let opened = SessionOpenResponse::decode(payload).unwrap();
     assert_eq!(opened.protocol_version, CURRENT_PROTOCOL_VERSION);
+    let role = SessionRole::try_from(opened.role).unwrap();
     let session_id = SessionId::from_bytes(opened.session_id.as_ref().try_into().unwrap()).unwrap();
     client
         .add_header(
@@ -956,16 +1306,19 @@ async fn authenticated_client(
             &format!("Bearer {}", opened.bearer_token),
         )
         .unwrap();
-    (client, session_id, opened.bearer_token)
+    (client, session_id, opened.bearer_token, role)
 }
 
 async fn raw_client(runtime: &FlightServerRuntime) -> FlightClient {
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", runtime.endpoint()))
+    FlightClient::new(channel(runtime).await)
+}
+
+async fn channel(runtime: &FlightServerRuntime) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://{}", runtime.endpoint()))
         .unwrap()
         .connect()
         .await
-        .unwrap();
-    FlightClient::new(channel)
+        .unwrap()
 }
 
 async fn client(runtime: &FlightServerRuntime, session: SessionId) -> FlightClient {

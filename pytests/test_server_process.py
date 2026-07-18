@@ -41,7 +41,7 @@ def _unused_gateway_endpoint() -> str:
 
 def _valid_ready_record() -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 5,
         "status": "ready",
         "health": {
             "readiness": {
@@ -50,6 +50,9 @@ def _valid_ready_record() -> dict[str, object]:
                 "gateway_configured": True,
                 "gateway_listener_ready": True,
                 "gateway_master_reachable": True,
+                "flight_configured": False,
+                "flight_listener_ready": False,
+                "flight_protocol_ready": False,
                 "native_storage_configured": True,
                 "native_catalog_ready": True,
                 "native_current_snapshot_files_ready": True,
@@ -467,12 +470,62 @@ def test_server_ready_record_requires_boolean_gateway_configuration(value: objec
         _validate_ready_record(record)
 
 
+@pytest.mark.parametrize("value", [None, "true"])
+def test_server_ready_record_requires_boolean_flight_configuration(value: object) -> None:
+    record = _valid_ready_record()
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    readiness["flight_configured"] = value
+
+    with pytest.raises(_ServerProcessError, match="invalid Flight configuration"):
+        _validate_ready_record(record)
+
+
+def test_server_ready_record_requires_configured_flight_listener_and_protocol() -> None:
+    record = _valid_ready_record()
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    readiness["flight_configured"] = True
+
+    with pytest.raises(_ServerProcessError, match="did not satisfy full readiness"):
+        _validate_ready_record(record)
+
+    readiness["flight_listener_ready"] = True
+    readiness["flight_protocol_ready"] = True
+    _validate_ready_record(record)
+
+
 def test_server_ready_record_rejects_previous_schema_version() -> None:
     record = _valid_ready_record()
     record["schema_version"] = 1
 
     with pytest.raises(_ServerProcessError, match="unsupported ready schema"):
         _validate_ready_record(record)
+
+
+def test_server_ready_record_accepts_previous_rolling_upgrade_schema() -> None:
+    record = _valid_ready_record()
+    record["schema_version"] = 4
+
+    _validate_ready_record(record)
+
+
+def test_server_ready_record_accepts_pre_flight_schema_without_flight_facts() -> None:
+    record = _valid_ready_record()
+    record["schema_version"] = 2
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    readiness.pop("flight_configured")
+    readiness.pop("flight_listener_ready")
+    readiness.pop("flight_protocol_ready")
+
+    _validate_ready_record(record)
 
 
 def test_server_status_normalizes_ready_v1_without_mutating_authoritative_state() -> None:
@@ -548,7 +601,7 @@ def test_server_status_rejects_generation_change_during_health_probe(
         log_dir=tmp_path / "logs",
     )
     state: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 5,
         "status": "ready",
         "launch_nonce": "old-generation",
         "pid": 43001,

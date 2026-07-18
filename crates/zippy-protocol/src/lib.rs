@@ -12,6 +12,7 @@ pub mod error;
 pub mod query;
 pub mod runtime;
 pub mod server;
+pub mod sql;
 
 /// Generated protobuf-compatible wire structures for protocol version 1.
 ///

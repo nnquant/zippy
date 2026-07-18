@@ -71,8 +71,13 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_FLIGHT_AUTH_ENABLED",
     "ZIPPY_FLIGHT_AUTH_TOKEN_FILE",
     "ZIPPY_FLIGHT_AUTH_TOKEN",
+    "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN_FILE",
+    "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN",
     "ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS",
     "ZIPPY_FLIGHT_AUTH_MAX_SESSIONS",
+    "ZIPPY_FLIGHT_METADATA_MAX_ROWS",
+    "ZIPPY_FLIGHT_METADATA_MAX_BYTES",
+    "ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS",
     "ZIPPY_MASTER_HOST",
     "ZIPPY_MASTER_PORT",
     "ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS",
@@ -1699,7 +1704,129 @@ session_ttl_ms = 29999
 
     assert!(error
         .to_string()
-        .contains("session_ttl_ms must cover query plan_ttl_ms"));
+        .contains("session_ttl_ms must cover query plan and metadata ticket TTLs"));
+}
+
+#[test]
+fn zippy_config_loads_distinct_admin_auth_and_metadata_environment_limits() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+
+[flight.auth]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let read_token = "test-only-flight-bootstrap-token-0001";
+    let admin_token = "test-only-flight-admin-token-00000001";
+
+    let config = with_env(
+        &[
+            ("ZIPPY_FLIGHT_AUTH_TOKEN", read_token),
+            ("ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN", admin_token),
+            ("ZIPPY_FLIGHT_METADATA_MAX_ROWS", "512"),
+            ("ZIPPY_FLIGHT_METADATA_MAX_BYTES", "1048576"),
+            ("ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS", "15000"),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap();
+
+    assert_eq!(config.flight.auth.bootstrap_token(), Some(read_token));
+    assert_eq!(
+        config.flight.auth.admin_bootstrap_token(),
+        Some(admin_token)
+    );
+    assert_eq!(config.flight.metadata.max_rows, 512);
+    assert_eq!(config.flight.metadata.max_bytes, 1_048_576);
+    assert_eq!(config.flight.metadata.ticket_ttl_ms, 15_000);
+    let debug = format!("{config:?}");
+    let json = config.to_json_value().to_string();
+    assert!(!debug.contains(read_token));
+    assert!(!debug.contains(admin_token));
+    assert!(!json.contains(read_token));
+    assert!(!json.contains(admin_token));
+}
+
+#[test]
+fn zippy_config_rejects_identical_read_and_admin_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[flight.auth]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let token = "test-only-flight-bootstrap-token-0001";
+
+    let error = with_env(
+        &[
+            ("ZIPPY_FLIGHT_AUTH_TOKEN", token),
+            ("ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN", token),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("read and administrator bootstrap tokens must be distinct"));
+}
+
+#[test]
+fn zippy_config_rejects_metadata_result_larger_than_shared_transport_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[runtime]
+max_query_buffer_bytes = 1048576
+
+[query]
+native_enabled = true
+max_buffered_bytes = 1048576
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+max_message_bytes = 1048576
+
+[flight.metadata]
+max_bytes = 2097152
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("metadata max_bytes must not exceed the shared transport budget"));
 }
 
 #[test]

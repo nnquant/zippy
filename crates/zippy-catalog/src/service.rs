@@ -803,6 +803,26 @@ impl CatalogFileRead for SqliteCatalog {
 }
 
 impl SqliteCatalogReadHandle {
+    /// Reads exact schemas in one bounded Catalog transaction without loading file manifests.
+    pub async fn read_schemas_at_with_limits(
+        &self,
+        selectors: &[snapshot_domain::SqliteCatalogSchemaSelector],
+        limits: snapshot_domain::SqliteCatalogSchemaReadLimits,
+    ) -> Result<snapshot_domain::SqliteCatalogSchemaSnapshot> {
+        snapshot_domain::validate_schema_selectors(selectors)?;
+        let limits = limits.validate()?;
+        let selectors = selectors.to_vec();
+        await_response(
+            self.endpoint
+                .control_request(|response| ControlReadMessage::ReadSchemas {
+                    selectors,
+                    limits,
+                    response,
+                }),
+        )
+        .await
+    }
+
     /// Returns query snapshot pin gauges, limits, and cumulative rejections.
     ///
     /// A Catalog that has begun shutdown but still has retained pin guards returns a status with
@@ -1783,6 +1803,15 @@ trait CatalogReadBackend: Send + Sync + 'static {
         table_domain::list_tables(connection, request)
     }
 
+    fn read_schemas(
+        &self,
+        connection: &mut Connection,
+        selectors: &[snapshot_domain::SqliteCatalogSchemaSelector],
+        limits: snapshot_domain::SqliteCatalogSchemaReadLimits,
+    ) -> Result<snapshot_domain::SqliteCatalogSchemaSnapshot> {
+        snapshot_domain::read_schemas_at_with_limits(connection, selectors, limits)
+    }
+
     fn resolve_tables(
         &self,
         connection: &mut Connection,
@@ -1915,6 +1944,11 @@ enum ControlReadMessage {
         ListTablesRequest,
         oneshot::Sender<Result<ListTablesResponse>>,
     ),
+    ReadSchemas {
+        selectors: Vec<snapshot_domain::SqliteCatalogSchemaSelector>,
+        limits: snapshot_domain::SqliteCatalogSchemaReadLimits,
+        response: oneshot::Sender<Result<snapshot_domain::SqliteCatalogSchemaSnapshot>>,
+    },
     ResolveTables(ResolveTablesRequest),
     InspectFiles(
         Vec<ManagedDataFileProbe>,
@@ -2318,6 +2352,16 @@ fn control_read_loop(
             ControlReadMessage::ListTables(request, response) => {
                 if !response.is_closed() {
                     let _ = response.send(backend.list_tables(&mut connection, request));
+                }
+            }
+            ControlReadMessage::ReadSchemas {
+                selectors,
+                limits,
+                response,
+            } => {
+                if !response.is_closed() {
+                    let _ =
+                        response.send(backend.read_schemas(&mut connection, &selectors, limits));
                 }
             }
             ControlReadMessage::ResolveTables(request) => {

@@ -11,6 +11,13 @@ message SessionOpenResponse {
   bytes session_id = 2;
   string bearer_token = 3;
   uint64 expires_at_ns = 4;
+  SessionRole role = 5;
+}
+
+enum SessionRole {
+  SESSION_ROLE_UNSPECIFIED = 0;
+  SESSION_ROLE_READ = 1;
+  SESSION_ROLE_ADMINISTRATOR = 2;
 }
 
 message QueryCommand {
@@ -64,6 +71,20 @@ message QueryTicket {
   bytes query_id = 4;
   uint64 generation = 5;
   uint64 expires_at_ns = 6;
+}
+
+message MetadataTicket {
+  uint32 protocol_version = 1;
+  bytes server_instance_id = 2;
+  bytes ticket_id = 3;
+  uint64 catalog_revision = 4;
+  uint64 expires_at_ns = 5;
+}
+
+message MetadataInfo {
+  uint32 protocol_version = 1;
+  uint64 catalog_revision = 2;
+  uint64 expires_at_ns = 3;
 }
 
 message QueryInfo {
@@ -158,4 +179,7 @@ message CapabilitiesResponse {
   uint64 max_pending_tickets = 5;
   bool authentication_required = 6;
   uint64 session_ttl_ms = 7;
+  bool administrator_authentication_enabled = 8;
+  uint64 metadata_max_rows = 9;
+  uint64 metadata_max_bytes = 10;
 }

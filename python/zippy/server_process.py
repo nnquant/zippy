@@ -31,7 +31,8 @@ if os.name == "posix":
 
 
 _STATE_SCHEMA_VERSION = 1
-_READY_SCHEMA_VERSION = 2
+_READY_SCHEMA_VERSION = 5
+_SUPPORTED_READY_SCHEMA_VERSIONS = frozenset({2, 3, 4, _READY_SCHEMA_VERSION})
 _SERVER_ERROR_CODES = frozenset(
     {
         "INVALID_ARGUMENT",
@@ -435,7 +436,7 @@ def _wait_for_ready(
 
 
 def _validate_ready_record(record: dict[str, object]) -> None:
-    if record.get("schema_version") != _READY_SCHEMA_VERSION:
+    if record.get("schema_version") not in _SUPPORTED_READY_SCHEMA_VERSIONS:
         raise _ServerProcessError("native server returned an unsupported ready schema")
     health = record.get("health")
     if not isinstance(health, dict):
@@ -448,6 +449,14 @@ def _validate_ready_record(record: dict[str, object]) -> None:
     if not isinstance(gateway_configured, bool):
         raise _ServerProcessError(
             "native server ready record has invalid gateway configuration fact"
+        )
+    schema_version = record.get("schema_version")
+    flight_configured = facts.get("flight_configured")
+    if schema_version == 2 and flight_configured is None:
+        flight_configured = False
+    if not isinstance(flight_configured, bool):
+        raise _ServerProcessError(
+            "native server ready record has invalid Flight configuration fact"
         )
     native_storage_configured = facts.get("native_storage_configured")
     if not isinstance(native_storage_configured, bool):
@@ -469,6 +478,13 @@ def _validate_ready_record(record: dict[str, object]) -> None:
             or (
                 facts.get("gateway_listener_ready") is True
                 and facts.get("gateway_master_reachable") is True
+            )
+        )
+        and (
+            not flight_configured
+            or (
+                facts.get("flight_listener_ready") is True
+                and facts.get("flight_protocol_ready") is True
             )
         )
     )
@@ -502,6 +518,9 @@ def _ready_record_for_status_validation(record: dict[str, object]) -> dict[str, 
             "native_current_snapshot_files_ready": False,
             "storage_reconciliation_complete": False,
             "commit_recovery_complete": False,
+            "flight_configured": False,
+            "flight_listener_ready": False,
+            "flight_protocol_ready": False,
         }
     )
     compatibility_health = dict(health)
@@ -1018,7 +1037,7 @@ def _state_for_endpoint(
         return paths, None
     schema_version = state.get("schema_version")
     schema_supported = (
-        schema_version in {1, _READY_SCHEMA_VERSION}
+        schema_version in ({1} | _SUPPORTED_READY_SCHEMA_VERSIONS)
         if state.get("status") == "ready"
         else schema_version == _STATE_SCHEMA_VERSION
     )
@@ -1081,7 +1100,7 @@ def _generation_still_owned(
     expected_identity = _launcher_from_state(state).get("process_identity")
     if (
         latest.get("schema_version") != state.get("schema_version")
-        or latest.get("schema_version") not in {1, _READY_SCHEMA_VERSION}
+        or latest.get("schema_version") not in ({1} | _SUPPORTED_READY_SCHEMA_VERSIONS)
         or latest.get("status") != "ready"
         or latest.get("pid") != pid
         or latest.get("launch_nonce") != state.get("launch_nonce")

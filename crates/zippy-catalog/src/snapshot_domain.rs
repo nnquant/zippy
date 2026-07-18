@@ -27,6 +27,7 @@ const MAX_VISIBLE_FILES: usize = 65_536;
 const MAX_SOURCE_LINEAGE_ROWS: usize = 262_144;
 const LINEAGE_QUERY_CHUNK_SIZE: usize = 512;
 const MAX_SNAPSHOT_RAW_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_SCHEMA_RAW_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_RAW_DECODE_EXPANSION: usize = 32;
 const SNAPSHOT_SCHEMA_DECODE_TRANSIENT_BYTES: usize =
     crate::PERSISTED_SCHEMA_DECODE_TRANSIENT_BYTES;
@@ -95,6 +96,102 @@ pub struct SqliteCatalogSnapshotReadLimits {
     pub max_source_lineage_rows: usize,
     /// Maximum raw SQLite bytes copied into the owned snapshot response.
     pub max_raw_response_bytes: usize,
+}
+
+/// One exact table schema requested from the lightweight Catalog metadata reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SqliteCatalogSchemaSelector {
+    table_id: TableId,
+    schema_version: u64,
+}
+
+impl SqliteCatalogSchemaSelector {
+    /// Creates one exact nonzero schema selector.
+    pub fn try_new(table_id: TableId, schema_version: u64) -> Result<Self> {
+        if schema_version == 0 {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "catalog schema selector version must be nonzero",
+            )
+            .with_retryable(false));
+        }
+        Ok(Self {
+            table_id,
+            schema_version,
+        })
+    }
+
+    /// Returns the immutable table identity.
+    #[must_use]
+    pub const fn table_id(self) -> TableId {
+        self.table_id
+    }
+
+    /// Returns the selected schema version.
+    #[must_use]
+    pub const fn schema_version(self) -> u64 {
+        self.schema_version
+    }
+}
+
+/// Per-request raw-byte bound for lightweight exact schema reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteCatalogSchemaReadLimits {
+    /// Maximum raw SQLite bytes copied into the response.
+    pub max_raw_response_bytes: usize,
+}
+
+impl Default for SqliteCatalogSchemaReadLimits {
+    fn default() -> Self {
+        Self {
+            max_raw_response_bytes: DEFAULT_SCHEMA_RAW_RESPONSE_BYTES,
+        }
+    }
+}
+
+impl SqliteCatalogSchemaReadLimits {
+    pub(crate) fn validate(self) -> Result<Self> {
+        if self.max_raw_response_bytes == 0
+            || self.max_raw_response_bytes > MAX_SNAPSHOT_RAW_RESPONSE_BYTES
+        {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "catalog schema read byte limit must be between 1 and {} value=[{}]",
+                    MAX_SNAPSHOT_RAW_RESPONSE_BYTES, self.max_raw_response_bytes
+                ),
+            )
+            .with_retryable(false));
+        }
+        Ok(self)
+    }
+}
+
+/// One revision-consistent batch of exact table schemas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteCatalogSchemaSnapshot {
+    catalog_revision: u64,
+    schemas: Vec<SchemaDescriptor>,
+}
+
+impl SqliteCatalogSchemaSnapshot {
+    /// Returns the Catalog revision observed by the read transaction.
+    #[must_use]
+    pub const fn catalog_revision(&self) -> u64 {
+        self.catalog_revision
+    }
+
+    /// Returns schemas in the same strict table-id order as the selectors.
+    #[must_use]
+    pub fn schemas(&self) -> &[SchemaDescriptor] {
+        &self.schemas
+    }
+
+    /// Consumes the snapshot and returns its schema descriptors.
+    #[must_use]
+    pub fn into_schemas(self) -> Vec<SchemaDescriptor> {
+        self.schemas
+    }
 }
 
 impl Default for SqliteCatalogSnapshotReadLimits {
@@ -395,6 +492,72 @@ pub(crate) fn read_snapshot_at(
     )
 }
 
+pub(crate) fn read_schemas_at_with_limits(
+    connection: &mut Connection,
+    selectors: &[SqliteCatalogSchemaSelector],
+    limits: SqliteCatalogSchemaReadLimits,
+) -> Result<SqliteCatalogSchemaSnapshot> {
+    validate_schema_selectors(selectors)?;
+    let limits = limits.validate()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|error| crate::map_sqlite_error("begin catalog schema read", error))?;
+    let catalog_revision = crate::domain::revision(&transaction)?;
+    let mut budget = SnapshotReadBudget {
+        raw_bytes: 0,
+        files: 0,
+        lineage_rows: 0,
+        limits: SqliteCatalogSnapshotReadLimits {
+            max_visible_files: 1,
+            max_source_lineage_rows: 1,
+            max_raw_response_bytes: limits.max_raw_response_bytes,
+        },
+    };
+    let schemas = selectors
+        .iter()
+        .map(|selector| {
+            read_schema(
+                &transaction,
+                selector.table_id,
+                selector.schema_version,
+                &mut budget,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    transaction
+        .commit()
+        .map_err(|error| crate::map_sqlite_error("commit catalog schema read", error))?;
+    Ok(SqliteCatalogSchemaSnapshot {
+        catalog_revision,
+        schemas,
+    })
+}
+
+pub(crate) fn validate_schema_selectors(selectors: &[SqliteCatalogSchemaSelector]) -> Result<()> {
+    if selectors.len() > MAX_SNAPSHOT_SELECTORS {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "catalog schema selector count exceeds maximum actual=[{}] maximum=[{}]",
+                selectors.len(),
+                MAX_SNAPSHOT_SELECTORS
+            ),
+        )
+        .with_retryable(false));
+    }
+    if selectors
+        .windows(2)
+        .any(|pair| pair[0].table_id >= pair[1].table_id)
+    {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "catalog schema selectors must use strict table-id order without duplicates",
+        )
+        .with_retryable(false));
+    }
+    Ok(())
+}
+
 pub(crate) fn read_snapshot_at_with_limits(
     connection: &mut Connection,
     selectors: &[CatalogSnapshotSelector],
@@ -418,7 +581,12 @@ pub(crate) fn read_snapshot_at_with_limits(
     for selector in selectors {
         let table = read_table(&transaction, selector.table_id, &mut budget)?;
         validate_selector_bounds(selector, &table)?;
-        let schema = read_schema(&transaction, selector, &mut budget)?;
+        let schema = read_schema(
+            &transaction,
+            selector.table_id,
+            selector.schema_version,
+            &mut budget,
+        )?;
         let snapshot = read_snapshot(&transaction, selector, catalog_revision, &mut budget)?;
         ensure_snapshot_files_readable(&transaction, selector)?;
         let mut files = read_visible_files(&transaction, selector, &mut budget)?;
@@ -562,16 +730,20 @@ fn validate_selector_bounds(
 
 fn read_schema(
     connection: &Connection,
-    selector: &CatalogSnapshotSelector,
+    table_id: TableId,
+    schema_version: u64,
     budget: &mut SnapshotReadBudget,
 ) -> Result<SchemaDescriptor> {
-    let table_id = selector.table_id.into_bytes();
-    let schema_version = selector.schema_version.to_be_bytes();
+    let encoded_table_id = table_id.into_bytes();
+    let encoded_schema_version = schema_version.to_be_bytes();
     let mut statement = connection
         .prepare_cached(GET_SCHEMA_SQL)
         .map_err(|error| crate::map_sqlite_error("prepare exact catalog schema", error))?;
     let mut rows = statement
-        .query([table_id.as_slice(), schema_version.as_slice()])
+        .query([
+            encoded_table_id.as_slice(),
+            encoded_schema_version.as_slice(),
+        ])
         .map_err(|error| crate::map_sqlite_error("query exact catalog schema", error))?;
     let row = rows
         .next()
@@ -600,7 +772,7 @@ fn read_schema(
 
     let decoded_table_id = decode_table_id(raw_table_id, "catalog schema table id")?;
     let decoded_version = decode_u64(&raw_schema_version)?;
-    if decoded_table_id != selector.table_id || decoded_version != selector.schema_version {
+    if decoded_table_id != table_id || decoded_version != schema_version {
         return Err(corruption(
             "exact catalog schema identity does not match selector",
         ));
@@ -1566,9 +1738,10 @@ mod tests {
     };
 
     use super::{
-        checked_peak_add, checked_peak_mul, read_snapshot_at, SqliteCatalogSnapshotReadLimits,
-        GET_VISIBLE_FILES_SQL, MAX_SNAPSHOT_RAW_RESPONSE_BYTES, MAX_SNAPSHOT_SELECTORS,
-        MAX_SOURCE_LINEAGE_ROWS, MAX_VISIBLE_FILES,
+        checked_peak_add, checked_peak_mul, read_schemas_at_with_limits, read_snapshot_at,
+        SqliteCatalogSchemaReadLimits, SqliteCatalogSchemaSelector,
+        SqliteCatalogSnapshotReadLimits, GET_VISIBLE_FILES_SQL, MAX_SNAPSHOT_RAW_RESPONSE_BYTES,
+        MAX_SNAPSHOT_SELECTORS, MAX_SOURCE_LINEAGE_ROWS, MAX_VISIBLE_FILES,
     };
     use crate::encoding::{encode_offset_watermark, encode_optional_u64, encode_u64};
     use crate::storage_codec::{
@@ -1854,6 +2027,63 @@ mod tests {
         let addition = checked_peak_add(usize::MAX, 1, "test")
             .expect_err("addition overflow must fail closed");
         assert_eq!(addition.code(), ErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn lightweight_schema_reader_is_revision_fixed_and_skips_file_manifests() {
+        let (mut connection, selected) = migrated_catalog();
+        insert_file(
+            &connection,
+            99,
+            1,
+            TestFileKind::Native,
+            Some((0, 0)),
+            vec![0xff],
+        );
+        let selector =
+            SqliteCatalogSchemaSelector::try_new(selected.table_id, selected.schema_version)
+                .unwrap();
+
+        let snapshot = read_schemas_at_with_limits(
+            &mut connection,
+            &[selector],
+            SqliteCatalogSchemaReadLimits::default(),
+        )
+        .expect("schema-only read does not decode malformed file metadata");
+
+        assert_eq!(snapshot.catalog_revision(), 2);
+        assert_eq!(snapshot.schemas().len(), 1);
+        assert_eq!(snapshot.schemas()[0].table_id, selected.table_id);
+        assert_eq!(
+            snapshot.schemas()[0].schema_version,
+            selected.schema_version
+        );
+        assert_eq!(snapshot.schemas()[0].schema_ipc, schema_ipc());
+    }
+
+    #[test]
+    fn lightweight_schema_reader_enforces_order_and_raw_byte_budget() {
+        let (mut connection, selected) = migrated_catalog();
+        let selector =
+            SqliteCatalogSchemaSelector::try_new(selected.table_id, selected.schema_version)
+                .unwrap();
+        let duplicate_error = read_schemas_at_with_limits(
+            &mut connection,
+            &[selector, selector],
+            SqliteCatalogSchemaReadLimits::default(),
+        )
+        .expect_err("duplicate selectors must fail before SQLite work");
+        assert_eq!(duplicate_error.code(), ErrorCode::InvalidArgument);
+
+        let budget_error = read_schemas_at_with_limits(
+            &mut connection,
+            &[selector],
+            SqliteCatalogSchemaReadLimits {
+                max_raw_response_bytes: 1,
+            },
+        )
+        .expect_err("schema payload must respect the exact raw-byte budget");
+        assert_eq!(budget_error.code(), ErrorCode::ResourceExhausted);
     }
 
     #[test]

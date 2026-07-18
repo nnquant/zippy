@@ -12,11 +12,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::Int64Array;
+use arrow::array::{BinaryArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::error::FlightError;
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_flight::sql::CommandGetTables;
 use arrow_flight::FlightClient;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
@@ -37,7 +39,9 @@ use zippy_protocol::error::status_to_server_error;
 use zippy_protocol::query::{
     encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
 };
-use zippy_protocol::wire::{QueryInfo, SessionOpenRequest, SessionOpenResponse};
+use zippy_protocol::wire::{
+    MetadataInfo, QueryInfo, SessionOpenRequest, SessionOpenResponse, SessionRole,
+};
 use zippy_protocol::{AUTHORIZATION_METADATA_KEY, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY};
 use zippy_server::{
     LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationState,
@@ -961,7 +965,7 @@ async fn flight_only_runtime_streams_real_native_snapshot_and_releases_ticket() 
         .unwrap();
     let session_id = SessionId::from_u128(2_001).unwrap();
     let query_id = QueryId::from_u128(2_002).unwrap();
-    let mut client = FlightClient::new(channel);
+    let mut client = FlightClient::new(channel.clone());
     client
         .add_header(SESSION_METADATA_KEY, &session_id.to_string())
         .unwrap();
@@ -1029,8 +1033,50 @@ async fn flight_only_runtime_streams_real_native_snapshot_and_releases_ticket() 
         other => panic!("expected structured Flight status, got {other}"),
     };
     assert_eq!(status_to_server_error(&status).code(), ErrorCode::NotFound);
+
+    let mut sql_client = FlightSqlServiceClient::new(channel);
+    sql_client.set_header(SESSION_METADATA_KEY, session_id.to_string());
+    let table_info = sql_client
+        .get_tables(CommandGetTables {
+            catalog: Some("zippy".to_owned()),
+            db_schema_filter_pattern: Some("default".to_owned()),
+            table_name_filter_pattern: Some("events".to_owned()),
+            table_types: vec!["TABLE".to_owned()],
+            include_schema: true,
+        })
+        .await
+        .expect("standard Flight SQL GetTables prepares Catalog metadata");
+    let metadata = MetadataInfo::decode(table_info.app_metadata.clone()).unwrap();
+    assert_eq!(metadata.catalog_revision, query_info.catalog_revision);
+    let table_batches: Vec<RecordBatch> = sql_client
+        .do_get(table_info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .expect("Flight SQL metadata DoGet starts")
+        .try_collect()
+        .await
+        .expect("Flight SQL metadata batches decode");
+    assert_eq!(table_batches.len(), 1);
+    assert_eq!(table_batches[0].num_rows(), 1);
+    let table_names = table_batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(table_names.value(0), "events");
+    let table_schemas = table_batches[0]
+        .column(4)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert!(!table_schemas.value(0).is_empty());
+
     assert_eq!(runtime.flight_status().unwrap().pending_tickets, 0);
-    assert_eq!(runtime.flight_status().unwrap().consumed_tickets, 1);
+    assert_eq!(runtime.flight_status().unwrap().consumed_tickets, 2);
+    assert_eq!(runtime.flight_status().unwrap().metadata_tickets_issued, 1);
+    assert_eq!(
+        runtime.flight_status().unwrap().metadata_tickets_consumed,
+        1
+    );
     assert_eq!(
         runtime
             .native_query_engine()
@@ -1080,6 +1126,7 @@ async fn server_runtime_loads_protected_credentials_and_issues_tls_flight_sessio
     let cert_path = temp.path().join("flight-server.pem");
     let key_path = temp.path().join("flight-server.key");
     let token_path = temp.path().join("flight.token");
+    let admin_token_path = temp.path().join("flight-admin.token");
     fs::write(
         &cert_path,
         format!("{}{ca_pem}", server.serialize_pem_with_signer(&ca).unwrap()),
@@ -1087,8 +1134,10 @@ async fn server_runtime_loads_protected_credentials_and_issues_tls_flight_sessio
     .unwrap();
     fs::write(&key_path, server.serialize_private_key_pem()).unwrap();
     fs::write(&token_path, "test-only-flight-bootstrap-token-0001\n").unwrap();
+    fs::write(&admin_token_path, "test-only-flight-admin-token-00000001\n").unwrap();
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&admin_token_path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let mut source = fs::read_to_string(config_path).unwrap();
     source.push_str(&format!(
@@ -1100,12 +1149,14 @@ async fn server_runtime_loads_protected_credentials_and_issues_tls_flight_sessio
             "[flight.auth]\n",
             "enabled = true\n",
             "token_file = {:?}\n",
+            "admin_token_file = {:?}\n",
             "session_ttl_ms = 60000\n",
             "max_sessions = 8\n"
         ),
         cert_path.display().to_string(),
         key_path.display().to_string(),
         token_path.display().to_string(),
+        admin_token_path.display().to_string(),
     ));
     fs::write(config_path, source).unwrap();
 
@@ -1133,7 +1184,7 @@ async fn server_runtime_loads_protected_credentials_and_issues_tls_flight_sessio
     .connect()
     .await
     .unwrap();
-    let mut client = FlightClient::new(channel);
+    let mut client = FlightClient::new(channel.clone());
     client
         .add_header(
             AUTHORIZATION_METADATA_KEY,
@@ -1151,9 +1202,41 @@ async fn server_runtime_loads_protected_credentials_and_issues_tls_flight_sessio
         .unwrap();
     let opened = SessionOpenResponse::decode(response).unwrap();
     assert_eq!(opened.protocol_version, CURRENT_PROTOCOL_VERSION);
+    assert_eq!(
+        SessionRole::try_from(opened.role).unwrap(),
+        SessionRole::Read
+    );
     assert!(SessionId::from_bytes(opened.session_id.as_ref().try_into().unwrap()).is_ok());
     assert!(opened.bearer_token.starts_with("zfs1_"));
-    assert_eq!(runtime.flight_status().unwrap().active_sessions, 1);
+    let mut administrator = FlightClient::new(channel);
+    administrator
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            "Bearer test-only-flight-admin-token-00000001",
+        )
+        .unwrap();
+    let response = administrator
+        .handshake(
+            SessionOpenRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+    let opened = SessionOpenResponse::decode(response).unwrap();
+    assert_eq!(
+        SessionRole::try_from(opened.role).unwrap(),
+        SessionRole::Administrator
+    );
+    assert_eq!(runtime.flight_status().unwrap().active_sessions, 2);
+    assert_eq!(
+        runtime
+            .flight_status()
+            .unwrap()
+            .active_administrator_sessions,
+        1
+    );
 
     assert!(runtime.shutdown().is_clean());
     wait_until_bindable(flight_addr);

@@ -37,11 +37,38 @@ pub(crate) fn load_flight_security(
             }
         };
         strip_one_line_ending(&mut token);
-        Some(FlightBearerAuthConfig::try_new(
+        let auth_result = FlightBearerAuthConfig::try_new(
             &token,
             Duration::from_millis(config.auth.session_ttl_ms),
             config.auth.max_sessions,
-        )?)
+        );
+        token.fill(0);
+        let mut auth = auth_result?;
+        let mut admin_token = match (
+            config.auth.admin_bootstrap_token(),
+            config.auth.admin_token_file.as_deref(),
+        ) {
+            (Some(token), None) => Some(token.as_bytes().to_vec()),
+            (None, Some(path)) => Some(read_bounded_file(
+                path,
+                MAX_BOOTSTRAP_TOKEN_BYTES,
+                true,
+                "administrator bootstrap token",
+            )?),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "validated Flight auth has multiple administrator credential sources",
+                ));
+            }
+        };
+        if let Some(admin_token) = admin_token.as_mut() {
+            strip_one_line_ending(admin_token);
+            let admin_result = auth.with_admin_token(admin_token);
+            admin_token.fill(0);
+            auth = admin_result?;
+        }
+        Some(auth)
     } else {
         None
     };

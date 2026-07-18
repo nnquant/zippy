@@ -16,6 +16,16 @@ pub struct SessionOpenResponse {
     pub bearer_token: ::prost::alloc::string::String,
     #[prost(uint64, tag = "4")]
     pub expires_at_ns: u64,
+    #[prost(enumeration = "SessionRole", tag = "5")]
+    pub role: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionRole {
+    Unspecified = 0,
+    Read = 1,
+    Administrator = 2,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -109,6 +119,30 @@ pub struct QueryTicket {
     #[prost(uint64, tag = "5")]
     pub generation: u64,
     #[prost(uint64, tag = "6")]
+    pub expires_at_ns: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataTicket {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub server_instance_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub ticket_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "4")]
+    pub catalog_revision: u64,
+    #[prost(uint64, tag = "5")]
+    pub expires_at_ns: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetadataInfo {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(uint64, tag = "2")]
+    pub catalog_revision: u64,
+    #[prost(uint64, tag = "3")]
     pub expires_at_ns: u64,
 }
 
@@ -280,4 +314,10 @@ pub struct CapabilitiesResponse {
     pub authentication_required: bool,
     #[prost(uint64, tag = "7")]
     pub session_ttl_ms: u64,
+    #[prost(bool, tag = "8")]
+    pub administrator_authentication_enabled: bool,
+    #[prost(uint64, tag = "9")]
+    pub metadata_max_rows: u64,
+    #[prost(uint64, tag = "10")]
+    pub metadata_max_bytes: u64,
 }

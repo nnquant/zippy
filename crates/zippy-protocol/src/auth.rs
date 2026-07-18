@@ -23,6 +23,7 @@ const SESSION_TOKEN_PREFIX: &str = "zfs1_";
 #[derive(Clone, PartialEq, Eq)]
 pub struct FlightBearerAuthConfig {
     bootstrap_digest: [u8; 32],
+    admin_bootstrap_digest: Option<[u8; 32]>,
     session_ttl: Duration,
     max_sessions: usize,
 }
@@ -32,6 +33,10 @@ impl fmt::Debug for FlightBearerAuthConfig {
         formatter
             .debug_struct("FlightBearerAuthConfig")
             .field("bootstrap_token", &"[REDACTED]")
+            .field(
+                "admin_bootstrap_token_configured",
+                &self.admin_bootstrap_digest.is_some(),
+            )
             .field("session_ttl", &self.session_ttl)
             .field("max_sessions", &self.max_sessions)
             .finish()
@@ -45,15 +50,7 @@ impl FlightBearerAuthConfig {
         session_ttl: Duration,
         max_sessions: usize,
     ) -> Result<Self> {
-        if !(MIN_BOOTSTRAP_TOKEN_BYTES..=MAX_BOOTSTRAP_TOKEN_BYTES).contains(&bootstrap_token.len())
-            || !bootstrap_token
-                .iter()
-                .all(|byte| (0x21..=0x7e).contains(byte))
-        {
-            return Err(invalid(format!(
-                "Flight bootstrap token must contain {MIN_BOOTSTRAP_TOKEN_BYTES}..={MAX_BOOTSTRAP_TOKEN_BYTES} visible ASCII bytes"
-            )));
-        }
+        validate_bootstrap_token(bootstrap_token)?;
         if session_ttl.is_zero() || session_ttl > MAX_SESSION_TTL {
             return Err(invalid(
                 "Flight session TTL must be positive and no longer than 24 hours",
@@ -64,9 +61,23 @@ impl FlightBearerAuthConfig {
         }
         Ok(Self {
             bootstrap_digest: digest(bootstrap_token),
+            admin_bootstrap_digest: None,
             session_ttl,
             max_sessions,
         })
+    }
+
+    /// Adds a distinct administrator bootstrap credential.
+    pub fn with_admin_token(mut self, admin_bootstrap_token: &[u8]) -> Result<Self> {
+        validate_bootstrap_token(admin_bootstrap_token)?;
+        let admin_digest = digest(admin_bootstrap_token);
+        if bool::from(self.bootstrap_digest.ct_eq(&admin_digest)) {
+            return Err(invalid(
+                "Flight read and administrator bootstrap tokens must be distinct",
+            ));
+        }
+        self.admin_bootstrap_digest = Some(admin_digest);
+        Ok(self)
     }
 
     /// Returns the configured server-issued session lifetime.
@@ -80,12 +91,31 @@ impl FlightBearerAuthConfig {
     pub const fn max_sessions(&self) -> usize {
         self.max_sessions
     }
+
+    /// Returns whether administrator sessions may be issued.
+    #[must_use]
+    pub const fn administrator_enabled(&self) -> bool {
+        self.admin_bootstrap_digest.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlightSessionRole {
+    Read,
+    Administrator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthenticatedFlightSession {
+    pub(crate) session_id: SessionId,
+    pub(crate) role: FlightSessionRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionAuthorityStatus {
     pub(crate) admission_open: bool,
     pub(crate) active_sessions: usize,
+    pub(crate) active_administrator_sessions: usize,
     pub(crate) opened_sessions: u64,
     pub(crate) expired_sessions: u64,
     pub(crate) auth_failures: u64,
@@ -94,6 +124,7 @@ pub(crate) struct SessionAuthorityStatus {
 
 pub(crate) struct OpenedSession {
     pub(crate) session_id: SessionId,
+    pub(crate) role: FlightSessionRole,
     pub(crate) bearer_token: String,
     pub(crate) expires_at_ns: u64,
 }
@@ -103,6 +134,7 @@ impl fmt::Debug for OpenedSession {
         formatter
             .debug_struct("OpenedSession")
             .field("session_id", &self.session_id)
+            .field("role", &self.role)
             .field("bearer_token", &"[REDACTED]")
             .field("expires_at_ns", &self.expires_at_ns)
             .finish()
@@ -123,6 +155,7 @@ struct SessionAuthorityState {
 #[derive(Clone, Copy)]
 struct SessionEntry {
     session_id: SessionId,
+    role: FlightSessionRole,
     expires_at_ns: u64,
 }
 
@@ -153,9 +186,20 @@ impl SessionAuthority {
     pub(crate) fn open(&self, metadata: &MetadataMap, now_ns: u64) -> Result<OpenedSession> {
         let supplied = bearer_token(metadata).ok_or_else(|| self.authentication_failed())?;
         let supplied_digest = digest(supplied.as_bytes());
-        if !bool::from(self.config.bootstrap_digest.ct_eq(&supplied_digest)) {
+        let read_match = bool::from(self.config.bootstrap_digest.ct_eq(&supplied_digest));
+        let administrator_match = self
+            .config
+            .admin_bootstrap_digest
+            .as_ref()
+            .is_some_and(|digest| bool::from(digest.ct_eq(&supplied_digest)));
+        if !read_match && !administrator_match {
             return Err(self.authentication_failed());
         }
+        let role = if administrator_match {
+            FlightSessionRole::Administrator
+        } else {
+            FlightSessionRole::Read
+        };
         let expired = self.sweep_expired(now_ns);
         drop(expired);
 
@@ -194,6 +238,7 @@ impl SessionAuthority {
                 token_digest,
                 SessionEntry {
                     session_id,
+                    role,
                     expires_at_ns,
                 },
             );
@@ -201,6 +246,7 @@ impl SessionAuthority {
             self.metrics.opened_sessions.fetch_add(1, Ordering::Relaxed);
             return Ok(OpenedSession {
                 session_id,
+                role,
                 bearer_token,
                 expires_at_ns,
             });
@@ -208,7 +254,11 @@ impl SessionAuthority {
         Err(internal("could not allocate a unique Flight session"))
     }
 
-    pub(crate) fn authenticate(&self, metadata: &MetadataMap, now_ns: u64) -> Result<SessionId> {
+    pub(crate) fn authenticate(
+        &self,
+        metadata: &MetadataMap,
+        now_ns: u64,
+    ) -> Result<AuthenticatedFlightSession> {
         let supplied = bearer_token(metadata).ok_or_else(|| self.authentication_failed())?;
         if !valid_session_token_shape(supplied) {
             return Err(self.authentication_failed());
@@ -227,7 +277,10 @@ impl SessionAuthority {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(self.authentication_failed());
         }
-        Ok(entry.session_id)
+        Ok(AuthenticatedFlightSession {
+            session_id: entry.session_id,
+            role: entry.role,
+        })
     }
 
     pub(crate) fn sweep_expired(&self, now_ns: u64) -> Vec<SessionId> {
@@ -267,6 +320,11 @@ impl SessionAuthority {
         SessionAuthorityStatus {
             admission_open: state.admission_open,
             active_sessions: state.entries.len(),
+            active_administrator_sessions: state
+                .entries
+                .values()
+                .filter(|entry| entry.role == FlightSessionRole::Administrator)
+                .count(),
             opened_sessions: self.metrics.opened_sessions.load(Ordering::Relaxed),
             expired_sessions: self.metrics.expired_sessions.load(Ordering::Relaxed),
             auth_failures: self.metrics.auth_failures.load(Ordering::Relaxed),
@@ -288,6 +346,17 @@ impl SessionAuthority {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+fn validate_bootstrap_token(token: &[u8]) -> Result<()> {
+    if !(MIN_BOOTSTRAP_TOKEN_BYTES..=MAX_BOOTSTRAP_TOKEN_BYTES).contains(&token.len())
+        || !token.iter().all(|byte| (0x21..=0x7e).contains(byte))
+    {
+        return Err(invalid(format!(
+            "Flight bootstrap token must contain {MIN_BOOTSTRAP_TOKEN_BYTES}..={MAX_BOOTSTRAP_TOKEN_BYTES} visible ASCII bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn bearer_token(metadata: &MetadataMap) -> Option<&str> {
@@ -405,14 +474,44 @@ mod tests {
             AUTHORIZATION_METADATA_KEY,
             MetadataValue::try_from(format!("Bearer {}", opened.bearer_token)).unwrap(),
         );
-        assert_eq!(
-            authority.authenticate(&session, 109).unwrap(),
-            opened.session_id
-        );
+        let authenticated = authority.authenticate(&session, 109).unwrap();
+        assert_eq!(authenticated.session_id, opened.session_id);
+        assert_eq!(authenticated.role, FlightSessionRole::Read);
         assert_eq!(
             authority.authenticate(&session, 110).unwrap_err().code(),
             ErrorCode::Unauthenticated
         );
         assert_eq!(authority.status().active_sessions, 0);
+    }
+
+    #[test]
+    fn administrator_token_is_distinct_and_issues_an_explicit_role() {
+        const ADMIN_TOKEN: &str = "test-only-flight-administrator-token-0001";
+        let config =
+            FlightBearerAuthConfig::try_new(BOOTSTRAP_TOKEN.as_bytes(), Duration::from_secs(60), 2)
+                .unwrap()
+                .with_admin_token(ADMIN_TOKEN.as_bytes())
+                .unwrap();
+        assert!(config.administrator_enabled());
+        assert!(!format!("{config:?}").contains(ADMIN_TOKEN));
+        let authority = SessionAuthority::new(config);
+        let mut bootstrap = MetadataMap::new();
+        bootstrap.insert(
+            AUTHORIZATION_METADATA_KEY,
+            MetadataValue::try_from(format!("Bearer {ADMIN_TOKEN}")).unwrap(),
+        );
+
+        let opened = authority.open(&bootstrap, 10).unwrap();
+
+        assert_eq!(opened.role, FlightSessionRole::Administrator);
+        assert_eq!(authority.status().active_administrator_sessions, 1);
+        assert!(FlightBearerAuthConfig::try_new(
+            BOOTSTRAP_TOKEN.as_bytes(),
+            Duration::from_secs(60),
+            2,
+        )
+        .unwrap()
+        .with_admin_token(BOOTSTRAP_TOKEN.as_bytes())
+        .is_err());
     }
 }

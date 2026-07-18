@@ -1,7 +1,7 @@
 # ADR-0004：Arrow Flight 作为远端数据协议
 
 - 日期：2026-07-13
-- 状态：已接受，Stage 6.2 查询安全边界已实施
+- 状态：已接受，Stage 6.3 查询控制与 metadata 已实施
 - 决策所有者：Zippy core maintainers
 
 ## 背景
@@ -36,9 +36,10 @@ Flight frontend 必须在 QueryService 已拥有 query lifecycle 后实施，禁
 
 截至 2026-07-18，`GetFlightInfo`/`DoGet`、version 1 query/ticket/error envelope、capability
 discovery、session-bound single-use ticket、有界 transport 和 Server 生命周期接线已经实现。TLS、可选
-mTLS、Bearer Handshake、服务端签发 session、凭据文件约束和重启证书轮换也已完成；非 loopback
-endpoint 只有同时配置 TLS 与认证才会 bind。`DoPut`、`DoExchange`、Flight SQL、cancel/admin 和
-Python client cutover 仍待后续阶段。
+mTLS、Bearer Handshake、服务端签发 read/control-only administrator session、凭据文件约束和重启证书
+轮换也已完成；非 loopback endpoint 只有同时配置 TLS 与认证才会 bind。标准 `CancelFlightInfo`、
+owner/admin 权限、ABA fence，以及 Catalogs/DbSchemas/Tables/TableTypes metadata 已完成。`DoPut`、
+`DoExchange` 和 Python client cutover 仍待后续阶段。
 
 正向结果：
 

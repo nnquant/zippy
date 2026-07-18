@@ -68,6 +68,18 @@ pub const MAX_FLIGHT_SESSIONS: usize = 65_536;
 pub const MIN_FLIGHT_BOOTSTRAP_TOKEN_BYTES: usize = 32;
 /// Maximum bootstrap bearer token size accepted from environment or credential file.
 pub const MAX_FLIGHT_BOOTSTRAP_TOKEN_BYTES: usize = 4 * 1024;
+/// Default maximum rows materialized by one Flight SQL metadata request.
+pub const DEFAULT_FLIGHT_METADATA_MAX_ROWS: usize = 4_096;
+/// Hard ceiling for one Flight SQL metadata result.
+pub const MAX_FLIGHT_METADATA_ROWS: usize = 4_096;
+/// Default retained bytes allowed for one Flight SQL metadata result.
+pub const DEFAULT_FLIGHT_METADATA_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Hard ceiling for one Flight SQL metadata result.
+pub const MAX_FLIGHT_METADATA_BYTES: usize = 64 * 1024 * 1024;
+/// Default lifetime of one prepared Flight SQL metadata ticket.
+pub const DEFAULT_FLIGHT_METADATA_TICKET_TTL_MS: u64 = 30_000;
+/// Longest supported Flight SQL metadata ticket lifetime.
+pub const MAX_FLIGHT_METADATA_TICKET_TTL_MS: u64 = 5 * 60 * 1_000;
 /// Backward-compatible canary default, independent from a configured production override.
 pub const DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES: u64 = DEFAULT_QUERY_OPERATOR_MEMORY_BYTES;
 pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
@@ -449,6 +461,8 @@ pub struct ZippyFlightConfig {
     pub tls: ZippyFlightTlsConfig,
     /// Bootstrap authentication and server-issued session policy.
     pub auth: ZippyFlightAuthConfig,
+    /// Bounded Flight SQL metadata materialization policy.
+    pub metadata: ZippyFlightMetadataConfig,
 }
 
 impl Default for ZippyFlightConfig {
@@ -461,6 +475,7 @@ impl Default for ZippyFlightConfig {
             max_pending_tickets: DEFAULT_FLIGHT_MAX_PENDING_TICKETS,
             tls: ZippyFlightTlsConfig::default(),
             auth: ZippyFlightAuthConfig::default(),
+            metadata: ZippyFlightMetadataConfig::default(),
         }
     }
 }
@@ -487,12 +502,16 @@ pub struct ZippyFlightAuthConfig {
     pub enabled: bool,
     /// Owner-only file containing the bootstrap bearer token.
     pub token_file: Option<PathBuf>,
+    /// Optional owner-only file containing a distinct administrator bootstrap token.
+    pub admin_token_file: Option<PathBuf>,
     /// Lifetime of one server-issued session credential.
     pub session_ttl_ms: u64,
     /// Maximum number of simultaneously valid server-issued sessions.
     pub max_sessions: usize,
     #[serde(skip)]
     bootstrap_token: Option<String>,
+    #[serde(skip)]
+    admin_bootstrap_token: Option<String>,
 }
 
 impl std::fmt::Debug for ZippyFlightAuthConfig {
@@ -501,11 +520,16 @@ impl std::fmt::Debug for ZippyFlightAuthConfig {
             .debug_struct("ZippyFlightAuthConfig")
             .field("enabled", &self.enabled)
             .field("token_file", &self.token_file)
+            .field("admin_token_file", &self.admin_token_file)
             .field("session_ttl_ms", &self.session_ttl_ms)
             .field("max_sessions", &self.max_sessions)
             .field(
                 "bootstrap_token_configured",
                 &self.bootstrap_token.is_some(),
+            )
+            .field(
+                "admin_bootstrap_token_configured",
+                &self.admin_bootstrap_token.is_some(),
             )
             .finish()
     }
@@ -516,9 +540,11 @@ impl Default for ZippyFlightAuthConfig {
         Self {
             enabled: false,
             token_file: None,
+            admin_token_file: None,
             session_ttl_ms: DEFAULT_FLIGHT_SESSION_TTL_MS,
             max_sessions: DEFAULT_FLIGHT_MAX_SESSIONS,
             bootstrap_token: None,
+            admin_bootstrap_token: None,
         }
     }
 }
@@ -528,6 +554,33 @@ impl ZippyFlightAuthConfig {
     #[must_use]
     pub fn bootstrap_token(&self) -> Option<&str> {
         self.bootstrap_token.as_deref()
+    }
+
+    /// Returns the environment-sourced administrator token without serializing it.
+    #[must_use]
+    pub fn admin_bootstrap_token(&self) -> Option<&str> {
+        self.admin_bootstrap_token.as_deref()
+    }
+}
+
+/// Bounded materialization and ticket policy for Flight SQL metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyFlightMetadataConfig {
+    /// Maximum rows examined and returned by one metadata request.
+    pub max_rows: usize,
+    /// Maximum retained Arrow bytes for one prepared metadata result.
+    pub max_bytes: usize,
+    /// Lifetime of one single-use prepared metadata ticket.
+    pub ticket_ttl_ms: u64,
+}
+
+impl Default for ZippyFlightMetadataConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_FLIGHT_METADATA_MAX_ROWS,
+            max_bytes: DEFAULT_FLIGHT_METADATA_MAX_BYTES,
+            ticket_ttl_ms: DEFAULT_FLIGHT_METADATA_TICKET_TTL_MS,
+        }
     }
 }
 
@@ -678,6 +731,7 @@ struct PartialFlightConfig {
     max_pending_tickets: Option<usize>,
     tls: Option<PartialFlightTlsConfig>,
     auth: Option<PartialFlightAuthConfig>,
+    metadata: Option<PartialFlightMetadataConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -695,8 +749,17 @@ struct PartialFlightTlsConfig {
 struct PartialFlightAuthConfig {
     enabled: Option<bool>,
     token_file: Option<String>,
+    admin_token_file: Option<String>,
     session_ttl_ms: Option<u64>,
     max_sessions: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFlightMetadataConfig {
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
+    ticket_ttl_ms: Option<u64>,
 }
 
 impl Default for ZippyConfig {
@@ -1037,11 +1100,29 @@ impl ZippyConfig {
                         Some(resolve_config_path(&token_file, config_base));
                     self.flight.auth.bootstrap_token = None;
                 }
+                if let Some(admin_token_file) = auth.admin_token_file {
+                    let admin_token_file =
+                        non_empty(admin_token_file, "flight.auth.admin_token_file")?;
+                    self.flight.auth.admin_token_file =
+                        Some(resolve_config_path(&admin_token_file, config_base));
+                    self.flight.auth.admin_bootstrap_token = None;
+                }
                 if let Some(session_ttl_ms) = auth.session_ttl_ms {
                     self.flight.auth.session_ttl_ms = session_ttl_ms;
                 }
                 if let Some(max_sessions) = auth.max_sessions {
                     self.flight.auth.max_sessions = max_sessions;
+                }
+            }
+            if let Some(metadata) = flight.metadata {
+                if let Some(max_rows) = metadata.max_rows {
+                    self.flight.metadata.max_rows = max_rows;
+                }
+                if let Some(max_bytes) = metadata.max_bytes {
+                    self.flight.metadata.max_bytes = max_bytes;
+                }
+                if let Some(ticket_ttl_ms) = metadata.ticket_ttl_ms {
+                    self.flight.metadata.ticket_ttl_ms = ticket_ttl_ms;
                 }
             }
         }
@@ -1448,6 +1529,29 @@ impl ZippyConfig {
             self.flight.auth.bootstrap_token = Some(non_empty(token, "ZIPPY_FLIGHT_AUTH_TOKEN")?);
             self.flight.auth.token_file = None;
         }
+        let admin_token_file = env_string("ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN_FILE");
+        let admin_token = env_string("ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN");
+        if admin_token_file.is_some() && admin_token.is_some() {
+            return Err(ZippyError::InvalidConfig {
+                reason: concat!(
+                    "only one of ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN_FILE and ",
+                    "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN may be set"
+                )
+                .to_string(),
+            });
+        }
+        if let Some(path) = admin_token_file {
+            self.flight.auth.admin_token_file = Some(resolve_env_absolute_path(
+                "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN_FILE",
+                path,
+            )?);
+            self.flight.auth.admin_bootstrap_token = None;
+        }
+        if let Some(token) = admin_token {
+            self.flight.auth.admin_bootstrap_token =
+                Some(non_empty(token, "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN")?);
+            self.flight.auth.admin_token_file = None;
+        }
         if let Some(value) = env_string("ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS") {
             self.flight.auth.session_ttl_ms =
                 parse_u64_env("ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS", &value)?;
@@ -1455,6 +1559,18 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_FLIGHT_AUTH_MAX_SESSIONS") {
             self.flight.auth.max_sessions =
                 parse_usize_env("ZIPPY_FLIGHT_AUTH_MAX_SESSIONS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_METADATA_MAX_ROWS") {
+            self.flight.metadata.max_rows =
+                parse_usize_env("ZIPPY_FLIGHT_METADATA_MAX_ROWS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_METADATA_MAX_BYTES") {
+            self.flight.metadata.max_bytes =
+                parse_usize_env("ZIPPY_FLIGHT_METADATA_MAX_BYTES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS") {
+            self.flight.metadata.ticket_ttl_ms =
+                parse_u64_env("ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS", &value)?;
         }
         Ok(())
     }
@@ -2124,6 +2240,34 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
             reason: "flight max_pending_tickets must be greater than zero".to_string(),
         });
     }
+    if !(1..=MAX_FLIGHT_METADATA_ROWS).contains(&config.flight.metadata.max_rows) {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight metadata max_rows must be between 1 and {} value=[{}]",
+                MAX_FLIGHT_METADATA_ROWS, config.flight.metadata.max_rows
+            ),
+        });
+    }
+    if !(MIN_FLIGHT_MAX_MESSAGE_BYTES..=MAX_FLIGHT_METADATA_BYTES)
+        .contains(&config.flight.metadata.max_bytes)
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight metadata max_bytes must be between {} and {} value=[{}]",
+                MIN_FLIGHT_MAX_MESSAGE_BYTES,
+                MAX_FLIGHT_METADATA_BYTES,
+                config.flight.metadata.max_bytes
+            ),
+        });
+    }
+    if !(1..=MAX_FLIGHT_METADATA_TICKET_TTL_MS).contains(&config.flight.metadata.ticket_ttl_ms) {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight metadata ticket_ttl_ms must be between 1 and {} value=[{}]",
+                MAX_FLIGHT_METADATA_TICKET_TTL_MS, config.flight.metadata.ticket_ttl_ms
+            ),
+        });
+    }
     if !(1..=MAX_FLIGHT_SESSIONS).contains(&config.flight.auth.max_sessions) {
         return Err(ZippyError::InvalidConfig {
             reason: format!(
@@ -2154,6 +2298,10 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
         &config.flight.tls.client_ca_file,
     )?;
     validate_absolute_optional_path("flight.auth.token_file", &config.flight.auth.token_file)?;
+    validate_absolute_optional_path(
+        "flight.auth.admin_token_file",
+        &config.flight.auth.admin_token_file,
+    )?;
     if config.flight.tls.enabled
         && (config.flight.tls.cert_file.is_none() || config.flight.tls.key_file.is_none())
     {
@@ -2164,6 +2312,9 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
     if let Some(token) = config.flight.auth.bootstrap_token() {
         validate_flight_bootstrap_token(token)?;
     }
+    if let Some(token) = config.flight.auth.admin_bootstrap_token() {
+        validate_flight_bootstrap_token(token)?;
+    }
     if config.flight.auth.enabled {
         let credential_sources = usize::from(config.flight.auth.token_file.is_some())
             + usize::from(config.flight.auth.bootstrap_token().is_some());
@@ -2172,11 +2323,37 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
                 reason: "flight auth requires exactly one bootstrap token source".to_string(),
             });
         }
-        if config.flight.auth.session_ttl_ms < config.query.plan_ttl_ms {
+        let administrator_sources = usize::from(config.flight.auth.admin_token_file.is_some())
+            + usize::from(config.flight.auth.admin_bootstrap_token().is_some());
+        if administrator_sources > 1 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight auth accepts at most one administrator token source".to_string(),
+            });
+        }
+        if config.flight.auth.token_file.is_some()
+            && config.flight.auth.token_file == config.flight.auth.admin_token_file
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight read and administrator token files must be distinct".to_string(),
+            });
+        }
+        if config.flight.auth.bootstrap_token().is_some()
+            && config.flight.auth.bootstrap_token() == config.flight.auth.admin_bootstrap_token()
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight read and administrator bootstrap tokens must be distinct"
+                    .to_string(),
+            });
+        }
+        let required_session_ttl_ms = config
+            .query
+            .plan_ttl_ms
+            .max(config.flight.metadata.ticket_ttl_ms);
+        if config.flight.auth.session_ttl_ms < required_session_ttl_ms {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
-                    "flight auth session_ttl_ms must cover query plan_ttl_ms session_ttl_ms=[{}] plan_ttl_ms=[{}]",
-                    config.flight.auth.session_ttl_ms, config.query.plan_ttl_ms
+                    "flight auth session_ttl_ms must cover query plan and metadata ticket TTLs session_ttl_ms=[{}] required_ttl_ms=[{}]",
+                    config.flight.auth.session_ttl_ms, required_session_ttl_ms
                 ),
             });
         }
@@ -2193,6 +2370,14 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
             reason: format!(
                 "flight max_message_bytes must not exceed the query transport budget value=[{}] budget=[{}]",
                 config.flight.max_message_bytes, transport_budget
+            ),
+        });
+    }
+    if config.flight.metadata.max_bytes > transport_budget {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight metadata max_bytes must not exceed the shared transport budget value=[{}] budget=[{}]",
+                config.flight.metadata.max_bytes, transport_budget
             ),
         });
     }
