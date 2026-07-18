@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
@@ -24,7 +25,8 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use prost::Message;
 use prost_types::Timestamp;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
 use zippy_types::query::{
@@ -38,6 +40,7 @@ use crate::auth::{
     AuthenticatedFlightSession, FlightBearerAuthConfig, FlightSessionRole, SessionAuthority,
 };
 use crate::error::server_error_to_status;
+use crate::ingest::{decode_put_descriptor, put_batch_result, FlightPutBatch, FlightPutLimits};
 use crate::query::{
     decode_query_descriptor, decode_query_ticket, encode_query_ticket, query_info,
     FlightQueryRequest, OPAQUE_TICKET_ID_BYTES,
@@ -63,6 +66,7 @@ const BEARER_HANDSHAKE_CAPABILITY: &str = "auth.bearer_handshake.v1";
 const SESSION_ROLE_CAPABILITY: &str = "auth.session_roles.v1";
 const QUERY_CANCEL_CAPABILITY: &str = "query.cancel_flight_info.v1";
 const FLIGHT_SQL_METADATA_CAPABILITY: &str = "flight_sql.metadata.v1";
+const FLIGHT_MEMORY_INGEST_CAPABILITY: &str = "ingest.append.memory.v1";
 const CANCEL_FLIGHT_INFO_ACTION: &str = "CancelFlightInfo";
 const MAX_HANDSHAKE_PAYLOAD_BYTES: usize = 4 * 1024;
 
@@ -138,6 +142,18 @@ pub trait FlightQueryFrontend: Send + Sync + 'static {
             .with_retryable(false))
         })
     }
+
+    /// Applies one bounded append batch to the configured memory-durability backend.
+    fn write_batch(&self, batch: FlightPutBatch) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "Flight ingest is not configured",
+            )
+            .with_request_id(batch.command.put_id)
+            .with_retryable(false))
+        })
+    }
 }
 
 /// Resource and compatibility limits for one Flight query service.
@@ -150,6 +166,7 @@ pub struct FlightServiceConfig {
     bearer_auth: Option<FlightBearerAuthConfig>,
     query_control_enabled: bool,
     metadata: Option<FlightSqlMetadataLimits>,
+    ingest: Option<FlightPutLimits>,
 }
 
 impl FlightServiceConfig {
@@ -188,6 +205,7 @@ impl FlightServiceConfig {
             bearer_auth: None,
             query_control_enabled: false,
             metadata: None,
+            ingest: None,
         })
     }
 
@@ -209,6 +227,13 @@ impl FlightServiceConfig {
     #[must_use]
     pub fn with_sql_metadata(mut self, metadata: FlightSqlMetadataLimits) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    /// Enables bounded append-only `DoPut` with process-local memory acknowledgements.
+    #[must_use]
+    pub fn with_ingest(mut self, ingest: FlightPutLimits) -> Self {
+        self.ingest = Some(ingest);
         self
     }
 
@@ -262,6 +287,8 @@ pub struct FlightServiceStatus {
     pub active_sessions: usize,
     /// Active sessions issued from the distinct administrator credential.
     pub active_administrator_sessions: usize,
+    /// Active sessions issued from the distinct writer credential.
+    pub active_writer_sessions: usize,
     /// Server-issued sessions created since service construction.
     pub opened_sessions: u64,
     /// Server-issued sessions removed after their fixed expiry.
@@ -280,6 +307,20 @@ pub struct FlightServiceStatus {
     pub metadata_tickets_issued: u64,
     /// Flight SQL metadata tickets consumed since service construction.
     pub metadata_tickets_consumed: u64,
+    /// `DoPut` streams admitted since service construction.
+    pub puts_started: u64,
+    /// `DoPut` streams that reached a clean input EOF.
+    pub puts_completed: u64,
+    /// `DoPut` streams rejected or failed before reaching a clean input EOF.
+    pub put_rejections: u64,
+    /// Append batches acknowledged at memory durability.
+    pub put_batches: u64,
+    /// Rows acknowledged at memory durability.
+    pub put_rows: u64,
+    /// Decoded Arrow bytes acknowledged at memory durability.
+    pub put_bytes: u64,
+    /// Currently admitted `DoPut` streams.
+    pub active_puts: usize,
 }
 
 /// Arrow Flight implementation for bounded, snapshot-fixed Zippy queries.
@@ -294,6 +335,7 @@ struct FlightServiceInner {
     tickets: TicketRegistry,
     sessions: Option<SessionAuthority>,
     transport_budget: Arc<Semaphore>,
+    put_admission: Option<Arc<Semaphore>>,
     metrics: FlightMetrics,
 }
 
@@ -309,6 +351,12 @@ struct FlightMetrics {
     administrator_cancellations: AtomicU64,
     metadata_tickets_issued: AtomicU64,
     metadata_tickets_consumed: AtomicU64,
+    puts_started: AtomicU64,
+    puts_completed: AtomicU64,
+    put_rejections: AtomicU64,
+    put_batches: AtomicU64,
+    put_rows: AtomicU64,
+    put_bytes: AtomicU64,
 }
 
 impl ZippyFlightService {
@@ -319,11 +367,33 @@ impl ZippyFlightService {
     ) -> Result<Self> {
         let mut server_instance_id = [0_u8; OPAQUE_TICKET_ID_BYTES];
         fill_random_nonzero(&mut server_instance_id)?;
+        if config.ingest.is_some()
+            && !config
+                .bearer_auth
+                .as_ref()
+                .is_some_and(FlightBearerAuthConfig::writer_enabled)
+        {
+            return Err(invalid(
+                "Flight ingest requires a distinct authenticated writer credential",
+            ));
+        }
+        if config
+            .ingest
+            .is_some_and(|limits| limits.max_batch_bytes() > config.transport_buffer_bytes)
+        {
+            return Err(invalid(
+                "Flight ingest batch bytes must not exceed the shared transport budget",
+            ));
+        }
         let sessions = config.bearer_auth.clone().map(SessionAuthority::new);
+        let put_admission = config
+            .ingest
+            .map(|limits| Arc::new(Semaphore::new(limits.max_concurrent_puts())));
         Ok(Self {
             inner: Arc::new(FlightServiceInner {
                 tickets: TicketRegistry::new(server_instance_id, config.max_pending_tickets),
                 transport_budget: Arc::new(Semaphore::new(config.transport_buffer_bytes)),
+                put_admission,
                 sessions,
                 config,
                 frontend,
@@ -364,6 +434,17 @@ impl ZippyFlightService {
     pub fn status(&self) -> FlightServiceStatus {
         let registry = self.inner.tickets.status();
         let sessions = self.inner.sessions.as_ref().map(SessionAuthority::status);
+        let active_puts = self
+            .inner
+            .config
+            .ingest
+            .zip(self.inner.put_admission.as_ref())
+            .map(|(limits, admission)| {
+                limits
+                    .max_concurrent_puts()
+                    .saturating_sub(admission.available_permits())
+            })
+            .unwrap_or(0);
         let transport_buffer_bytes_capacity = self.inner.config.transport_buffer_bytes;
         let transport_buffer_bytes_in_use = transport_buffer_bytes_capacity.saturating_sub(
             self.inner
@@ -391,6 +472,7 @@ impl ZippyFlightService {
             active_sessions: sessions.map_or(0, |status| status.active_sessions),
             active_administrator_sessions: sessions
                 .map_or(0, |status| status.active_administrator_sessions),
+            active_writer_sessions: sessions.map_or(0, |status| status.active_writer_sessions),
             opened_sessions: sessions.map_or(0, |status| status.opened_sessions),
             expired_sessions: sessions.map_or(0, |status| status.expired_sessions),
             authentication_failures: sessions.map_or(0, |status| status.auth_failures),
@@ -420,6 +502,13 @@ impl ZippyFlightService {
                 .metrics
                 .metadata_tickets_consumed
                 .load(Ordering::Relaxed),
+            puts_started: self.inner.metrics.puts_started.load(Ordering::Relaxed),
+            puts_completed: self.inner.metrics.puts_completed.load(Ordering::Relaxed),
+            put_rejections: self.inner.metrics.put_rejections.load(Ordering::Relaxed),
+            put_batches: self.inner.metrics.put_batches.load(Ordering::Relaxed),
+            put_rows: self.inner.metrics.put_rows.load(Ordering::Relaxed),
+            put_bytes: self.inner.metrics.put_bytes.load(Ordering::Relaxed),
+            active_puts,
         }
     }
 
@@ -447,7 +536,11 @@ impl ZippyFlightService {
         if self.inner.config.metadata.is_some() {
             capabilities.push(FLIGHT_SQL_METADATA_CAPABILITY.to_owned());
         }
+        if self.inner.config.ingest.is_some() {
+            capabilities.push(FLIGHT_MEMORY_INGEST_CAPABILITY.to_owned());
+        }
         let metadata = self.inner.config.metadata;
+        let ingest = self.inner.config.ingest;
         CapabilitiesResponse {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             server_version: self.inner.config.server_version.clone(),
@@ -477,6 +570,27 @@ impl ZippyFlightService {
             metadata_max_bytes: metadata
                 .map(|limits| u64::try_from(limits.max_bytes()).unwrap_or(u64::MAX))
                 .unwrap_or(0),
+            writer_authentication_enabled: self
+                .inner
+                .config
+                .bearer_auth
+                .as_ref()
+                .is_some_and(FlightBearerAuthConfig::writer_enabled),
+            ingest_enabled: ingest.is_some(),
+            ingest_max_concurrent_puts: ingest
+                .map(|limits| u64::try_from(limits.max_concurrent_puts()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+            ingest_max_batches_per_put: ingest
+                .map(|limits| u64::try_from(limits.max_batches_per_put()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+            ingest_max_rows_per_batch: ingest.map(FlightPutLimits::max_rows_per_batch).unwrap_or(0),
+            ingest_max_rows_per_put: ingest.map(FlightPutLimits::max_rows_per_put).unwrap_or(0),
+            ingest_max_batch_bytes: ingest
+                .map(|limits| u64::try_from(limits.max_batch_bytes()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+            ingest_max_bytes_per_put: ingest
+                .map(|limits| u64::try_from(limits.max_bytes_per_put()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
         }
     }
 
@@ -504,11 +618,32 @@ impl ZippyFlightService {
         metadata: &MetadataMap,
     ) -> std::result::Result<AuthenticatedFlightSession, Status> {
         let principal = self.request_session(metadata)?;
-        if principal.role == FlightSessionRole::Administrator {
+        if principal.role != FlightSessionRole::Read {
             return Err(server_error_to_status(
                 &ServerError::new(
                     ErrorCode::PermissionDenied,
-                    "Flight administrator sessions are restricted to control actions",
+                    "Flight read RPCs require a read session",
+                )
+                .with_retryable(false),
+            ));
+        }
+        Ok(principal)
+    }
+
+    fn request_write_session(
+        &self,
+        metadata: &MetadataMap,
+    ) -> std::result::Result<AuthenticatedFlightSession, Status> {
+        let principal = self.request_session(metadata)?;
+        if principal.role != FlightSessionRole::Writer {
+            self.inner
+                .metrics
+                .put_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(server_error_to_status(
+                &ServerError::new(
+                    ErrorCode::PermissionDenied,
+                    "Flight DoPut requires a writer session",
                 )
                 .with_retryable(false),
             ));
@@ -538,6 +673,13 @@ impl ZippyFlightService {
         request: CancelFlightInfoRequest,
         principal: AuthenticatedFlightSession,
     ) -> Result<CancelFlightInfoResult> {
+        if principal.role == FlightSessionRole::Writer {
+            return Err(ServerError::new(
+                ErrorCode::PermissionDenied,
+                "Flight writer sessions cannot cancel queries",
+            )
+            .with_retryable(false));
+        }
         if !self.inner.config.query_control_enabled {
             return Err(ServerError::new(
                 ErrorCode::UnsupportedPlan,
@@ -581,6 +723,13 @@ impl ZippyFlightService {
                         .cancel_administrator(instance_id)
                         .await?;
                 }
+                FlightSessionRole::Writer => {
+                    return Err(ServerError::new(
+                        ErrorCode::PermissionDenied,
+                        "Flight writer sessions cannot cancel queries",
+                    )
+                    .with_retryable(false));
+                }
             },
         }
         match principal.role {
@@ -603,6 +752,13 @@ impl ZippyFlightService {
                     generation = instance_id.generation().get(),
                     "administrator cancelled an exact Flight query"
                 );
+            }
+            FlightSessionRole::Writer => {
+                return Err(ServerError::new(
+                    ErrorCode::PermissionDenied,
+                    "Flight writer sessions cannot cancel queries",
+                )
+                .with_retryable(false));
             }
         }
         Ok(CancelFlightInfoResult::new(CancelStatus::Cancelled))
@@ -669,6 +825,184 @@ impl ZippyFlightService {
             })
             .boxed()
     }
+
+    async fn process_put(
+        &self,
+        mut decoder: FlightDataDecoder,
+        session: AuthenticatedFlightSession,
+        limits: FlightPutLimits,
+        responses: mpsc::Sender<std::result::Result<PutResult, Status>>,
+    ) -> Result<()> {
+        let first = decoder
+            .next()
+            .await
+            .ok_or_else(|| invalid("Flight DoPut stream is empty"))?
+            .map_err(flight_decode_error)?;
+        let DecodedPayload::Schema(_) = first.payload else {
+            return Err(invalid(
+                "Flight DoPut must begin with exactly one Arrow schema message",
+            ));
+        };
+        let descriptor = first
+            .inner
+            .flight_descriptor
+            .as_ref()
+            .ok_or_else(|| invalid("Flight DoPut schema has no command descriptor"))?;
+        let command = Arc::new(decode_put_descriptor(descriptor)?);
+        if command.session_id != session.session_id {
+            return Err(ServerError::new(
+                ErrorCode::PermissionDenied,
+                "Flight ingest command session differs from request metadata",
+            )
+            .with_request_id(command.put_id)
+            .with_retryable(false));
+        }
+
+        let mut batch_count = 0_usize;
+        let mut total_rows = 0_u64;
+        let mut total_bytes = 0_usize;
+        while let Some(decoded) = decoder.next().await {
+            let decoded = decoded.map_err(flight_decode_error)?;
+            if decoded.inner.flight_descriptor.is_some() {
+                return Err(invalid(
+                    "Flight DoPut descriptor may appear only on the first schema message",
+                )
+                .with_request_id(command.put_id));
+            }
+            let batch = match decoded.payload {
+                DecodedPayload::RecordBatch(batch) => batch,
+                DecodedPayload::Schema(_) => {
+                    return Err(invalid(
+                        "Flight DoPut does not permit mid-stream schema replacement",
+                    )
+                    .with_request_id(command.put_id));
+                }
+                DecodedPayload::None => {
+                    return Err(
+                        invalid("Flight DoPut contains an unsupported empty IPC message")
+                            .with_request_id(command.put_id),
+                    );
+                }
+            };
+            if batch_count >= limits.max_batches_per_put() {
+                return Err(put_resource_exhausted(
+                    command.put_id,
+                    "batch_count",
+                    u64::try_from(batch_count.saturating_add(1)).unwrap_or(u64::MAX),
+                    u64::try_from(limits.max_batches_per_put()).unwrap_or(u64::MAX),
+                ));
+            }
+            let row_count = u64::try_from(batch.num_rows()).unwrap_or(u64::MAX);
+            if row_count > limits.max_rows_per_batch() {
+                return Err(put_resource_exhausted(
+                    command.put_id,
+                    "batch_rows",
+                    row_count,
+                    limits.max_rows_per_batch(),
+                ));
+            }
+            let batch_bytes = batch.get_array_memory_size();
+            if batch_bytes > limits.max_batch_bytes() {
+                return Err(put_resource_exhausted(
+                    command.put_id,
+                    "batch_bytes",
+                    u64::try_from(batch_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(limits.max_batch_bytes()).unwrap_or(u64::MAX),
+                ));
+            }
+            total_rows = total_rows.checked_add(row_count).ok_or_else(|| {
+                put_resource_exhausted(
+                    command.put_id,
+                    "put_rows",
+                    u64::MAX,
+                    limits.max_rows_per_put(),
+                )
+            })?;
+            if total_rows > limits.max_rows_per_put() {
+                return Err(put_resource_exhausted(
+                    command.put_id,
+                    "put_rows",
+                    total_rows,
+                    limits.max_rows_per_put(),
+                ));
+            }
+            total_bytes = total_bytes.checked_add(batch_bytes).ok_or_else(|| {
+                put_resource_exhausted(
+                    command.put_id,
+                    "put_bytes",
+                    u64::MAX,
+                    u64::try_from(limits.max_bytes_per_put()).unwrap_or(u64::MAX),
+                )
+            })?;
+            if total_bytes > limits.max_bytes_per_put() {
+                return Err(put_resource_exhausted(
+                    command.put_id,
+                    "put_bytes",
+                    u64::try_from(total_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(limits.max_bytes_per_put()).unwrap_or(u64::MAX),
+                ));
+            }
+            let batch_sequence = command
+                .first_batch_sequence
+                .checked_add(u64::try_from(batch_count).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    invalid("Flight ingest batch sequence exhausted u64")
+                        .with_request_id(command.put_id)
+                })?;
+            let permit_count = u32::try_from(batch_bytes.max(1)).map_err(|_| {
+                internal("Flight ingest batch bytes exceed semaphore representation")
+                    .with_request_id(command.put_id)
+            })?;
+            let batch_permit = Arc::clone(&self.inner.transport_budget)
+                .try_acquire_many_owned(permit_count)
+                .map_err(|_| {
+                    ServerError::new(
+                        ErrorCode::ResourceExhausted,
+                        "Flight ingest shared transport byte budget is exhausted",
+                    )
+                    .with_request_id(command.put_id)
+                    .with_retryable(true)
+                })?;
+            self.inner
+                .frontend
+                .write_batch(FlightPutBatch {
+                    command: Arc::clone(&command),
+                    batch_sequence,
+                    batch,
+                })
+                .await?;
+            drop(batch_permit);
+
+            self.inner
+                .metrics
+                .put_batches
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .metrics
+                .put_rows
+                .fetch_add(row_count, Ordering::Relaxed);
+            self.inner.metrics.put_bytes.fetch_add(
+                u64::try_from(batch_bytes).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            let result = PutResult {
+                app_metadata: Bytes::from(
+                    put_batch_result(&command, batch_sequence, row_count).encode_to_vec(),
+                ),
+            };
+            if responses.send(Ok(result)).await.is_err() {
+                return Err(unavailable("Flight DoPut response consumer disconnected")
+                    .with_request_id(command.put_id));
+            }
+            batch_count += 1;
+        }
+        if batch_count == 0 {
+            return Err(
+                invalid("Flight DoPut contains no record batches").with_request_id(command.put_id)
+            );
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -721,6 +1055,7 @@ impl FlightService for ZippyFlightService {
             role: match opened.role {
                 FlightSessionRole::Read => SessionRole::Read as i32,
                 FlightSessionRole::Administrator => SessionRole::Administrator as i32,
+                FlightSessionRole::Writer => SessionRole::Writer as i32,
             },
         }
         .encode_to_vec();
@@ -960,9 +1295,69 @@ impl FlightService for ZippyFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
-        Err(unsupported_status("DoPut"))
+        let limits = self
+            .inner
+            .config
+            .ingest
+            .ok_or_else(|| unsupported_status("DoPut"))?;
+        let session = self.request_write_session(request.metadata())?;
+        let admission = Arc::clone(
+            self.inner
+                .put_admission
+                .as_ref()
+                .expect("configured Flight ingest owns an admission semaphore"),
+        )
+        .try_acquire_owned()
+        .map_err(|_| {
+            self.inner
+                .metrics
+                .put_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            server_error_to_status(
+                &ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "Flight concurrent DoPut capacity is exhausted",
+                )
+                .with_retryable(true),
+            )
+        })?;
+        self.inner
+            .metrics
+            .puts_started
+            .fetch_add(1, Ordering::Relaxed);
+
+        let input = request
+            .into_inner()
+            .map(|result| result.map_err(FlightError::from));
+        let decoder = FlightDataDecoder::new(input);
+        let service = self.clone();
+        let (responses, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let result = service
+                .process_put(decoder, session, limits, responses.clone())
+                .await;
+            match result {
+                Ok(()) => {
+                    service
+                        .inner
+                        .metrics
+                        .puts_completed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    service
+                        .inner
+                        .metrics
+                        .put_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = responses.send(Err(server_error_to_status(&error))).await;
+                }
+            }
+            drop(admission);
+        });
+        Ok(Response::new(ReceiverStream::new(receiver).boxed()))
     }
 
     async fn do_action(
@@ -1615,10 +2010,44 @@ fn flight_error_to_status(error: FlightError) -> Status {
     }
 }
 
+fn flight_decode_error(error: FlightError) -> ServerError {
+    match error {
+        FlightError::Tonic(status) => ServerError::new(
+            ErrorCode::Unavailable,
+            format!(
+                "Flight DoPut input stream failed status=[{}]",
+                status.code()
+            ),
+        )
+        .with_retryable(true),
+        other => ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!("Flight DoPut Arrow IPC is malformed error=[{other}]"),
+        )
+        .with_retryable(false),
+    }
+}
+
+fn put_resource_exhausted(
+    put_id: zippy_types::RequestId,
+    resource: &str,
+    requested: u64,
+    maximum: u64,
+) -> ServerError {
+    ServerError::new(
+        ErrorCode::ResourceExhausted,
+        format!(
+            "Flight ingest resource limit exceeded resource=[{resource}] requested=[{requested}] maximum=[{maximum}]"
+        ),
+    )
+    .with_request_id(put_id)
+    .with_retryable(false)
+}
+
 fn unsupported_status(operation: &str) -> Status {
     let error = ServerError::new(
         ErrorCode::UnsupportedPlan,
-        format!("Flight operation is not enabled in protocol stage 6.3 operation=[{operation}]"),
+        format!("Flight operation is not enabled in protocol stage 6.4 operation=[{operation}]"),
     )
     .with_retryable(false)
     .with_details(ServerErrorDetails::UnsupportedPlan {

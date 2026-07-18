@@ -2,7 +2,7 @@
 
 日期：2026-07-13
 
-状态：实施中（Phase 0/1 已完成，Phase 2 P2.2 与 Phase 3 持久化查询租约基础设施进行中）
+状态：实施中（Phase 0-5 已完成，Phase 6 Stage 6.4 有界内存写入已完成，Phase 7 durable ingest 待实施）
 
 适用范围：Zippy 单机部署模式。本文不设计集群、Raft、多副本、跨节点查询和分布式事务。
 
@@ -2526,20 +2526,22 @@ descriptor 若缺少该字段，仍留在 legacy live route。persisted native �
 
 目标：用标准 Arrow 协议替换自定义远端查询/写入 framing。
 
-当前进度（2026-07-18）：Stage 6.3 查询控制与 Catalog metadata 已完成。`zippy-protocol` 已拥有 version 1
+当前进度（2026-07-18）：Stage 6.4 有界内存写入已完成。`zippy-protocol` 已拥有 version 1
 Protobuf、稳定 error envelope、capability discovery、单次 ticket 和有界 Flight transport；
 Server 可在 Gateway 关闭时独立启动 Flight，并直接复用 Phase 5 `NativeQueryEngine` 的固定快照、
 资源账本和取消生命周期。TLS、可选 mTLS、Bearer Handshake、服务端 session authority、凭据文件约束
 和重启证书轮换已经完成；非 loopback endpoint 必须同时启用 TLS 与认证。owner-bound 标准取消、
 control-only admin session、query generation/server-instance ABA fence，以及四类标准 Flight SQL metadata
-已经接入相同 Catalog/Query authority。配置、协议边界和验收方法见
+已经接入相同 Catalog/Query authority。标准 `DoPut` 已实现独立 Writer session、append + memory command、
+逐 batch 回执和并发/行数/字节硬上限；当前通过 Gateway compatibility facade 接入 segment materializer，
+不承诺 WAL、producer fencing、去重或 persisted durability。配置、协议边界和验收方法见
 [`flight-query-service.md`](flight-query-service.md)。
 
 任务：
 
 1. 新建 `zippy-protocol` Protobuf 和 error mapping。（Stage 6.1 已完成）
 2. 实现 Flight query `GetFlightInfo/DoGet`。（Stage 6.1 已完成）
-3. 实现 Flight ingest `DoPut`。
+3. 实现 Flight ingest `DoPut`。（Stage 6.4 memory compatibility backend 已完成；durable backend 属于 Phase 7）
 4. 实现 query cancel/admin actions。（Stage 6.3 已完成）
 5. 实现 Flight SQL catalog metadata。（Stage 6.3 已完成）
 6. 实现 TLS/auth middleware。（Stage 6.2 已完成）
@@ -2548,18 +2550,21 @@ control-only admin session、query generation/server-instance ABA fence，以及
 9. 增加 protocol version negotiation 和 capability discovery。（查询 capability discovery 已完成；
    多版本协商待后续版本出现时实施）
 
-Stage 6.1/6.2/6.3 自动化证据：
+Stage 6.1/6.2/6.3/6.4 自动化证据：
 
 - `zippy-protocol` TCP tests 验证固定 snapshot、single-use ticket、session 绑定、ticket expiry 和
   客户端断连释放；
 - `zippy-server` runtime E2E 使用真实 SQLite Catalog、legacy import 和 Parquet scan 验证
   `GetFlightInfo -> DoGet`，并断言重复消费失败、operator memory 归零；
-- Flight listener 已纳入 schema version 5 ready record、动态健康检查和 Gateway 之前的有序 shutdown；
+- Flight listener 已纳入 schema version 6 ready record、动态健康检查和 Gateway 之前的有序 shutdown；
 - TLS 测试验证明文/不受信 CA 失败、受信 CA 成功、mTLS client identity 和重启证书轮换；认证测试验证
   服务端签发 session、防伪造、容量上限、过期和 pending ticket 回收。
 - 标准 Flight 客户端测试覆盖 owner/admin cancel、control-only admin、跨 session 拒绝和 ABA fence；
 - 标准 Flight SQL client 覆盖四类 metadata，真实 Server E2E 验证 `GetTables(include_schema=true)` 的
   revision 固定与轻量 schema 读取；共享字节预算测试验证 ticket 生命周期归还 permit。
+- 标准 Flight client 覆盖 Writer/read 权限隔离、逐 batch memory receipt 和超限 batch 在 backend 前拒绝；
+  真实 Server E2E 启动 master + Gateway + Flight，并从 Gateway metrics 和 Master active segment descriptor
+  双向证明 `DoPut` 已进入兼容 materializer。
 
 验收：
 

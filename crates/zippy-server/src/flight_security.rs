@@ -68,6 +68,30 @@ pub(crate) fn load_flight_security(
             admin_token.fill(0);
             auth = admin_result?;
         }
+        let mut writer_token = match (
+            config.auth.writer_bootstrap_token(),
+            config.auth.writer_token_file.as_deref(),
+        ) {
+            (Some(token), None) => Some(token.as_bytes().to_vec()),
+            (None, Some(path)) => Some(read_bounded_file(
+                path,
+                MAX_BOOTSTRAP_TOKEN_BYTES,
+                true,
+                "writer bootstrap token",
+            )?),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "validated Flight auth has multiple writer credential sources",
+                ));
+            }
+        };
+        if let Some(writer_token) = writer_token.as_mut() {
+            strip_one_line_ending(writer_token);
+            let writer_result = auth.with_writer_token(writer_token);
+            writer_token.fill(0);
+            auth = writer_result?;
+        }
         Some(auth)
     } else {
         None

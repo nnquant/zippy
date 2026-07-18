@@ -31,8 +31,8 @@ if os.name == "posix":
 
 
 _STATE_SCHEMA_VERSION = 1
-_READY_SCHEMA_VERSION = 5
-_SUPPORTED_READY_SCHEMA_VERSIONS = frozenset({2, 3, 4, _READY_SCHEMA_VERSION})
+_READY_SCHEMA_VERSION = 6
+_SUPPORTED_READY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5, _READY_SCHEMA_VERSION})
 _SERVER_ERROR_CODES = frozenset(
     {
         "INVALID_ARGUMENT",
@@ -838,6 +838,7 @@ def _compose_live_payload(
         "runtime_health": ready.get("health"),
         "master": master,
         "gateway": gateway,
+        "flight": ready.get("flight"),
         "webui": webui,
         "bootstrap_log": launcher.get("bootstrap_log"),
         "native_log": ready.get("log_file"),
@@ -1342,9 +1343,11 @@ def _format_server_summary(payload: dict[str, object], *, action: str) -> str:
     heading = "zippy server started" if action == "run" else "zippy server status"
     master = payload.get("master", {})
     gateway = payload.get("gateway", {})
+    flight = payload.get("flight", {})
     webui = payload.get("webui", {})
     master = master if isinstance(master, dict) else {}
     gateway = gateway if isinstance(gateway, dict) else {}
+    flight = flight if isinstance(flight, dict) else {}
     webui = webui if isinstance(webui, dict) else {}
     lines = [
         heading,
@@ -1367,6 +1370,16 @@ def _format_server_summary(payload: dict[str, object], *, action: str) -> str:
     elif gateway:
         lines.append(
             f"gateway: {gateway.get('status', 'unknown')} endpoint=[{gateway.get('endpoint')}]"
+        )
+    if flight.get("enabled") is False:
+        lines.append("flight: disabled")
+    elif flight:
+        ingest = "memory" if flight.get("flight_ingest_enabled") is True else "disabled"
+        lines.append(
+            f"flight: enabled endpoint=[{flight.get('endpoint')}] "
+            f"tls=[{'yes' if flight.get('tls_enabled') else 'no'}] "
+            f"ingest=[{ingest}] "
+            f"writer_auth=[{'yes' if flight.get('writer_authentication_enabled') else 'no'}]"
         )
     if webui:
         webui_status = str(webui.get("status", "unknown")).replace("_", " ")

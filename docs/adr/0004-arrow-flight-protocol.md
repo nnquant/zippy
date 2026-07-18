@@ -1,7 +1,7 @@
 # ADR-0004：Arrow Flight 作为远端数据协议
 
 - 日期：2026-07-13
-- 状态：已接受，Stage 6.3 查询控制与 metadata 已实施
+- 状态：已接受，Stage 6.4 有界内存写入已实施
 - 决策所有者：Zippy core maintainers
 
 ## 背景
@@ -38,18 +38,25 @@ Flight frontend 必须在 QueryService 已拥有 query lifecycle 后实施，禁
 discovery、session-bound single-use ticket、有界 transport 和 Server 生命周期接线已经实现。TLS、可选
 mTLS、Bearer Handshake、服务端签发 read/control-only administrator session、凭据文件约束和重启证书
 轮换也已完成；非 loopback endpoint 只有同时配置 TLS 与认证才会 bind。标准 `CancelFlightInfo`、
-owner/admin 权限、ABA fence，以及 Catalogs/DbSchemas/Tables/TableTypes metadata 已完成。`DoPut`、
-`DoExchange` 和 Python client cutover 仍待后续阶段。
+owner/admin 权限、ABA fence，以及 Catalogs/DbSchemas/Tables/TableTypes metadata 已完成。
+
+Stage 6.4 已实现标准 `DoPut` 的 append + memory 子集：独立 Writer session、逐 batch 回执、并发/批次/
+行数/字节硬上限、共享 transport byte permit 和容量为 1 的回执背压。当前 backend 通过受限 facade 复用
+Gateway materializer；它没有 producer fencing、服务端去重、ingest WAL 或 persisted ACK，因此只承诺
+process-local memory durability。`DoExchange`、durable `DoPut` backend 和 Python client cutover 仍待
+后续阶段。
 
 正向结果：
 
 - Arrow batch 可以跨语言、流式、低复制传输。
 - 查询 ticket、取消和 schema discovery 有标准协议基础。
+- 写入 transport、Writer 权限和资源治理可以先于 durable ingest 独立稳定。
 - Python 和 Rust 客户端共享一致的服务端查询行为。
 
 代价与约束：
 
 - Flight、gRPC、TLS 和认证增加部署与测试面。
+- Stage 6.4 memory ACK 不能解决断线后的写入歧义；重试可能重复，生产客户端必须显式接受该边界。
 - durable subscription 的 offset/ack 仍是 Zippy 业务协议，Flight 不自动提供其正确性。
 - compatibility adapter 必须有删除条件，不能长期演化为第二个 frontend。
 

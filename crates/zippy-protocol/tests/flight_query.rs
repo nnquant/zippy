@@ -9,13 +9,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient as RawFlightClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::sql::{
     CommandGetDbSchemas, CommandGetTableTypes, CommandGetTables, ProstMessageExt,
 };
-use arrow_flight::{Action, CancelFlightInfoRequest, CancelStatus, FlightClient, HandshakeRequest};
+use arrow_flight::{
+    Action, CancelFlightInfoRequest, CancelStatus, FlightClient, FlightDescriptor, HandshakeRequest,
+};
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
@@ -23,6 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate as TonicCertificate, ClientTlsConfig, Identity};
 use zippy_protocol::auth::FlightBearerAuthConfig;
 use zippy_protocol::error::status_to_server_error;
+use zippy_protocol::ingest::{encode_put_descriptor, FlightPutBatch, FlightPutLimits};
 use zippy_protocol::query::{
     decode_query_ticket, encode_query_descriptor, encode_query_request, encode_query_ticket,
     FlightQueryRequest, FlightTableBinding,
@@ -36,7 +40,8 @@ use zippy_protocol::sql::{
     FlightSqlMetadataLimits, FlightSqlMetadataRequest, PreparedFlightSqlMetadata,
 };
 use zippy_protocol::wire::{
-    CapabilitiesResponse, MetadataInfo, SessionOpenRequest, SessionOpenResponse, SessionRole,
+    CapabilitiesResponse, MetadataInfo, PutBatchResult, PutCommand, PutDurability, PutMutation,
+    SessionOpenRequest, SessionOpenResponse, SessionRole,
 };
 use zippy_protocol::{
     AUTHORIZATION_METADATA_KEY, CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY,
@@ -46,12 +51,15 @@ use zippy_types::query::{
     RecordBatchStream, SendableRecordBatchStream,
 };
 use zippy_types::table::{CatalogName, TableRef};
-use zippy_types::{BoxFuture, ErrorCode, QueryId, ResourceLimit, Result, ServerError, SessionId};
+use zippy_types::{
+    BoxFuture, ErrorCode, QueryId, RequestId, ResourceLimit, Result, ServerError, SessionId,
+};
 
 const TEST_MESSAGE_BYTES: usize = 64 * 1024;
 const TEST_TRANSPORT_BYTES: usize = 4 * TEST_MESSAGE_BYTES;
 const TEST_BOOTSTRAP_TOKEN: &str = "test-only-flight-bootstrap-token-0001";
 const TEST_ADMIN_BOOTSTRAP_TOKEN: &str = "test-only-flight-admin-token-00000001";
+const TEST_WRITER_BOOTSTRAP_TOKEN: &str = "test-only-flight-writer-token-000000001";
 
 struct FakeFrontend {
     next_generation: AtomicU64,
@@ -60,6 +68,41 @@ struct FakeFrontend {
     hang_after_first: bool,
     poll_block: Option<PollBlock>,
     metadata_payload_bytes: usize,
+}
+
+#[derive(Default)]
+struct RecordingPutFrontend {
+    writes: Mutex<Vec<(String, u64, usize)>>,
+}
+
+impl FlightQueryFrontend for RecordingPutFrontend {
+    fn prepare(
+        &self,
+        request: FlightQueryRequest,
+    ) -> BoxFuture<'_, Result<OpaquePreparedFlightQuery>> {
+        Box::pin(async move {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "recording put frontend does not implement queries",
+            )
+            .with_query_id(request.request.query_id)
+            .with_retryable(false))
+        })
+    }
+
+    fn write_batch(&self, request: FlightPutBatch) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((
+                    request.command.stream_name.clone(),
+                    request.batch_sequence,
+                    request.batch.num_rows(),
+                ));
+            Ok(())
+        })
+    }
 }
 
 impl FakeFrontend {
@@ -492,6 +535,219 @@ async fn authenticated_handshake_does_not_wait_for_client_stream_eof() {
     assert!(SessionOpenResponse::decode(opened.payload).is_ok());
     drop(sender);
     runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writer_session_streams_bounded_memory_puts_and_read_session_is_rejected() {
+    let frontend = Arc::new(RecordingPutFrontend::default());
+    let auth = FlightBearerAuthConfig::try_new(
+        TEST_BOOTSTRAP_TOKEN.as_bytes(),
+        Duration::from_secs(60),
+        4,
+    )
+    .unwrap()
+    .with_writer_token(TEST_WRITER_BOOTSTRAP_TOKEN.as_bytes())
+    .unwrap();
+    let limits =
+        FlightPutLimits::try_new(2, 4, 16, 32, TEST_MESSAGE_BYTES, TEST_TRANSPORT_BYTES).unwrap();
+    let config = service_config(4).with_bearer_auth(auth).with_ingest(limits);
+    let (service, mut runtime) = start_frontend_with_config(frontend.clone(), config);
+    let (mut writer, session_id, _, role) =
+        open_authenticated_client(&runtime, TEST_WRITER_BOOTSTRAP_TOKEN).await;
+    assert_eq!(role, SessionRole::Writer);
+    let bodies = writer
+        .do_action(Action::new(CAPABILITIES_ACTION, Vec::<u8>::new()))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let capabilities = CapabilitiesResponse::decode(bodies[0].clone()).unwrap();
+    assert!(capabilities.writer_authentication_enabled);
+    assert!(capabilities
+        .capabilities
+        .iter()
+        .any(|capability| capability == "ingest.append.memory.v1"));
+    assert_eq!(capabilities.ingest_max_concurrent_puts, 2);
+    assert_eq!(capabilities.ingest_max_batches_per_put, 4);
+    assert_eq!(capabilities.ingest_max_rows_per_batch, 16);
+    assert_eq!(capabilities.ingest_max_rows_per_put, 32);
+    assert_eq!(
+        capabilities.ingest_max_batch_bytes,
+        u64::try_from(TEST_MESSAGE_BYTES).unwrap()
+    );
+    assert_eq!(
+        capabilities.ingest_max_bytes_per_put,
+        u64::try_from(TEST_TRANSPORT_BYTES).unwrap()
+    );
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batches = vec![
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef],
+        )
+        .unwrap(),
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![30])) as ArrayRef],
+        )
+        .unwrap(),
+    ];
+    let put_id = RequestId::from_u128(700).unwrap();
+    let descriptor = encode_put_descriptor(&PutCommand {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        session_id: session_id.into_bytes().to_vec().into(),
+        put_id: put_id.into_bytes().to_vec().into(),
+        stream_name: "ticks".to_owned(),
+        first_batch_sequence: 11,
+        mutation: PutMutation::Append as i32,
+        durability: PutDurability::Memory as i32,
+    });
+    let input = FlightDataEncoderBuilder::new()
+        .with_schema(Arc::clone(&schema))
+        .with_flight_descriptor(Some(descriptor))
+        .build(futures::stream::iter(batches.into_iter().map(Ok)));
+    let results = writer
+        .do_put(input)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    let first = PutBatchResult::decode(results[0].app_metadata.clone()).unwrap();
+    let second = PutBatchResult::decode(results[1].app_metadata.clone()).unwrap();
+    assert_eq!((first.batch_sequence, first.row_count), (11, 2));
+    assert_eq!((second.batch_sequence, second.row_count), (12, 1));
+    assert_eq!(
+        frontend
+            .writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        [("ticks".to_owned(), 11, 2), ("ticks".to_owned(), 12, 1)]
+    );
+    let status = service.status();
+    assert_eq!(status.puts_started, 1);
+    assert_eq!(status.puts_completed, 1);
+    assert_eq!(status.put_batches, 2);
+    assert_eq!(status.put_rows, 3);
+    assert_eq!(status.active_puts, 0);
+    let error = match writer
+        .get_flight_info(FlightDescriptor::new_cmd(vec![1]))
+        .await
+    {
+        Ok(_) => panic!("writer session must not execute read RPCs"),
+        Err(error) => error,
+    };
+    assert_eq!(flight_error_code(error), ErrorCode::PermissionDenied);
+
+    let (mut reader, reader_session, _) =
+        authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
+    let denied_descriptor = encode_put_descriptor(&PutCommand {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        session_id: reader_session.into_bytes().to_vec().into(),
+        put_id: RequestId::from_u128(701)
+            .unwrap()
+            .into_bytes()
+            .to_vec()
+            .into(),
+        stream_name: "ticks".to_owned(),
+        first_batch_sequence: 0,
+        mutation: PutMutation::Append as i32,
+        durability: PutDurability::Memory as i32,
+    });
+    let denied_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![40])) as ArrayRef],
+    )
+    .unwrap();
+    let denied = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_flight_descriptor(Some(denied_descriptor))
+        .build(futures::stream::iter([Ok(denied_batch)]));
+    let error = match reader.do_put(denied).await {
+        Ok(_) => panic!("read session must not open a DoPut response stream"),
+        Err(error) => error,
+    };
+    assert_eq!(flight_error_code(error), ErrorCode::PermissionDenied);
+
+    runtime.shutdown(Duration::from_secs(2)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_row_limit_rejects_batch_before_frontend_write() {
+    let frontend = Arc::new(RecordingPutFrontend::default());
+    let auth = FlightBearerAuthConfig::try_new(
+        TEST_BOOTSTRAP_TOKEN.as_bytes(),
+        Duration::from_secs(60),
+        2,
+    )
+    .unwrap()
+    .with_writer_token(TEST_WRITER_BOOTSTRAP_TOKEN.as_bytes())
+    .unwrap();
+    let limits =
+        FlightPutLimits::try_new(1, 1, 1, 1, TEST_MESSAGE_BYTES, TEST_MESSAGE_BYTES).unwrap();
+    let config = service_config(2).with_bearer_auth(auth).with_ingest(limits);
+    let (service, mut runtime) = start_frontend_with_config(frontend.clone(), config);
+    let (mut writer, session_id, _, role) =
+        open_authenticated_client(&runtime, TEST_WRITER_BOOTSTRAP_TOKEN).await;
+    assert_eq!(role, SessionRole::Writer);
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef],
+    )
+    .unwrap();
+    let descriptor = encode_put_descriptor(&PutCommand {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        session_id: session_id.into_bytes().to_vec().into(),
+        put_id: RequestId::from_u128(702)
+            .unwrap()
+            .into_bytes()
+            .to_vec()
+            .into(),
+        stream_name: "ticks".to_owned(),
+        first_batch_sequence: 0,
+        mutation: PutMutation::Append as i32,
+        durability: PutDurability::Memory as i32,
+    });
+    let input = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_flight_descriptor(Some(descriptor))
+        .build(futures::stream::iter([Ok(batch)]));
+    let error = writer
+        .do_put(input)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .expect_err("oversized batch must fail the DoPut response stream");
+    assert_eq!(flight_error_code(error), ErrorCode::ResourceExhausted);
+    assert!(frontend
+        .writes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty());
+    let status = service.status();
+    assert_eq!(status.puts_started, 1);
+    assert_eq!(status.puts_completed, 0);
+    assert_eq!(status.put_rejections, 1);
+    assert_eq!(status.put_batches, 0);
+    assert_eq!(status.active_puts, 0);
+
+    runtime.shutdown(Duration::from_secs(2)).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

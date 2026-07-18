@@ -73,11 +73,20 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_FLIGHT_AUTH_TOKEN",
     "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN_FILE",
     "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN",
+    "ZIPPY_FLIGHT_AUTH_WRITER_TOKEN_FILE",
+    "ZIPPY_FLIGHT_AUTH_WRITER_TOKEN",
     "ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS",
     "ZIPPY_FLIGHT_AUTH_MAX_SESSIONS",
     "ZIPPY_FLIGHT_METADATA_MAX_ROWS",
     "ZIPPY_FLIGHT_METADATA_MAX_BYTES",
     "ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS",
+    "ZIPPY_FLIGHT_INGEST_ENABLED",
+    "ZIPPY_FLIGHT_INGEST_MAX_CONCURRENT_PUTS",
+    "ZIPPY_FLIGHT_INGEST_MAX_BATCHES_PER_PUT",
+    "ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_BATCH",
+    "ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_PUT",
+    "ZIPPY_FLIGHT_INGEST_MAX_BATCH_BYTES",
+    "ZIPPY_FLIGHT_INGEST_MAX_BYTES_PER_PUT",
     "ZIPPY_MASTER_HOST",
     "ZIPPY_MASTER_PORT",
     "ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS",
@@ -1789,6 +1798,118 @@ enabled = true
     assert!(error
         .to_string()
         .contains("read and administrator bootstrap tokens must be distinct"));
+}
+
+#[test]
+fn zippy_config_loads_explicit_flight_ingest_and_redacts_writer_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[gateway]
+enabled = true
+endpoint = "127.0.0.1:17691"
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+
+[flight.auth]
+enabled = true
+
+[flight.ingest]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let read_token = "test-only-flight-bootstrap-token-0001";
+    let writer_token = "test-only-flight-writer-token-000000001";
+
+    let config = with_env(
+        &[
+            ("ZIPPY_FLIGHT_AUTH_TOKEN", read_token),
+            ("ZIPPY_FLIGHT_AUTH_WRITER_TOKEN", writer_token),
+            ("ZIPPY_FLIGHT_INGEST_MAX_CONCURRENT_PUTS", "3"),
+            ("ZIPPY_FLIGHT_INGEST_MAX_BATCHES_PER_PUT", "9"),
+            ("ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_BATCH", "1000"),
+            ("ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_PUT", "5000"),
+            ("ZIPPY_FLIGHT_INGEST_MAX_BATCH_BYTES", "1048576"),
+            ("ZIPPY_FLIGHT_INGEST_MAX_BYTES_PER_PUT", "4194304"),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap();
+
+    assert!(config.flight.ingest.enabled);
+    assert_eq!(
+        config.flight.auth.writer_bootstrap_token(),
+        Some(writer_token)
+    );
+    assert_eq!(config.flight.ingest.max_concurrent_puts, 3);
+    assert_eq!(config.flight.ingest.max_batches_per_put, 9);
+    assert_eq!(config.flight.ingest.max_rows_per_batch, 1_000);
+    assert_eq!(config.flight.ingest.max_rows_per_put, 5_000);
+    assert_eq!(config.flight.ingest.max_batch_bytes, 1_048_576);
+    assert_eq!(config.flight.ingest.max_bytes_per_put, 4_194_304);
+    assert!(!format!("{config:?}").contains(writer_token));
+    assert!(!config.to_json_value().to_string().contains(writer_token));
+}
+
+#[test]
+fn zippy_config_rejects_flight_ingest_without_distinct_writer_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[gateway]
+enabled = true
+endpoint = "127.0.0.1:17691"
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+
+[flight.auth]
+enabled = true
+
+[flight.ingest]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(
+        &[(
+            "ZIPPY_FLIGHT_AUTH_TOKEN",
+            "test-only-flight-bootstrap-token-0001",
+        )],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("requires exactly one writer bootstrap token source"));
 }
 
 #[test]

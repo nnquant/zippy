@@ -18,6 +18,35 @@ enum SessionRole {
   SESSION_ROLE_UNSPECIFIED = 0;
   SESSION_ROLE_READ = 1;
   SESSION_ROLE_ADMINISTRATOR = 2;
+  SESSION_ROLE_WRITER = 3;
+}
+
+message PutCommand {
+  uint32 protocol_version = 1;
+  bytes session_id = 2;
+  bytes put_id = 3;
+  string stream_name = 4;
+  uint64 first_batch_sequence = 5;
+  PutMutation mutation = 6;
+  PutDurability durability = 7;
+}
+
+enum PutMutation {
+  PUT_MUTATION_UNSPECIFIED = 0;
+  PUT_MUTATION_APPEND = 1;
+}
+
+enum PutDurability {
+  PUT_DURABILITY_UNSPECIFIED = 0;
+  PUT_DURABILITY_MEMORY = 1;
+}
+
+message PutBatchResult {
+  uint32 protocol_version = 1;
+  bytes put_id = 2;
+  uint64 batch_sequence = 3;
+  uint64 row_count = 4;
+  PutDurability durability_reached = 5;
 }
 
 message QueryCommand {
@@ -182,4 +211,12 @@ message CapabilitiesResponse {
   bool administrator_authentication_enabled = 8;
   uint64 metadata_max_rows = 9;
   uint64 metadata_max_bytes = 10;
+  bool writer_authentication_enabled = 11;
+  bool ingest_enabled = 12;
+  uint64 ingest_max_concurrent_puts = 13;
+  uint64 ingest_max_batches_per_put = 14;
+  uint64 ingest_max_rows_per_batch = 15;
+  uint64 ingest_max_rows_per_put = 16;
+  uint64 ingest_max_batch_bytes = 17;
+  uint64 ingest_max_bytes_per_put = 18;
 }

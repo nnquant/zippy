@@ -16,6 +16,7 @@ use arrow::array::{BinaryArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::sql::CommandGetTables;
@@ -36,11 +37,13 @@ use zippy_master::snapshot::{
     SnapshotStreamRecord,
 };
 use zippy_protocol::error::status_to_server_error;
+use zippy_protocol::ingest::encode_put_descriptor;
 use zippy_protocol::query::{
     encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
 };
 use zippy_protocol::wire::{
-    MetadataInfo, QueryInfo, SessionOpenRequest, SessionOpenResponse, SessionRole,
+    MetadataInfo, PutBatchResult, PutCommand, PutDurability, PutMutation, QueryInfo,
+    SessionOpenRequest, SessionOpenResponse, SessionRole,
 };
 use zippy_protocol::{AUTHORIZATION_METADATA_KEY, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY};
 use zippy_server::{
@@ -1088,6 +1091,159 @@ async fn flight_only_runtime_streams_real_native_snapshot_and_releases_ticket() 
 
     assert!(runtime.shutdown().is_clean());
     wait_until_bindable(flight_addr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const READ_TOKEN: &str = "test-only-flight-read-token-0000000001";
+    const WRITER_TOKEN: &str = "test-only-flight-writer-token-00000001";
+
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let gateway_addr = reserve_tcp_addr();
+    let flight_addr = reserve_tcp_addr();
+    let config = runtime_config_with_native_query_frontend(&temp, &data_dir, gateway_addr);
+    let config_path = config
+        .master()
+        .config_path
+        .as_ref()
+        .expect("Flight ingest test has a config file");
+    let read_token_path = temp.path().join("flight-read.token");
+    let writer_token_path = temp.path().join("flight-writer.token");
+    fs::write(&read_token_path, format!("{READ_TOKEN}\n")).unwrap();
+    fs::write(&writer_token_path, format!("{WRITER_TOKEN}\n")).unwrap();
+    fs::set_permissions(&read_token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&writer_token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut source = fs::read_to_string(config_path).unwrap();
+    source.push_str(&format!(
+        concat!(
+            "\n[flight]\n",
+            "enabled = true\n",
+            "endpoint = {:?}\n",
+            "max_message_bytes = 2097152\n",
+            "max_pending_tickets = 16\n\n",
+            "[flight.auth]\n",
+            "enabled = true\n",
+            "token_file = {:?}\n",
+            "writer_token_file = {:?}\n",
+            "session_ttl_ms = 60000\n",
+            "max_sessions = 8\n\n",
+            "[flight.ingest]\n",
+            "enabled = true\n",
+            "max_concurrent_puts = 2\n",
+            "max_batches_per_put = 4\n",
+            "max_rows_per_batch = 16\n",
+            "max_rows_per_put = 32\n",
+            "max_batch_bytes = 1048576\n",
+            "max_bytes_per_put = 2097152\n"
+        ),
+        flight_addr.to_string(),
+        read_token_path.display().to_string(),
+        writer_token_path.display().to_string(),
+    ));
+    fs::write(config_path, source).unwrap();
+
+    let mut runtime = LegacyServerRuntime::start(config).expect("start Flight ingest runtime");
+    let health = runtime.health();
+    assert!(health.readiness.gateway_listener_ready);
+    assert!(health.readiness.flight_protocol_ready);
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{flight_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut writer = FlightClient::new(channel);
+    writer
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {WRITER_TOKEN}"),
+        )
+        .unwrap();
+    let response = writer
+        .handshake(
+            SessionOpenRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+    let opened = SessionOpenResponse::decode(response).unwrap();
+    assert_eq!(
+        SessionRole::try_from(opened.role).unwrap(),
+        SessionRole::Writer
+    );
+    let session_id = SessionId::from_bytes(opened.session_id.as_ref().try_into().unwrap()).unwrap();
+    writer
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {}", opened.bearer_token),
+        )
+        .unwrap();
+
+    let schema = append_table_schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![101_i64, 102, 103]))],
+    )
+    .unwrap();
+    let descriptor = encode_put_descriptor(&PutCommand {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        session_id: session_id.into_bytes().to_vec().into(),
+        put_id: RequestId::from_u128(2_101)
+            .unwrap()
+            .into_bytes()
+            .to_vec()
+            .into(),
+        stream_name: "flight_ingest_ticks".to_owned(),
+        first_batch_sequence: 41,
+        mutation: PutMutation::Append as i32,
+        durability: PutDurability::Memory as i32,
+    });
+    let input = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_flight_descriptor(Some(descriptor))
+        .build(futures::stream::iter([Ok(batch)]));
+    let results = writer
+        .do_put(input)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let result = PutBatchResult::decode(results[0].app_metadata.clone()).unwrap();
+    assert_eq!((result.batch_sequence, result.row_count), (41, 3));
+
+    let flight = runtime.flight_status().unwrap();
+    assert_eq!(flight.active_writer_sessions, 1);
+    assert_eq!(flight.puts_completed, 1);
+    assert_eq!(flight.put_rows, 3);
+    let gateway = runtime.gateway_metrics().unwrap();
+    assert_eq!(gateway["write_batches_total"], 1);
+    assert_eq!(gateway["written_rows_total"], 3);
+    let mut master = MasterClient::connect_endpoint(runtime.control_endpoint().clone()).unwrap();
+    master
+        .register_process("flight-ingest-runtime-test")
+        .unwrap();
+    let stream = master.get_stream("flight_ingest_ticks").unwrap();
+    assert!(stream.active_segment_descriptor.is_some());
+    assert_eq!(
+        stream.active_segment_preflight.as_ref().unwrap()["status"],
+        "ok"
+    );
+    master.unregister_process().unwrap();
+    drop(master);
+    drop(writer);
+
+    let outcome = runtime.shutdown();
+    assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+    wait_until_bindable(flight_addr);
+    wait_until_bindable(gateway_addr);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

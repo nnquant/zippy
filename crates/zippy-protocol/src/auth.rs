@@ -24,6 +24,7 @@ const SESSION_TOKEN_PREFIX: &str = "zfs1_";
 pub struct FlightBearerAuthConfig {
     bootstrap_digest: [u8; 32],
     admin_bootstrap_digest: Option<[u8; 32]>,
+    writer_bootstrap_digest: Option<[u8; 32]>,
     session_ttl: Duration,
     max_sessions: usize,
 }
@@ -36,6 +37,10 @@ impl fmt::Debug for FlightBearerAuthConfig {
             .field(
                 "admin_bootstrap_token_configured",
                 &self.admin_bootstrap_digest.is_some(),
+            )
+            .field(
+                "writer_bootstrap_token_configured",
+                &self.writer_bootstrap_digest.is_some(),
             )
             .field("session_ttl", &self.session_ttl)
             .field("max_sessions", &self.max_sessions)
@@ -62,6 +67,7 @@ impl FlightBearerAuthConfig {
         Ok(Self {
             bootstrap_digest: digest(bootstrap_token),
             admin_bootstrap_digest: None,
+            writer_bootstrap_digest: None,
             session_ttl,
             max_sessions,
         })
@@ -76,7 +82,34 @@ impl FlightBearerAuthConfig {
                 "Flight read and administrator bootstrap tokens must be distinct",
             ));
         }
+        if self
+            .writer_bootstrap_digest
+            .as_ref()
+            .is_some_and(|digest| bool::from(digest.ct_eq(&admin_digest)))
+        {
+            return Err(invalid(
+                "Flight administrator and writer bootstrap tokens must be distinct",
+            ));
+        }
         self.admin_bootstrap_digest = Some(admin_digest);
+        Ok(self)
+    }
+
+    /// Adds a distinct writer bootstrap credential.
+    pub fn with_writer_token(mut self, writer_bootstrap_token: &[u8]) -> Result<Self> {
+        validate_bootstrap_token(writer_bootstrap_token)?;
+        let writer_digest = digest(writer_bootstrap_token);
+        if bool::from(self.bootstrap_digest.ct_eq(&writer_digest))
+            || self
+                .admin_bootstrap_digest
+                .as_ref()
+                .is_some_and(|digest| bool::from(digest.ct_eq(&writer_digest)))
+        {
+            return Err(invalid(
+                "Flight read, administrator, and writer bootstrap tokens must be distinct",
+            ));
+        }
+        self.writer_bootstrap_digest = Some(writer_digest);
         Ok(self)
     }
 
@@ -97,12 +130,19 @@ impl FlightBearerAuthConfig {
     pub const fn administrator_enabled(&self) -> bool {
         self.admin_bootstrap_digest.is_some()
     }
+
+    /// Returns whether writer sessions may be issued.
+    #[must_use]
+    pub const fn writer_enabled(&self) -> bool {
+        self.writer_bootstrap_digest.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlightSessionRole {
     Read,
     Administrator,
+    Writer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +156,7 @@ pub(crate) struct SessionAuthorityStatus {
     pub(crate) admission_open: bool,
     pub(crate) active_sessions: usize,
     pub(crate) active_administrator_sessions: usize,
+    pub(crate) active_writer_sessions: usize,
     pub(crate) opened_sessions: u64,
     pub(crate) expired_sessions: u64,
     pub(crate) auth_failures: u64,
@@ -192,11 +233,18 @@ impl SessionAuthority {
             .admin_bootstrap_digest
             .as_ref()
             .is_some_and(|digest| bool::from(digest.ct_eq(&supplied_digest)));
-        if !read_match && !administrator_match {
+        let writer_match = self
+            .config
+            .writer_bootstrap_digest
+            .as_ref()
+            .is_some_and(|digest| bool::from(digest.ct_eq(&supplied_digest)));
+        if !read_match && !administrator_match && !writer_match {
             return Err(self.authentication_failed());
         }
         let role = if administrator_match {
             FlightSessionRole::Administrator
+        } else if writer_match {
+            FlightSessionRole::Writer
         } else {
             FlightSessionRole::Read
         };
@@ -324,6 +372,11 @@ impl SessionAuthority {
                 .entries
                 .values()
                 .filter(|entry| entry.role == FlightSessionRole::Administrator)
+                .count(),
+            active_writer_sessions: state
+                .entries
+                .values()
+                .filter(|entry| entry.role == FlightSessionRole::Writer)
                 .count(),
             opened_sessions: self.metrics.opened_sessions.load(Ordering::Relaxed),
             expired_sessions: self.metrics.expired_sessions.load(Ordering::Relaxed),
@@ -512,6 +565,42 @@ mod tests {
         )
         .unwrap()
         .with_admin_token(BOOTSTRAP_TOKEN.as_bytes())
+        .is_err());
+    }
+
+    #[test]
+    fn writer_token_is_distinct_and_issues_a_control_isolated_role() {
+        const ADMIN_TOKEN: &str = "test-only-flight-administrator-token-0001";
+        const WRITER_TOKEN: &str = "test-only-flight-writer-token-000000001";
+        let config =
+            FlightBearerAuthConfig::try_new(BOOTSTRAP_TOKEN.as_bytes(), Duration::from_secs(60), 3)
+                .unwrap()
+                .with_admin_token(ADMIN_TOKEN.as_bytes())
+                .unwrap()
+                .with_writer_token(WRITER_TOKEN.as_bytes())
+                .unwrap();
+        assert!(config.writer_enabled());
+        assert!(!format!("{config:?}").contains(WRITER_TOKEN));
+        let authority = SessionAuthority::new(config);
+        let mut bootstrap = MetadataMap::new();
+        bootstrap.insert(
+            AUTHORIZATION_METADATA_KEY,
+            MetadataValue::try_from(format!("Bearer {WRITER_TOKEN}")).unwrap(),
+        );
+
+        let opened = authority.open(&bootstrap, 10).unwrap();
+
+        assert_eq!(opened.role, FlightSessionRole::Writer);
+        assert_eq!(authority.status().active_writer_sessions, 1);
+        assert!(FlightBearerAuthConfig::try_new(
+            BOOTSTRAP_TOKEN.as_bytes(),
+            Duration::from_secs(60),
+            3,
+        )
+        .unwrap()
+        .with_admin_token(ADMIN_TOKEN.as_bytes())
+        .unwrap()
+        .with_writer_token(ADMIN_TOKEN.as_bytes())
         .is_err());
     }
 }

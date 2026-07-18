@@ -80,6 +80,28 @@ pub const MAX_FLIGHT_METADATA_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_FLIGHT_METADATA_TICKET_TTL_MS: u64 = 30_000;
 /// Longest supported Flight SQL metadata ticket lifetime.
 pub const MAX_FLIGHT_METADATA_TICKET_TTL_MS: u64 = 5 * 60 * 1_000;
+/// Default maximum simultaneously active Flight `DoPut` streams.
+pub const DEFAULT_FLIGHT_INGEST_MAX_CONCURRENT_PUTS: usize = 4;
+/// Default maximum decoded Arrow batches accepted by one `DoPut` stream.
+pub const DEFAULT_FLIGHT_INGEST_MAX_BATCHES_PER_PUT: usize = 1_024;
+/// Default maximum rows accepted in one decoded ingest batch.
+pub const DEFAULT_FLIGHT_INGEST_MAX_ROWS_PER_BATCH: u64 = 65_536;
+/// Default maximum cumulative rows accepted by one `DoPut` stream.
+pub const DEFAULT_FLIGHT_INGEST_MAX_ROWS_PER_PUT: u64 = 1_048_576;
+/// Default maximum retained Arrow bytes accepted in one decoded ingest batch.
+pub const DEFAULT_FLIGHT_INGEST_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Default maximum cumulative decoded Arrow bytes accepted by one `DoPut` stream.
+pub const DEFAULT_FLIGHT_INGEST_MAX_BYTES_PER_PUT: usize = 256 * 1024 * 1024;
+/// Hard ceiling for simultaneous Flight `DoPut` streams.
+pub const MAX_FLIGHT_INGEST_CONCURRENT_PUTS: usize = 1_024;
+/// Hard ceiling for decoded batches in one Flight `DoPut` stream.
+pub const MAX_FLIGHT_INGEST_BATCHES_PER_PUT: usize = 65_536;
+/// Hard ceiling for cumulative rows in one Flight `DoPut` stream.
+pub const MAX_FLIGHT_INGEST_ROWS_PER_PUT: u64 = 1_000_000_000;
+/// Hard ceiling for one retained decoded ingest batch.
+pub const MAX_FLIGHT_INGEST_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Hard ceiling for cumulative decoded bytes in one Flight `DoPut` stream.
+pub const MAX_FLIGHT_INGEST_BYTES_PER_PUT: usize = 4 * 1024 * 1024 * 1024;
 /// Backward-compatible canary default, independent from a configured production override.
 pub const DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES: u64 = DEFAULT_QUERY_OPERATOR_MEMORY_BYTES;
 pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
@@ -463,6 +485,8 @@ pub struct ZippyFlightConfig {
     pub auth: ZippyFlightAuthConfig,
     /// Bounded Flight SQL metadata materialization policy.
     pub metadata: ZippyFlightMetadataConfig,
+    /// Bounded append-only Flight `DoPut` compatibility policy.
+    pub ingest: ZippyFlightIngestConfig,
 }
 
 impl Default for ZippyFlightConfig {
@@ -476,6 +500,7 @@ impl Default for ZippyFlightConfig {
             tls: ZippyFlightTlsConfig::default(),
             auth: ZippyFlightAuthConfig::default(),
             metadata: ZippyFlightMetadataConfig::default(),
+            ingest: ZippyFlightIngestConfig::default(),
         }
     }
 }
@@ -504,6 +529,8 @@ pub struct ZippyFlightAuthConfig {
     pub token_file: Option<PathBuf>,
     /// Optional owner-only file containing a distinct administrator bootstrap token.
     pub admin_token_file: Option<PathBuf>,
+    /// Optional owner-only file containing a distinct writer bootstrap token.
+    pub writer_token_file: Option<PathBuf>,
     /// Lifetime of one server-issued session credential.
     pub session_ttl_ms: u64,
     /// Maximum number of simultaneously valid server-issued sessions.
@@ -512,6 +539,8 @@ pub struct ZippyFlightAuthConfig {
     bootstrap_token: Option<String>,
     #[serde(skip)]
     admin_bootstrap_token: Option<String>,
+    #[serde(skip)]
+    writer_bootstrap_token: Option<String>,
 }
 
 impl std::fmt::Debug for ZippyFlightAuthConfig {
@@ -521,6 +550,7 @@ impl std::fmt::Debug for ZippyFlightAuthConfig {
             .field("enabled", &self.enabled)
             .field("token_file", &self.token_file)
             .field("admin_token_file", &self.admin_token_file)
+            .field("writer_token_file", &self.writer_token_file)
             .field("session_ttl_ms", &self.session_ttl_ms)
             .field("max_sessions", &self.max_sessions)
             .field(
@@ -530,6 +560,10 @@ impl std::fmt::Debug for ZippyFlightAuthConfig {
             .field(
                 "admin_bootstrap_token_configured",
                 &self.admin_bootstrap_token.is_some(),
+            )
+            .field(
+                "writer_bootstrap_token_configured",
+                &self.writer_bootstrap_token.is_some(),
             )
             .finish()
     }
@@ -541,10 +575,12 @@ impl Default for ZippyFlightAuthConfig {
             enabled: false,
             token_file: None,
             admin_token_file: None,
+            writer_token_file: None,
             session_ttl_ms: DEFAULT_FLIGHT_SESSION_TTL_MS,
             max_sessions: DEFAULT_FLIGHT_MAX_SESSIONS,
             bootstrap_token: None,
             admin_bootstrap_token: None,
+            writer_bootstrap_token: None,
         }
     }
 }
@@ -560,6 +596,12 @@ impl ZippyFlightAuthConfig {
     #[must_use]
     pub fn admin_bootstrap_token(&self) -> Option<&str> {
         self.admin_bootstrap_token.as_deref()
+    }
+
+    /// Returns the environment-sourced writer token without serializing it.
+    #[must_use]
+    pub fn writer_bootstrap_token(&self) -> Option<&str> {
+        self.writer_bootstrap_token.as_deref()
     }
 }
 
@@ -580,6 +622,39 @@ impl Default for ZippyFlightMetadataConfig {
             max_rows: DEFAULT_FLIGHT_METADATA_MAX_ROWS,
             max_bytes: DEFAULT_FLIGHT_METADATA_MAX_BYTES,
             ticket_ttl_ms: DEFAULT_FLIGHT_METADATA_TICKET_TTL_MS,
+        }
+    }
+}
+
+/// Bounded Stage 6.4 Flight append-ingest policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyFlightIngestConfig {
+    /// Enables append-only `DoPut` through the compatibility backend.
+    pub enabled: bool,
+    /// Maximum simultaneously active `DoPut` streams.
+    pub max_concurrent_puts: usize,
+    /// Maximum decoded Arrow batches in one stream.
+    pub max_batches_per_put: usize,
+    /// Maximum rows in one decoded batch.
+    pub max_rows_per_batch: u64,
+    /// Maximum cumulative rows in one stream.
+    pub max_rows_per_put: u64,
+    /// Maximum retained Arrow bytes in one decoded batch.
+    pub max_batch_bytes: usize,
+    /// Maximum cumulative decoded Arrow bytes in one stream.
+    pub max_bytes_per_put: usize,
+}
+
+impl Default for ZippyFlightIngestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent_puts: DEFAULT_FLIGHT_INGEST_MAX_CONCURRENT_PUTS,
+            max_batches_per_put: DEFAULT_FLIGHT_INGEST_MAX_BATCHES_PER_PUT,
+            max_rows_per_batch: DEFAULT_FLIGHT_INGEST_MAX_ROWS_PER_BATCH,
+            max_rows_per_put: DEFAULT_FLIGHT_INGEST_MAX_ROWS_PER_PUT,
+            max_batch_bytes: DEFAULT_FLIGHT_INGEST_MAX_BATCH_BYTES,
+            max_bytes_per_put: DEFAULT_FLIGHT_INGEST_MAX_BYTES_PER_PUT,
         }
     }
 }
@@ -732,6 +807,7 @@ struct PartialFlightConfig {
     tls: Option<PartialFlightTlsConfig>,
     auth: Option<PartialFlightAuthConfig>,
     metadata: Option<PartialFlightMetadataConfig>,
+    ingest: Option<PartialFlightIngestConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -750,6 +826,7 @@ struct PartialFlightAuthConfig {
     enabled: Option<bool>,
     token_file: Option<String>,
     admin_token_file: Option<String>,
+    writer_token_file: Option<String>,
     session_ttl_ms: Option<u64>,
     max_sessions: Option<usize>,
 }
@@ -760,6 +837,18 @@ struct PartialFlightMetadataConfig {
     max_rows: Option<usize>,
     max_bytes: Option<usize>,
     ticket_ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFlightIngestConfig {
+    enabled: Option<bool>,
+    max_concurrent_puts: Option<usize>,
+    max_batches_per_put: Option<usize>,
+    max_rows_per_batch: Option<u64>,
+    max_rows_per_put: Option<u64>,
+    max_batch_bytes: Option<usize>,
+    max_bytes_per_put: Option<usize>,
 }
 
 impl Default for ZippyConfig {
@@ -1107,6 +1196,13 @@ impl ZippyConfig {
                         Some(resolve_config_path(&admin_token_file, config_base));
                     self.flight.auth.admin_bootstrap_token = None;
                 }
+                if let Some(writer_token_file) = auth.writer_token_file {
+                    let writer_token_file =
+                        non_empty(writer_token_file, "flight.auth.writer_token_file")?;
+                    self.flight.auth.writer_token_file =
+                        Some(resolve_config_path(&writer_token_file, config_base));
+                    self.flight.auth.writer_bootstrap_token = None;
+                }
                 if let Some(session_ttl_ms) = auth.session_ttl_ms {
                     self.flight.auth.session_ttl_ms = session_ttl_ms;
                 }
@@ -1123,6 +1219,29 @@ impl ZippyConfig {
                 }
                 if let Some(ticket_ttl_ms) = metadata.ticket_ttl_ms {
                     self.flight.metadata.ticket_ttl_ms = ticket_ttl_ms;
+                }
+            }
+            if let Some(ingest) = flight.ingest {
+                if let Some(enabled) = ingest.enabled {
+                    self.flight.ingest.enabled = enabled;
+                }
+                if let Some(max_concurrent_puts) = ingest.max_concurrent_puts {
+                    self.flight.ingest.max_concurrent_puts = max_concurrent_puts;
+                }
+                if let Some(max_batches_per_put) = ingest.max_batches_per_put {
+                    self.flight.ingest.max_batches_per_put = max_batches_per_put;
+                }
+                if let Some(max_rows_per_batch) = ingest.max_rows_per_batch {
+                    self.flight.ingest.max_rows_per_batch = max_rows_per_batch;
+                }
+                if let Some(max_rows_per_put) = ingest.max_rows_per_put {
+                    self.flight.ingest.max_rows_per_put = max_rows_per_put;
+                }
+                if let Some(max_batch_bytes) = ingest.max_batch_bytes {
+                    self.flight.ingest.max_batch_bytes = max_batch_bytes;
+                }
+                if let Some(max_bytes_per_put) = ingest.max_bytes_per_put {
+                    self.flight.ingest.max_bytes_per_put = max_bytes_per_put;
                 }
             }
         }
@@ -1552,6 +1671,29 @@ impl ZippyConfig {
                 Some(non_empty(token, "ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN")?);
             self.flight.auth.admin_token_file = None;
         }
+        let writer_token_file = env_string("ZIPPY_FLIGHT_AUTH_WRITER_TOKEN_FILE");
+        let writer_token = env_string("ZIPPY_FLIGHT_AUTH_WRITER_TOKEN");
+        if writer_token_file.is_some() && writer_token.is_some() {
+            return Err(ZippyError::InvalidConfig {
+                reason: concat!(
+                    "only one of ZIPPY_FLIGHT_AUTH_WRITER_TOKEN_FILE and ",
+                    "ZIPPY_FLIGHT_AUTH_WRITER_TOKEN may be set"
+                )
+                .to_string(),
+            });
+        }
+        if let Some(path) = writer_token_file {
+            self.flight.auth.writer_token_file = Some(resolve_env_absolute_path(
+                "ZIPPY_FLIGHT_AUTH_WRITER_TOKEN_FILE",
+                path,
+            )?);
+            self.flight.auth.writer_bootstrap_token = None;
+        }
+        if let Some(token) = writer_token {
+            self.flight.auth.writer_bootstrap_token =
+                Some(non_empty(token, "ZIPPY_FLIGHT_AUTH_WRITER_TOKEN")?);
+            self.flight.auth.writer_token_file = None;
+        }
         if let Some(value) = env_string("ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS") {
             self.flight.auth.session_ttl_ms =
                 parse_u64_env("ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS", &value)?;
@@ -1571,6 +1713,33 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS") {
             self.flight.metadata.ticket_ttl_ms =
                 parse_u64_env("ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_INGEST_ENABLED") {
+            self.flight.ingest.enabled = parse_bool_env("ZIPPY_FLIGHT_INGEST_ENABLED", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_INGEST_MAX_CONCURRENT_PUTS") {
+            self.flight.ingest.max_concurrent_puts =
+                parse_usize_env("ZIPPY_FLIGHT_INGEST_MAX_CONCURRENT_PUTS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_INGEST_MAX_BATCHES_PER_PUT") {
+            self.flight.ingest.max_batches_per_put =
+                parse_usize_env("ZIPPY_FLIGHT_INGEST_MAX_BATCHES_PER_PUT", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_BATCH") {
+            self.flight.ingest.max_rows_per_batch =
+                parse_u64_env("ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_BATCH", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_PUT") {
+            self.flight.ingest.max_rows_per_put =
+                parse_u64_env("ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_PUT", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_INGEST_MAX_BATCH_BYTES") {
+            self.flight.ingest.max_batch_bytes =
+                parse_usize_env("ZIPPY_FLIGHT_INGEST_MAX_BATCH_BYTES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_INGEST_MAX_BYTES_PER_PUT") {
+            self.flight.ingest.max_bytes_per_put =
+                parse_usize_env("ZIPPY_FLIGHT_INGEST_MAX_BYTES_PER_PUT", &value)?;
         }
         Ok(())
     }
@@ -2268,6 +2437,43 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
             ),
         });
     }
+    if !(1..=MAX_FLIGHT_INGEST_CONCURRENT_PUTS).contains(&config.flight.ingest.max_concurrent_puts)
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight ingest max_concurrent_puts must be between 1 and {} value=[{}]",
+                MAX_FLIGHT_INGEST_CONCURRENT_PUTS, config.flight.ingest.max_concurrent_puts
+            ),
+        });
+    }
+    if !(1..=MAX_FLIGHT_INGEST_BATCHES_PER_PUT).contains(&config.flight.ingest.max_batches_per_put)
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight ingest max_batches_per_put must be between 1 and {} value=[{}]",
+                MAX_FLIGHT_INGEST_BATCHES_PER_PUT, config.flight.ingest.max_batches_per_put
+            ),
+        });
+    }
+    if config.flight.ingest.max_rows_per_batch == 0
+        || config.flight.ingest.max_rows_per_batch > config.flight.ingest.max_rows_per_put
+        || config.flight.ingest.max_rows_per_put > MAX_FLIGHT_INGEST_ROWS_PER_PUT
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: "flight ingest row limits are zero, inverted, or exceed the platform ceiling"
+                .to_string(),
+        });
+    }
+    if config.flight.ingest.max_batch_bytes == 0
+        || config.flight.ingest.max_batch_bytes > MAX_FLIGHT_INGEST_BATCH_BYTES
+        || config.flight.ingest.max_batch_bytes > config.flight.ingest.max_bytes_per_put
+        || config.flight.ingest.max_bytes_per_put > MAX_FLIGHT_INGEST_BYTES_PER_PUT
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: "flight ingest byte limits are zero, inverted, or exceed the platform ceiling"
+                .to_string(),
+        });
+    }
     if !(1..=MAX_FLIGHT_SESSIONS).contains(&config.flight.auth.max_sessions) {
         return Err(ZippyError::InvalidConfig {
             reason: format!(
@@ -2302,6 +2508,10 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
         "flight.auth.admin_token_file",
         &config.flight.auth.admin_token_file,
     )?;
+    validate_absolute_optional_path(
+        "flight.auth.writer_token_file",
+        &config.flight.auth.writer_token_file,
+    )?;
     if config.flight.tls.enabled
         && (config.flight.tls.cert_file.is_none() || config.flight.tls.key_file.is_none())
     {
@@ -2313,6 +2523,9 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
         validate_flight_bootstrap_token(token)?;
     }
     if let Some(token) = config.flight.auth.admin_bootstrap_token() {
+        validate_flight_bootstrap_token(token)?;
+    }
+    if let Some(token) = config.flight.auth.writer_bootstrap_token() {
         validate_flight_bootstrap_token(token)?;
     }
     if config.flight.auth.enabled {
@@ -2330,6 +2543,13 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
                 reason: "flight auth accepts at most one administrator token source".to_string(),
             });
         }
+        let writer_sources = usize::from(config.flight.auth.writer_token_file.is_some())
+            + usize::from(config.flight.auth.writer_bootstrap_token().is_some());
+        if writer_sources > 1 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight auth accepts at most one writer token source".to_string(),
+            });
+        }
         if config.flight.auth.token_file.is_some()
             && config.flight.auth.token_file == config.flight.auth.admin_token_file
         {
@@ -2337,11 +2557,30 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
                 reason: "flight read and administrator token files must be distinct".to_string(),
             });
         }
+        if config.flight.auth.writer_token_file.is_some()
+            && (config.flight.auth.writer_token_file == config.flight.auth.token_file
+                || config.flight.auth.writer_token_file == config.flight.auth.admin_token_file)
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight read, administrator, and writer token files must be distinct"
+                    .to_string(),
+            });
+        }
         if config.flight.auth.bootstrap_token().is_some()
             && config.flight.auth.bootstrap_token() == config.flight.auth.admin_bootstrap_token()
         {
             return Err(ZippyError::InvalidConfig {
                 reason: "flight read and administrator bootstrap tokens must be distinct"
+                    .to_string(),
+            });
+        }
+        if config.flight.auth.writer_bootstrap_token().is_some()
+            && (config.flight.auth.writer_bootstrap_token() == config.flight.auth.bootstrap_token()
+                || config.flight.auth.writer_bootstrap_token()
+                    == config.flight.auth.admin_bootstrap_token())
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight read, administrator, and writer bootstrap tokens must be distinct"
                     .to_string(),
             });
         }
@@ -2355,6 +2594,32 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
                     "flight auth session_ttl_ms must cover query plan and metadata ticket TTLs session_ttl_ms=[{}] required_ttl_ms=[{}]",
                     config.flight.auth.session_ttl_ms, required_session_ttl_ms
                 ),
+            });
+        }
+    }
+    if config.flight.ingest.enabled {
+        if !config.flight.enabled {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight ingest requires the Flight listener to be enabled".to_string(),
+            });
+        }
+        if !config.gateway.enabled {
+            return Err(ZippyError::InvalidConfig {
+                reason: "Stage 6.4 Flight ingest requires the Gateway compatibility backend"
+                    .to_string(),
+            });
+        }
+        if !config.flight.auth.enabled {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight ingest requires bearer authentication".to_string(),
+            });
+        }
+        let writer_sources = usize::from(config.flight.auth.writer_token_file.is_some())
+            + usize::from(config.flight.auth.writer_bootstrap_token().is_some());
+        if writer_sources != 1 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight ingest requires exactly one writer bootstrap token source"
+                    .to_string(),
             });
         }
     }
@@ -2378,6 +2643,14 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
             reason: format!(
                 "flight metadata max_bytes must not exceed the shared transport budget value=[{}] budget=[{}]",
                 config.flight.metadata.max_bytes, transport_budget
+            ),
+        });
+    }
+    if config.flight.ingest.enabled && config.flight.ingest.max_batch_bytes > transport_budget {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight ingest max_batch_bytes must not exceed the shared transport budget value=[{}] budget=[{}]",
+                config.flight.ingest.max_batch_bytes, transport_budget
             ),
         });
     }

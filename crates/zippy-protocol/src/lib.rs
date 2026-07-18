@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod ingest;
 pub mod query;
 pub mod runtime;
 pub mod server;

@@ -62,9 +62,11 @@ use zippy_types::query::{QueryPriority, QueryTableVersion, SendableRecordBatchSt
 use zippy_types::table::TableRef;
 use zippy_types::{BoxFuture, QueryId, ResourceLimit, ServerError, SessionId};
 
+pub mod legacy_ingest;
 pub mod legacy_query;
 mod persisted_read_shadow;
 
+pub use legacy_ingest::LegacyWriteFacade;
 pub use legacy_query::{LegacyCollectCursor, LegacyCollectFacade, LegacyCollectRequest};
 pub use persisted_read_shadow::{
     PersistedReadShadowConfig, PersistedReadShadowMetrics, PersistedReadShadowMismatch,
@@ -2087,6 +2089,11 @@ impl GatewayServer {
     /// Return a cloneable facade for legacy blocking collect adapters.
     pub fn legacy_collect_facade(&self) -> LegacyCollectFacade {
         LegacyCollectFacade::new(Arc::clone(&self.state))
+    }
+
+    /// Returns a cloneable facade for compatibility ingest frontends.
+    pub fn legacy_write_facade(&self) -> LegacyWriteFacade {
+        LegacyWriteFacade::new(Arc::clone(&self.state))
     }
 
     /// Verify the configured Master dependency with one bounded control request.

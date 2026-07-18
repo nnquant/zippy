@@ -316,10 +316,12 @@ persistence probes the complete command before final publication, moves an affin
 into the Catalog actor, and takes an exclusive publication exclusion before rejected-candidate
 cleanup. Exact, conflicting, and missing historical replays therefore never publish final
 candidates. Snapshot leases, runtime pins, QueryService integration, safe-GC claims, and bounded
-Gateway transport are implemented. Physical GC, Flight write/subscription/metadata and the final
-removal of legacy metadata authority remain later phases. Flight query TLS, bearer authentication
-and server-issued sessions are implemented behind explicit configuration. Standard Flight
-`GetFlightInfo`/`DoGet` query transport is implemented behind the opt-in `[flight]` gate.
+Gateway transport are implemented. Physical GC, durable Flight write/subscription and the final
+removal of legacy metadata authority remain later phases. Flight query TLS, bearer authentication,
+server-issued read/admin/writer sessions, Catalog metadata, and bounded append + memory `DoPut` are
+implemented behind explicit configuration. Standard Flight `GetFlightInfo`/`DoGet` query transport
+is implemented behind the opt-in `[flight]` gate; Stage 6.4 `DoPut` additionally requires Gateway
+because its process-local compatibility backend reuses the existing materializer.
 Legacy live descriptors without exact logical-offset provenance are intentionally not promoted into
 native active snapshots.
 

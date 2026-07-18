@@ -8,6 +8,8 @@ use zippy_catalog::{
     decode_persisted_schema, SqliteCatalogReadHandle, SqliteCatalogSchemaReadLimits,
     SqliteCatalogSchemaSelector,
 };
+use zippy_gateway::LegacyWriteFacade;
+use zippy_protocol::ingest::FlightPutBatch;
 use zippy_protocol::query::FlightQueryRequest;
 use zippy_protocol::server::{FlightQueryFrontend, OpaquePreparedFlightQuery, PreparedFlightQuery};
 use zippy_protocol::sql::{
@@ -28,13 +30,25 @@ const FLIGHT_SQL_TABLE_TYPE: &str = "TABLE";
 pub struct NativeFlightQueryFrontend {
     engine: NativeQueryEngine,
     catalog: SqliteCatalogReadHandle,
+    legacy_ingest: Option<LegacyWriteFacade>,
 }
 
 impl NativeFlightQueryFrontend {
     /// Creates a Flight frontend over one server-owned native query engine.
     #[must_use]
     pub const fn new(engine: NativeQueryEngine, catalog: SqliteCatalogReadHandle) -> Self {
-        Self { engine, catalog }
+        Self {
+            engine,
+            catalog,
+            legacy_ingest: None,
+        }
+    }
+
+    /// Installs the Stage 6.4 compatibility append backend.
+    #[must_use]
+    pub fn with_legacy_ingest(mut self, legacy_ingest: LegacyWriteFacade) -> Self {
+        self.legacy_ingest = Some(legacy_ingest);
+        self
     }
 
     async fn prepare_metadata_inner(
@@ -243,6 +257,34 @@ impl FlightQueryFrontend for NativeFlightQueryFrontend {
     ) -> BoxFuture<'_, Result<PreparedFlightSqlMetadata>> {
         Box::pin(async move { self.prepare_metadata_inner(request, limits).await })
     }
+
+    fn write_batch(&self, request: FlightPutBatch) -> BoxFuture<'_, Result<()>> {
+        let Some(facade) = self.legacy_ingest.clone() else {
+            return Box::pin(async move {
+                Err(ServerError::new(
+                    ErrorCode::UnsupportedPlan,
+                    "Flight ingest compatibility backend is not configured",
+                )
+                .with_request_id(request.command.put_id)
+                .with_retryable(false))
+            });
+        };
+        Box::pin(async move {
+            let put_id = request.command.put_id;
+            let stream_name = request.command.stream_name.clone();
+            tokio::task::spawn_blocking(move || facade.write_batch(&stream_name, request.batch))
+                .await
+                .map_err(|error| {
+                    ServerError::new(
+                        ErrorCode::Internal,
+                        format!("join Flight ingest compatibility writer failed error=[{error}]"),
+                    )
+                    .with_request_id(put_id)
+                    .with_retryable(false)
+                })?
+                .map_err(|error| map_legacy_ingest_error(put_id, error))
+        })
+    }
 }
 
 impl PreparedFlightQuery for NativePreparedQuery {
@@ -310,6 +352,38 @@ fn catalog_changed(expected: u64, actual: u64) -> ServerError {
 fn metadata_build_error(error: impl std::fmt::Display) -> ServerError {
     internal(format!(
         "build Flight SQL metadata batch failed error=[{error}]"
+    ))
+}
+
+fn map_legacy_ingest_error(
+    put_id: zippy_types::RequestId,
+    error: zippy_core::ZippyError,
+) -> ServerError {
+    let code = match &error {
+        zippy_core::ZippyError::InvalidConfig { .. } => ErrorCode::InvalidArgument,
+        zippy_core::ZippyError::ResourceExhausted { .. } => ErrorCode::ResourceExhausted,
+        zippy_core::ZippyError::NotFound { .. } => ErrorCode::NotFound,
+        zippy_core::ZippyError::Conflict { .. } => ErrorCode::Conflict,
+        zippy_core::ZippyError::DataCorruption { .. } => ErrorCode::DataCorruption,
+        zippy_core::ZippyError::SchemaMismatch { .. } => ErrorCode::SchemaMismatch,
+        zippy_core::ZippyError::Cancelled { .. } => ErrorCode::Cancelled,
+        zippy_core::ZippyError::DeadlineExceeded { .. } => ErrorCode::DeadlineExceeded,
+        zippy_core::ZippyError::MasterShutdownRequested { .. }
+        | zippy_core::ZippyError::InvalidState { .. }
+        | zippy_core::ZippyError::Io { .. }
+        | zippy_core::ZippyError::ChannelSend
+        | zippy_core::ZippyError::ChannelReceive
+        | zippy_core::ZippyError::QueueClosed => ErrorCode::Unavailable,
+        zippy_core::ZippyError::LateData { .. } => ErrorCode::Internal,
+    };
+    ServerError::new(
+        code,
+        format!("Flight ingest compatibility write failed error=[{error}]"),
+    )
+    .with_request_id(put_id)
+    .with_retryable(matches!(
+        code,
+        ErrorCode::ResourceExhausted | ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
     ))
 }
 

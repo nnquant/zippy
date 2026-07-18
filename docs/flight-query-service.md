@@ -1,12 +1,11 @@
-# Arrow Flight 查询服务
+# Arrow Flight 查询与内存写入服务
 
 ## 定位
 
-Stage 6.3 在标准 Arrow Flight 查询入口上补齐精确查询取消、独立管理员会话和 Flight SQL Catalog
-metadata。Flight 仍只负责协议、listener、ticket 和 Arrow batch 传输，不复制 Catalog、DataFusion
-或资源调度逻辑。一次查询仍由 Server 固定
+Stage 6.4 在标准 Arrow Flight 查询入口上增加了有界、append-only 的 `DoPut`。Flight 仍只负责协议、
+listener、session、ticket 和 Arrow batch 传输，不复制 Catalog、DataFusion 或资源调度逻辑。一次查询仍由 Server 固定
 Catalog revision、table snapshot/schema version，并由原有 QueryService 负责内存、任务、取消和结果
-batch permit。
+batch permit；一次 Stage 6.4 写入则复用现有 Gateway materializer，回执只表示进程内存已接收。
 
 当前适用场景：
 
@@ -15,10 +14,12 @@ batch permit。
 - 在不启动 legacy Gateway 时运行 persisted native SQL 查询。
 - 使用标准 Flight SQL 客户端发现 catalog、namespace、table 和 Arrow schema；
 - 由查询 owner 取消自己的查询，或由控制面管理员精确取消跨 session 查询。
+- 从 Rust/Python 等 Arrow 客户端批量追加实时数据，并接受“进程退出可能丢失”的明确语义；
+- 在 Phase 7 durable ingest 上线前，先迁移远端批量写入的 transport、鉴权和资源治理。
 
-当前不适用场景：公网裸露、写入、实时订阅、完整 Flight SQL statement 执行、细粒度表级 RBAC 或
-未经兼容性验证的通用 BI 客户端直连。管理员凭据是 control-only，不具备查询或 metadata 读取权限；
-后续写入权限也不会复用 read/admin bearer。
+当前不适用场景：公网裸露、要求 WAL/persisted durability 的写入、网络重试去重、实时订阅、完整
+Flight SQL statement 执行、细粒度表级 RBAC 或未经兼容性验证的通用 BI 客户端直连。管理员凭据是
+control-only，不具备查询、metadata 读取或写入权限；Writer 凭据也不能读取或取消查询。
 
 ## 启用
 
@@ -30,6 +31,11 @@ native_storage_enabled = true
 
 [catalog]
 backend = "sqlite_shadow"
+
+# Stage 6.4 DoPut 复用 Gateway materializer，因此启用写入时 Gateway 必须运行。
+[gateway]
+enabled = true
+endpoint = "127.0.0.1:17666"
 
 [runtime]
 max_cpu_cores = 4
@@ -66,6 +72,8 @@ enabled = true
 token_file = "/etc/zippy/flight/query.token"
 # 可选；必须与 query.token 使用不同文件和内容。
 admin_token_file = "/etc/zippy/flight/admin.token"
+# 启用 DoPut 时必填；必须与 read/admin 使用不同文件和内容。
+writer_token_file = "/etc/zippy/flight/writer.token"
 session_ttl_ms = 3600000
 max_sessions = 1024
 
@@ -73,6 +81,15 @@ max_sessions = 1024
 max_rows = 4096
 max_bytes = 8388608
 ticket_ttl_ms = 30000
+
+[flight.ingest]
+enabled = true
+max_concurrent_puts = 4
+max_batches_per_put = 1024
+max_rows_per_batch = 65536
+max_rows_per_put = 1048576
+max_batch_bytes = 8388608
+max_bytes_per_put = 268435456
 ```
 
 若 `endpoint` 省略，且 master 配置了 TCP host/port，则使用相同 host 和 `master.port + 2`。
@@ -99,15 +116,26 @@ ZIPPY_FLIGHT_AUTH_TOKEN_FILE
 ZIPPY_FLIGHT_AUTH_TOKEN
 ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN_FILE
 ZIPPY_FLIGHT_AUTH_ADMIN_TOKEN
+ZIPPY_FLIGHT_AUTH_WRITER_TOKEN_FILE
+ZIPPY_FLIGHT_AUTH_WRITER_TOKEN
 ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS
 ZIPPY_FLIGHT_AUTH_MAX_SESSIONS
 ZIPPY_FLIGHT_METADATA_MAX_ROWS
 ZIPPY_FLIGHT_METADATA_MAX_BYTES
 ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS
+ZIPPY_FLIGHT_INGEST_ENABLED
+ZIPPY_FLIGHT_INGEST_MAX_CONCURRENT_PUTS
+ZIPPY_FLIGHT_INGEST_MAX_BATCHES_PER_PUT
+ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_BATCH
+ZIPPY_FLIGHT_INGEST_MAX_ROWS_PER_PUT
+ZIPPY_FLIGHT_INGEST_MAX_BATCH_BYTES
+ZIPPY_FLIGHT_INGEST_MAX_BYTES_PER_PUT
 ```
 
 默认值是 disabled、protocol version 1、2 MiB message、64 个 pending ticket、1 小时 session TTL、
 1024 个 active session、4096 行 metadata、8 MiB 单结果 metadata 和 30 秒 metadata ticket TTL。
+ingest 默认关闭；启用后的默认上限为 4 个并发 put、每个 put 1024 个 batch/1,048,576 行/256 MiB、
+单 batch 65,536 行/8 MiB。
 环境变量中的凭据文件路径必须是绝对路径；TOML 相对路径按配置文件目录解析。
 
 ## 查询协议
@@ -132,6 +160,32 @@ ZIPPY_FLIGHT_METADATA_TICKET_TTL_MS
 
 Version 1 只接受 SQL input；typed logical plan 会以 `UNSUPPORTED_PLAN` 明确失败，不会编码成空 SQL。
 binding 必须非空、有界且名称唯一。Server 不会根据 SQL 隐式猜测 Catalog table。
+
+## `DoPut` 内存写入协议
+
+1. 客户端先用独立 writer bootstrap token 调用 `Handshake`，得到 `Writer` role、随机
+   `session_id` 和短期 session bearer。read/admin token 均不能建立 Writer session。
+2. 客户端创建标准 Flight `DoPut` stream。第一条消息必须是唯一的 Arrow schema，并携带 command
+   descriptor；后续消息只能是相同 schema 的 record batch。
+3. version 1 `PutCommand` 必须提供非零 `put_id`、与 bearer 一致的 `session_id`、`stream_name`、
+   `first_batch_sequence`，并显式选择 `Append + Memory`。其他 mutation/durability 返回
+   `UNSUPPORTED_PLAN`。
+4. Server 按顺序解码和提交 batch。每个成功 batch 返回一个标准 `PutResult`，其 `app_metadata` 是
+   `PutBatchResult`，包含 `put_id`、`batch_sequence`、`row_count` 和实际达到的 `Memory` durability。
+5. 回执 channel 容量为 1；客户端不读取回执时，Server 不会继续无限解码。单 batch 在 backend
+   返回前占用共享 transport byte permit，返回后才释放。
+
+`put_id` 和 `batch_sequence` 在 Stage 6.4 只用于关联请求和回执，**不提供服务端去重或 producer
+fencing**。若连接在部分 batch 成功后断开，客户端可能已经收到部分回执，也可能无法确定最后一批是否
+生效。此时不能盲目重试并期待 exactly-once。需要网络重试去重、重启恢复或 WAL/persisted ACK 的生产
+写入，应继续使用既有受控链路，或等待 Phase 7 durable ingest。
+
+Stage 6.4 backend 通过 process-local `LegacyWriteFacade` 复用 Gateway 的 segment materializer，并在
+每批后完成现有 flush；它不会写 ingest WAL、登记 producer epoch、推进 durable sequence，也不会把
+memory ACK 冒充磁盘提交。启用 `[flight.ingest]` 因而要求 `[gateway]` 同时启用。后续 Phase 7 只替换
+该 backend 为原生 `IngestService`，不会再改 Flight command、Writer role 和资源边界。
+若不再服务旧 remote client，应像示例一样把 Gateway listener 只绑定到 loopback；Flight frontend 与
+facade 的进程内调用不经过该 TCP listener。
 
 ## 查询取消与管理员权限
 
@@ -186,9 +240,15 @@ session registry 同样有 `max_sessions` 硬上限和固定 TTL，不做滑动�
 ticket 会被撤销并释放 prepared query。已经通过 `DoGet` 完成认证的运行中查询不会被 session TTL 中途
 终止，仍受 query deadline、客户端断开和 Server shutdown 约束。
 
+ingest 另有 `max_concurrent_puts` semaphore，以及每个 put 的 batch、row、byte 累计上限和单 batch
+row/byte 上限。并发槽耗尽时在读取请求体前快速返回可重试的 `RESOURCE_EXHAUSTED`；解码后超限的 batch
+不会调用 backend。`max_batch_bytes` 不得超过共享 query transport budget，避免写入绕过进程级内存账本。
+每个 put 内顺序提交，默认最多只有 4 条活跃写入流，因此 `spawn_blocking` 的 Gateway 兼容调用也是有界的。
+capability response 和 ready record 同时公开六项有效上限，客户端应在发送前按较小值切 batch。
+
 ## 凭据与 TLS 约束
 
-- read/admin bootstrap token 都必须是 32 到 4096 个可见 ASCII 字节。TOML 不接受明文 token 字段；
+- read/admin/writer bootstrap token 都必须是 32 到 4096 个可见 ASCII 字节，且两两不同。TOML 不接受明文 token 字段；
   只能使用 owner-only 文件或对应环境变量。
 - token file 和 private key 必须由 Server 当前用户拥有、只有一个硬链接，且 group/other 权限为零；
   推荐 `chmod 600`。credential reader 使用 no-follow 打开，符号链接、目录和超限文件会失败。
@@ -205,7 +265,7 @@ ticket 会被撤销并释放 prepared query。已经通过 `DoGet` 完成认证�
 1. 将新证书和新私钥写入新的 regular file，并把私钥权限设为 `0600`；
 2. 原子替换配置或更新配置路径；
 3. 执行有界 `zippy server restart`；
-4. 等待 schema version 5 ready record，再核对 `flight.certificate_sha256`；
+4. 等待 schema version 6 ready record，再核对 `flight.certificate_sha256`；
 5. 客户端信任库切换到新 CA 后建立新 session。旧 session 随旧 listener 退出，不跨进程复用。
 
 自动化测试覆盖旧 CA 在重启轮换后失败、新 CA 成功，以及 mTLS 无 client identity 失败。进程内无损
@@ -217,13 +277,15 @@ ticket 会被撤销并释放 prepared query。已经通过 `DoGet` 完成认证�
 `x-zippy-error-bin` 中携带同一份 versioned protobuf envelope。客户端应解析结构化 envelope，不依赖
 message 文本。两份 envelope 不一致时客户端必须 fail closed。
 
-未实现 RPC（包括 `DoPut`、`DoExchange`、`ListFlights` 和 `GetSchema`）返回结构化
+未实现 RPC（包括 `DoExchange`、`ListFlights` 和 `GetSchema`）返回结构化
 `UNSUPPORTED_PLAN`，不会静默降级到 legacy collect。
 
 ## Readiness 与关停
 
-Server ready record schema version 5 包含 Flight enabled/endpoint/protocol、TLS/auth 状态、管理员认证
-开关、query control/metadata capability、metadata limits、客户端证书要求和非敏感证书指纹。进程
+Server ready record schema version 6 包含 Flight enabled/endpoint/protocol、TLS/auth 状态、管理员和
+Writer 认证开关、query control/metadata/ingest capability、metadata/ingest limits、客户端证书要求和
+非敏感证书指纹。`zippy server run/status` 摘要会显示 Flight endpoint、TLS、memory ingest 和 Writer
+鉴权状态。进程
 readiness 需要
 `flight_configured`、`flight_listener_ready` 和 `flight_protocol_ready` 同时满足。listener 异常退出会撤销
 动态 readiness。
@@ -235,6 +297,6 @@ listener 在后台继续清理，不会用无界 `join` 突破调用方 deadline
 
 ## 后续阶段
 
-1. Stage 6.4：`DoPut` ingest，并接入后续 durable producer epoch/sequence。
-2. Stage 6.5：Python/Rust connector 切换 Flight query，legacy Gateway 变为 compatibility adapter。
-3. Phase 7：`DoExchange` durable subscription、offset/ack 和 replay。
+1. Stage 6.5：Python/Rust connector 切换 Flight query/DoPut，legacy Gateway 变为 compatibility adapter。
+2. Phase 7：把 `DoPut` backend 切到 producer epoch/sequence + WAL，并实现 `DoExchange` durable
+   subscription、offset/ack 和 replay。

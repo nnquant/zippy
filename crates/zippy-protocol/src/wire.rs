@@ -26,6 +26,53 @@ pub enum SessionRole {
     Unspecified = 0,
     Read = 1,
     Administrator = 2,
+    Writer = 3,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PutCommand {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub session_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub put_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "4")]
+    pub stream_name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub first_batch_sequence: u64,
+    #[prost(enumeration = "PutMutation", tag = "6")]
+    pub mutation: i32,
+    #[prost(enumeration = "PutDurability", tag = "7")]
+    pub durability: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PutMutation {
+    Unspecified = 0,
+    Append = 1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PutDurability {
+    Unspecified = 0,
+    Memory = 1,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PutBatchResult {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub put_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "3")]
+    pub batch_sequence: u64,
+    #[prost(uint64, tag = "4")]
+    pub row_count: u64,
+    #[prost(enumeration = "PutDurability", tag = "5")]
+    pub durability_reached: i32,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -320,4 +367,20 @@ pub struct CapabilitiesResponse {
     pub metadata_max_rows: u64,
     #[prost(uint64, tag = "10")]
     pub metadata_max_bytes: u64,
+    #[prost(bool, tag = "11")]
+    pub writer_authentication_enabled: bool,
+    #[prost(bool, tag = "12")]
+    pub ingest_enabled: bool,
+    #[prost(uint64, tag = "13")]
+    pub ingest_max_concurrent_puts: u64,
+    #[prost(uint64, tag = "14")]
+    pub ingest_max_batches_per_put: u64,
+    #[prost(uint64, tag = "15")]
+    pub ingest_max_rows_per_batch: u64,
+    #[prost(uint64, tag = "16")]
+    pub ingest_max_rows_per_put: u64,
+    #[prost(uint64, tag = "17")]
+    pub ingest_max_batch_bytes: u64,
+    #[prost(uint64, tag = "18")]
+    pub ingest_max_bytes_per_put: u64,
 }

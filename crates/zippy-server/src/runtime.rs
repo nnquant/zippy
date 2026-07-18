@@ -32,6 +32,7 @@ use zippy_master::daemon::{
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
 use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use zippy_master::server::MasterServer;
+use zippy_protocol::ingest::FlightPutLimits;
 use zippy_protocol::runtime::{FlightServerRuntime, FlightShutdownOutcome, FlightTlsStatus};
 use zippy_protocol::server::{FlightServiceConfig, FlightServiceStatus, ZippyFlightService};
 use zippy_protocol::sql::FlightSqlMetadataLimits;
@@ -59,7 +60,7 @@ use crate::{
 const DEFAULT_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SERVER_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-const SERVER_READY_SCHEMA_VERSION: u8 = 5;
+const SERVER_READY_SCHEMA_VERSION: u8 = 6;
 
 /// Runs the server-owned legacy runtime until shutdown or dynamic readiness loss.
 ///
@@ -605,10 +606,18 @@ struct ServerReadyFlight<'a> {
     tls_enabled: bool,
     authentication_required: bool,
     administrator_authentication_enabled: bool,
+    writer_authentication_enabled: bool,
     query_control_enabled: bool,
     flight_sql_metadata_enabled: bool,
+    flight_ingest_enabled: bool,
     metadata_max_rows: usize,
     metadata_max_bytes: usize,
+    ingest_max_concurrent_puts: usize,
+    ingest_max_batches_per_put: usize,
+    ingest_max_rows_per_batch: u64,
+    ingest_max_rows_per_put: u64,
+    ingest_max_batch_bytes: usize,
+    ingest_max_bytes_per_put: usize,
     certificate_sha256: Option<&'a str>,
     client_certificate_required: bool,
 }
@@ -847,8 +856,13 @@ fn publish_ready_record(
                 && flight_config.auth.enabled
                 && (flight_config.auth.admin_token_file.is_some()
                     || flight_config.auth.admin_bootstrap_token().is_some()),
+            writer_authentication_enabled: flight_enabled
+                && flight_config.auth.enabled
+                && (flight_config.auth.writer_token_file.is_some()
+                    || flight_config.auth.writer_bootstrap_token().is_some()),
             query_control_enabled: flight_enabled,
             flight_sql_metadata_enabled: flight_enabled,
+            flight_ingest_enabled: flight_enabled && flight_config.ingest.enabled,
             metadata_max_rows: if flight_enabled {
                 flight_config.metadata.max_rows
             } else {
@@ -856,6 +870,36 @@ fn publish_ready_record(
             },
             metadata_max_bytes: if flight_enabled {
                 flight_config.metadata.max_bytes
+            } else {
+                0
+            },
+            ingest_max_concurrent_puts: if flight_enabled && flight_config.ingest.enabled {
+                flight_config.ingest.max_concurrent_puts
+            } else {
+                0
+            },
+            ingest_max_batches_per_put: if flight_enabled && flight_config.ingest.enabled {
+                flight_config.ingest.max_batches_per_put
+            } else {
+                0
+            },
+            ingest_max_rows_per_batch: if flight_enabled && flight_config.ingest.enabled {
+                flight_config.ingest.max_rows_per_batch
+            } else {
+                0
+            },
+            ingest_max_rows_per_put: if flight_enabled && flight_config.ingest.enabled {
+                flight_config.ingest.max_rows_per_put
+            } else {
+                0
+            },
+            ingest_max_batch_bytes: if flight_enabled && flight_config.ingest.enabled {
+                flight_config.ingest.max_batch_bytes
+            } else {
+                0
+            },
+            ingest_max_bytes_per_put: if flight_enabled && flight_config.ingest.enabled {
+                flight_config.ingest.max_bytes_per_put
             } else {
                 0
             },
@@ -1401,6 +1445,7 @@ impl LegacyServerRuntime {
         let mut flight = match start_flight_if_enabled(
             &runtime_config,
             native_storage.as_ref(),
+            gateway.as_ref(),
             startup_deadline,
         ) {
             Ok(flight) => flight,
@@ -2247,6 +2292,7 @@ fn gateway_persisted_read_snapshot_source(
 fn start_flight_if_enabled(
     runtime_config: &ZippyConfig,
     native_storage: Option<&NativeStorageRuntime>,
+    gateway: Option<&GatewayServer>,
     startup_deadline: Instant,
 ) -> Result<Option<FlightServerRuntime>, ServerError> {
     if !runtime_config.flight.enabled {
@@ -2298,11 +2344,29 @@ fn start_flight_if_enabled(
     if let Some(bearer_auth) = security.bearer_auth {
         config = config.with_bearer_auth(bearer_auth);
     }
-    let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> =
-        Arc::new(NativeFlightQueryFrontend::new(
-            native_storage.query_engine(),
-            native_storage.catalog_read_handle(),
-        ));
+    let mut frontend = NativeFlightQueryFrontend::new(
+        native_storage.query_engine(),
+        native_storage.catalog_read_handle(),
+    );
+    if runtime_config.flight.ingest.enabled {
+        let gateway = gateway.ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Internal,
+                "validated Flight ingest configuration did not start Gateway",
+            )
+            .with_retryable(false)
+        })?;
+        config = config.with_ingest(FlightPutLimits::try_new(
+            runtime_config.flight.ingest.max_concurrent_puts,
+            runtime_config.flight.ingest.max_batches_per_put,
+            runtime_config.flight.ingest.max_rows_per_batch,
+            runtime_config.flight.ingest.max_rows_per_put,
+            runtime_config.flight.ingest.max_batch_bytes,
+            runtime_config.flight.ingest.max_bytes_per_put,
+        )?);
+        frontend = frontend.with_legacy_ingest(gateway.legacy_write_facade());
+    }
+    let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> = Arc::new(frontend);
     let service = ZippyFlightService::try_new(config, frontend)?;
     let startup_timeout = remaining_before(startup_deadline, "start Flight listener")?;
     match security.tls {
@@ -3332,10 +3396,18 @@ token = "must-not-appear-in-ready-record"
                 record["flight"]["administrator_authentication_enabled"],
                 false
             );
+            assert_eq!(record["flight"]["writer_authentication_enabled"], false);
             assert_eq!(record["flight"]["query_control_enabled"], false);
             assert_eq!(record["flight"]["flight_sql_metadata_enabled"], false);
+            assert_eq!(record["flight"]["flight_ingest_enabled"], false);
             assert_eq!(record["flight"]["metadata_max_rows"], 0);
             assert_eq!(record["flight"]["metadata_max_bytes"], 0);
+            assert_eq!(record["flight"]["ingest_max_concurrent_puts"], 0);
+            assert_eq!(record["flight"]["ingest_max_batches_per_put"], 0);
+            assert_eq!(record["flight"]["ingest_max_rows_per_batch"], 0);
+            assert_eq!(record["flight"]["ingest_max_rows_per_put"], 0);
+            assert_eq!(record["flight"]["ingest_max_batch_bytes"], 0);
+            assert_eq!(record["flight"]["ingest_max_bytes_per_put"], 0);
             assert!(record["flight"]["certificate_sha256"].is_null());
             assert_eq!(record["flight"]["client_certificate_required"], false);
             assert!(!payload.contains("must-not-appear-in-ready-record"));

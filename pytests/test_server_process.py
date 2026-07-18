@@ -41,7 +41,7 @@ def _unused_gateway_endpoint() -> str:
 
 def _valid_ready_record() -> dict[str, object]:
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": "ready",
         "health": {
             "readiness": {
@@ -115,6 +115,13 @@ def test_server_startup_summary_reports_health_logs_and_unmanaged_webui() -> Non
             "endpoint": "tcp://127.0.0.1:17690",
         },
         "gateway": {"enabled": False, "status": "disabled"},
+        "flight": {
+            "enabled": True,
+            "endpoint": "127.0.0.1:17700",
+            "tls_enabled": True,
+            "flight_ingest_enabled": True,
+            "writer_authentication_enabled": True,
+        },
         "webui": {
             "managed": False,
             "status": "not_running",
@@ -133,6 +140,10 @@ def test_server_startup_summary_reports_health_logs_and_unmanaged_webui() -> Non
     assert "health: healthy" in summary
     assert "master: healthy" in summary
     assert "gateway: disabled" in summary
+    assert (
+        "flight: enabled endpoint=[127.0.0.1:17700] tls=[yes] "
+        "ingest=[memory] writer_auth=[yes]" in summary
+    )
     assert "webui: not running managed=[no] url=[http://127.0.0.1:17688/]" in summary
     assert "native log: /tmp/native.jsonl" in summary
     assert "--run-dir /tmp/custom-run" in summary
@@ -601,7 +612,7 @@ def test_server_status_rejects_generation_change_during_health_probe(
         log_dir=tmp_path / "logs",
     )
     state: dict[str, object] = {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": "ready",
         "launch_nonce": "old-generation",
         "pid": 43001,
