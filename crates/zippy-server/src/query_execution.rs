@@ -18,10 +18,10 @@ use zippy_query::{
     PersistedExecutionErrorClass, PersistedFileDescription, PersistedFileOpenRequest,
     PersistedFileOpener, PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile,
     PersistedRecordBatchStream, PersistedSnapshotDescription, PersistedTableBinding,
-    PreparedPersistedPlan, QuerySessionPolicy,
+    PreparedPersistedPlan, QueryProcessMemoryPool, QuerySessionPolicy,
 };
 use zippy_segment_store::RowSpanBatchReader;
-use zippy_types::query::QueryInstanceId;
+use zippy_types::query::{QueryInstanceId, QueryResultBatch};
 use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
 use zippy_types::{ErrorCode, QueryId, Result, ServerError};
 
@@ -39,6 +39,7 @@ const PERSISTED_FILE_TASK_CPU_SLOTS: u32 = 1;
 const PERSISTED_FILE_TASK_MEMORY_BYTES: u64 = 64 * 1024;
 const ACTIVE_SEGMENT_TASK_CPU_SLOTS: u32 = 1;
 const ACTIVE_SEGMENT_TASK_BYTES_PER_SEGMENT: u64 = 1024;
+const EXECUTION_DRIVER_CPU_SLOTS: u32 = 1;
 const OPERATOR_CONTEXT_RETAINED_MEMORY_BYTES: u64 = 1024 * 1024;
 const OPERATOR_CONTEXT_BUILD_TRANSIENT_MEMORY_BYTES: u64 = 1024 * 1024;
 const EXECUTION_DRIVER_MEMORY_BYTES: u64 = 64 * 1024;
@@ -265,6 +266,7 @@ impl NativeExecutionAuthority {
         &self,
         policy: QuerySessionPolicy,
         operator_pool_memory_bytes: NonZeroU64,
+        process_memory: &QueryProcessMemoryPool,
     ) -> Result<QueryRetainedPermit<PersistedExecutionContext>> {
         let retained_memory_bytes = operator_pool_memory_bytes
             .get()
@@ -291,7 +293,8 @@ impl NativeExecutionAuthority {
                 })?
         };
         task.into_retained(|()| {
-            let context = policy.create_execution_context(operator_pool_memory_bytes)?;
+            let context =
+                policy.create_execution_context_in(operator_pool_memory_bytes, process_memory)?;
             Ok((
                 context,
                 QueryRetainedCharge {
@@ -321,17 +324,13 @@ impl NativeExecutionAuthority {
     }
 
     fn admit_execution_driver(&self, policy: QuerySessionPolicy) -> Result<QueryTaskPermit<()>> {
-        let cpu_slots = u32::try_from(policy.target_partitions().get())
-            .ok()
-            .and_then(NonZeroU32::new)
-            .ok_or_else(|| {
-                ServerError::new(
-                    ErrorCode::ResourceExhausted,
-                    "native query target partitions do not fit the CPU resource ledger",
-                )
-                .with_query_id(self.binding.instance_id.query_id())
-                .with_retryable(false)
-            })?;
+        let _target_partitions = policy.target_partitions();
+        // The driver is one orchestration task. Scan and active-segment workers each acquire
+        // their own CPU slots, which is the actual I/O/decode concurrency boundary. Charging the
+        // driver for every target partition would reserve the whole query budget before the first
+        // admitted reader could start.
+        let cpu_slots = NonZeroU32::new(EXECUTION_DRIVER_CPU_SLOTS)
+            .expect("execution driver CPU charge is nonzero");
         let execution = self
             .execution
             .lock()
@@ -700,6 +699,11 @@ impl NativeQueryBatch {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.permit.is_cancelled()
     }
+
+    pub(crate) fn into_public(self) -> QueryResultBatch {
+        let batch = self.permit.as_ref().clone();
+        QueryResultBatch::with_owner(batch, self)
+    }
 }
 
 enum NativeBatchPoll {
@@ -1030,10 +1034,26 @@ impl NativeExecutionLease {
         policy: QuerySessionPolicy,
         config: NativeQueryExecutionConfig,
     ) -> Result<NativeQueryResultStream> {
-        let operator_context = match self
-            .authority
-            .admit_operator_context(policy, config.operator_pool_memory_bytes)
-        {
+        let process_memory =
+            match QueryProcessMemoryPool::try_new(config.operator_pool_memory_bytes) {
+                Ok(process_memory) => process_memory,
+                Err(error) => return Err(publish_lease_failure(self, error)),
+            };
+        self.execute_in(policy, config, &process_memory)
+    }
+
+    /// Starts execution inside the process-wide DataFusion operator-memory pool.
+    pub(crate) fn execute_in(
+        self,
+        policy: QuerySessionPolicy,
+        config: NativeQueryExecutionConfig,
+        process_memory: &QueryProcessMemoryPool,
+    ) -> Result<NativeQueryResultStream> {
+        let operator_context = match self.authority.admit_operator_context(
+            policy,
+            config.operator_pool_memory_bytes,
+            process_memory,
+        ) {
             Ok(context) => context,
             Err(error) => return Err(publish_lease_failure(self, error)),
         };

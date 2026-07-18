@@ -14,6 +14,7 @@ mod composition;
 mod health;
 mod legacy_catalog_migration;
 mod legacy_query;
+mod native_query;
 mod native_query_canary;
 mod native_storage;
 // Remove this allowance when the native query frontend owns execution leases directly.
@@ -51,6 +52,7 @@ pub use legacy_query::{
     LegacyGatewayPlan, LegacyQueryEngineAdapter, LegacyQueryEngineConfig,
     LEGACY_GATEWAY_PLAN_FORMAT_VERSION,
 };
+pub use native_query::{NativeQueryBinding, NativeQueryEngine};
 pub use native_query_canary::{
     NativeQueryCanaryBinding, NativeQueryCanaryComparison, NativeQueryCanaryDigestBuilder,
     NativeQueryCanaryExpected, NativeQueryCanaryMetrics, NativeQueryCanaryQueryStatus,

@@ -22,7 +22,9 @@ use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zippy_core::ZippyQueryCanaryConfig;
-use zippy_query::{PersistedPlanLimits, PersistedTableBinding, QuerySessionPolicy};
+use zippy_query::{
+    PersistedPlanLimits, PersistedTableBinding, QueryProcessMemoryPool, QuerySessionPolicy,
+};
 use zippy_types::query::{OpaqueQueryOwnerCapability, QueryInstanceId, QueryState};
 use zippy_types::table::TableRef;
 use zippy_types::{ErrorCode, QueryId, Result, ServerError, SessionId};
@@ -593,6 +595,7 @@ struct NativeQueryCanaryInner {
     config: NativeQueryCanaryRuntimeConfig,
     snapshots: NativeQuerySnapshotCoordinator,
     resources: QueryResourceCoordinator,
+    process_memory: QueryProcessMemoryPool,
     admin: QueryAdminHandle,
     accepting: AtomicBool,
     state: Mutex<NativeQueryCanaryState>,
@@ -609,6 +612,7 @@ impl NativeQueryCanaryService {
         config: NativeQueryCanaryRuntimeConfig,
         snapshots: NativeQuerySnapshotCoordinator,
         resources: QueryResourceCoordinator,
+        process_memory: QueryProcessMemoryPool,
     ) -> Self {
         let admin = resources.admin_handle();
         Self {
@@ -616,6 +620,7 @@ impl NativeQueryCanaryService {
                 config,
                 snapshots,
                 resources,
+                process_memory,
                 admin,
                 accepting: AtomicBool::new(true),
                 state: Mutex::new(NativeQueryCanaryState::default()),
@@ -996,9 +1001,10 @@ impl NativeQueryCanaryRun {
         };
         let snapshot_and_plan_elapsed_us = elapsed_us(snapshot_and_plan_started.elapsed());
         let execution_started = Instant::now();
-        let stream = match lease.execute(
+        let stream = match lease.execute_in(
             self.service.inner.config.policy,
             self.service.inner.config.execution,
+            &self.service.inner.process_memory,
         ) {
             Ok(stream) => stream,
             Err(error) => return Err(self.record_failure(error)),
@@ -1841,6 +1847,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
+    use futures::future::poll_fn;
     use tempfile::TempDir;
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::{OwnedDataDirectory, ZippyQueryCanaryConfig, DEFAULT_QUERY_MAX_MEMORY_BYTES};
@@ -1849,6 +1856,7 @@ mod tests {
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogWrite,
         CreateNamespaceCommand, CreateTableCommand,
     };
+    use zippy_types::query::{QueryEngine, QueryInput, QueryPriority, QueryRequest, QueryState};
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance,
         SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages,
@@ -1856,7 +1864,7 @@ mod tests {
     };
     use zippy_types::{
         ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, QueryId,
-        RequestId, SessionId, TableId,
+        RequestId, ResourceLimit, SessionId, TableId,
     };
 
     use super::{
@@ -1867,6 +1875,7 @@ mod tests {
     use crate::native_storage::{
         NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
     };
+    use crate::NativeQueryBinding;
 
     const NAMESPACE: u128 = 1;
     const TABLE: u128 = 10;
@@ -2403,14 +2412,13 @@ mod tests {
                 .expect("valid unused binding"),
             ],
         );
-        let reordered_error = canary
+        let reordered_report = canary
             .submit(reordered)
             .expect("submit request-order mapping canary")
             .execute()
             .await
-            .expect_err("cross join remains outside bounded output admission");
-        assert_eq!(reordered_error.code(), ErrorCode::UnsupportedPlan);
-        assert!(reordered_error.message().contains("CrossJoinExec"));
+            .expect("execute request-order mapping cross join");
+        assert_eq!(reordered_report.row_count(), 6);
         let canonical_order = NativeQueryCanaryRequest::new(
             query_id(1003),
             session_id(7),
@@ -2432,37 +2440,123 @@ mod tests {
                 .expect("valid canonical target binding"),
             ],
         );
-        let canonical_order_error = canary
+        let canonical_order_report = canary
             .submit(canonical_order)
             .expect("submit canonical-order mapping canary")
             .execute()
             .await
-            .expect_err("canonical binding order cannot bypass bounded output admission");
-        assert_eq!(canonical_order_error.code(), ErrorCode::UnsupportedPlan);
-        assert!(canonical_order_error.message().contains("CrossJoinExec"));
+            .expect("execute canonical-order mapping cross join");
+        assert_eq!(canonical_order_report.row_count(), 6);
+        assert_eq!(canonical_order_report.digest(), reordered_report.digest());
 
         let status = canary.status();
         assert!(status.accepting());
         assert_eq!(status.active_runs(), 0);
         assert_eq!(status.metrics().submissions_total, 4);
-        assert_eq!(status.metrics().succeeded_total, 2);
-        assert_eq!(status.metrics().failed_total, 2);
+        assert_eq!(status.metrics().succeeded_total, 4);
+        assert_eq!(status.metrics().failed_total, 0);
         assert_eq!(status.metrics().comparisons_matched_total, 1);
-        assert_eq!(status.metrics().rows_total, 6);
+        assert_eq!(status.metrics().rows_total, 18);
         assert_eq!(
             status.metrics().canonical_bytes_total,
             first
                 .canonical_bytes()
                 .saturating_add(second.canonical_bytes())
+                .saturating_add(reordered_report.canonical_bytes())
+                .saturating_add(canonical_order_report.canonical_bytes())
         );
         assert_eq!(
             status.metrics().total_elapsed_us_total,
             first
                 .total_elapsed_us()
                 .saturating_add(second.total_elapsed_us())
+                .saturating_add(reordered_report.total_elapsed_us())
+                .saturating_add(canonical_order_report.total_elapsed_us())
         );
         test.shutdown();
         assert!(!canary.status().accepting());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_native_engine_streams_permit_owned_results_and_cancels_on_drop() {
+        let mut test = start_runtime(100).await;
+        let engine = test.runtime.query_engine();
+        let owner = engine.owner(session_id(70));
+        let query_request = |query: u128, sql: &str| QueryRequest {
+            query_id: query_id(query),
+            session_id: session_id(70),
+            input: QueryInput::Sql(sql.to_owned()),
+            tables: vec![TableRef::Id {
+                table_id: table_id(TABLE),
+            }],
+            priority: QueryPriority::Normal,
+            deadline_ns: None,
+            memory_limit_bytes: ResourceLimit::ServerDefault,
+            spill_limit_bytes: ResourceLimit::Disabled,
+            result_batch_rows: None,
+        };
+        let binding = || {
+            vec![NativeQueryBinding::try_new(
+                "ticks",
+                TableRef::Id {
+                    table_id: table_id(TABLE),
+                },
+            )
+            .expect("valid native engine binding")]
+        };
+
+        let token = engine
+            .plan_bound(
+                owner.as_ref(),
+                query_request(1100, "SELECT sum(price) AS total FROM ticks"),
+                binding(),
+            )
+            .await
+            .expect("plan public native aggregate");
+        let instance_id = token.instance_id();
+        let mut stream = engine
+            .execute(token)
+            .await
+            .expect("execute public native aggregate");
+        let mut rows = 0_usize;
+        while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context))
+            .await
+            .transpose()
+            .expect("read public native result")
+        {
+            assert!(batch.has_owner());
+            rows += batch.record_batch().num_rows();
+        }
+        assert_eq!(rows, 1);
+        let finished = engine
+            .status(owner.as_ref(), instance_id)
+            .await
+            .expect("read completed native query status");
+        assert_eq!(finished.state, QueryState::Finished);
+        assert_eq!(finished.metrics["query.active_memory_bytes"], 0);
+        assert_eq!(engine.process_memory_status().reserved_bytes, 0);
+
+        let abandoned = engine
+            .plan_bound(
+                owner.as_ref(),
+                query_request(1101, "SELECT price FROM ticks ORDER BY price"),
+                binding(),
+            )
+            .await
+            .expect("plan cancellable native query");
+        let abandoned_instance = abandoned.instance_id();
+        let abandoned_stream = engine
+            .execute(abandoned)
+            .await
+            .expect("start cancellable native query");
+        drop(abandoned_stream);
+        let cancelled = engine
+            .status(owner.as_ref(), abandoned_instance)
+            .await
+            .expect("read abandoned native query status");
+        assert_eq!(cancelled.state, QueryState::Cancelled);
+        assert_eq!(engine.process_memory_status().reserved_bytes, 0);
+        test.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

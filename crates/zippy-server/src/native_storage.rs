@@ -1,5 +1,6 @@
 //! Server-owned lifecycle for the SQLite Catalog and native manifest storage.
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -52,6 +53,7 @@ pub struct NativeStorageRuntimeConfig {
     table_actors: TableActorRegistryConfig,
     query_resources: crate::query_service::QueryServiceResourceConfig,
     query_registry: crate::query_service::QueryServiceRegistryConfig,
+    query_engine: crate::native_query::NativeQueryEngineConfig,
     query_canary: Option<crate::native_query_canary::NativeQueryCanaryRuntimeConfig>,
     actor: CatalogActor,
     legacy_catalog_migration: LegacyCatalogMigrationStartup,
@@ -61,6 +63,7 @@ impl NativeStorageRuntimeConfig {
     /// Creates a conservative runtime configuration under the process-owned data root.
     #[must_use]
     pub fn new(data_directory: &Arc<OwnedDataDirectory>) -> Self {
+        let query_resources = crate::query_service::QueryServiceResourceConfig::default();
         Self {
             data_directory: Arc::clone(data_directory),
             catalog: SqliteCatalogConfig::new(data_directory),
@@ -69,8 +72,17 @@ impl NativeStorageRuntimeConfig {
             reconciliation: StartupOrphanReconcilerConfig::new(),
             catalog_file_verification: StartupCatalogFileVerifierConfig::new(),
             table_actors: TableActorRegistryConfig::new(),
-            query_resources: crate::query_service::QueryServiceResourceConfig::default(),
+            query_resources,
             query_registry: crate::query_service::QueryServiceRegistryConfig::default(),
+            query_engine: crate::native_query::NativeQueryEngineConfig::try_new(
+                usize::try_from(query_resources.max_cpu_slots)
+                    .expect("default query CPU slots fit usize"),
+                query_resources.max_active_tasks,
+                query_resources.max_cpu_slots,
+                query_resources.max_memory_bytes,
+                query_resources.max_memory_bytes.saturating_div(4).max(1),
+            )
+            .expect("default native query engine config is valid"),
             query_canary: None,
             actor: CatalogActor {
                 kind: CatalogActorKind::Server,
@@ -148,6 +160,14 @@ impl NativeStorageRuntimeConfig {
         query_registry: crate::query_service::QueryServiceRegistryConfig,
     ) -> Self {
         self.query_registry = query_registry;
+        self
+    }
+
+    pub(crate) fn with_query_engine_config(
+        mut self,
+        query_engine: crate::native_query::NativeQueryEngineConfig,
+    ) -> Self {
+        self.query_engine = query_engine;
         self
     }
 
@@ -364,8 +384,15 @@ impl NativeStorageStartup {
                 config,
                 query_snapshot_coordinator.clone(),
                 ready.query_resources.clone(),
+                ready.query_process_memory.clone(),
             )
         });
+        let query_engine = crate::native_query::NativeQueryEngine::new(
+            ready.query_engine,
+            query_snapshot_coordinator.clone(),
+            ready.query_resources.clone(),
+            ready.query_process_memory.clone(),
+        );
         NativeStorageRuntime {
             report: ready.reconciliation,
             catalog_file_verification: ready.catalog_file_verification,
@@ -377,6 +404,8 @@ impl NativeStorageStartup {
             table_actor_admission: ready.table_actor_admission,
             query_snapshot_coordinator,
             query_resources: ready.query_resources,
+            query_process_memory: ready.query_process_memory,
+            query_engine,
             query_canary,
             healthy: ready.healthy,
             terminal_failure: Arc::clone(&self.terminal_failure),
@@ -436,6 +465,8 @@ pub struct NativeStorageRuntime {
     table_actor_admission: TableActorAdmissionControl,
     query_snapshot_coordinator: crate::query_snapshot::NativeQuerySnapshotCoordinator,
     query_resources: crate::query_service::QueryResourceCoordinator,
+    query_process_memory: zippy_query::QueryProcessMemoryPool,
+    query_engine: crate::native_query::NativeQueryEngine,
     query_canary: Option<crate::native_query_canary::NativeQueryCanaryService>,
     healthy: Arc<AtomicBool>,
     terminal_failure: Arc<Mutex<Option<ServerError>>>,
@@ -538,6 +569,18 @@ impl NativeStorageRuntime {
         &self,
     ) -> crate::query_service::QueryResourceCoordinator {
         self.query_resources.clone()
+    }
+
+    /// Returns process-wide native operator-memory allocation counters.
+    #[must_use]
+    pub fn query_process_memory_status(&self) -> zippy_query::QueryProcessMemoryStatus {
+        self.query_process_memory.status()
+    }
+
+    /// Returns the server-owned native SQL query engine.
+    #[must_use]
+    pub fn query_engine(&self) -> crate::native_query::NativeQueryEngine {
+        self.query_engine.clone()
     }
 
     /// Returns the internal persisted-only canary when it was explicitly configured.
@@ -720,6 +763,8 @@ struct SupervisorReady {
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
     query_resources: crate::query_service::QueryResourceCoordinator,
+    query_process_memory: zippy_query::QueryProcessMemoryPool,
+    query_engine: crate::native_query::NativeQueryEngineConfig,
     query_canary: Option<crate::native_query_canary::NativeQueryCanaryRuntimeConfig>,
 }
 
@@ -1006,6 +1051,18 @@ async fn supervise_storage(
             fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
         );
     }
+    let query_process_memory = match zippy_query::QueryProcessMemoryPool::try_new(
+        NonZeroU64::new(config.query_resources.max_memory_bytes)
+            .expect("validated query process memory is nonzero"),
+    ) {
+        Ok(memory) => memory,
+        Err(error) => {
+            return (
+                false,
+                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
+            );
+        }
+    };
     let query_resources = match crate::query_service::QueryResourceCoordinator::with_registry_config_and_snapshot_memory_lease_issuer(
         config.query_resources,
         config.query_registry,
@@ -1066,6 +1123,8 @@ async fn supervise_storage(
             table_actor_admission,
             healthy: Arc::clone(&healthy),
             query_resources,
+            query_process_memory,
+            query_engine: config.query_engine,
             query_canary: config.query_canary,
         }))
         .is_err()

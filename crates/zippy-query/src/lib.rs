@@ -13,6 +13,7 @@ use std::io::{self, Read};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -20,7 +21,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::disk_manager::DiskManagerConfig;
-use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
+};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -61,6 +64,195 @@ pub type PersistedExecutionError = DataFusionError;
 
 /// One DataFusion record-batch stream bound to a server-owned persisted snapshot.
 pub type PersistedRecordBatchStream = SendableRecordBatchStream;
+
+/// Point-in-time process-wide DataFusion operator-memory counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryProcessMemoryStatus {
+    /// Hard process-wide operator-memory capacity.
+    pub capacity_bytes: usize,
+    /// Bytes currently retained by all DataFusion operators.
+    pub reserved_bytes: usize,
+    /// Largest process-wide reservation observed since startup.
+    pub peak_reserved_bytes: usize,
+    /// Number of allocations rejected by either a query or process limit.
+    pub rejected_allocations: usize,
+}
+
+/// Process-owned DataFusion operator-memory authority shared by every native query.
+///
+/// Each execution receives a query-scoped child pool. A reservation must fit both the child
+/// limit and this process limit before DataFusion may allocate it. Spilling is intentionally not
+/// implied by this type; the current execution profile disables DataFusion's disk manager and
+/// returns `RESOURCE_EXHAUSTED` when either limit is reached.
+#[derive(Debug, Clone)]
+pub struct QueryProcessMemoryPool {
+    state: Arc<QueryProcessMemoryState>,
+}
+
+#[derive(Debug)]
+struct QueryProcessMemoryState {
+    capacity_bytes: usize,
+    pool: GreedyMemoryPool,
+    peak_reserved_bytes: AtomicUsize,
+    rejected_allocations: AtomicUsize,
+}
+
+impl QueryProcessMemoryPool {
+    /// Creates one process-wide operator-memory authority.
+    pub fn try_new(capacity_bytes: NonZeroU64) -> zippy_types::Result<Self> {
+        let capacity_bytes = usize::try_from(capacity_bytes.get()).map_err(|_| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "native query process memory limit does not fit this platform",
+            )
+            .with_retryable(false)
+        })?;
+        Ok(Self {
+            state: Arc::new(QueryProcessMemoryState {
+                capacity_bytes,
+                pool: GreedyMemoryPool::new(capacity_bytes),
+                peak_reserved_bytes: AtomicUsize::new(0),
+                rejected_allocations: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    /// Creates a query-local pool that also consumes this process authority.
+    pub fn query_pool(
+        &self,
+        query_limit_bytes: NonZeroU64,
+    ) -> zippy_types::Result<Arc<dyn MemoryPool>> {
+        let query_limit_bytes = usize::try_from(query_limit_bytes.get()).map_err(|_| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "native query operator memory limit does not fit this platform",
+            )
+            .with_retryable(false)
+        })?;
+        if query_limit_bytes > self.state.capacity_bytes {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "native query operator memory limit exceeds the process memory pool",
+            )
+            .with_retryable(false));
+        }
+        Ok(Arc::new(QueryScopedMemoryPool {
+            process: Arc::clone(&self.state),
+            limit_bytes: query_limit_bytes,
+            reserved_bytes: AtomicUsize::new(0),
+            peak_reserved_bytes: AtomicUsize::new(0),
+        }))
+    }
+
+    /// Returns current process-wide allocation counters.
+    #[must_use]
+    pub fn status(&self) -> QueryProcessMemoryStatus {
+        QueryProcessMemoryStatus {
+            capacity_bytes: self.state.capacity_bytes,
+            reserved_bytes: self.state.pool.reserved(),
+            peak_reserved_bytes: self.state.peak_reserved_bytes.load(Ordering::Relaxed),
+            rejected_allocations: self.state.rejected_allocations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueryScopedMemoryPool {
+    process: Arc<QueryProcessMemoryState>,
+    limit_bytes: usize,
+    reserved_bytes: AtomicUsize,
+    peak_reserved_bytes: AtomicUsize,
+}
+
+impl QueryScopedMemoryPool {
+    fn record_growth(&self, query_reserved: usize) {
+        self.peak_reserved_bytes
+            .fetch_max(query_reserved, Ordering::Relaxed);
+        self.process
+            .peak_reserved_bytes
+            .fetch_max(self.process.pool.reserved(), Ordering::Relaxed);
+    }
+
+    fn reserve_query_bytes(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::common::Result<usize> {
+        self.reserved_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved
+                    .checked_add(additional)
+                    .filter(|next| *next <= self.limit_bytes)
+            })
+            .map(|previous| previous + additional)
+            .map_err(|reserved| {
+                DataFusionError::ResourcesExhausted(format!(
+                    "query operator memory exhausted consumer=[{}] requested=[{}] reserved=[{}] limit=[{}]",
+                    reservation.consumer().name(),
+                    additional,
+                    reserved,
+                    self.limit_bytes
+                ))
+            })
+    }
+}
+
+impl MemoryPool for QueryScopedMemoryPool {
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.process.pool.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.process.pool.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        let query_reserved = self
+            .reserved_bytes
+            .fetch_add(additional, Ordering::Relaxed)
+            .saturating_add(additional);
+        self.process.pool.grow(reservation, additional);
+        self.record_growth(query_reserved);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.process.pool.shrink(reservation, shrink);
+        let previous = self.reserved_bytes.fetch_sub(shrink, Ordering::Relaxed);
+        debug_assert!(
+            previous >= shrink,
+            "query memory pool reservation underflow"
+        );
+    }
+
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::common::Result<()> {
+        let query_reserved = match self.reserve_query_bytes(reservation, additional) {
+            Ok(reserved) => reserved,
+            Err(error) => {
+                self.process
+                    .rejected_allocations
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.process.pool.try_grow(reservation, additional) {
+            self.reserved_bytes.fetch_sub(additional, Ordering::Relaxed);
+            self.process
+                .rejected_allocations
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+        self.record_growth(query_reserved);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.reserved_bytes.load(Ordering::Relaxed)
+    }
+}
 
 /// Stable execution-error classes used by the server protocol boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,15 +774,23 @@ impl QuerySessionPolicy {
         self,
         operator_memory_bytes: NonZeroU64,
     ) -> zippy_types::Result<PersistedExecutionContext> {
-        let pool_size = usize::try_from(operator_memory_bytes.get()).map_err(|_| {
-            ServerError::new(
-                ErrorCode::ResourceExhausted,
-                "native query operator memory limit does not fit this platform",
-            )
-            .with_retryable(false)
-        })?;
+        let process_memory = QueryProcessMemoryPool::try_new(operator_memory_bytes)?;
+        self.create_execution_context_in(operator_memory_bytes, &process_memory)
+    }
+
+    /// Creates an execution context inside a process-owned operator-memory authority.
+    ///
+    /// The query-scoped pool enforces `operator_memory_bytes`, while every allocation also
+    /// consumes `process_memory`. The disk manager remains disabled, so an exhausted complex
+    /// operator returns a resource error without creating an untracked temporary file.
+    pub fn create_execution_context_in(
+        self,
+        operator_memory_bytes: NonZeroU64,
+        process_memory: &QueryProcessMemoryPool,
+    ) -> zippy_types::Result<PersistedExecutionContext> {
+        let memory_pool = process_memory.query_pool(operator_memory_bytes)?;
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_size)))
+            .with_memory_pool(memory_pool)
             .with_disk_manager(DiskManagerConfig::Disabled)
             .build()
             .map_err(|error| {
@@ -651,8 +851,9 @@ mod tests {
         parquet_metadata_memory_charge, structured_persisted_execution_error,
         AdmittedAsyncParquetReader, AdmittedParquetSource, AdmittedRandomAccessFile,
         BoxedAsyncFileReader, PersistedDecodedOutputAdmission, PersistedExecutionErrorClass,
-        QuerySessionPolicy, MAX_POSITIONED_READ_BYTES, PARQUET_METADATA_DECODE_EXPANSION_FACTOR,
-        PARQUET_METADATA_FIXED_MEMORY_BYTES, PARQUET_TRAILER_SIZE_BYTES,
+        QueryProcessMemoryPool, QuerySessionPolicy, MAX_POSITIONED_READ_BYTES,
+        PARQUET_METADATA_DECODE_EXPANSION_FACTOR, PARQUET_METADATA_FIXED_MEMORY_BYTES,
+        PARQUET_TRAILER_SIZE_BYTES,
     };
     use zippy_types::{ErrorCode, ServerError};
 
@@ -960,6 +1161,50 @@ mod tests {
         assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
         drop(reservation);
         assert_eq!(task.memory_pool().reserved(), 0);
+    }
+
+    #[test]
+    fn query_memory_children_share_one_process_limit_and_release_exactly() {
+        let process = QueryProcessMemoryPool::try_new(NonZeroU64::new(96).unwrap())
+            .expect("create process memory pool");
+        let first = process
+            .query_pool(NonZeroU64::new(64).unwrap())
+            .expect("create first query pool");
+        let second = process
+            .query_pool(NonZeroU64::new(64).unwrap())
+            .expect("create second query pool");
+
+        let mut first_reservation = MemoryConsumer::new("first").register(&first);
+        let mut second_reservation = MemoryConsumer::new("second").register(&second);
+        first_reservation
+            .try_grow(64)
+            .expect("fill first query limit");
+        let query_error = first_reservation
+            .try_grow(1)
+            .expect_err("query limit must reject independent of process capacity");
+        assert!(matches!(
+            query_error,
+            DataFusionError::ResourcesExhausted(_)
+        ));
+        second_reservation
+            .try_grow(32)
+            .expect("fill remaining process capacity");
+        let process_error = second_reservation
+            .try_grow(1)
+            .expect_err("shared process limit must reject another query");
+        assert!(matches!(
+            process_error,
+            DataFusionError::ResourcesExhausted(_)
+        ));
+
+        let saturated = process.status();
+        assert_eq!(saturated.capacity_bytes, 96);
+        assert_eq!(saturated.reserved_bytes, 96);
+        assert_eq!(saturated.peak_reserved_bytes, 96);
+        assert_eq!(saturated.rejected_allocations, 2);
+        drop(first_reservation);
+        drop(second_reservation);
+        assert_eq!(process.status().reserved_bytes, 0);
     }
 
     #[test]

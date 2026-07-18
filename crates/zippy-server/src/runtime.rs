@@ -1458,6 +1458,14 @@ impl LegacyServerRuntime {
             .and_then(NativeStorageRuntime::query_canary)
     }
 
+    /// Returns the server-owned native SQL engine when native storage is configured.
+    #[must_use]
+    pub fn native_query_engine(&self) -> Option<crate::NativeQueryEngine> {
+        self.native_storage
+            .as_ref()
+            .map(NativeStorageRuntime::query_engine)
+    }
+
     /// Returns the boot-scoped runtime registry adapter in both compatibility modes.
     #[must_use]
     pub fn runtime_registry(&self) -> Arc<LegacyRuntimeRegistryAdapter> {
@@ -1702,6 +1710,7 @@ fn start_native_storage_if_enabled(
     let runtime_snapshot_pins = runtime_config.catalog.runtime_snapshot_pins;
     let query_resources = native_query_resource_config(runtime_config)?;
     let query_registry = native_query_registry_config(runtime_config);
+    let query_engine = native_query_engine_config(runtime_config, query_resources)?;
     let query_canary = native_query_canary_config(runtime_config, query_resources)?;
     let catalog = SqliteCatalogConfig::new(data_directory).with_runtime_snapshot_pin_limits(
         runtime_snapshot_pins.max_active_pins,
@@ -1712,6 +1721,7 @@ fn start_native_storage_if_enabled(
         .with_persist_controller_config(persist_controller)
         .with_query_resource_config(query_resources)
         .with_query_registry_config(query_registry)
+        .with_query_engine_config(query_engine)
         .with_query_canary_config(query_canary)
         .with_legacy_catalog_migration(legacy_catalog_migration);
     match NativeStorageRuntime::start_until(native_storage, startup_deadline) {
@@ -1761,6 +1771,19 @@ fn native_query_registry_config(
         plan_ttl: Duration::from_millis(runtime_config.query.plan_ttl_ms),
         ..crate::query_service::QueryServiceRegistryConfig::default()
     }
+}
+
+fn native_query_engine_config(
+    runtime_config: &ZippyConfig,
+    resources: crate::query_service::QueryServiceResourceConfig,
+) -> Result<crate::native_query::NativeQueryEngineConfig, ServerError> {
+    crate::native_query::NativeQueryEngineConfig::try_new(
+        runtime_config.query_parallelism(),
+        resources.max_active_tasks,
+        resources.max_cpu_slots,
+        resources.max_memory_bytes,
+        runtime_config.query_canary_operator_memory_bytes(),
+    )
 }
 
 fn native_query_canary_config(

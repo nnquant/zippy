@@ -18,7 +18,7 @@ use datafusion::sql::parser::{DFParser, Statement as DataFusionStatement};
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, Distinct, Expr as SqlExpr, FunctionArgumentClause, FunctionArguments,
     GroupByExpr, Ident, JoinConstraint, JoinOperator, Query as SqlQuery, SelectItem, SetExpr,
-    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, Visitor,
+    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, Visitor, WindowType,
 };
 use sha2::{Digest, Sha256};
 
@@ -31,7 +31,7 @@ use crate::{
     PersistedTableDescription, QuerySessionPolicy, ZippyTableProvider,
 };
 
-const PROFILE_FORMAT_VERSION: u32 = 9;
+const PROFILE_FORMAT_VERSION: u32 = 10;
 const PREFLIGHT_FIXED_TRANSIENT_BYTES: u64 = 2 * 1024 * 1024;
 const PREFLIGHT_BYTES_PER_SQL_BYTE: u64 = 1024;
 const PREFLIGHT_BYTES_PER_BINDING: u64 = 64 * 1024;
@@ -873,10 +873,20 @@ impl SqlPreflightVisitor {
             || query.with.is_some()
             || query.fetch.is_some()
             || !query.limit_by.is_empty()
-            || query.order_by.is_some()
         {
             return Err(plan_error(
-                "persisted SQL query contains unsupported CTE, ordering, or control clauses",
+                "persisted SQL query contains unsupported CTE or control clauses",
+            ));
+        }
+        if query.order_by.as_ref().is_some_and(|order_by| {
+            order_by.interpolate.is_some()
+                || order_by
+                    .exprs
+                    .iter()
+                    .any(|expression| expression.with_fill.is_some())
+        }) {
+            return Err(plan_error(
+                "persisted SQL ORDER BY interpolation and fill clauses are unsupported",
             ));
         }
         let subquery_expansion =
@@ -999,11 +1009,6 @@ impl SqlPreflightVisitor {
             ));
         }
         if let SqlExpr::Function(function) = expression {
-            if function.over.is_some() {
-                return Err(plan_error(
-                    "persisted SQL WINDOW expressions are unsupported because physical ordering expansion is not pre-admissible",
-                ));
-            }
             if function
                 .name
                 .0
@@ -1028,16 +1033,63 @@ impl SqlPreflightVisitor {
                     "persisted SQL ordered aggregate expressions are unsupported because physical ordering expansion is not pre-admissible",
                 ));
             }
-            let is_bounded_aggregate = function.name.0.len() == 1
-                && function.name.0.last().is_some_and(|identifier| {
+            let function_name = function
+                .name
+                .0
+                .last()
+                .filter(|_| function.name.0.len() == 1)
+                .map(|identifier| identifier.value.as_str());
+            if let Some(window) = &function.over {
+                match window {
+                    WindowType::WindowSpec(spec)
+                        if spec.window_name.is_none()
+                            && spec
+                                .order_by
+                                .iter()
+                                .all(|expression| expression.with_fill.is_none()) => {}
+                    WindowType::WindowSpec(_) => {
+                        return Err(plan_error(
+                            "persisted SQL WINDOW inheritance and fill clauses are unsupported",
+                        ));
+                    }
+                    WindowType::NamedWindow(_) => {
+                        return Err(plan_error(
+                            "persisted SQL named WINDOW references are unsupported",
+                        ));
+                    }
+                }
+                let is_bounded_window = function_name.is_some_and(|identifier| {
+                    [
+                        "row_number",
+                        "rank",
+                        "dense_rank",
+                        "lag",
+                        "lead",
+                        "count",
+                        "min",
+                        "max",
+                        "sum",
+                        "avg",
+                    ]
+                    .iter()
+                    .any(|name| identifier.eq_ignore_ascii_case(name))
+                });
+                if !is_bounded_window {
+                    return Err(plan_error(
+                        "persisted SQL function is outside the bounded window allowlist",
+                    ));
+                }
+            } else {
+                let is_bounded_aggregate = function_name.is_some_and(|identifier| {
                     ["count", "min", "max", "sum", "avg"]
                         .iter()
-                        .any(|name| identifier.value.eq_ignore_ascii_case(name))
+                        .any(|name| identifier.eq_ignore_ascii_case(name))
                 });
-            if !is_bounded_aggregate {
-                return Err(plan_error(
-                    "persisted SQL function is outside the bounded aggregate allowlist",
-                ));
+                if !is_bounded_aggregate {
+                    return Err(plan_error(
+                        "persisted SQL function is outside the bounded aggregate allowlist",
+                    ));
+                }
             }
         }
         self.expression_node_count = checked_increment(
@@ -1664,6 +1716,26 @@ mod tests {
         prepare_validated_persisted_plan(policy, sql, bindings, &snapshot, admitted).await
     }
 
+    async fn assert_sql_output_admitted(
+        sql: &str,
+        bindings: &[PersistedTableBinding],
+        tables: &[PersistedTableDescription],
+    ) {
+        let profile = profile_persisted_plan(sql, bindings, tables, limits())
+            .expect("profile bounded analytical SQL");
+        let prepared = prepare_persisted_plan(policy(), sql, bindings, tables, profile)
+            .await
+            .expect("prepare bounded analytical SQL");
+        let opener: Arc<dyn PersistedFileOpener> = Arc::new(RejectingOpener {
+            snapshot: PersistedSnapshotDescription::try_new(tables.to_vec())
+                .expect("build analytical output snapshot"),
+        });
+        let bound = prepared.bind(&opener).expect("bind analytical output plan");
+        bound
+            .streaming_output_admission(NonZeroUsize::new(1024).unwrap())
+            .expect("admit bounded analytical output plan");
+    }
+
     #[tokio::test]
     async fn qualified_self_join_retains_preoptimization_relations_and_consumes_into_binding() {
         let tables = vec![table(0, 1, 1)];
@@ -1817,14 +1889,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_window_forms_fail_closed() {
+    #[tokio::test]
+    async fn bounded_inline_windows_are_admitted_and_named_or_unknown_forms_fail_closed() {
         let tables = vec![table(0, 1, 1)];
         let bindings = vec![binding("ticks", 0)];
-        let inline_sql = "select row_number() over (order by price) from ticks";
-        let inline_error = profile_persisted_plan(inline_sql, &bindings, &tables, limits())
-            .expect_err("inline WINDOW must fail before DataFusion planning");
-        assert!(inline_error.to_string().contains("WINDOW expressions"));
+        for inline_sql in [
+            "select row_number() over (order by price) from ticks",
+            "select sum(price) over (order by price rows unbounded preceding) from ticks",
+            "select lag(price) over (order by price) from ticks",
+        ] {
+            let profile = profile_persisted_plan(inline_sql, &bindings, &tables, limits())
+                .expect("profile bounded inline window");
+            prepare_persisted_plan(policy(), inline_sql, &bindings, &tables, profile)
+                .await
+                .expect("prepare bounded inline window");
+        }
 
         let named_sql = concat!(
             "select row_number() over w as row_number from ticks ",
@@ -1833,6 +1912,15 @@ mod tests {
         let error = profile_persisted_plan(named_sql, &bindings, &tables, limits())
             .expect_err("named WINDOW must fail before DataFusion planning");
         assert!(error.to_string().contains("unsupported semantic clause"));
+
+        let unknown = profile_persisted_plan(
+            "select ntile(4) over (order by price) from ticks",
+            &bindings,
+            &tables,
+            limits(),
+        )
+        .expect_err("unknown window function must fail before DataFusion planning");
+        assert!(unknown.to_string().contains("bounded window allowlist"));
 
         for sql in [
             "select array_agg(price order by symbol) from ticks",
@@ -1847,6 +1935,41 @@ mod tests {
                 "unexpected ordered aggregate error for SQL [{sql}]: {ordered_error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fixed_width_sort_aggregate_join_and_window_reach_output_admission() {
+        let fixed_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let one = vec![table_with_schema(0, 1, 1, Arc::clone(&fixed_schema))];
+        let one_binding = vec![binding("ticks", 0)];
+        for sql in [
+            "select key, value from ticks order by value desc limit 10",
+            "select key, sum(value) as total from ticks group by key order by total",
+            concat!(
+                "select key, row_number() over (partition by key order by value) as row_no ",
+                "from ticks order by key, row_no"
+            ),
+        ] {
+            assert_sql_output_admitted(sql, &one_binding, &one).await;
+        }
+
+        let joined = vec![
+            table_with_schema(0, 1, 1, Arc::clone(&fixed_schema)),
+            table_with_schema(1, 2, 1, fixed_schema),
+        ];
+        let joined_bindings = vec![binding("ticks", 0), binding("quotes", 1)];
+        assert_sql_output_admitted(
+            concat!(
+                "select ticks.key, ticks.value, quotes.value as quote_value ",
+                "from ticks join quotes on ticks.key = quotes.key"
+            ),
+            &joined_bindings,
+            &joined,
+        )
+        .await;
     }
 
     #[test]
@@ -2158,7 +2281,6 @@ mod tests {
             "select price from ticks qualify row_number() over () = 1",
             "select price from ticks cluster by symbol",
             "select price from ticks sort by symbol",
-            "select price from ticks order by price",
             "select distinct on (symbol) symbol, price from ticks",
             "with quoted as (select price from ticks) select price from quoted",
             concat!(
@@ -2172,6 +2294,14 @@ mod tests {
                 "SQL must be rejected: {sql}"
             );
         }
+
+        profile_persisted_plan(
+            "select price from ticks order by price desc nulls last",
+            &bindings,
+            &tables,
+            limits(),
+        )
+        .expect("ordinary ORDER BY remains inside the bounded sort profile");
 
         for sql in [
             "select count(*) from ticks group by cube(price, symbol)",

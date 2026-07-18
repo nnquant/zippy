@@ -12,11 +12,21 @@ use datafusion::physical_expr::expressions::{
     TryCastExpr,
 };
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec, SymmetricHashJoinExec,
+};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::partial_sort::PartialSortExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion::physical_plan::ExecutionPlan;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::ParquetMetaData;
@@ -31,12 +41,12 @@ const PARQUET_DECODER_FIXED_MEMORY_BYTES: u64 = 256 * 1024;
 const PARQUET_ROW_GROUP_DECODE_COPIES: u64 = 2;
 const ACTIVE_SEGMENT_READER_FIXED_MEMORY_BYTES: u64 = 64 * 1024;
 
-/// A versioned memory envelope for one fixed-width persisted streaming scan.
+/// A versioned memory envelope for a fixed-width persisted analytical pipeline.
 ///
-/// The envelope is deliberately limited to the first native execution subset: one Parquet scan
-/// (or an optimizer-eliminated empty scan), direct column projection, fixed-width predicates, and
-/// limit/slice operators. It is not a generic DataFusion memory estimate. The server must retain
-/// the resulting per-file charge before giving the corresponding reader to DataFusion.
+/// This is not a generic DataFusion memory estimate. It covers decoded batches flowing between
+/// an explicit physical-operator allowlist; buffering operators are independently constrained by
+/// the query-scoped and process-wide DataFusion memory pools. The server must retain the resulting
+/// per-file charge before giving the corresponding reader to DataFusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistedDecodedOutputAdmission {
     format_version: u32,
@@ -57,9 +67,11 @@ impl PersistedDecodedOutputAdmission {
         scan_schema: &Schema,
         concurrent_batch_copies: NonZeroUsize,
     ) -> Result<Self> {
-        let scan_column_count = NonZeroUsize::new(scan_schema.fields().len()).ok_or_else(|| {
-            unsupported("bounded persisted output requires at least one scanned column")
-        })?;
+        // DataFusion legitimately uses zero-column scans to preserve only row cardinality for
+        // COUNT/CROSS JOIN inputs. Charge one synthetic control slot so such batches still have
+        // a nonzero per-row and array-control envelope.
+        let scan_column_count = NonZeroUsize::new(scan_schema.fields().len().max(1))
+            .expect("synthetic scan column count is nonzero");
         let row_width_bytes = scan_schema
             .fields()
             .iter()
@@ -123,7 +135,9 @@ impl PersistedDecodedOutputAdmission {
         self.batch_size
     }
 
-    /// Returns the number of fixed-width columns decoded by the Parquet scan.
+    /// Returns the number of accounted fixed-width column slots.
+    ///
+    /// A cardinality-only zero-column scan reports one synthetic control slot.
     #[must_use]
     pub const fn scan_column_count(self) -> NonZeroUsize {
         self.scan_column_count
@@ -198,7 +212,7 @@ pub(crate) fn profile_streaming_output_plan(
 
     let mut physical_node_count = 0_usize;
     let mut expression_node_count = 0_usize;
-    let mut scan_schema = None;
+    let mut scan_schemas = Vec::new();
     let mut scan_count = 0_usize;
     let mut active_scan_count = 0_usize;
     plan.apply(|node| {
@@ -211,7 +225,7 @@ pub(crate) fn profile_streaming_output_plan(
             scan_count = scan_count
                 .checked_add(1)
                 .ok_or_else(|| exhausted("bounded output scan count overflowed"))?;
-            merge_scan_schema(&mut scan_schema, parquet.schema())?;
+            scan_schemas.push(parquet.schema());
             if let Some(predicate) = parquet.predicate() {
                 profile_bounded_filter_expression(
                     predicate,
@@ -228,14 +242,15 @@ pub(crate) fn profile_streaming_output_plan(
                     "active segment batch size differs from output admission policy",
                 ));
             }
-            merge_scan_schema(&mut scan_schema, active.schema())?;
+            scan_schemas.push(active.schema());
         } else if let Some(projection) = node.as_any().downcast_ref::<ProjectionExec>() {
             for (expression, _) in projection.expr() {
-                if expression.as_any().downcast_ref::<Column>().is_none() {
-                    return Err(unsupported(
-                        "bounded persisted output only supports direct column projection",
-                    ));
-                }
+                profile_bounded_expression(
+                    expression,
+                    projection.input().schema().as_ref(),
+                    &mut expression_node_count,
+                    "projection",
+                )?;
             }
         } else if let Some(filter) = node.as_any().downcast_ref::<FilterExec>() {
             let input_schema = filter.input().schema();
@@ -248,7 +263,20 @@ pub(crate) fn profile_streaming_output_plan(
             || node.as_any().is::<LocalLimitExec>()
             || node.as_any().is::<CoalescePartitionsExec>()
             || node.as_any().is::<PersistedAndActiveExec>()
-            || node.as_any().is::<EmptyExec>())
+            || node.as_any().is::<EmptyExec>()
+            || node.as_any().is::<SortExec>()
+            || node.as_any().is::<SortPreservingMergeExec>()
+            || node.as_any().is::<PartialSortExec>()
+            || node.as_any().is::<AggregateExec>()
+            || node.as_any().is::<HashJoinExec>()
+            || node.as_any().is::<CrossJoinExec>()
+            || node.as_any().is::<NestedLoopJoinExec>()
+            || node.as_any().is::<SortMergeJoinExec>()
+            || node.as_any().is::<SymmetricHashJoinExec>()
+            || node.as_any().is::<WindowAggExec>()
+            || node.as_any().is::<BoundedWindowAggExec>()
+            || node.as_any().is::<RepartitionExec>()
+            || node.as_any().is::<UnionExec>())
         {
             return Err(unsupported(format!(
                 "physical operator is outside the bounded persisted output subset operator=[{}]",
@@ -258,40 +286,39 @@ pub(crate) fn profile_streaming_output_plan(
         Ok(TreeNodeRecursion::Continue)
     })?;
 
-    if scan_count > 1 {
-        return Err(unsupported(format!(
-            "bounded persisted output supports at most one Parquet scan actual=[{scan_count}]"
-        )));
-    }
-    if active_scan_count > 1 {
-        return Err(unsupported(format!(
-            "bounded persisted output supports at most one active scan actual=[{active_scan_count}]"
-        )));
+    if scan_count == 0 && active_scan_count == 0 {
+        scan_schemas.push(plan.schema());
     }
     let concurrent_batch_copies = physical_node_count
         .checked_add(expression_node_count)
         .and_then(|count| count.checked_add(2))
         .and_then(NonZeroUsize::new)
         .ok_or_else(|| exhausted("bounded output concurrent batch envelope overflowed"))?;
-    let admission_schema = scan_schema.unwrap_or_else(|| plan.schema());
-    PersistedDecodedOutputAdmission::try_for_fixed_width_schema(
-        batch_size,
-        admission_schema.as_ref(),
-        concurrent_batch_copies,
-    )
-}
-
-fn merge_scan_schema(slot: &mut Option<Arc<Schema>>, schema: Arc<Schema>) -> Result<()> {
-    if slot
-        .as_ref()
-        .is_some_and(|existing| existing.as_ref() != schema.as_ref())
-    {
-        return Err(unsupported(
-            "persisted and active scan schemas differ inside bounded output plan",
-        ));
-    }
-    *slot = Some(schema);
-    Ok(())
+    scan_schemas
+        .iter()
+        .map(|schema| {
+            PersistedDecodedOutputAdmission::try_for_fixed_width_schema(
+                batch_size,
+                schema.as_ref(),
+                concurrent_batch_copies,
+            )
+        })
+        .try_fold(
+            None,
+            |widest: Option<PersistedDecodedOutputAdmission>, admission| {
+                let admission = admission?;
+                Ok::<Option<PersistedDecodedOutputAdmission>, DataFusionError>(Some(match widest {
+                    Some(current)
+                        if current.batch_peak_memory_bytes()
+                            >= admission.batch_peak_memory_bytes() =>
+                    {
+                        current
+                    }
+                    _ => admission,
+                }))
+            },
+        )?
+        .ok_or_else(|| unsupported("bounded output plan has no schema to admit"))
 }
 
 fn profile_bounded_filter_expression(
@@ -299,19 +326,28 @@ fn profile_bounded_filter_expression(
     input_schema: &Schema,
     expression_node_count: &mut usize,
 ) -> Result<()> {
+    profile_bounded_expression(expression, input_schema, expression_node_count, "filter")
+}
+
+fn profile_bounded_expression(
+    expression: &Arc<dyn PhysicalExpr>,
+    input_schema: &Schema,
+    expression_node_count: &mut usize,
+    role: &str,
+) -> Result<()> {
     expression.apply(|expression| {
         *expression_node_count = expression_node_count
             .checked_add(1)
             .ok_or_else(|| exhausted("bounded output predicate expression count overflowed"))?;
         if !is_bounded_filter_expression(expression.as_ref()) {
             return Err(unsupported(format!(
-                "physical filter expression is outside the bounded persisted output subset expression=[{expression}]"
+                "physical {role} expression is outside the bounded persisted output subset expression=[{expression}]"
             )));
         }
         let data_type = expression.data_type(input_schema)?;
         if fixed_width_bytes(&data_type).is_none() {
             return Err(unsupported(format!(
-                "bounded persisted output predicate materializes variable-width type=[{data_type}]"
+                "bounded persisted output {role} materializes variable-width type=[{data_type}]"
             )));
         }
         Ok(TreeNodeRecursion::Continue)
