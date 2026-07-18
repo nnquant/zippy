@@ -1799,7 +1799,7 @@ fn native_query_engine_config(
         resources.max_active_tasks,
         resources.max_cpu_slots,
         resources.max_memory_bytes,
-        runtime_config.query_canary_operator_memory_bytes(),
+        runtime_config.query_operator_memory_bytes(),
     )
 }
 

@@ -58,7 +58,7 @@ use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
     ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanBatchReader, RowSpanView,
 };
-use zippy_types::query::{QueryPriority, SendableRecordBatchStream};
+use zippy_types::query::{QueryPriority, QueryTableVersion, SendableRecordBatchStream};
 use zippy_types::table::TableRef;
 use zippy_types::{BoxFuture, QueryId, ResourceLimit, ServerError, SessionId};
 
@@ -182,6 +182,34 @@ pub struct GatewayNativeQueryRequest {
     pub result_batch_rows: Option<std::num::NonZeroU32>,
 }
 
+/// One output field reported by native physical planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewayNativeQueryOutputField {
+    /// Arrow field name.
+    pub name: String,
+    /// Stable display representation of the Arrow data type.
+    pub data_type: String,
+    /// Whether the output field may contain null values.
+    pub nullable: bool,
+}
+
+/// One bounded native query explanation returned without executing result operators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewayNativeQueryExplanation {
+    /// Caller-assigned query identifier.
+    pub query_id: QueryId,
+    /// Server-assigned generation for this planning lifecycle.
+    pub generation: std::num::NonZeroU64,
+    /// Catalog revision fixed by the planning snapshot.
+    pub catalog_revision: u64,
+    /// Exact table versions selected for planning.
+    pub snapshots: Vec<QueryTableVersion>,
+    /// Physical plan output fields.
+    pub output_fields: Vec<GatewayNativeQueryOutputField>,
+    /// Stable plan and physical-operator counters.
+    pub metrics: BTreeMap<String, u64>,
+}
+
 const fn default_native_query_priority() -> QueryPriority {
     QueryPriority::Normal
 }
@@ -197,10 +225,16 @@ const fn default_native_query_spill_limit() -> ResourceLimit {
 /// Server-owned native query authority installed into the Gateway before listener startup.
 pub trait GatewayNativeQueryFrontend: Send + Sync + 'static {
     /// Plans and starts one native query, returning a pull-based permit-owned result stream.
-    fn execute<'a>(
-        &'a self,
+    fn execute(
+        &self,
         request: GatewayNativeQueryRequest,
-    ) -> BoxFuture<'a, zippy_types::Result<SendableRecordBatchStream>>;
+    ) -> BoxFuture<'_, zippy_types::Result<SendableRecordBatchStream>>;
+
+    /// Plans one query and releases its snapshot without executing result operators.
+    fn explain(
+        &self,
+        request: GatewayNativeQueryRequest,
+    ) -> BoxFuture<'_, zippy_types::Result<GatewayNativeQueryExplanation>>;
 }
 
 /// Reads persisted file descriptors from the legacy Master `StreamInfo` response.
@@ -1726,6 +1760,8 @@ struct GatewayMetrics {
     native_query_requests_total: u64,
     native_query_requests_active: u64,
     native_query_failures_total: u64,
+    native_query_explain_requests_total: u64,
+    native_query_explain_failures_total: u64,
     native_query_transport_failures_total: u64,
     native_query_batches_delivered_total: u64,
     native_query_rows_delivered_total: u64,
@@ -2455,6 +2491,8 @@ fn gateway_metrics_json(metrics: &GatewayMetrics) -> Value {
         native_query_requests_total,
         native_query_requests_active,
         native_query_failures_total,
+        native_query_explain_requests_total,
+        native_query_explain_failures_total,
         native_query_transport_failures_total,
         native_query_batches_delivered_total,
         native_query_rows_delivered_total,
@@ -4823,6 +4861,27 @@ async fn handle_client_async(mut stream: tokio::net::TcpStream, state: Arc<Gatew
                         }
                     }
                 }
+                Ok(())
+                    if frame.header.get("kind").and_then(Value::as_str)
+                        == Some("query_explain") =>
+                {
+                    if frame.payload_len != 0 {
+                        Err(ZippyError::InvalidConfig {
+                            reason: "query_explain request must not include payload".to_string(),
+                        })
+                    } else {
+                        match handle_native_query_explain_async(
+                            &mut stream,
+                            Arc::clone(&state),
+                            frame.header,
+                        )
+                        .await
+                        {
+                            Ok(()) => return,
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
                 Ok(()) if frame.header.get("kind").and_then(Value::as_str) == Some("query_sql") => {
                     if frame.payload_len != 0 {
                         Err(ZippyError::InvalidConfig {
@@ -4907,6 +4966,71 @@ async fn handle_native_query_sql_async(
         }
     });
     result
+}
+
+async fn handle_native_query_explain_async(
+    stream: &mut tokio::net::TcpStream,
+    state: Arc<GatewayState>,
+    header: Value,
+) -> Result<()> {
+    state.increment_metric(|metrics| metrics.native_query_explain_requests_total += 1);
+    let request = match serde_json::from_value::<GatewayNativeQueryRequest>(header) {
+        Ok(request) => request,
+        Err(error) => {
+            let error = ServerError::new(
+                zippy_types::ErrorCode::InvalidArgument,
+                format!("invalid native query explain request: {error}"),
+            )
+            .with_retryable(false);
+            state.increment_metric(|metrics| metrics.native_query_explain_failures_total += 1);
+            write_native_query_error_async(stream, &error, false, state.write_timeout).await?;
+            return Ok(());
+        }
+    };
+    let Some(frontend) = state.native_query_frontend.as_ref() else {
+        let error = ServerError::new(
+            zippy_types::ErrorCode::UnsupportedPlan,
+            "native query capability is disabled",
+        )
+        .with_query_id(request.query_id)
+        .with_retryable(false);
+        state.increment_metric(|metrics| metrics.native_query_explain_failures_total += 1);
+        write_native_query_error_async(stream, &error, false, state.write_timeout).await?;
+        return Ok(());
+    };
+    let explanation_result = {
+        let explain = frontend.explain(request);
+        tokio::pin!(explain);
+        let disconnect = wait_for_gateway_peer_disconnect(stream);
+        tokio::pin!(disconnect);
+        tokio::select! {
+            result = &mut explain => result,
+            disconnected = &mut disconnect => {
+                disconnected?;
+                return Err(gateway_peer_disconnected());
+            }
+        }
+    };
+    let explanation = match explanation_result {
+        Ok(explanation) => explanation,
+        Err(error) => {
+            state.increment_metric(|metrics| metrics.native_query_explain_failures_total += 1);
+            write_native_query_error_async(stream, &error, false, state.write_timeout).await?;
+            return Ok(());
+        }
+    };
+    write_frame_async_with_timeout(
+        stream,
+        &json!({
+            "status": "ok",
+            "kind": "query_explain",
+            "query_authority": "native",
+            "explanation": explanation,
+        }),
+        &[],
+        state.write_timeout,
+    )
+    .await
 }
 
 async fn handle_native_query_sql_inner(
@@ -5032,6 +5156,7 @@ async fn handle_native_query_sql_inner(
             "query_authority": "native",
             "query_id": instance_id.query_id(),
             "generation": instance_id.generation(),
+            "metrics": query_stream.metrics(),
         }),
         &schema_payload,
         state.write_timeout,
@@ -5104,6 +5229,17 @@ async fn handle_native_query_sql_inner(
         });
     }
 
+    let mut query_metrics = query_stream.metrics();
+    query_metrics.insert("returned_rows".to_owned(), delivered_rows);
+    query_metrics.insert(
+        "result_batches".to_owned(),
+        u64::try_from(chunk_index).unwrap_or(u64::MAX),
+    );
+    query_metrics.insert("transport.returned_rows".to_owned(), delivered_rows);
+    query_metrics.insert(
+        "transport.result_batches".to_owned(),
+        u64::try_from(chunk_index).unwrap_or(u64::MAX),
+    );
     write_frame_async_with_timeout(
         stream,
         &json!({
@@ -5113,10 +5249,7 @@ async fn handle_native_query_sql_inner(
             "query_id": instance_id.query_id(),
             "generation": instance_id.generation(),
             "chunks": chunk_index,
-            "metrics": {
-                "returned_rows": delivered_rows,
-                "result_batches": chunk_index,
-            },
+            "metrics": query_metrics,
         }),
         &[],
         state.write_timeout,

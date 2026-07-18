@@ -55,8 +55,8 @@ pub use persisted_plan::{
 };
 pub use prepared_plan::{
     classify_persisted_plan_error, prepare_persisted_plan, profile_persisted_plan,
-    PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile, PersistedTableBinding,
-    PreparedPersistedPlan,
+    PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanMetrics, PersistedPlanProfile,
+    PersistedTableBinding, PreparedPersistedPlan,
 };
 
 /// The DataFusion error type returned while executing a bound persisted plan.
@@ -75,6 +75,19 @@ pub struct QueryProcessMemoryStatus {
     /// Largest process-wide reservation observed since startup.
     pub peak_reserved_bytes: usize,
     /// Number of allocations rejected by either a query or process limit.
+    pub rejected_allocations: usize,
+}
+
+/// Point-in-time counters for one query-scoped DataFusion operator-memory pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryOperatorMemoryStatus {
+    /// Hard operator-memory limit for this query.
+    pub limit_bytes: usize,
+    /// Bytes currently retained by this query's DataFusion operators.
+    pub reserved_bytes: usize,
+    /// Largest operator-memory reservation observed during this query.
+    pub peak_reserved_bytes: usize,
+    /// Number of this query's allocations rejected by query or process limits.
     pub rejected_allocations: usize,
 }
 
@@ -122,6 +135,14 @@ impl QueryProcessMemoryPool {
         &self,
         query_limit_bytes: NonZeroU64,
     ) -> zippy_types::Result<Arc<dyn MemoryPool>> {
+        self.query_scoped_pool(query_limit_bytes)
+            .map(|pool| pool as Arc<dyn MemoryPool>)
+    }
+
+    fn query_scoped_pool(
+        &self,
+        query_limit_bytes: NonZeroU64,
+    ) -> zippy_types::Result<Arc<QueryScopedMemoryPool>> {
         let query_limit_bytes = usize::try_from(query_limit_bytes.get()).map_err(|_| {
             ServerError::new(
                 ErrorCode::ResourceExhausted,
@@ -141,6 +162,7 @@ impl QueryProcessMemoryPool {
             limit_bytes: query_limit_bytes,
             reserved_bytes: AtomicUsize::new(0),
             peak_reserved_bytes: AtomicUsize::new(0),
+            rejected_allocations: AtomicUsize::new(0),
         }))
     }
 
@@ -162,9 +184,19 @@ struct QueryScopedMemoryPool {
     limit_bytes: usize,
     reserved_bytes: AtomicUsize,
     peak_reserved_bytes: AtomicUsize,
+    rejected_allocations: AtomicUsize,
 }
 
 impl QueryScopedMemoryPool {
+    fn status(&self) -> QueryOperatorMemoryStatus {
+        QueryOperatorMemoryStatus {
+            limit_bytes: self.limit_bytes,
+            reserved_bytes: self.reserved_bytes.load(Ordering::Relaxed),
+            peak_reserved_bytes: self.peak_reserved_bytes.load(Ordering::Relaxed),
+            rejected_allocations: self.rejected_allocations.load(Ordering::Relaxed),
+        }
+    }
+
     fn record_growth(&self, query_reserved: usize) {
         self.peak_reserved_bytes
             .fetch_max(query_reserved, Ordering::Relaxed);
@@ -232,6 +264,7 @@ impl MemoryPool for QueryScopedMemoryPool {
         let query_reserved = match self.reserve_query_bytes(reservation, additional) {
             Ok(reserved) => reserved,
             Err(error) => {
+                self.rejected_allocations.fetch_add(1, Ordering::Relaxed);
                 self.process
                     .rejected_allocations
                     .fetch_add(1, Ordering::Relaxed);
@@ -240,6 +273,7 @@ impl MemoryPool for QueryScopedMemoryPool {
         };
         if let Err(error) = self.process.pool.try_grow(reservation, additional) {
             self.reserved_bytes.fetch_sub(additional, Ordering::Relaxed);
+            self.rejected_allocations.fetch_add(1, Ordering::Relaxed);
             self.process
                 .rejected_allocations
                 .fetch_add(1, Ordering::Relaxed);
@@ -788,9 +822,10 @@ impl QuerySessionPolicy {
         operator_memory_bytes: NonZeroU64,
         process_memory: &QueryProcessMemoryPool,
     ) -> zippy_types::Result<PersistedExecutionContext> {
-        let memory_pool = process_memory.query_pool(operator_memory_bytes)?;
+        let memory_pool = process_memory.query_scoped_pool(operator_memory_bytes)?;
+        let runtime_memory_pool: Arc<dyn MemoryPool> = memory_pool.clone();
         let runtime = RuntimeEnvBuilder::new()
-            .with_memory_pool(memory_pool)
+            .with_memory_pool(runtime_memory_pool)
             .with_disk_manager(DiskManagerConfig::Disabled)
             .build()
             .map_err(|error| {
@@ -803,6 +838,7 @@ impl QuerySessionPolicy {
         let context = SessionContext::new_with_config_rt(self.session_config(), Arc::new(runtime));
         Ok(PersistedExecutionContext {
             task_context: context.task_ctx(),
+            memory_pool,
         })
     }
 
@@ -820,11 +856,18 @@ impl QuerySessionPolicy {
 /// Bounded DataFusion runtime context retained by one native persisted execution.
 pub struct PersistedExecutionContext {
     task_context: Arc<TaskContext>,
+    memory_pool: Arc<QueryScopedMemoryPool>,
 }
 
 impl PersistedExecutionContext {
     pub(crate) fn task_context(&self) -> Arc<TaskContext> {
         Arc::clone(&self.task_context)
+    }
+
+    /// Returns current and peak query-scoped operator-memory counters.
+    #[must_use]
+    pub fn operator_memory_status(&self) -> QueryOperatorMemoryStatus {
+        self.memory_pool.status()
     }
 }
 
@@ -1159,8 +1202,14 @@ mod tests {
             .try_grow(1)
             .expect_err("memory pool must reject one byte beyond its limit");
         assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        let status = context.operator_memory_status();
+        assert_eq!(status.limit_bytes, 64);
+        assert_eq!(status.reserved_bytes, 64);
+        assert_eq!(status.peak_reserved_bytes, 64);
+        assert_eq!(status.rejected_allocations, 1);
         drop(reservation);
         assert_eq!(task.memory_pool().reserved(), 0);
+        assert_eq!(context.operator_memory_status().reserved_bytes, 0);
     }
 
     #[test]

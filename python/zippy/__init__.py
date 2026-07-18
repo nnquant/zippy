@@ -400,6 +400,7 @@ _BUILTIN_CONFIG: dict[str, object] = {
     "query": {
         "native_enabled": False,
         "parallelism": None,
+        "operator_memory_bytes": None,
         "max_buffered_bytes": None,
         "plan_ttl_ms": _DEFAULT_QUERY_PLAN_TTL_MS,
     },
@@ -3454,7 +3455,9 @@ def _remote_request(
         ) from error
     if response.get("status") != "ok":
         reason = response.get("reason", "unknown remote gateway error")
-        raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
+        error_code = response.get("error_code")
+        code = f" code=[{error_code}]" if error_code else ""
+        raise RuntimeError(f"remote gateway request failed{code} reason=[{reason}]")
     return response, response_payload
 
 
@@ -3554,6 +3557,62 @@ def _remote_native_query_request(
     result_batch_rows: int | None = None,
     priority: str = "normal",
 ):
+    header = _native_query_request_header(
+        sql,
+        bindings,
+        session_id=session_id,
+        memory_limit_bytes=memory_limit_bytes,
+        result_batch_rows=result_batch_rows,
+        priority=priority,
+        timeout_sec=timeout_sec,
+    )
+    return _remote_collect_stream_request(
+        endpoint,
+        header,
+        token=token,
+        timeout_sec=timeout_sec,
+        request_kind="query_sql",
+    )
+
+
+def _remote_native_query_explain_request(
+    endpoint: str,
+    sql: str,
+    bindings: list[dict[str, object]],
+    *,
+    token: str | None = None,
+    timeout_sec: float | None = None,
+    session_id: str | None = None,
+) -> dict[str, object]:
+    header = _native_query_request_header(
+        sql,
+        bindings,
+        session_id=session_id,
+        timeout_sec=timeout_sec,
+    )
+    header["kind"] = "query_explain"
+    response, _ = _remote_request(
+        endpoint,
+        header,
+        token=token,
+        timeout_sec=timeout_sec,
+    )
+    explanation = response.get("explanation")
+    if not isinstance(explanation, dict):
+        raise RuntimeError("remote native query explain response is missing explanation")
+    return dict(explanation)
+
+
+def _native_query_request_header(
+    sql: str,
+    bindings: list[dict[str, object]],
+    *,
+    session_id: str | None,
+    memory_limit_bytes: int | None = None,
+    result_batch_rows: int | None = None,
+    priority: str = "normal",
+    timeout_sec: float | None = None,
+) -> dict[str, object]:
     if not str(sql).strip():
         raise ValueError("native query SQL must not be empty")
     if not bindings:
@@ -3582,13 +3641,7 @@ def _remote_native_query_request(
         header["result_batch_rows"] = int(result_batch_rows)
     if timeout_sec is not None:
         header["deadline_ns"] = time.time_ns() + int(float(timeout_sec) * 1_000_000_000)
-    return _remote_collect_stream_request(
-        endpoint,
-        header,
-        token=token,
-        timeout_sec=timeout_sec,
-        request_kind="query_sql",
-    )
+    return header
 
 
 def _remote_master_get_config(endpoint: str, timeout_sec: float = 5.0) -> dict[str, object]:
@@ -3927,6 +3980,24 @@ class _RemoteQuery:
         )
         self._last_collect_metrics = metrics
         return table
+
+    def explain_sql(
+        self,
+        sql: str,
+        bindings: list[dict[str, object]],
+        *,
+        timeout_sec: float | None = None,
+    ) -> dict[str, object]:
+        if not self._native_query_enabled:
+            raise RuntimeError("remote native query capability is disabled")
+        return _remote_native_query_explain_request(
+            self.endpoint,
+            sql,
+            bindings,
+            token=self.token,
+            timeout_sec=timeout_sec,
+            session_id=self._native_query_session_id,
+        )
 
     def last_collect_metrics(self) -> dict[str, object]:
         return dict(self._last_collect_metrics)
@@ -4896,6 +4967,31 @@ class Table:
         """
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        native_query_enabled = getattr(self._inner, "native_query_enabled", None)
+        native_explain = getattr(self._inner, "explain_sql", None)
+        if callable(native_query_enabled) and native_query_enabled() and callable(native_explain):
+            native_plan = _compile_native_table_sql(self)
+            server_plan = native_explain(native_plan.sql, native_plan.bindings)
+            return {
+                "source": self.source,
+                "snapshot": True,
+                "executor": "remote_native",
+                "query_authority": "native",
+                "original_plan": _query_plan_to_json(self._plan_ops),
+                "optimized_plan": _query_plan_to_json(optimized_plan),
+                "native_sql": native_plan.sql,
+                "native_bindings": list(native_plan.bindings),
+                "server_plan": server_plan,
+                "output_fields": list(server_plan.get("output_fields", [])),
+                "profile": dict(server_plan.get("metrics", {})),
+                "residual_plan": [],
+                "capability": {
+                    "executor": "remote_native",
+                    "server_plan": "complete_sql",
+                    "residual_execution": "disabled",
+                    "unsupported_gateway_ops": [],
+                },
+            }
         shard_names = self._logical_shard_names_for_collect()
         if shard_names:
             shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
@@ -5126,6 +5222,25 @@ class Table:
     def _new_query_metrics(self) -> dict[str, object]:
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        native_query_enabled = getattr(self._inner, "native_query_enabled", None)
+        if callable(native_query_enabled) and native_query_enabled():
+            native_plan = _compile_native_table_sql(self)
+            return {
+                "executor": "remote_native",
+                "query_authority": "native",
+                "original_plan": _query_plan_to_json(self._plan_ops),
+                "optimized_plan": _query_plan_to_json(optimized_plan),
+                "native_sql": native_plan.sql,
+                "native_bindings": list(native_plan.bindings),
+                "residual_plan": [],
+                "scanned_files": [],
+                "scanned_rows": 0,
+                "scanned_live_rows": 0,
+                "returned_rows": None,
+                "elapsed_ms": None,
+                "query_parallelism": self._query_parallelism,
+                "max_parallelism": self._max_parallelism,
+            }
         shard_names = self._logical_shard_names_for_collect()
         if shard_names:
             shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
@@ -5650,8 +5765,9 @@ def read_table(
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"500ms"``,
         ``"30s"`` or ``"2m"``. ``None`` waits indefinitely.
     :type timeout: float | str | None
-    :param snapshot: When true, reuse one query snapshot for repeated terminal operations. When
-        false, each terminal operation resolves the latest table snapshot.
+    :param snapshot: For local and legacy remote reads, reuse one query snapshot across repeated
+        terminal operations when true. Native remote queries always fix one server snapshot per
+        terminal request; they do not reuse a cross-request snapshot token in Phase 5.
     :type snapshot: bool
     :returns: Table object for further operations such as ``tail``.
     :rtype: Table
@@ -6189,6 +6305,9 @@ def _merge_remote_collect_metrics(metrics: dict[str, object], remote_query: obje
     if not isinstance(gateway_metrics, dict):
         return
     metrics["gateway"] = dict(gateway_metrics)
+    for key, value in gateway_metrics.items():
+        if str(key).startswith(("plan.", "operator.", "result.", "transport.")):
+            metrics[str(key)] = value
     for key in ("scanned_rows", "scanned_live_rows", "returned_rows"):
         if key in gateway_metrics:
             metrics[key] = gateway_metrics[key]

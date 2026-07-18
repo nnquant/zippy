@@ -386,6 +386,14 @@ pub trait RecordBatchStream: Send {
     /// Returns the stable schema shared by every batch in the stream.
     fn schema(&self) -> SchemaRef;
 
+    /// Returns a bounded point-in-time query profile using stable metric names.
+    ///
+    /// Implementations that do not expose native plan or operator metrics return an empty map.
+    /// Transport code should call this only for low-frequency profile or terminal frames.
+    fn metrics(&self) -> BTreeMap<String, u64> {
+        BTreeMap::new()
+    }
+
     /// Polls the next batch without allocating a future per result batch.
     fn poll_next(
         self: Pin<&mut Self>,

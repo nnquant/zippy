@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -21,7 +21,8 @@ use zippy_core::{
 };
 use zippy_engines::StreamTableMaterializer;
 use zippy_gateway::{
-    GatewayNativeQueryFrontend, GatewayNativeQueryRequest, GatewayServer, GatewayServerConfig,
+    GatewayNativeQueryExplanation, GatewayNativeQueryFrontend, GatewayNativeQueryOutputField,
+    GatewayNativeQueryRequest, GatewayServer, GatewayServerConfig,
 };
 use zippy_master::server::MasterServer;
 use zippy_types::query::{
@@ -85,6 +86,7 @@ fn native_query_frontend_streams_one_owned_batch_at_a_time() {
     assert_eq!(frames[1].0["rows"], 3);
     assert_eq!(frames[2].0["kind"], "collect_end");
     assert_eq!(frames[2].0["metrics"]["returned_rows"], 3);
+    assert_eq!(frames[2].0["metrics"]["operator.scan.count"], 1);
     let values = decode_ipc_batch(&frames[1].1)
         .column(0)
         .as_any()
@@ -104,6 +106,67 @@ fn native_query_frontend_streams_one_owned_batch_at_a_time() {
     assert_eq!(metrics["native_query_batches_delivered_total"], 1);
     assert_eq!(metrics["native_query_rows_delivered_total"], 3);
     assert!(stream_dropped.load(Ordering::Acquire));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_query_explain_returns_server_plan_without_result_execution() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let frontend = Arc::new(TestNativeQueryFrontend {
+        seen: Arc::new(Mutex::new(None)),
+        stream_dropped: Arc::new(AtomicBool::new(false)),
+        block_after_batches: false,
+    });
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: format!("127.0.0.1:{}", reserve_tcp_port()),
+        master_endpoint: master_endpoint.clone(),
+        token: None,
+        max_write_rows: None,
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+        write_timeout_ms: None,
+    })
+    .unwrap()
+    .with_native_query_frontend(frontend)
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "query_explain",
+            "query_id": QueryId::from_u128(31).unwrap(),
+            "session_id": SessionId::from_u128(32).unwrap(),
+            "sql": "SELECT value FROM ticks",
+            "bindings": [{
+                "sql_name": "ticks",
+                "table": {
+                    "type": "name",
+                    "namespace": "default",
+                    "table": "ticks"
+                }
+            }]
+        }),
+        vec![],
+    );
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0["kind"], "query_explain");
+    assert_eq!(frames[0].0["query_authority"], "native");
+    assert_eq!(
+        frames[0].0["explanation"]["metrics"]["operator.scan.count"],
+        1
+    );
+    assert_eq!(
+        frames[0].0["explanation"]["output_fields"][0]["name"],
+        "value"
+    );
+    assert_eq!(gateway.metrics()["native_query_explain_requests_total"], 1);
 
     gateway.stop();
     master.shutdown();
@@ -188,10 +251,10 @@ struct TestNativeQueryFrontend {
 }
 
 impl GatewayNativeQueryFrontend for TestNativeQueryFrontend {
-    fn execute<'a>(
-        &'a self,
+    fn execute(
+        &self,
         request: GatewayNativeQueryRequest,
-    ) -> BoxFuture<'a, zippy_types::Result<SendableRecordBatchStream>> {
+    ) -> BoxFuture<'_, zippy_types::Result<SendableRecordBatchStream>> {
         Box::pin(async move {
             *self.seen.lock().unwrap() = Some(request.clone());
             let schema = Arc::new(Schema::new(vec![Field::new(
@@ -216,6 +279,27 @@ impl GatewayNativeQueryFrontend for TestNativeQueryFrontend {
             }) as SendableRecordBatchStream)
         })
     }
+
+    fn explain(
+        &self,
+        request: GatewayNativeQueryRequest,
+    ) -> BoxFuture<'_, zippy_types::Result<GatewayNativeQueryExplanation>> {
+        Box::pin(async move {
+            *self.seen.lock().unwrap() = Some(request.clone());
+            Ok(GatewayNativeQueryExplanation {
+                query_id: request.query_id,
+                generation: std::num::NonZeroU64::new(1).unwrap(),
+                catalog_revision: 7,
+                snapshots: Vec::new(),
+                output_fields: vec![GatewayNativeQueryOutputField {
+                    name: "value".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                }],
+                metrics: BTreeMap::from([("operator.scan.count".to_string(), 1)]),
+            })
+        })
+    }
 }
 
 struct TestNativeQueryStream {
@@ -233,6 +317,10 @@ impl RecordBatchStream for TestNativeQueryStream {
 
     fn schema(&self) -> Arc<Schema> {
         Arc::clone(&self.schema)
+    }
+
+    fn metrics(&self) -> BTreeMap<String, u64> {
+        BTreeMap::from([("operator.scan.count".to_string(), 1)])
     }
 
     fn poll_next(
@@ -4797,7 +4885,8 @@ fn send_gateway_stream_frames(
         }
         let response = serde_json::from_slice::<serde_json::Value>(&response_header).unwrap();
         let kind = response.get("kind").and_then(serde_json::Value::as_str);
-        let is_terminal = matches!(kind, Some("collect_end")) || response["status"] == "error";
+        let is_terminal =
+            matches!(kind, Some("collect_end" | "query_explain")) || response["status"] == "error";
         frames.push((response, response_payload));
         if is_terminal {
             break;

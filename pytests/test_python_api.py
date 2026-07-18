@@ -11165,26 +11165,47 @@ def test_remote_native_table_plan_pushes_join_sort_and_tail_to_server(monkeypatc
             captured["bindings"] = bindings
             return pa.table({"instrument_id": ["CB001"], "ts": [2], "notional": [30.0]})
 
+        def explain_sql(self, sql: str, bindings: list[dict[str, object]]) -> dict[str, object]:
+            captured["explain_sql"] = sql
+            captured["explain_bindings"] = bindings
+            return {
+                "catalog_revision": 7,
+                "output_fields": [{"name": "notional", "data_type": "Float64"}],
+                "metrics": {
+                    "plan.physical_nodes": 9,
+                    "operator.join.count": 1,
+                    "operator.sort.count": 2,
+                },
+            }
+
         def collect_plan(self, *_args: object, **_kwargs: object) -> pa.Table:
             raise AssertionError("native query mode must not use legacy collect or residual plans")
 
         def last_collect_metrics(self) -> dict[str, object]:
-            return {"query_authority": "native"}
+            return {
+                "query_authority": "native",
+                "returned_rows": 1,
+                "plan.physical_nodes": 9,
+                "operator.join.count": 1,
+                "operator.memory_peak_bytes": 4096,
+            }
 
     monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
     master = FakeMaster()
     ticks = zippy.read_table("ticks", master=master, snapshot=False)
     instruments = zippy.read_table("instruments", master=master, snapshot=False)
 
-    result = (
+    query = (
         ticks.filter(zippy.col("price") > 10.0)
         .join(instruments, on="instrument_id")
         .with_columns((zippy.col("price") * zippy.col("multiplier")).alias("notional"))
         .select("instrument_id", "ts", "notional")
         .sort("ts")
         .tail(2)
-        .collect()
     )
+    result = query.collect()
+    explanation = query.explain()
+    profile = query.profile()
 
     assert result.column("notional").to_pylist() == [30.0]
     sql = str(captured["sql"])
@@ -11194,6 +11215,12 @@ def test_remote_native_table_plan_pushes_join_sort_and_tail_to_server(monkeypatc
     assert "LIMIT 2" in sql
     bindings = captured["bindings"]
     assert [binding["table"]["table"] for binding in bindings] == ["ticks", "instruments"]
+    assert explanation["executor"] == "remote_native"
+    assert explanation["residual_plan"] == []
+    assert explanation["profile"]["operator.join.count"] == 1
+    assert captured["explain_sql"] == sql
+    assert profile["metrics"]["operator.join.count"] == 1
+    assert profile["metrics"]["operator.memory_peak_bytes"] == 4096
 
 
 def test_remote_native_table_tail_without_sort_fails_without_legacy_fallback(monkeypatch) -> None:

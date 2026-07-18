@@ -13,6 +13,20 @@ use datafusion::datasource::physical_plan::parquet::ParquetExec;
 use datafusion::datasource::source_as_provider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec, SymmetricHashJoinExec,
+};
+use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::partial_sort::PartialSortExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::parser::{DFParser, Statement as DataFusionStatement};
 use datafusion::sql::sqlparser::ast::{
@@ -22,7 +36,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::active_plan::ActiveSegmentExec;
+use crate::active_plan::{ActiveSegmentExec, PersistedAndActiveExec};
 use crate::persisted_plan::{
     bind_persisted_snapshot_plan, is_exact_planning_active, is_exact_planning_parquet,
 };
@@ -241,6 +255,130 @@ pub struct PersistedPlanProfile {
     retained_plan_bytes: NonZeroU64,
 }
 
+/// Stable, allocation-free metrics for one prepared persisted physical plan.
+///
+/// The metric names emitted by [`Self::visit_stable_metrics`] are part of the Phase 5 query
+/// profile contract. They describe the admitted plan without retaining DataFusion plan objects or
+/// exposing version-specific operator internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedPlanMetrics {
+    profile_format_version: u32,
+    sql_bytes: usize,
+    binding_count: usize,
+    expanded_input_count: usize,
+    max_plan_schema_bytes: u64,
+    logical_node_count: usize,
+    expression_node_count: usize,
+    physical_node_count: usize,
+    relation_occurrence_count: usize,
+    planning_scan_count: usize,
+    planning_active_scan_count: usize,
+    build_peak_bytes: NonZeroU64,
+    retained_plan_bytes: NonZeroU64,
+    operators: PhysicalOperatorCounts,
+}
+
+impl PersistedPlanMetrics {
+    /// Visits every stable metric as a bounded name/value pair without allocating a map.
+    ///
+    /// Names use the `plan.*` and `operator.*.count` namespaces. Counts that cannot fit `u64` on
+    /// an exotic platform are saturated instead of wrapping.
+    pub fn visit_stable_metrics(self, mut visit: impl FnMut(&'static str, u64)) {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        visit(
+            "plan.profile_format_version",
+            u64::from(self.profile_format_version),
+        );
+        visit("plan.sql_bytes", count(self.sql_bytes));
+        visit("plan.bindings", count(self.binding_count));
+        visit("plan.expanded_inputs", count(self.expanded_input_count));
+        visit("plan.max_schema_bytes", self.max_plan_schema_bytes);
+        visit("plan.logical_nodes", count(self.logical_node_count));
+        visit("plan.expression_nodes", count(self.expression_node_count));
+        visit("plan.physical_nodes", count(self.physical_node_count));
+        visit(
+            "plan.relation_occurrences",
+            count(self.relation_occurrence_count),
+        );
+        visit("plan.persisted_scans", count(self.planning_scan_count));
+        visit("plan.active_scans", count(self.planning_active_scan_count));
+        visit("plan.build_peak_bytes", self.build_peak_bytes.get());
+        visit("plan.retained_bytes", self.retained_plan_bytes.get());
+        self.operators.visit_stable_metrics(visit);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhysicalOperatorCounts {
+    scan: usize,
+    filter: usize,
+    projection: usize,
+    sort: usize,
+    aggregate: usize,
+    join: usize,
+    window: usize,
+    limit: usize,
+    union: usize,
+    exchange: usize,
+    other: usize,
+}
+
+impl PhysicalOperatorCounts {
+    fn record(&mut self, operator: &Arc<dyn ExecutionPlan>) -> Result<()> {
+        let kind = operator.as_any();
+        let counter = if kind.is::<ParquetExec>() || kind.is::<ActiveSegmentExec>() {
+            &mut self.scan
+        } else if kind.is::<FilterExec>() {
+            &mut self.filter
+        } else if kind.is::<ProjectionExec>() {
+            &mut self.projection
+        } else if kind.is::<SortExec>()
+            || kind.is::<PartialSortExec>()
+            || kind.is::<SortPreservingMergeExec>()
+        {
+            &mut self.sort
+        } else if kind.is::<AggregateExec>() {
+            &mut self.aggregate
+        } else if kind.is::<CrossJoinExec>()
+            || kind.is::<HashJoinExec>()
+            || kind.is::<NestedLoopJoinExec>()
+            || kind.is::<SortMergeJoinExec>()
+            || kind.is::<SymmetricHashJoinExec>()
+        {
+            &mut self.join
+        } else if kind.is::<BoundedWindowAggExec>() || kind.is::<WindowAggExec>() {
+            &mut self.window
+        } else if kind.is::<GlobalLimitExec>() || kind.is::<LocalLimitExec>() {
+            &mut self.limit
+        } else if kind.is::<UnionExec>() || kind.is::<PersistedAndActiveExec>() {
+            &mut self.union
+        } else if kind.is::<RepartitionExec>() || kind.is::<CoalescePartitionsExec>() {
+            &mut self.exchange
+        } else {
+            &mut self.other
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| exhausted("physical operator metric count overflowed usize"))?;
+        Ok(())
+    }
+
+    fn visit_stable_metrics(self, mut visit: impl FnMut(&'static str, u64)) {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        visit("operator.scan.count", count(self.scan));
+        visit("operator.filter.count", count(self.filter));
+        visit("operator.projection.count", count(self.projection));
+        visit("operator.sort.count", count(self.sort));
+        visit("operator.aggregate.count", count(self.aggregate));
+        visit("operator.join.count", count(self.join));
+        visit("operator.window.count", count(self.window));
+        visit("operator.limit.count", count(self.limit));
+        visit("operator.union.count", count(self.union));
+        visit("operator.exchange.count", count(self.exchange));
+        visit("operator.other.count", count(self.other));
+    }
+}
+
 /// Stable server-facing classification of a persisted-plan failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistedPlanErrorClass {
@@ -321,6 +459,7 @@ pub struct PreparedPersistedPlan {
     physical_node_count: usize,
     planning_scan_count: usize,
     planning_active_scan_count: usize,
+    operator_counts: PhysicalOperatorCounts,
 }
 
 impl fmt::Debug for PreparedPersistedPlan {
@@ -336,6 +475,7 @@ impl fmt::Debug for PreparedPersistedPlan {
                 "planning_active_scan_count",
                 &self.planning_active_scan_count,
             )
+            .field("operator_counts", &self.operator_counts)
             .finish_non_exhaustive()
     }
 }
@@ -345,6 +485,27 @@ impl PreparedPersistedPlan {
     #[must_use]
     pub const fn profile(&self) -> PersistedPlanProfile {
         self.profile
+    }
+
+    /// Returns the immutable, stable plan and physical-operator metric profile.
+    #[must_use]
+    pub fn metrics(&self) -> PersistedPlanMetrics {
+        PersistedPlanMetrics {
+            profile_format_version: self.profile.format_version,
+            sql_bytes: self.profile.sql_bytes,
+            binding_count: self.profile.binding_count,
+            expanded_input_count: self.profile.expanded_file_count,
+            max_plan_schema_bytes: self.profile.max_plan_schema_bytes,
+            logical_node_count: self.logical_node_count,
+            expression_node_count: self.expression_node_count,
+            physical_node_count: self.physical_node_count,
+            relation_occurrence_count: self.referenced_table_indices.len(),
+            planning_scan_count: self.planning_scan_count,
+            planning_active_scan_count: self.planning_active_scan_count,
+            build_peak_bytes: self.profile.build_peak_bytes,
+            retained_plan_bytes: self.profile.retained_plan_bytes,
+            operators: self.operator_counts,
+        }
     }
 
     /// Returns the number of pre-optimization persisted relation occurrences.
@@ -533,8 +694,7 @@ pub async fn prepare_persisted_plan(
         .query_planner()
         .create_physical_plan(&optimized, &state)
         .await?;
-    let (physical_node_count, planning_scan_count, planning_active_scan_count) =
-        validate_physical_plan(&plan, admitted.limits)?;
+    let physical = validate_physical_plan(&plan, admitted.limits)?;
     drop(state);
     drop(context);
 
@@ -547,9 +707,10 @@ pub async fn prepare_persisted_plan(
         expression_node_count: logical_stats
             .expression_node_count
             .max(optimized_stats.expression_node_count),
-        physical_node_count,
-        planning_scan_count,
-        planning_active_scan_count,
+        physical_node_count: physical.node_count,
+        planning_scan_count: physical.planning_scan_count,
+        planning_active_scan_count: physical.planning_active_scan_count,
+        operator_counts: physical.operators,
     })
 }
 
@@ -673,10 +834,11 @@ fn is_allowed_logical_node(plan: &LogicalPlan) -> bool {
 fn validate_physical_plan(
     plan: &Arc<dyn ExecutionPlan>,
     limits: PersistedPlanLimits,
-) -> Result<(usize, usize, usize)> {
+) -> Result<PhysicalPlanStats> {
     let mut node_count = 0_usize;
     let mut planning_scan_count = 0_usize;
     let mut planning_active_scan_count = 0_usize;
+    let mut operators = PhysicalOperatorCounts::default();
     plan.apply(|node| {
         node_count =
             checked_increment(node_count, limits.max_physical_nodes, "physical plan nodes")?;
@@ -699,9 +861,22 @@ fn validate_physical_plan(
                 .checked_add(1)
                 .ok_or_else(|| exhausted("planning active scan count overflowed usize"))?;
         }
+        operators.record(node)?;
         Ok(TreeNodeRecursion::Continue)
     })?;
-    Ok((node_count, planning_scan_count, planning_active_scan_count))
+    Ok(PhysicalPlanStats {
+        node_count,
+        planning_scan_count,
+        planning_active_scan_count,
+        operators,
+    })
+}
+
+struct PhysicalPlanStats {
+    node_count: usize,
+    planning_scan_count: usize,
+    planning_active_scan_count: usize,
+    operators: PhysicalOperatorCounts,
 }
 
 fn register_bindings(
@@ -1859,7 +2034,7 @@ mod tests {
 
     #[tokio::test]
     async fn constant_function_outputs_fail_before_optimizer_materialization() {
-        let tables = vec![table(0, 1, 0)];
+        let tables = vec![table(0, 1, 1)];
         let bindings = vec![binding("ticks", 0)];
         for sql in [
             "select repeat('x', 1000000000) from ticks",
@@ -1883,9 +2058,22 @@ mod tests {
         ] {
             let profile = profile_persisted_plan(sql, &bindings, &tables, limits())
                 .expect("profile bounded aggregate function");
-            prepare_persisted_plan(policy(), sql, &bindings, &tables, profile)
+            let prepared = prepare_persisted_plan(policy(), sql, &bindings, &tables, profile)
                 .await
                 .expect("prepare bounded aggregate function");
+            let mut metrics = Vec::new();
+            prepared
+                .metrics()
+                .visit_stable_metrics(|name, value| metrics.push((name, value)));
+            assert!(
+                metrics
+                    .iter()
+                    .any(|(name, _)| *name == "operator.aggregate.count"),
+                "unexpected aggregate plan metrics: {metrics:?}"
+            );
+            assert!(metrics
+                .iter()
+                .any(|(name, value)| *name == "plan.physical_nodes" && *value >= 1));
         }
     }
 

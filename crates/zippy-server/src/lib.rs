@@ -53,7 +53,7 @@ pub use legacy_query::{
     LegacyGatewayPlan, LegacyQueryEngineAdapter, LegacyQueryEngineConfig,
     LEGACY_GATEWAY_PLAN_FORMAT_VERSION,
 };
-pub use native_query::{NativeQueryBinding, NativeQueryEngine};
+pub use native_query::{NativeQueryBinding, NativeQueryEngine, NativeQueryExplanation};
 pub use native_query_canary::{
     NativeQueryCanaryBinding, NativeQueryCanaryComparison, NativeQueryCanaryDigestBuilder,
     NativeQueryCanaryExpected, NativeQueryCanaryMetrics, NativeQueryCanaryQueryStatus,

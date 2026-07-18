@@ -268,9 +268,9 @@ fn runtime_config_with_native_query_frontend_and_persist_root(
         .expect("test runtime config has an explicit path");
     let mut source = fs::read_to_string(config_path).unwrap();
     source.push_str(concat!(
-        "\n[query]\nnative_enabled = true\n\n",
-        "[query.resources]\nmax_memory_bytes = 1073741824\n\n",
-        "[query.canary]\noperator_memory_bytes = 268435456\n"
+        "\n[query]\nnative_enabled = true\n",
+        "operator_memory_bytes = 268435456\n\n",
+        "[query.resources]\nmax_memory_bytes = 1073741824\n"
     ));
     fs::write(config_path, source).unwrap();
     runtime
@@ -488,8 +488,9 @@ fn gateway_stream_frames(
     let mut frames = Vec::new();
     loop {
         let frame = read_gateway_frame(&mut stream);
-        let terminal = frame.0["status"] == "error"
-            || frame.0.get("kind").and_then(serde_json::Value::as_str) == Some("collect_end");
+        let kind = frame.0.get("kind").and_then(serde_json::Value::as_str);
+        let terminal =
+            frame.0["status"] == "error" || matches!(kind, Some("collect_end" | "query_explain"));
         frames.push(frame);
         if terminal {
             return frames;
@@ -693,6 +694,41 @@ async fn native_gateway_query_matches_legacy_and_releases_on_budget_or_disconnec
             "snapshot": true,
         }),
     );
+    let explained = gateway_stream_frames(
+        &endpoint,
+        serde_json::json!({
+            "kind": "query_explain",
+            "token": "shadow-catalog-test",
+            "query_id": QueryId::from_u128(999).unwrap(),
+            "session_id": SessionId::from_u128(1000).unwrap(),
+            "sql": concat!(
+                "SELECT value, count(*) AS copies FROM events ",
+                "GROUP BY value ORDER BY value LIMIT 10"
+            ),
+            "bindings": [{
+                "sql_name": "events",
+                "table": {"type": "name", "namespace": "default", "table": "events"},
+            }],
+        }),
+    );
+    assert_eq!(explained.len(), 1);
+    assert_eq!(explained[0].0["kind"], "query_explain");
+    assert_eq!(
+        explained[0].0["explanation"]["output_fields"][0]["name"],
+        "value"
+    );
+    assert!(
+        explained[0].0["explanation"]["metrics"]["operator.sort.count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        explained[0].0["explanation"]["metrics"]["operator.aggregate.count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
     let native = gateway_stream_frames(
         &endpoint,
         serde_json::json!({
@@ -714,6 +750,16 @@ async fn native_gateway_query_matches_legacy_and_releases_on_budget_or_disconnec
         "native frames: {native:?}"
     );
     assert_eq!(native[0].0["query_authority"], "native");
+    assert!(
+        native.last().unwrap().0["metrics"]["operator.scan.count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        native.last().unwrap().0["metrics"]["operator.memory_reserved_bytes"],
+        0
+    );
     assert_eq!(gateway_i64_values(&legacy), values);
     assert_eq!(gateway_i64_values(&native), values);
 

@@ -8,12 +8,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
 use zippy_query::{
-    PersistedPlanLimits, PersistedTableBinding, QueryProcessMemoryPool, QueryProcessMemoryStatus,
-    QuerySessionPolicy,
+    PersistedPlanLimits, PersistedPlanMetrics, PersistedTableBinding, QueryOperatorMemoryStatus,
+    QueryProcessMemoryPool, QueryProcessMemoryStatus, QuerySessionPolicy,
 };
 use zippy_types::query::{
     OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryEngine, QueryExecutionToken,
@@ -65,6 +65,19 @@ impl NativeQueryBinding {
     pub const fn table(&self) -> &TableRef {
         &self.table
     }
+}
+
+/// One server-planned native SQL explanation with no result execution.
+#[derive(Debug, Clone)]
+pub struct NativeQueryExplanation {
+    /// Exact query incarnation used for the bounded planning operation.
+    pub instance_id: QueryInstanceId,
+    /// Snapshot and Catalog metadata fixed by native planning.
+    pub plan: QueryPlanInfo,
+    /// Output Arrow schema of the prepared physical plan.
+    pub output_schema: SchemaRef,
+    /// Stable plan and physical-operator counters.
+    pub metrics: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,6 +177,34 @@ impl NativeQueryEngine {
         bindings: Vec<NativeQueryBinding>,
     ) -> BoxFuture<'a, Result<OpaqueQueryExecutionToken>> {
         Box::pin(async move { self.plan_bound_inner(owner, request, bindings).await })
+    }
+
+    /// Prepares and explains SQL using explicit bindings without executing result operators.
+    pub fn explain_bound<'a>(
+        &'a self,
+        owner: &'a dyn QueryOwnerCapability,
+        request: QueryRequest,
+        bindings: Vec<NativeQueryBinding>,
+    ) -> BoxFuture<'a, Result<NativeQueryExplanation>> {
+        Box::pin(async move {
+            let token = self.plan_bound_inner(owner, request, bindings).await?;
+            let plan = token.info().clone();
+            let transferred = transfer_native_token(token)?;
+            let instance_id = transferred.instance_id;
+            let lease = self.prepare_transferred(transferred).await?;
+            let output_schema = lease.plan().schema();
+            let mut metrics = BTreeMap::new();
+            lease.plan_metrics().visit_stable_metrics(|name, value| {
+                metrics.insert(name.to_owned(), value);
+            });
+            lease.finish()?;
+            Ok(NativeQueryExplanation {
+                instance_id,
+                plan,
+                output_schema,
+                metrics,
+            })
+        })
     }
 
     /// Returns process-wide DataFusion operator-memory counters.
@@ -353,10 +394,10 @@ impl NativeQueryEngine {
         ))
     }
 
-    async fn execute_token(
+    async fn prepare_transferred(
         &self,
         transferred: NativeTransferredToken,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<NativeExecutionLease> {
         if transferred.engine_nonce != self.inner.nonce {
             return Err(
                 invalid("native query token belongs to another engine instance")
@@ -371,7 +412,7 @@ impl NativeQueryEngine {
             Ok(manifest) => manifest,
             Err(error) => return Err(fail_execution(execution, error)),
         };
-        let lease = NativeExecutionLease::prepare(
+        NativeExecutionLease::prepare(
             self.inner.snapshots.clone(),
             execution,
             manifest,
@@ -380,17 +421,25 @@ impl NativeQueryEngine {
             &transferred.bindings,
             self.inner.config.plan,
         )
-        .await?;
+        .await
+    }
+
+    async fn execute_token(
+        &self,
+        transferred: NativeTransferredToken,
+    ) -> Result<SendableRecordBatchStream> {
+        let instance_id = transferred.instance_id;
+        let policy = transferred.policy;
+        let execution = transferred.execution;
+        let lease = self.prepare_transferred(transferred).await?;
         let schema = lease.plan().schema();
-        let stream = lease.execute_in(
-            transferred.policy,
-            transferred.execution,
-            &self.inner.process_memory,
-        )?;
+        let plan_metrics = lease.plan_metrics();
+        let stream = lease.execute_in(policy, execution, &self.inner.process_memory)?;
         Ok(Box::pin(NativeRecordBatchStream::new(
-            transferred.instance_id,
+            instance_id,
             schema,
             stream,
+            plan_metrics,
         )))
     }
 }
@@ -427,14 +476,10 @@ impl QueryEngine for NativeQueryEngine {
         &self,
         token: OpaqueQueryExecutionToken,
     ) -> BoxFuture<'_, Result<SendableRecordBatchStream>> {
-        let transferred = match token.into_any().downcast::<NativeTransferredToken>() {
-            Ok(token) => *token,
-            Err(_) => {
-                return Box::pin(async {
-                    Err(invalid(
-                        "query execution token was not issued by the native engine",
-                    ))
-                });
+        let transferred = match transfer_native_token(token) {
+            Ok(token) => token,
+            Err(error) => {
+                return Box::pin(async move { Err(error) });
             }
         };
         Box::pin(async move { self.execute_token(transferred).await })
@@ -513,6 +558,14 @@ struct NativeTransferredToken {
     execution: NativeQueryExecutionConfig,
 }
 
+fn transfer_native_token(token: OpaqueQueryExecutionToken) -> Result<NativeTransferredToken> {
+    token
+        .into_any()
+        .downcast::<NativeTransferredToken>()
+        .map(|token| *token)
+        .map_err(|_| invalid("query execution token was not issued by the native engine"))
+}
+
 type PendingNativeBatch = Pin<
     Box<dyn Future<Output = (NativeQueryResultStream, Result<Option<NativeQueryBatch>>)> + Send>,
 >;
@@ -520,8 +573,14 @@ type PendingNativeBatch = Pin<
 struct NativeRecordBatchStream {
     instance_id: QueryInstanceId,
     schema: SchemaRef,
+    plan_metrics: PersistedPlanMetrics,
     stream: Option<NativeQueryResultStream>,
     pending: Option<PendingNativeBatch>,
+    operator_memory_status: QueryOperatorMemoryStatus,
+    result_batches: u64,
+    result_rows: u64,
+    result_memory_bytes: u64,
+    started_at: Instant,
     terminal: bool,
 }
 
@@ -530,14 +589,60 @@ impl NativeRecordBatchStream {
         instance_id: QueryInstanceId,
         schema: SchemaRef,
         stream: NativeQueryResultStream,
+        plan_metrics: PersistedPlanMetrics,
     ) -> Self {
+        let operator_memory_status = stream.operator_memory_status();
         Self {
             instance_id,
             schema,
+            plan_metrics,
             stream: Some(stream),
             pending: None,
+            operator_memory_status,
+            result_batches: 0,
+            result_rows: 0,
+            result_memory_bytes: 0,
+            started_at: Instant::now(),
             terminal: false,
         }
+    }
+
+    fn profile(&self) -> BTreeMap<String, u64> {
+        let mut metrics = BTreeMap::new();
+        self.plan_metrics.visit_stable_metrics(|name, value| {
+            metrics.insert(name.to_owned(), value);
+        });
+        let operator_memory = self.stream.as_ref().map_or(
+            self.operator_memory_status,
+            NativeQueryResultStream::operator_memory_status,
+        );
+        metrics.insert(
+            "operator.memory_limit_bytes".to_owned(),
+            u64::try_from(operator_memory.limit_bytes).unwrap_or(u64::MAX),
+        );
+        metrics.insert(
+            "operator.memory_reserved_bytes".to_owned(),
+            u64::try_from(operator_memory.reserved_bytes).unwrap_or(u64::MAX),
+        );
+        metrics.insert(
+            "operator.memory_peak_bytes".to_owned(),
+            u64::try_from(operator_memory.peak_reserved_bytes).unwrap_or(u64::MAX),
+        );
+        metrics.insert(
+            "operator.memory_rejections".to_owned(),
+            u64::try_from(operator_memory.rejected_allocations).unwrap_or(u64::MAX),
+        );
+        metrics.insert("result.batches".to_owned(), self.result_batches);
+        metrics.insert("result.rows".to_owned(), self.result_rows);
+        metrics.insert(
+            "result.accounted_bytes".to_owned(),
+            self.result_memory_bytes,
+        );
+        metrics.insert(
+            "query.elapsed_us".to_owned(),
+            u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        metrics
     }
 }
 
@@ -548,6 +653,10 @@ impl RecordBatchStream for NativeRecordBatchStream {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+
+    fn metrics(&self) -> BTreeMap<String, u64> {
+        self.profile()
     }
 
     fn poll_next(
@@ -574,10 +683,20 @@ impl RecordBatchStream for NativeRecordBatchStream {
         match pending.as_mut().poll(context) {
             Poll::Pending => Poll::Pending,
             Poll::Ready((stream, result)) => {
+                self.operator_memory_status = stream.operator_memory_status();
                 self.pending = None;
                 self.stream = Some(stream);
                 match result {
-                    Ok(Some(batch)) => Poll::Ready(Some(Ok(batch.into_public()))),
+                    Ok(Some(batch)) => {
+                        self.result_batches = self.result_batches.saturating_add(1);
+                        self.result_rows = self.result_rows.saturating_add(
+                            u64::try_from(batch.record_batch().num_rows()).unwrap_or(u64::MAX),
+                        );
+                        self.result_memory_bytes = self
+                            .result_memory_bytes
+                            .saturating_add(batch.memory_bytes().get());
+                        Poll::Ready(Some(Ok(batch.into_public())))
+                    }
                     Ok(None) => {
                         self.terminal = true;
                         drop(self.stream.take());

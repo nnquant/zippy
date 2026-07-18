@@ -2457,18 +2457,47 @@ publication 接入 table actor，跨进程长 lease registry 也不在本阶段�
 process-wide pool、受配额 spill/temp、transport backpressure、公开 batch ownership contract，以及依赖 sort 的 tail 仍按
 后续任务推进。
 
+Stage 5.4k native query authority 与可观测性已完成（2026-07-18）：`QueryProcessMemoryPool` 现在是所有
+DataFusion execution 共享的进程级 authority，每个查询取得独立 child limit 和 peak/rejection counters。固定宽度
+decoded pipeline 的 allowlist 已扩展到 sort、aggregate、join、union 和 window；这些 buffering operator 同时受
+query/process pool 约束。DataFusion 44 disk manager 继续显式关闭，非零 spill request 返回
+`UNSUPPORTED_PLAN`，实际超预算返回 `RESOURCE_EXHAUSTED`，因此不会创建未受配额管理的 temp 文件。配额化
+spill/temp 作为吞吐增强留到后续，不再是 Phase 5 正确性前置条件。正式查询的 per-query operator budget 使用
+`[query].operator_memory_bytes` / `ZIPPY_QUERY_OPERATOR_MEMORY_BYTES`，不再隐式复用 canary 配置。
+
+公开 `QueryResultBatch` 是 non-cloneable permit owner，Gateway 编码和 socket write 完成前持续持有该 owner，释放
+当前 batch 后才 poll 下一批；另一个全局 byte semaphore 给 transport 提供硬背压。规划、buffer admission 和每个
+pending batch poll 都与 peer disconnect 竞争，连接关闭会 drop stream 并取消 QueryService lifecycle。Gateway
+`query_sql` 与 `query_explain` 仅在 `query.native_enabled=true`、native storage ready、Gateway ready 且 Catalog 为
+`sqlite_shadow` 时安装；默认关闭，shutdown readiness 会先撤销 capability。自定义 framing 是 Phase 6 Flight 前的
+有界兼容协议，不是长期 wire contract。
+
+Python `Table` 在 native capability 下把完整计划编译成显式 SQL bindings：shard fanout 使用 Server-side
+`UNION ALL`，projection/filter/with_columns/drop/rename/head/slice/sort/join/tail 不再留下 Python residual；tail 必须
+继承显式 sort，否则直接拒绝。`read_sql` 为任意 SQL 提供同一 native 路径，aggregate/join/window 不在客户端执行。
+native 模式遇到 unsupported plan 会明确失败，不会自动下载全表。`Table.explain()` 固定真实 snapshot 并完整 prepare
+物理计划，但不启动 result operator；返回后立即 finish 和释放 lease。`Table.profile()` 返回 plan、operator category、
+query operator-memory peak/rejection、result batch/row/accounted bytes 与 transport counters。
+
+Stage 5.4k 没有伪造生产 live provenance：native table actor 已支持 exact logical-offset publication，但旧 writer
+descriptor 若缺少该字段，仍留在 legacy live route。persisted native 查询不受影响；生产 writer authority 的逐个迁移
+属于后续 cutover，不能为了宣称 Phase 5 完成而猜测 offset。
+
+至此 Phase 5 完成。当前完成定义是“服务器拥有完整、固定快照、可取消、受硬内存和 transport 背压约束的查询计划与
+执行”；它不包含 Phase 6 标准 Flight/TLS/auth，也不包含 quota-safe spill 带来的成功率优化。
+
 任务：
 
 1. 完成 DataFusion/Arrow version spike。（已完成）
 2. 新建 `zippy-query` 和 per-session `SessionContext` policy。（persisted planning 已完成）
 3. 实现 `ZippyTableProvider`。（persisted-only 已完成）
-4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。（已完成；生产 writer publication 接线待后续）
-5. 先迁移 projection/filter/head/tail/slice。（fixed-width projection/filter/head/slice 已覆盖 persisted + active；tail 随 sort 迁移）
-6. 迁移 sort/aggregate/join/window。
-7. 实现 query registry、cancel、deadline。（registry/lifecycle 与内部 persisted result stream 已完成）
-8. 接入全局 memory pool、spill 和 temp quota。
-9. 实现 explain/profile/operator metrics。
-10. Python Table 改为发送完整 server plan，关闭 residual fallback。
+4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。（已完成；只有具备 exact offset provenance 的 writer 可发布）
+5. 先迁移 projection/filter/head/tail/slice。（已完成；tail 强制依赖显式 sort）
+6. 迁移 sort/aggregate/join/window。（已完成 fixed-width bounded subset）
+7. 实现 query registry、cancel、deadline。（已完成）
+8. 接入全局 memory pool、spill 和 temp quota。（全局/query pool 已完成；spill/temp 禁用并 fail closed）
+9. 实现 explain/profile/operator metrics。（已完成）
+10. Python Table 改为发送完整 server plan，关闭 residual fallback。（已完成）
 
 验收：
 
@@ -2478,6 +2507,18 @@ process-wide pool、受配额 spill/temp、transport backpressure、公开 batch
 - 超预算 query spill 或返回 `RESOURCE_EXHAUSTED`。
 - Join/aggregate 不在 Python 客户端执行。
 - 本地热订阅性能不受 DataFusion 引入影响。
+
+自动化验收证据：
+
+| 验收项 | 证据 |
+| --- | --- |
+| legacy/native golden 一致 | `native_gateway_query_matches_legacy_and_releases_on_budget_or_disconnect` |
+| fixed snapshot / active payload 不混读 | `crates/zippy-query/tests/active_plan.rs` 与 Stage 5.4j lifecycle tests |
+| disconnect 取消并释放 | Gateway pending-stream test 与 Server E2E pin/operator/transport 归零断言 |
+| 低预算稳定失败 | Server E2E 断言 `RESOURCE_EXHAUSTED`，disk manager disabled test |
+| join/aggregate 不在 Python | native Table SQL/compiler tests 与真实 Server aggregate explain |
+| explain/profile/operator metrics | Gateway explain test、plan category test 与 Python profile test |
+| 热订阅隔离 | Gateway subscribe suite/perf smoke；native query 模块不被 ingest/subscription 调用 |
 
 回滚：按 query capability 路由到 legacy engine；不得自动拉全表做 residual。
 

@@ -13,18 +13,18 @@ result permit 链路，但不会把裸 `RecordBatch` 返回给调用方。Server
 - 在 LDC 或其他单机生产环境验证 snapshot、取消、deadline 和内存限额；
 - 收集 native planning / execution 耗时，评估正式切换前的性能。
 
-它不适合作为 Python/远端客户端查询入口，也不能读取 active segment 或尚未落盘的数据。
-`LegacyServerCapabilities::query_sql` 和 `query_manifest_snapshot_pinning` 仍为 `false`；启用 canary
-不会绕过 Gateway capability、认证或正式 transport 协议。
+它不适合作为 Python/远端客户端查询入口。启用 canary 不会自动开启 Gateway；远端能力由独立的
+`[query].native_enabled` gate 控制，见 [`native-query-service.md`](native-query-service.md)。canary 仍主要用于
+persisted golden 对照，而正式 native query 可以读取具有 exact logical-offset provenance 的 active segment。
 当前 persisted planner 要求每个 canonical manifest table 恰好一个 binding，因此同表 self-join / 多 alias
 也不属于本阶段的灰度范围。
 
-当前可执行的 decoded-output 子集进一步收紧为：单表 persisted scan（空表可优化为无 scan）、固定宽度
-Arrow 列、直接列投影、显式 allowlist 的基础定宽 filter（列、字面量、二元运算、定宽 cast、
-null/not/negative），以及 limit/offset slice。exact filter 和 Parquet pushed predicate 都执行同一校验；
-`Utf8`/`Binary` 等变长列、计算投影、`IN`/UDF predicate、batch coalesce、sort、aggregate、join、union 和
-window 会在打开 reader 前返回 `UNSUPPORTED_PLAN`。这与下文 golden 摘要支持字符串并不矛盾：摘要构造器
-可验证 legacy 结果，但 native 执行 authority 目前只开放已证明具有产出前内存上界的子集。
+当前 decoded-output 准入要求完整物理计划的中间和输出 schema 都是固定宽度，并且 operator/expression
+位于显式 allowlist。projection、基础定宽 filter、limit/slice、sort、aggregate、join、union 和 window 已接入
+同一个 process-wide/operator query memory pool；`Utf8`/`Binary` 等变长中间结果、未知 UDF/expression 或未知
+physical operator 会在 reader 创建前返回 `UNSUPPORTED_PLAN`。超出 sort/hash/window 内存上限会返回
+`RESOURCE_EXHAUSTED`，不会 spill 到未受配额管理的目录。下文 golden 摘要仍可验证 flat string/binary legacy
+结果，因此摘要支持范围可以大于 native 执行 allowlist。
 
 ## 配置
 
@@ -154,9 +154,9 @@ canary 外层返回错误。deadline、显式 cancel 和 run drop 保留 `TimedO
 
 ## 灰度顺序
 
-1. 保持 Gateway `query_sql=false`，仅在测试进程启用 canary。
+1. 保持 `[query].native_enabled=false`，仅在测试进程启用 canary。
 2. 从 flat scalar 单表 projection/filter 开始，用 legacy batch builder 生成 golden。
 3. 检查 mismatch、失败分类、最大单批内存和总耗时，不只比较平均延迟。
 4. 扩大到多文件、多表和并发请求，同时验证 cancel、deadline 与 shutdown drain。
-5. 只有 decoded output 产出前准入、ActiveSegmentExec、process-wide pool、受配额 spill/temp 和
-   transport backpressure 都完成后，才设计正式 Gateway/Flight 查询 authority 切换。
+5. 上述 golden 稳定后，再按 `native-query-service.md` 开启 bounded Gateway query frontend；标准 Flight、
+   TLS/auth 和配额化 spill/temp 属于后续阶段。

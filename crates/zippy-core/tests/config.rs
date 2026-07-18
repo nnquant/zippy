@@ -31,6 +31,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_QUERY_MAX_CONCURRENT_QUERIES",
     "ZIPPY_QUERY_MAX_MEMORY_BYTES",
     "ZIPPY_QUERY_NATIVE_ENABLED",
+    "ZIPPY_QUERY_OPERATOR_MEMORY_BYTES",
     "ZIPPY_QUERY_PARALLELISM",
     "ZIPPY_QUERY_PLAN_TTL_MS",
     "ZIPPY_QUERY_CANARY_ENABLED",
@@ -1118,13 +1119,44 @@ endpoint = "127.0.0.1:17666"
 
 [query]
 native_enabled = true
+operator_memory_bytes = 16777216
 "#,
     )
     .unwrap();
 
-    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+    let config = with_env(&[("ZIPPY_QUERY_OPERATOR_MEMORY_BYTES", "33554432")], || {
+        ZippyConfig::load_from_path(Some(&config_path))
+    })
+    .unwrap();
 
     assert!(config.query.native_enabled);
+    assert_eq!(config.query.operator_memory_bytes, Some(33554432));
+    assert_eq!(config.query_operator_memory_bytes(), 33554432);
+}
+
+#[test]
+fn zippy_config_rejects_invalid_native_query_operator_memory() {
+    for (value, expected) in [
+        (0, "query operator_memory_bytes must be greater than zero"),
+        (
+            2_097_152,
+            "query operator_memory_bytes must not exceed query resources memory",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[query]\noperator_memory_bytes = {value}\n\
+                 [query.resources]\nmax_memory_bytes = 1048576\n"
+            ),
+        )
+        .unwrap();
+
+        let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+        assert!(error.to_string().contains(expected), "value={value}");
+    }
 }
 
 #[test]

@@ -98,14 +98,13 @@ the DataFusion stream and operator arena, then marks execution complete; the que
 `Finished` only after already-delivered batches drain. Dropping the stream publishes cancellation
 before releasing execution resources.
 
-The first decoded-output admission gate is now fail closed. Session batch size is explicitly 8192
-rows and DataFusion batch coalescing is disabled. Before any reader can be opened, the complete
-physical plan must contain at most one fixed-width Parquet scan (or an optimizer-eliminated empty
-scan) and only direct column projection, allowlisted primitive fixed-width predicates (column,
-literal, binary, fixed-width cast, null/not/negative), partition coalescing, and limit/slice
-operators. Variable-width columns, computed projections, `IN`/UDF predicates,
-`CoalesceBatchesExec`, sort, aggregate, join, union, and window plans return `UNSUPPORTED_PLAN`
-before file decoding begins. Both exact `FilterExec` and Parquet's pushed predicate are checked.
+Decoded-output admission remains fail closed. Session batch size is explicitly 8192 rows and
+DataFusion batch coalescing is disabled. Before any reader can be opened, every physical node and
+intermediate schema must fit the fixed-width allowlist. Direct/computed fixed-width projection,
+primitive predicates, limit/slice, sort, aggregate, join, union and window are admitted; variable
+width intermediates, unknown UDF/expression nodes, `CoalesceBatchesExec`, or unknown physical
+operators return `UNSUPPORTED_PLAN`. Both exact `FilterExec` and Parquet's pushed predicate are
+checked.
 
 The blocking file open parses Parquet metadata once under the existing footer reservation,
 validates the footer row count against the Catalog, then atomically grows the same file task to
@@ -116,9 +115,12 @@ independent result permits, and a produced batch still receives its downstream r
 the caller-owned lifetime. This deliberately double-counts the handoff interval instead of leaving
 an allocation gap.
 
-The result stream remains an internal canary and is not advertised by Gateway capabilities.
-Active-segment execution, a process-wide DataFusion memory pool for complex operators,
-quota-enforced spill/temp storage, transport backpressure, and Gateway routing remain required
-before native execution can replace the legacy query engine. The footer and row-group envelopes
-cover valid Zippy-managed Parquet files; treating arbitrary hostile local files as input would
-additionally require a bounded Thrift/page decoder or process/allocator isolation.
+The result stream is exposed through a non-cloneable public `QueryResultBatch` whose opaque owner
+retains the exact QueryService result permit. All executions share one process-wide DataFusion pool
+and each query has a child limit with peak/rejection counters. Snapshot-bound active segments use a
+weak server opener and can join the same fixed-width plan when their publication carries exact
+logical-offset provenance. Gateway applies one-batch-at-a-time transport backpressure and cancels
+the stream on peer disconnect. Quota-enforced spill/temp storage is not installed: the disk manager
+is disabled and over-budget complex operators return `RESOURCE_EXHAUSTED`. The footer and row-group
+envelopes cover valid Zippy-managed Parquet files; treating arbitrary hostile local files as input
+would additionally require a bounded Thrift/page decoder or process/allocator isolation.

@@ -16,9 +16,10 @@ use zippy_query::{
     ActiveSegmentOpenRequest, ActiveSegmentOpener, BoundPersistedPlan, BoxedAsyncFileReader,
     PersistedDecodedOutputAdmission, PersistedExecutionContext, PersistedExecutionError,
     PersistedExecutionErrorClass, PersistedFileDescription, PersistedFileOpenRequest,
-    PersistedFileOpener, PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile,
-    PersistedRecordBatchStream, PersistedSnapshotDescription, PersistedTableBinding,
-    PreparedPersistedPlan, QueryProcessMemoryPool, QuerySessionPolicy,
+    PersistedFileOpener, PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanMetrics,
+    PersistedPlanProfile, PersistedRecordBatchStream, PersistedSnapshotDescription,
+    PersistedTableBinding, PreparedPersistedPlan, QueryOperatorMemoryStatus,
+    QueryProcessMemoryPool, QuerySessionPolicy,
 };
 use zippy_segment_store::RowSpanBatchReader;
 use zippy_types::query::{QueryInstanceId, QueryResultBatch};
@@ -153,8 +154,10 @@ impl AdmittedPreparedPersistedPlan {
         QueryTaskPermit<()>,
         PreparedPersistedPlan,
         PersistedPlanProfile,
+        PersistedPlanMetrics,
     ) {
-        (self.task, self.prepared, self.profile)
+        let metrics = self.prepared.metrics();
+        (self.task, self.prepared, self.profile, metrics)
     }
 }
 
@@ -717,6 +720,7 @@ pub(crate) struct NativeQueryResultStream {
     execution_driver: Option<QueryTaskPermit<()>>,
     operator_context: Option<QueryRetainedPermit<PersistedExecutionContext>>,
     lease: Option<NativeExecutionLease>,
+    operator_memory_status: QueryOperatorMemoryStatus,
     terminal: bool,
 }
 
@@ -727,13 +731,23 @@ impl NativeQueryResultStream {
         operator_context: QueryRetainedPermit<PersistedExecutionContext>,
         lease: NativeExecutionLease,
     ) -> Self {
+        let operator_memory_status = operator_context.resource().operator_memory_status();
         Self {
             inner: Some(inner),
             execution_driver: Some(execution_driver),
             operator_context: Some(operator_context),
             lease: Some(lease),
+            operator_memory_status,
             terminal: false,
         }
+    }
+
+    pub(crate) fn operator_memory_status(&self) -> QueryOperatorMemoryStatus {
+        self.operator_context
+            .as_ref()
+            .map_or(self.operator_memory_status, |context| {
+                context.resource().operator_memory_status()
+            })
     }
 
     /// Returns the next accounted batch, or `None` after successful execution completion.
@@ -796,9 +810,10 @@ impl NativeQueryResultStream {
 
     fn finish_execution(&mut self) -> Result<()> {
         self.terminal = true;
+        self.capture_operator_memory_status();
         drop(self.inner.take());
         drop(self.execution_driver.take());
-        drop(self.operator_context.take());
+        self.release_operator_context();
         self.lease
             .take()
             .expect("active native result stream owns its execution lease")
@@ -807,6 +822,7 @@ impl NativeQueryResultStream {
 
     pub(crate) fn fail(&mut self, error: ServerError) -> ServerError {
         self.terminal = true;
+        self.capture_operator_memory_status();
         let terminal = match self.lease.take() {
             None => error,
             Some(lease) => match lease.fail(error.clone()) {
@@ -816,16 +832,30 @@ impl NativeQueryResultStream {
         };
         drop(self.inner.take());
         drop(self.execution_driver.take());
-        drop(self.operator_context.take());
+        self.release_operator_context();
         terminal
     }
 
     fn close_after_terminal(&mut self) {
         self.terminal = true;
+        self.capture_operator_memory_status();
         drop(self.lease.take());
         drop(self.inner.take());
         drop(self.execution_driver.take());
-        drop(self.operator_context.take());
+        self.release_operator_context();
+    }
+
+    fn capture_operator_memory_status(&mut self) {
+        if let Some(context) = self.operator_context.as_ref() {
+            self.operator_memory_status = context.resource().operator_memory_status();
+        }
+    }
+
+    fn release_operator_context(&mut self) {
+        if let Some(context) = self.operator_context.take() {
+            drop(context);
+            self.operator_memory_status.reserved_bytes = 0;
+        }
     }
 }
 
@@ -847,6 +877,7 @@ pub(crate) struct NativeExecutionLease {
     opener: Option<Arc<dyn PersistedFileOpener>>,
     active_opener: Option<Arc<dyn ActiveSegmentOpener>>,
     retained_plan: Option<QueryRetainedPermit<BoundPersistedPlan>>,
+    plan_metrics: PersistedPlanMetrics,
 }
 
 impl NativeExecutionLease {
@@ -923,7 +954,7 @@ impl NativeExecutionLease {
             authority: Arc::downgrade(&authority),
             snapshot: manifest.resource().description().clone(),
         });
-        let (task, prepared, profile) = admitted.into_parts();
+        let (task, prepared, profile, plan_metrics) = admitted.into_parts();
         let retained_plan = manifest.rebuild_with_build_task(task, |manifest, ()| {
             if manifest.query_id() != instance_id.query_id()
                 || manifest.catalog_revision() != catalog_revision
@@ -1010,6 +1041,7 @@ impl NativeExecutionLease {
             opener: Some(opener),
             active_opener: Some(active_opener),
             retained_plan: Some(retained_plan),
+            plan_metrics,
         })
     }
 
@@ -1026,6 +1058,10 @@ impl NativeExecutionLease {
             .as_ref()
             .expect("live native execution lease owns its retained physical plan")
             .resource()
+    }
+
+    pub(crate) const fn plan_metrics(&self) -> PersistedPlanMetrics {
+        self.plan_metrics
     }
 
     /// Starts persisted execution under a hard DataFusion operator-memory reservation.

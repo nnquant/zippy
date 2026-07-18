@@ -46,8 +46,10 @@ pub const DEFAULT_QUERY_CANARY_MAX_ROWS: u64 = 1_000_000;
 pub const DEFAULT_QUERY_CANARY_MAX_BATCHES: usize = 4_096;
 /// Default cumulative encoded or accounted result bytes accepted by one canary run.
 pub const DEFAULT_QUERY_CANARY_MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
-/// Preferred DataFusion operator pool size when the global query budget permits it.
-pub const DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Preferred per-query DataFusion operator pool size when the global query budget permits it.
+pub const DEFAULT_QUERY_OPERATOR_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Backward-compatible canary default, independent from a configured production override.
+pub const DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES: u64 = DEFAULT_QUERY_OPERATOR_MEMORY_BYTES;
 pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
 pub const DEFAULT_CATALOG_SHADOW_METADATA_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON: usize = 4_096;
@@ -279,6 +281,8 @@ pub struct ZippyQueryConfig {
     #[serde(default)]
     pub native_enabled: bool,
     pub parallelism: Option<usize>,
+    /// Per-query DataFusion operator-memory limit before returning `RESOURCE_EXHAUSTED`.
+    pub operator_memory_bytes: Option<u64>,
     pub max_buffered_bytes: Option<usize>,
     #[serde(default = "default_query_plan_ttl_ms")]
     pub plan_ttl_ms: u64,
@@ -293,6 +297,7 @@ impl Default for ZippyQueryConfig {
         Self {
             native_enabled: false,
             parallelism: None,
+            operator_memory_bytes: None,
             max_buffered_bytes: None,
             plan_ttl_ms: DEFAULT_QUERY_PLAN_TTL_MS,
             resources: ZippyQueryResourceConfig::default(),
@@ -458,6 +463,7 @@ struct PartialRuntimeConfig {
 struct PartialQueryConfig {
     native_enabled: Option<bool>,
     parallelism: Option<usize>,
+    operator_memory_bytes: Option<u64>,
     max_buffered_bytes: Option<usize>,
     plan_ttl_ms: Option<u64>,
     resources: Option<PartialQueryResourceConfig>,
@@ -837,6 +843,9 @@ impl ZippyConfig {
             if let Some(parallelism) = query.parallelism {
                 self.query.parallelism = Some(parallelism);
             }
+            if let Some(operator_memory_bytes) = query.operator_memory_bytes {
+                self.query.operator_memory_bytes = Some(operator_memory_bytes);
+            }
             if let Some(max_buffered_bytes) = query.max_buffered_bytes {
                 self.query.max_buffered_bytes = Some(max_buffered_bytes);
             }
@@ -993,6 +1002,10 @@ impl ZippyConfig {
         }
         if let Some(value) = env_string("ZIPPY_QUERY_NATIVE_ENABLED") {
             self.query.native_enabled = parse_bool_env("ZIPPY_QUERY_NATIVE_ENABLED", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_OPERATOR_MEMORY_BYTES") {
+            self.query.operator_memory_bytes =
+                Some(parse_u64_env("ZIPPY_QUERY_OPERATOR_MEMORY_BYTES", &value)?);
         }
         if let Some(value) = env_string("ZIPPY_QUERY_MAX_BUFFERED_BYTES") {
             self.query.max_buffered_bytes =
@@ -1342,6 +1355,25 @@ impl ZippyConfig {
                 reason: "query canary operator_memory_bytes must be greater than zero".to_string(),
             });
         }
+        if self.query.operator_memory_bytes == Some(0) {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query operator_memory_bytes must be greater than zero".to_string(),
+            });
+        }
+        if self
+            .query
+            .operator_memory_bytes
+            .is_some_and(|value| value > self.query.resources.max_memory_bytes)
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query operator_memory_bytes must not exceed query resources memory \
+                     operator_memory_bytes=[{}] max_memory_bytes=[{}]",
+                    self.query.operator_memory_bytes.unwrap_or_default(),
+                    self.query.resources.max_memory_bytes
+                ),
+            });
+        }
         if self
             .query
             .canary
@@ -1486,6 +1518,15 @@ impl ZippyConfig {
             .max_buffered_bytes
             .unwrap_or(DEFAULT_QUERY_MAX_BUFFERED_BYTES)
             .min(self.runtime.max_query_buffer_bytes)
+    }
+
+    /// Return the hard per-query DataFusion operator-memory limit.
+    pub fn query_operator_memory_bytes(&self) -> u64 {
+        self.query.operator_memory_bytes.unwrap_or_else(|| {
+            DEFAULT_QUERY_OPERATOR_MEMORY_BYTES
+                .min(self.query.resources.max_memory_bytes.saturating_div(2))
+                .max(1)
+        })
     }
 
     /// Return the hard native canary operator pool derived inside the global query budget.
