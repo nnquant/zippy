@@ -275,6 +275,9 @@ impl Default for ZippyQueryResourceConfig {
 /// Optional query-specific limits plus native query admission resources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyQueryConfig {
+    /// Whether Gateway SQL requests use the server-owned native query authority.
+    #[serde(default)]
+    pub native_enabled: bool,
     pub parallelism: Option<usize>,
     pub max_buffered_bytes: Option<usize>,
     #[serde(default = "default_query_plan_ttl_ms")]
@@ -288,6 +291,7 @@ pub struct ZippyQueryConfig {
 impl Default for ZippyQueryConfig {
     fn default() -> Self {
         Self {
+            native_enabled: false,
             parallelism: None,
             max_buffered_bytes: None,
             plan_ttl_ms: DEFAULT_QUERY_PLAN_TTL_MS,
@@ -452,6 +456,7 @@ struct PartialRuntimeConfig {
 
 #[derive(Debug, Deserialize)]
 struct PartialQueryConfig {
+    native_enabled: Option<bool>,
     parallelism: Option<usize>,
     max_buffered_bytes: Option<usize>,
     plan_ttl_ms: Option<u64>,
@@ -826,6 +831,9 @@ impl ZippyConfig {
             }
         }
         if let Some(query) = partial.query {
+            if let Some(native_enabled) = query.native_enabled {
+                self.query.native_enabled = native_enabled;
+            }
             if let Some(parallelism) = query.parallelism {
                 self.query.parallelism = Some(parallelism);
             }
@@ -982,6 +990,9 @@ impl ZippyConfig {
         }
         if let Some(value) = env_string("ZIPPY_QUERY_PARALLELISM") {
             self.query.parallelism = Some(parse_usize_env("ZIPPY_QUERY_PARALLELISM", &value)?);
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_NATIVE_ENABLED") {
+            self.query.native_enabled = parse_bool_env("ZIPPY_QUERY_NATIVE_ENABLED", &value)?;
         }
         if let Some(value) = env_string("ZIPPY_QUERY_MAX_BUFFERED_BYTES") {
             self.query.max_buffered_bytes =
@@ -1349,6 +1360,22 @@ impl ZippyConfig {
         if self.query.canary.enabled && !self.server.native_storage_enabled {
             return Err(ZippyError::InvalidConfig {
                 reason: "query canary requires server native_storage_enabled".to_string(),
+            });
+        }
+        if self.query.native_enabled && !self.server.native_storage_enabled {
+            return Err(ZippyError::InvalidConfig {
+                reason: "native query frontend requires server native_storage_enabled".to_string(),
+            });
+        }
+        if self.query.native_enabled && !self.gateway.enabled {
+            return Err(ZippyError::InvalidConfig {
+                reason: "native query frontend requires gateway enabled".to_string(),
+            });
+        }
+        if self.query.native_enabled && self.catalog.backend != ZippyCatalogBackend::SqliteShadow {
+            return Err(ZippyError::InvalidConfig {
+                reason: "native query frontend requires catalog sqlite_shadow backend until explicit cutover"
+                    .to_string(),
             });
         }
         let query_parallelism = self.query_parallelism();

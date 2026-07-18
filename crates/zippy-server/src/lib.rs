@@ -11,6 +11,7 @@
 mod catalog_command_shadow;
 mod catalog_shadow;
 mod composition;
+mod gateway_query;
 mod health;
 mod legacy_catalog_migration;
 mod legacy_query;

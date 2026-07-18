@@ -44,6 +44,14 @@ impl LegacyServerCapabilities {
             query_manifest_snapshot_pinning: false,
         }
     }
+
+    /// Returns the capability matrix after applying the native query authority gate.
+    #[must_use]
+    pub const fn with_native_query(mut self, enabled: bool) -> Self {
+        self.query_sql = enabled;
+        self.query_manifest_snapshot_pinning = enabled;
+        self
+    }
 }
 
 /// Unified health view published by the legacy composition root.
@@ -105,6 +113,13 @@ impl LegacyServerHealth {
             gateway_facade_available,
             end_to_end_liveness: None,
             capabilities: LegacyServerCapabilities::phase_one(),
+        }
+    }
+
+    pub(crate) fn set_native_query_ready(&mut self, ready: bool) {
+        self.capabilities = self.capabilities.with_native_query(ready);
+        if ready {
+            self.query = ServiceHealth::Ready;
         }
     }
 }

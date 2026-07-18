@@ -30,6 +30,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_QUERY_MAX_BUFFERED_BYTES",
     "ZIPPY_QUERY_MAX_CONCURRENT_QUERIES",
     "ZIPPY_QUERY_MAX_MEMORY_BYTES",
+    "ZIPPY_QUERY_NATIVE_ENABLED",
     "ZIPPY_QUERY_PARALLELISM",
     "ZIPPY_QUERY_PLAN_TTL_MS",
     "ZIPPY_QUERY_CANARY_ENABLED",
@@ -222,6 +223,7 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     assert_eq!(config.runtime.max_cpu_cores, 4);
     assert_eq!(config.runtime.max_query_buffer_bytes, 536870912);
     assert_eq!(config.query.parallelism, None);
+    assert!(!config.query.native_enabled);
     assert_eq!(config.query.max_buffered_bytes, None);
     assert_eq!(config.query.plan_ttl_ms, 30000);
     assert_eq!(config.query_parallelism(), 4);
@@ -1095,6 +1097,84 @@ fn zippy_config_rejects_enabled_query_canary_without_native_storage() {
     assert!(error
         .to_string()
         .contains("query canary requires server native_storage_enabled"));
+}
+
+#[test]
+fn zippy_config_loads_native_query_frontend_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[gateway]
+enabled = true
+endpoint = "127.0.0.1:17666"
+
+[query]
+native_enabled = true
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert!(config.query.native_enabled);
+}
+
+#[test]
+fn zippy_config_rejects_incomplete_native_query_frontend_dependencies() {
+    let cases = [
+        (
+            r#"
+[query]
+native_enabled = true
+"#,
+            "native query frontend requires server native_storage_enabled",
+        ),
+        (
+            r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+"#,
+            "native query frontend requires gateway enabled",
+        ),
+        (
+            r#"
+[server]
+native_storage_enabled = true
+
+[gateway]
+enabled = true
+endpoint = "127.0.0.1:17666"
+
+[query]
+native_enabled = true
+"#,
+            "native query frontend requires catalog sqlite_shadow backend",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, source).unwrap();
+
+        let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+        assert!(error.to_string().contains(expected), "source={source}");
+    }
 }
 
 #[test]

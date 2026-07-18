@@ -3497,6 +3497,7 @@ dependencies = [
  "zippy-engines",
  "zippy-master",
  "zippy-segment-store",
+ "zippy-types",
 ]
 
 [[package]]

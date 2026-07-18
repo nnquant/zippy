@@ -27,8 +27,7 @@ use zippy_gateway::{
     PersistedReadShadowConfig, PersistedReadSnapshotSource, ShadowPersistedReadSnapshotSource,
 };
 use zippy_master::daemon::{
-    prepare_master_runtime, start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled,
-    MasterDaemonConfig,
+    prepare_master_runtime, start_legacy_gateway_with_query_frontend_if_enabled, MasterDaemonConfig,
 };
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
 use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
@@ -38,6 +37,7 @@ use zippy_types::{ErrorCode, ServerError};
 
 #[cfg(test)]
 use crate::catalog_command_shadow::LegacyCatalogShadowTestFault;
+use crate::gateway_query::NativeGatewayQueryFrontend;
 use crate::legacy_catalog_migration::{
     plan_legacy_catalog_metadata_import, LegacyCatalogMetadataImportPlan,
     LegacyCatalogMigrationStartup,
@@ -1173,10 +1173,19 @@ impl LegacyServerRuntime {
                 return Err(with_startup_rollback(error, rollback));
             }
         };
-        let mut gateway = match start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
+        let native_query_frontend = runtime_config.query.native_enabled.then(|| {
+            Arc::new(NativeGatewayQueryFrontend::new(
+                native_storage
+                    .as_ref()
+                    .expect("validated native query config starts native storage")
+                    .query_engine(),
+            )) as Arc<dyn zippy_gateway::GatewayNativeQueryFrontend>
+        });
+        let mut gateway = match start_legacy_gateway_with_query_frontend_if_enabled(
             &runtime_config,
             &control_endpoint,
             persisted_read_snapshot_source,
+            native_query_frontend,
         ) {
             Ok(gateway) => gateway,
             Err(error) => {
@@ -1495,6 +1504,14 @@ impl LegacyServerRuntime {
             readiness.gateway_master_reachable = false;
         }
         services.end_to_end_liveness = Some(readiness.is_ready());
+        services.set_native_query_ready(
+            readiness.is_ready()
+                && self.runtime_config.query.native_enabled
+                && self
+                    .gateway
+                    .as_ref()
+                    .is_some_and(GatewayServer::has_native_query_frontend),
+        );
         LegacyServerRuntimeHealth {
             mode: self.mode(),
             readiness,
