@@ -2526,7 +2526,7 @@ descriptor 若缺少该字段，仍留在 legacy live route。persisted native �
 
 目标：用标准 Arrow 协议替换自定义远端查询/写入 framing。
 
-当前进度（2026-07-18）：Stage 6.4 有界内存写入已完成。`zippy-protocol` 已拥有 version 1
+当前进度（2026-07-18）：Stage 6.5 Python connector 已完成。`zippy-protocol` 已拥有 version 1
 Protobuf、稳定 error envelope、capability discovery、单次 ticket 和有界 Flight transport；
 Server 可在 Gateway 关闭时独立启动 Flight，并直接复用 Phase 5 `NativeQueryEngine` 的固定快照、
 资源账本和取消生命周期。TLS、可选 mTLS、Bearer Handshake、服务端 session authority、凭据文件约束
@@ -2534,7 +2534,11 @@ Server 可在 Gateway 关闭时独立启动 Flight，并直接复用 Phase 5 `Na
 control-only admin session、query generation/server-instance ABA fence，以及四类标准 Flight SQL metadata
 已经接入相同 Catalog/Query authority。标准 `DoPut` 已实现独立 Writer session、append + memory command、
 逐 batch 回执和并发/行数/字节硬上限；当前通过 Gateway compatibility facade 接入 segment materializer，
-不承诺 WAL、producer fencing、去重或 persisted durability。配置、协议边界和验收方法见
+不承诺 WAL、producer fencing、去重或 persisted durability。独立 `zippy-client` 现在从 Master 自动发现
+Flight，隔离 read/writer session，将 lazy Table 完整编译为 SQL + 显式 Catalog bindings，执行
+`GetFlightInfo -> DoGet`，并按服务端上限切分 DoPut、逐批校验 memory receipt。结构化错误公开稳定
+`code/retryable/ID/details`；查询和写入优先 Flight，SHM 仍服务同 namespace 热订阅，Gateway 只作为旧
+服务和 Phase 7 前远端订阅的 compatibility adapter。配置、协议边界和验收方法见
 [`flight-query-service.md`](flight-query-service.md)。
 
 任务：
@@ -2545,8 +2549,9 @@ control-only admin session、query generation/server-instance ABA fence，以及
 4. 实现 query cancel/admin actions。（Stage 6.3 已完成）
 5. 实现 Flight SQL catalog metadata。（Stage 6.3 已完成）
 6. 实现 TLS/auth middleware。（Stage 6.2 已完成）
-7. Python remote client 切 Flight。
-8. 旧 Gateway endpoint 转为 compatibility adapter。
+7. Python remote client 切 Flight。（Stage 6.5 已完成；Rust connector 后续独立发布）
+8. 旧 Gateway endpoint 转为 compatibility adapter。（客户端路由已完成；Server listener 在 Phase 7
+   DoExchange 前继续承载远端订阅）
 9. 增加 protocol version negotiation 和 capability discovery。（查询 capability discovery 已完成；
    多版本协商待后续版本出现时实施）
 
@@ -2565,6 +2570,10 @@ Stage 6.1/6.2/6.3/6.4 自动化证据：
 - 标准 Flight client 覆盖 Writer/read 权限隔离、逐 batch memory receipt 和超限 batch 在 backend 前拒绝；
   真实 Server E2E 启动 master + Gateway + Flight，并从 Gateway metrics 和 Master active segment descriptor
   双向证明 `DoPut` 已进入兼容 materializer。
+- Python connector 的真实 PyArrow loopback 覆盖 capability、command descriptor、单 ticket 和 Arrow batch
+  stream；mock protocol suite 覆盖 read/writer Handshake、session 隔离、显式 binding、DoPut 分组回执和
+  结构化错误与 ambiguous write fail-closed。Flight transport + SQL compiler 聚焦覆盖率为 83%，
+  完整客户端回归 53 passed、1 skipped。
 
 验收：
 

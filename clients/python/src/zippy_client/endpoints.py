@@ -100,6 +100,11 @@ def split_host_port(value: str) -> tuple[str, int]:
 
 def connectable_gateway_endpoint(endpoint: str, control: ControlEndpoint) -> str:
     """Replace wildcard Gateway hosts with a host reachable by this client."""
+    return connectable_data_endpoint(endpoint, control)
+
+
+def connectable_data_endpoint(endpoint: str, control: ControlEndpoint) -> str:
+    """Replace wildcard data-plane hosts with a host reachable by this client."""
     host, port = split_host_port(endpoint)
     if host not in {"0.0.0.0", "::"}:
         return normalize_tcp_address(endpoint)
@@ -110,6 +115,11 @@ def connectable_gateway_endpoint(endpoint: str, control: ControlEndpoint) -> str
 
 def gateway_is_local(endpoint: str, control: ControlEndpoint) -> bool:
     """Return whether a Gateway endpoint is local to the client host."""
+    return data_endpoint_is_local(endpoint, control)
+
+
+def data_endpoint_is_local(endpoint: str, control: ControlEndpoint) -> bool:
+    """Return whether a TCP data endpoint is local to the client host."""
     if control.kind == "unix":
         return True
     host, _ = split_host_port(endpoint)

@@ -22,6 +22,7 @@ ticks = (
     zp.read_table("ldc_tgw_ticks", snapshot=False)
     .filter(zp.col("instrument_id") == "110059.SH")
     .select("instrument_id", "dt", "last_price")
+    .sort("dt")
     .tail(1000)
     .collect(stream=True)
 )
@@ -33,16 +34,19 @@ ticks = (
 
 旧代码中的 `master=` 参数仍可迁移使用，但不是新客户端的推荐调用方式。
 
-`read_sql()` 只提交给服务端执行，不在客户端解析 SQL。连接的服务端必须显式发布
-`query_sql` capability，否则客户端会抛出 `CapabilityError`：
+`read_sql()` 只提交给服务端执行，不在客户端解析 SQL。Flight version 1 要求显式声明 SQL relation
+与 Catalog table 的绑定，服务端不会从 SQL 文本猜表：
 
 ```python
 result = zp.read_sql(
-    "select instrument_id, max(dt) from ldc_tgw_ticks group by instrument_id"
+    "select instrument_id, max(dt) from ticks group by instrument_id",
+    bindings={"ticks": "ldc_tgw_ticks"},
 )
 ```
 
-Gateway token 可以通过 `connect(token=...)` 或 `ZIPPY_GATEWAY_TOKEN` 提供；显式参数优先。
+连接旧 Gateway 时，原来的无 `bindings` 调用仍走 compatibility adapter。Flight 查询 bootstrap token
+使用 `connect(flight_token=...)` 或 `ZIPPY_FLIGHT_AUTH_TOKEN`；Gateway token 仍使用
+`connect(token=...)` 或 `ZIPPY_GATEWAY_TOKEN`。
 
 ## Transport 路由
 
@@ -50,6 +54,8 @@ Gateway token 可以通过 `connect(token=...)` 或 `ZIPPY_GATEWAY_TOKEN` 提供
 
 - `auto`
 - `shm`
+- `flight_local`
+- `flight_remote`
 - `gateway_local`
 - `gateway_remote`
 
@@ -58,12 +64,13 @@ Gateway token 可以通过 `connect(token=...)` 或 `ZIPPY_GATEWAY_TOKEN` 提供
 | 操作 | 选择顺序 |
 |---|---|
 | 实时订阅 | SHM -> Local Gateway -> Remote Gateway |
-| 表查询 | Local Gateway -> Remote Gateway |
-| SQL | Local Gateway -> Remote Gateway |
-| 写入 | Local Gateway -> Remote Gateway |
+| 表查询 | Local Flight -> Remote Flight -> Gateway compatibility |
+| SQL | Local Flight -> Remote Flight -> Gateway compatibility |
+| 写入 | 支持 ingest 的 Local Flight -> Remote Flight -> Gateway compatibility |
 
-SHM 仅用于同一 IPC namespace 内的实时只读订阅。Windows 客户端连接 WSL 服务端时，
-即使网络地址是 localhost，也不能访问 WSL 的 POSIX SHM，因此会使用 Gateway。
+SHM 仅用于同一 IPC namespace 内的实时只读订阅。Windows 客户端连接 WSL 服务端时，即使网络地址
+是 localhost，也不能访问 WSL 的 POSIX SHM；查询和写入使用 Flight，实时订阅在
+Phase 7 DoExchange 上线前继续使用 Gateway。
 
 ```python
 subscriber = zp.subscribe(
@@ -81,7 +88,68 @@ subscriber = zp.subscribe(
 时，收到过数据后的断线默认抛出 `ContinuityError`。只有显式设置 `allow_data_loss=True` 才允许
 从最新位置重新订阅。
 
+## Flight TLS 和写入
+
+私有 CA、mTLS 和 server name 使用以下参数或对应环境变量：
+
+```python
+zp.connect(
+    "zippy://10.0.0.8:17690/default",
+    flight_token=read_token,
+    flight_writer_token=writer_token,
+    flight_tls_root_cert_file="zippy-ca.pem",
+    flight_tls_cert_chain_file="client.pem",  # 仅 mTLS 需要
+    flight_tls_private_key_file="client.key", # 仅 mTLS 需要
+    flight_tls_server_name="zippy.internal",
+)
+```
+
+```text
+ZIPPY_FLIGHT_AUTH_TOKEN
+ZIPPY_FLIGHT_AUTH_WRITER_TOKEN
+ZIPPY_FLIGHT_TLS_ROOT_CERT_FILE
+ZIPPY_FLIGHT_TLS_CLIENT_CERT_FILE
+ZIPPY_FLIGHT_TLS_CLIENT_KEY_FILE
+ZIPPY_FLIGHT_TLS_SERVER_NAME
+```
+
+`get_writer()` 自动按服务端上限切分 Arrow batch，并在 `flush()` 返回前逐批校验 memory durability
+receipt。Stage 6.5 的 `Append + Memory` 没有 WAL、producer fencing 或服务端去重；连接中断时最后一批
+是否生效可能不确定，不能把整批盲目重试当作 exactly-once。需要可恢复持久写入时继续使用既有受控链路，
+或等待 Phase 7 durable ingest。发生这类错误时 writer 永久 fail-closed，`AmbiguousWriteError.receipts`
+只列出已明确收到的回执；调用方核对业务状态后必须创建新 writer。
+
+Flight 每次 terminal query 都固定一个服务端 snapshot；同一次 `collect()` 内结果一致。旧 Gateway
+`snapshot=True` 的跨多次 terminal 调用 lease 复用不属于 Flight version 1。`tail()` 必须先显式
+`sort()`，否则客户端会拒绝不确定的“最后 N 行”。
+
+## 协议代码生成
+
+修改 `crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto` 后重新生成 Python protobuf：
+
+```bash
+uv run --package zippy-client --group dev python -m grpc_tools.protoc \
+  -I crates/zippy-protocol/proto/zippy/flight/v1 \
+  --python_out clients/python/src/zippy_client/_generated \
+  --pyi_out clients/python/src/zippy_client/_generated \
+  crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto
+```
+
+## 构建发行 wheel
+
+构建时必须把 Cargo 产物放到仓库外；客户端 SHM crate 会间接编译 Arrow/Parquet，复用根目录
+`target/` 会快速占用数 GiB：
+
+```bash
+uv run --package zippy-client --extra dev maturin build --release \
+  --target-dir /tmp/zippy-client-target \
+  --out /tmp/zippy-client-dist
+```
+
+发布完成后删除两个 `/tmp/zippy-client-*` 目录。面向用户应发布各平台的预编译 wheel，不能要求
+Windows 或远程客户端现场编译 Rust workspace。
+
 ## 依赖边界
 
-`zippy-client` 默认依赖 PyArrow 和 Loguru，并包含一个小型 `zippy_client._shm` 原生模块。
+`zippy-client` 默认依赖 PyArrow、protobuf 和 Loguru，并包含一个小型 `zippy_client._shm` 原生模块。
 它不依赖完整 `zippy` 包。完整 `zippy` 可以依赖 `zippy-client`，依赖方向不能反转。

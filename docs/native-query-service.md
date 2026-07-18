@@ -71,9 +71,9 @@ max_pending_tickets = 64
 ```
 
 Stage 6.2 允许在同时启用 `[flight.tls]` 和 `[flight.auth]` 时使用非 loopback endpoint；完整安全配置、
-Handshake 和凭据文件约束见 [Arrow Flight 查询服务](flight-query-service.md)。现有 Python Table API
-尚未切换到 Flight；这段 loopback 配置用于 Rust/integration 验收以及后续客户端迁移，不替代当前远程
-Gateway 配置。
+Handshake 和凭据文件约束见 [Arrow Flight 查询服务](flight-query-service.md)。Stage 6.5 的独立
+`zippy-client` 已默认把 Table query 和显式 binding SQL 切到 Flight；Gateway 仅保留为旧客户端和
+DoExchange 上线前订阅的 compatibility adapter。
 
 `operator_memory_bytes` 未配置时取 `min(64 MiB, query.resources.max_memory_bytes / 2)`，且至少为
 1 byte。它是单查询 DataFusion buffering operator 上限；`query.resources.max_memory_bytes` 是全局

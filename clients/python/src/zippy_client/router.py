@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .endpoints import ControlEndpoint, gateway_is_local
+from .endpoints import ControlEndpoint, data_endpoint_is_local, gateway_is_local
 from .errors import TransportUnavailableError
 from .models import Operation, Transport, TransportDecision
 
 
 class TransportRouter:
     """
-    Select SHM or Gateway without changing operation semantics.
+    Select SHM, Flight, or Gateway without changing operation semantics.
 
     :param control_endpoint: Resolved Master endpoint.
     :type control_endpoint: ControlEndpoint
@@ -19,6 +19,10 @@ class TransportRouter:
     :type gateway_endpoint: str | None
     :param shm_available: Callback reporting native SHM module availability.
     :type shm_available: Callable[[], bool]
+    :param flight_endpoint: Advertised connectable Flight endpoint.
+    :type flight_endpoint: str | None
+    :param flight_ingest_available: Whether Flight append + memory ingest is usable.
+    :type flight_ingest_available: bool
     """
 
     def __init__(
@@ -26,9 +30,13 @@ class TransportRouter:
         control_endpoint: ControlEndpoint,
         gateway_endpoint: str | None,
         shm_available: Callable[[], bool],
+        flight_endpoint: str | None = None,
+        flight_ingest_available: bool = False,
     ) -> None:
         self.control_endpoint = control_endpoint
         self.gateway_endpoint = gateway_endpoint
+        self.flight_endpoint = flight_endpoint
+        self.flight_ingest_available = bool(flight_ingest_available)
         self._shm_available = shm_available
 
     def select(
@@ -56,17 +64,42 @@ class TransportRouter:
                     f"requested=[{requested_transport.value}] discovered=[{selected.value}]"
                 )
             return TransportDecision(requested_transport, selected, "explicit Gateway transport")
+        if requested_transport in {Transport.FLIGHT_LOCAL, Transport.FLIGHT_REMOTE}:
+            if operation == Operation.SUBSCRIBE:
+                raise TransportUnavailableError(
+                    "Flight subscription requires Phase 7 DoExchange and is not yet available"
+                )
+            if operation == Operation.WRITE and not self.flight_ingest_available:
+                raise TransportUnavailableError(
+                    "Flight endpoint does not advertise authenticated append + memory ingest"
+                )
+            selected = self._flight_transport()
+            if selected != requested_transport:
+                raise TransportUnavailableError(
+                    "requested Flight scope does not match discovered endpoint "
+                    f"requested=[{requested_transport.value}] discovered=[{selected.value}]"
+                )
+            return TransportDecision(requested_transport, selected, "explicit Flight transport")
         if operation == Operation.SUBSCRIBE and allow_shm and self._can_shm(stream_info):
             return TransportDecision(
                 requested_transport,
                 Transport.SHM,
                 "same IPC namespace and compatible SHM reader are available",
             )
+        flight_supports_operation = operation != Operation.WRITE or self.flight_ingest_available
+        if (
+            operation != Operation.SUBSCRIBE
+            and self.flight_endpoint is not None
+            and flight_supports_operation
+        ):
+            selected = self._flight_transport()
+            reason = "query, SQL, and writes prefer the standard Flight endpoint"
+            return TransportDecision(requested_transport, selected, reason)
         selected = self._gateway_transport()
         reason = (
-            "query, SQL, and writes are server-owned Gateway operations"
+            "Flight is unavailable for this operation, so it uses Gateway compatibility"
             if operation != Operation.SUBSCRIBE
-            else "SHM is unavailable, so subscription uses Gateway"
+            else "SHM is unavailable, so subscription uses Gateway compatibility"
         )
         return TransportDecision(requested_transport, selected, reason)
 
@@ -105,3 +138,10 @@ class TransportRouter:
         if gateway_is_local(self.gateway_endpoint, self.control_endpoint):
             return Transport.GATEWAY_LOCAL
         return Transport.GATEWAY_REMOTE
+
+    def _flight_transport(self) -> Transport:
+        if self.flight_endpoint is None:
+            raise TransportUnavailableError("server does not advertise an Arrow Flight endpoint")
+        if data_endpoint_is_local(self.flight_endpoint, self.control_endpoint):
+            return Transport.FLIGHT_LOCAL
+        return Transport.FLIGHT_REMOTE

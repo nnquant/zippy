@@ -30,6 +30,7 @@ ticks = (
     zp.read_table("ldc_tgw_ticks", snapshot=False)
     .filter(zp.col("instrument_id") == "110059.SH")
     .select("instrument_id", "dt", "last_price")
+    .sort("dt")
     .tail(1000)
     .collect(stream=True)
 )
@@ -47,14 +48,16 @@ ticks = (
 | API | 用途 | 执行位置 |
 |---|---|---|
 | `zp.connect()` | 建立并注册进程唯一默认连接 | Client + Master |
-| `zp.read_table()` | 构建 lazy table plan | Gateway 执行 |
-| `zp.read_sql()` | 提交服务端 SQL | Gateway 查询服务执行 |
-| `zp.get_writer()` | 写入行或 Arrow batch | Gateway 执行 |
+| `zp.read_table()` | 构建 lazy table plan | Flight；旧服务回退 Gateway |
+| `zp.read_sql()` | 提交服务端 SQL | Flight；旧服务回退 Gateway |
+| `zp.get_writer()` | 写入行或 Arrow batch | Flight；旧服务回退 Gateway |
 | `zp.subscribe()` | 逐行实时回调 | SHM 或 Gateway |
 | `zp.subscribe_table()` | Arrow table 实时回调 | SHM 或 Gateway |
 
-`read_sql()` 的 API 已固定，但当前 0.5 服务端尚未发布 `query_sql` capability。连接旧服务端时
-会立即抛出 `CapabilityError`，客户端不会自行解析 SQL，也不会把全表拉回本地执行。
+Flight `read_sql()` 要求显式 Catalog binding，例如
+`bindings={"ticks": "ldc_tgw_ticks"}`。这不是额外的客户端 SQL 解析负担，而是明确限定本次查询可见的
+表；Server 不会从 SQL 文本猜测 Catalog authority。连接旧 Gateway 时，无 `bindings` 的原调用仍通过
+compatibility adapter 执行。两条路径都不会把全表拉回客户端做 residual。
 
 ## Transport 路由
 
@@ -63,28 +66,30 @@ ticks = (
 | 操作 | 自动选择顺序 |
 |---|---|
 | `subscribe*` | SHM -> Local Gateway -> Remote Gateway |
-| `read_table` / `read_sql` | Local Gateway -> Remote Gateway |
-| `get_writer` | Local Gateway -> Remote Gateway |
+| `read_table` / `read_sql` | Local Flight -> Remote Flight -> Gateway compatibility |
+| `get_writer` | 支持 ingest 的 Local Flight -> Remote Flight -> Gateway compatibility |
 
-SHM 只用于实时只读订阅。主动查询和写入始终由 Gateway 执行，以避免客户端承担全量扫描、
-SQL 解析或存储一致性逻辑。
+SHM 只用于实时只读订阅。主动查询和写入优先由标准 Arrow Flight 执行；Gateway 保留为旧服务与
+Phase 7 之前远端订阅的 compatibility adapter。客户端不承担全量扫描、SQL 解析或存储一致性逻辑。
 
-可用的显式值为 `auto`、`shm`、`gateway_local` 和 `gateway_remote`：
+可用的显式值为 `auto`、`shm`、`flight_local`、`flight_remote`、`gateway_local` 和
+`gateway_remote`：
 
 ```python
 zp.connect(
     "zippy://127.0.0.1:17690/default",
-    transport="gateway_local",
+    transport="flight_local",
 )
 ```
 
-旧代码里的 `connect(local=False)` 仍可用，它会选择服务端实际发现的 Gateway scope，并禁止
-后续订阅自动切换到 SHM。
+旧代码里的 `connect(local=False)` 仍可用；它只禁止后续订阅自动切换到 SHM，不会阻止查询和写入
+选择 Flight。
 
 ## Windows 连接 WSL
 
 Windows 进程和 WSL 进程不属于同一个 POSIX IPC namespace。即使地址都是 `localhost`，
-客户端也不会尝试读取 WSL 内的 SHM，而会通过 Gateway：
+客户端也不会尝试读取 WSL 内的 SHM。查询和写入通过 Flight，实时订阅在 DoExchange 上线前通过
+Gateway：
 
 ```python
 zp.connect("zippy://127.0.0.1:17690/default")
@@ -97,18 +102,18 @@ print(decision.selected)
 
 ## 查询语义
 
-`read_table()` 返回 lazy `Table`。`filter`、`select`、`head`、`tail`、`slice`、`sort`、
-`drop` 和 `rename` 会序列化为 typed plan，在 Gateway 侧执行。当前服务端不能精确执行的操作
-会抛出 `CapabilityError`，不会静默退化为客户端全量计算。
+`read_table()` 返回 lazy `Table`。`filter`、`select`、`with_columns`、`head`、`tail`、`slice`、
+`sort`、`drop`、`rename` 和 `join` 会编译为带明确 binding 的完整 SQL，在 Server DataFusion
+执行。当前服务端不能精确执行的操作会抛出 `CapabilityError`，不会静默退化为客户端全量计算。
 
 ```python
-query = zp.read_table("ldc_tgw_ticks", snapshot=True)
-first = query.tail(100).collect()
-second = query.tail(100).collect()
+query = zp.read_table("ldc_tgw_ticks").sort("dt")
+latest = query.tail(100).collect()
 ```
 
-`snapshot=True` 会让同一查询链复用一个服务端 snapshot。查询 clone 共享引用计数 lease，父查询
-关闭不会提前释放仍被子查询使用的 snapshot。`snapshot=False` 的每次终结操作读取最新边界。
+Flight 每次 terminal query 都固定一个 snapshot，同一次 `collect()` 内不会混读不同版本。Flight version 1
+ticket 是单次消费，因此旧 Gateway `snapshot=True` 的跨多次 terminal 调用 lease 复用不适用于 Flight。
+`tail()` 必须继承显式 `sort()`，客户端会拒绝没有确定顺序的“最后 N 行”。
 
 ## 实时订阅语义
 
@@ -147,23 +152,49 @@ subscriber = zp.subscribe(
 
 ## 认证和协议边界
 
-Gateway token 的优先级为：显式 `token=`、`ZIPPY_GATEWAY_TOKEN`、服务端广告配置。
+Flight read/writer 使用不同 bootstrap credential。显式参数优先于环境变量：
 
 ```python
 import os
 
-zp.connect(server_uri, token=os.environ["ZIPPY_GATEWAY_TOKEN"])
+zp.connect(
+    server_uri,
+    flight_token=os.environ["ZIPPY_FLIGHT_AUTH_TOKEN"],
+    flight_writer_token=os.environ.get("ZIPPY_FLIGHT_AUTH_WRITER_TOKEN"),
+    flight_tls_root_cert_file="zippy-ca.pem",
+)
 ```
 
-客户端只支持 Gateway frame protocol v1，并在连接阶段拒绝未知版本。JSON header 默认限制为
-1 MiB，Arrow IPC payload 默认限制为 512 MiB；可通过以下环境变量收紧：
+TLS/mTLS 对应配置是：
+
+```text
+ZIPPY_FLIGHT_AUTH_TOKEN
+ZIPPY_FLIGHT_AUTH_WRITER_TOKEN
+ZIPPY_FLIGHT_TLS_ROOT_CERT_FILE
+ZIPPY_FLIGHT_TLS_CLIENT_CERT_FILE
+ZIPPY_FLIGHT_TLS_CLIENT_KEY_FILE
+ZIPPY_FLIGHT_TLS_SERVER_NAME
+```
+
+客户端先通过 `DoAction("zippy.capabilities.v1")` 校验协议、结构化错误和服务端硬上限。认证模式下，
+read/writer 分别 Handshake，后续 RPC 只使用服务端签发的短期 bearer；bootstrap token 不会进入查询
+descriptor。业务错误解析 versioned `ErrorEnvelope`，公开为带 `code`、`retryable`、ID 和 details 的
+`ServerError`，不会解析英文 message 决定重试。
+
+`get_writer()` 的 Stage 6.5 durability 是 `Append + Memory`。逐 batch receipt 只能证明数据已进入当前
+Server 内存 materializer，不代表 WAL/persisted durability，也不提供 producer fencing 或去重。断线后
+不能盲目重试不确定批次；writer 会永久 fail-closed，并在 `AmbiguousWriteError.receipts` 中保留已明确
+收到的回执。需要 exactly-once 或重启恢复时等待 Phase 7 durable ingest。
+
+Gateway token 的优先级仍是显式 `token=`、`ZIPPY_GATEWAY_TOKEN`、服务端广告配置。compatibility
+frame v1 的本地预算仍可通过以下变量收紧：
 
 ```text
 ZIPPY_CLIENT_MAX_FRAME_HEADER_BYTES
 ZIPPY_CLIENT_MAX_FRAME_PAYLOAD_BYTES
 ```
 
-这些限制是单 frame budget，不是整次流式查询的总结果上限。
+这些限制只适用于 Gateway 单 frame，不是 Flight 整次查询的总结果上限。
 
 ## 仓库边界
 
@@ -177,3 +208,14 @@ crates/zippy-client-py/         # 最小 PyO3 SHM reader
 
 依赖方向必须保持为完整 `zippy` 可以复用 `zippy-client`，`zippy-client` 不反向依赖完整
 `zippy`。这样 Windows 或远程用户不需要下载和构建 Server 端的全部 Rust/Python 组件。
+
+维护者构建 wheel 时必须显式使用仓库外的 Cargo target，并向用户发布预编译产物：
+
+```bash
+uv run --package zippy-client --extra dev maturin build --release \
+  --target-dir /tmp/zippy-client-target \
+  --out /tmp/zippy-client-dist
+```
+
+不要让 `maturin` 复用仓库根目录 `target/`；最小 SHM 扩展仍会间接编译 Arrow/Parquet，临时产物可达
+数 GiB，发布完成后应删除上述临时目录。

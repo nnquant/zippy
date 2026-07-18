@@ -1,4 +1,4 @@
-"""Lazy Gateway table query exposed by :mod:`zippy_client`."""
+"""Transport-neutral lazy table query exposed by :mod:`zippy_client`."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from .expressions import (
     normalize_expressions,
     normalize_temporal_filter,
 )
+from .models import Transport
+from .sql import compile_flight_table_sql
 
 if TYPE_CHECKING:
     from .client import Client
@@ -64,12 +66,23 @@ class Table:
     :type source: str
     :param client: Explicit connected client.
     :type client: Client
-    :param snapshot: Reuse one server snapshot across repeated terminal operations.
+    :param snapshot: Reuse a Gateway snapshot across terminal operations. Flight
+        always creates one consistent snapshot per terminal query.
     :type snapshot: bool
+    :param namespace: Catalog namespace used by Flight bindings.
+    :type namespace: str
     """
 
-    def __init__(self, source: str, client: Client, *, snapshot: bool = True) -> None:
+    def __init__(
+        self,
+        source: str,
+        client: Client,
+        *,
+        snapshot: bool = True,
+        namespace: str = "default",
+    ) -> None:
         self.source = str(source)
+        self.namespace = str(namespace)
         self._client = client
         self._snapshot_enabled = bool(snapshot)
         self._fixed_snapshot: _SnapshotLease | None = None
@@ -194,6 +207,15 @@ class Table:
 
     def snapshot(self) -> dict[str, object]:
         """Return the fixed or latest server-owned query snapshot."""
+        if self._uses_flight():
+            query = self._last_metrics.get("query")
+            if isinstance(query, dict):
+                return dict(query)
+            return {
+                "mode": "per_query",
+                "source": self.source,
+                "namespace": self.namespace,
+            }
         if self._snapshot_enabled and self._fixed_snapshot is not None:
             return dict(self._fixed_snapshot.snapshot)
         snapshot = self._client.gateway.create_snapshot(self.source)
@@ -213,18 +235,33 @@ class Table:
         started_ns = time.perf_counter_ns()
         table, metrics = self._execute(stream=stream)
         profile: dict[str, object] = {
-            "executor": "gateway",
+            "executor": str(metrics.get("executor", "gateway")),
             "transport": self._client.query_transport.value,
-            "gateway_endpoint": self._client.gateway.endpoint,
             "returned_rows": int(table.num_rows),
             "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
-            "gateway": dict(metrics),
         }
+        if self._uses_flight():
+            profile["flight_endpoint"] = self._client.flight.endpoint
+            profile["flight"] = dict(metrics)
+        else:
+            profile["gateway_endpoint"] = self._client.gateway.endpoint
+            profile["gateway"] = dict(metrics)
         profile.update(metrics)
         return {"result": table, "metrics": profile}
 
     def explain(self) -> dict[str, object]:
-        """Return the normalized Gateway plan without executing it."""
+        """Return the normalized server plan without executing it."""
+        if self._uses_flight():
+            compiled = compile_flight_table_sql(self)
+            return {
+                "source": self.source,
+                "namespace": self.namespace,
+                "transport": self._client.query_transport.value,
+                "flight_endpoint": self._client.flight.endpoint,
+                "snapshot": "per_query",
+                "sql": compiled.sql,
+                "bindings": compiled.bindings,
+            }
         return {
             "source": self.source,
             "transport": self._client.query_transport.value,
@@ -266,6 +303,15 @@ class Table:
     def _execute(self, *, stream: bool) -> tuple[Any, dict[str, object]]:
         if self._closed:
             raise RuntimeError("table query is closed")
+        if self._uses_flight():
+            compiled = compile_flight_table_sql(self)
+            table, metrics = self._client.flight.read_sql(
+                compiled.sql,
+                compiled.bindings,
+                stream=stream,
+            )
+            self._last_metrics = dict(metrics)
+            return table, dict(metrics)
         snapshot: bool | dict[str, object]
         snapshot = self.snapshot() if self._snapshot_enabled else False
         table, metrics = self._client.gateway.collect(
@@ -333,18 +379,49 @@ class Table:
     def _load_metadata(self, *, refresh: bool = False) -> None:
         if not refresh and self._schema is not None and self._info is not None:
             return
+        if self._uses_flight():
+            self._schema = self._client.flight.get_table_schema(
+                self.source,
+                namespace=self.namespace,
+            )
+            try:
+                self._info = self._client.control.get_stream(self.source)
+            except Exception as error:
+                logger.debug(
+                    "failed to resolve Flight table metadata source=[{}] namespace=[{}] error=[{}]",
+                    self.source,
+                    self.namespace,
+                    error,
+                )
+                self._info = {
+                    "name": self.source,
+                    "namespace": self.namespace,
+                    "transport": "flight",
+                }
+            return
         info, schema = self._client.gateway.get_stream(self.source)
         self._info = info
         self._schema = schema
 
     def _clone(self, operation: tuple[str, object]) -> Table:
-        clone = Table(self.source, self._client, snapshot=self._snapshot_enabled)
+        clone = Table(
+            self.source,
+            self._client,
+            snapshot=self._snapshot_enabled,
+            namespace=self.namespace,
+        )
         if self._fixed_snapshot is not None:
             clone._fixed_snapshot = self._fixed_snapshot.acquire()
         clone._schema = self._schema
         clone._info = self._info
         clone._plan = [*self._plan, operation]
         return clone
+
+    def _uses_flight(self) -> bool:
+        return self._client.query_transport in {
+            Transport.FLIGHT_LOCAL,
+            Transport.FLIGHT_REMOTE,
+        }
 
 
 def _column_names(columns: tuple[object, ...]) -> list[str]:

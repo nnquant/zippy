@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 from collections.abc import Callable
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Any
@@ -13,16 +14,26 @@ import weakref
 from loguru import logger
 
 from .control import ControlClient
-from .endpoints import connectable_gateway_endpoint, resolve_control_endpoint
-from .errors import CapabilityError, ProtocolError, TransportUnavailableError
+from .endpoints import (
+    connectable_data_endpoint,
+    connectable_gateway_endpoint,
+    resolve_control_endpoint,
+)
+from .errors import (
+    CapabilityError,
+    ProtocolError,
+    TransportUnavailableError,
+    ZippyConnectionError,
+)
 from .expressions import normalize_temporal_filter
 from .models import Operation, ServerCapabilities, Transport, TransportDecision
 from .protocol import GATEWAY_PROTOCOL_VERSION
 from .query import Table
 from .router import TransportRouter
 from .subscriber import GatewaySubscriber, ShmSubscriber, shm_available
+from .transports.flight import FlightTransport
 from .transports.gateway import GatewayTransport
-from .writer import GatewayWriter
+from .writer import FlightWriter, GatewayWriter
 
 _DEFAULT_CLIENT: Client | None = None
 _DEFAULT_CLIENT_LOCK = threading.RLock()
@@ -42,6 +53,18 @@ class Client:
     :type transport: str | Transport
     :param token: Optional Gateway authentication token.
     :type token: str | None
+    :param flight_token: Optional Flight read bootstrap token.
+    :type flight_token: str | None
+    :param flight_writer_token: Optional Flight writer bootstrap token.
+    :type flight_writer_token: str | None
+    :param flight_tls_root_cert_file: Optional PEM trust roots for Flight TLS.
+    :type flight_tls_root_cert_file: str | Path | None
+    :param flight_tls_cert_chain_file: Optional mTLS client certificate chain.
+    :type flight_tls_cert_chain_file: str | Path | None
+    :param flight_tls_private_key_file: Optional mTLS client private key.
+    :type flight_tls_private_key_file: str | Path | None
+    :param flight_tls_server_name: Optional TLS server-name override.
+    :type flight_tls_server_name: str | None
     :param heartbeat_interval_sec: Process lease heartbeat interval.
     :type heartbeat_interval_sec: float
     :param timeout_sec: Control request timeout.
@@ -55,6 +78,12 @@ class Client:
         app: str | None = None,
         transport: str | Transport = Transport.AUTO,
         token: str | None = None,
+        flight_token: str | None = None,
+        flight_writer_token: str | None = None,
+        flight_tls_root_cert_file: str | Path | None = None,
+        flight_tls_cert_chain_file: str | Path | None = None,
+        flight_tls_private_key_file: str | Path | None = None,
+        flight_tls_server_name: str | None = None,
         heartbeat_interval_sec: float = 3.0,
         timeout_sec: float = 5.0,
     ) -> None:
@@ -67,6 +96,8 @@ class Client:
             heartbeat_interval_sec=heartbeat_interval_sec,
         )
         self.config = self.control.get_config()
+        self._gateway_query_sql = _gateway_query_sql_enabled(self.config)
+        self._allow_auto_shm = True
         gateway_config = self.config.get("gateway", {})
         if not isinstance(gateway_config, dict):
             gateway_config = {}
@@ -86,12 +117,68 @@ class Client:
             if gateway_endpoint is not None
             else None
         )
+        flight_config = self.config.get("flight", {})
+        if not isinstance(flight_config, dict):
+            flight_config = {}
+        flight_endpoint = None
+        if flight_config.get("enabled") is not False and flight_config.get("endpoint"):
+            flight_endpoint = connectable_data_endpoint(
+                str(flight_config["endpoint"]), self.control_endpoint
+            )
+        tls_config = flight_config.get("tls", {})
+        if not isinstance(tls_config, dict):
+            tls_config = {}
+        read_token = flight_token or os.environ.get("ZIPPY_FLIGHT_AUTH_TOKEN")
+        writer_token = flight_writer_token or os.environ.get("ZIPPY_FLIGHT_AUTH_WRITER_TOKEN")
+        root_cert_file = flight_tls_root_cert_file or os.environ.get(
+            "ZIPPY_FLIGHT_TLS_ROOT_CERT_FILE"
+        )
+        cert_chain_file = flight_tls_cert_chain_file or os.environ.get(
+            "ZIPPY_FLIGHT_TLS_CLIENT_CERT_FILE"
+        )
+        private_key_file = flight_tls_private_key_file or os.environ.get(
+            "ZIPPY_FLIGHT_TLS_CLIENT_KEY_FILE"
+        )
+        server_name = flight_tls_server_name or os.environ.get("ZIPPY_FLIGHT_TLS_SERVER_NAME")
+        self._flight: FlightTransport | None = None
+        if flight_endpoint is not None:
+            try:
+                self._flight = FlightTransport(
+                    flight_endpoint,
+                    tls_enabled=bool(tls_config.get("enabled", False)),
+                    read_token=read_token,
+                    writer_token=writer_token,
+                    timeout_sec=float(flight_config.get("timeout_sec", 60.0) or 60.0),
+                    configured_max_message_bytes=_int_config(
+                        flight_config.get("max_message_bytes"), 2 * 1024 * 1024
+                    ),
+                    tls_root_certs=_read_optional_file(root_cert_file),
+                    cert_chain=_read_optional_file(cert_chain_file),
+                    private_key=_read_optional_file(private_key_file),
+                    override_hostname=server_name,
+                )
+            except (ZippyConnectionError, ProtocolError, CapabilityError) as error:
+                if self._gateway is None:
+                    raise
+                logger.warning(
+                    "Flight discovery failed; using Gateway compatibility endpoint=[{}] error=[{}]",
+                    flight_endpoint,
+                    error,
+                )
+                flight_endpoint = None
         self.router = TransportRouter(
             self.control_endpoint,
             gateway_endpoint,
             shm_available,
+            flight_endpoint,
+            bool(self._flight and self._flight.capabilities.memory_ingest),
         )
-        self.capabilities = _capabilities(self.config, gateway_config)
+        self.capabilities = _capabilities(
+            self.config,
+            gateway_config,
+            flight_config,
+            self._flight,
+        )
         if (
             self.capabilities.gateway
             and self.capabilities.gateway_protocol_version != GATEWAY_PROTOCOL_VERSION
@@ -112,6 +199,13 @@ class Client:
         if self._gateway is None:
             raise TransportUnavailableError("server does not advertise a Gateway endpoint")
         return self._gateway
+
+    @property
+    def flight(self) -> FlightTransport:
+        """Return the discovered Arrow Flight transport."""
+        if self._flight is None:
+            raise TransportUnavailableError("server does not advertise a usable Flight endpoint")
+        return self._flight
 
     @property
     def query_transport(self) -> Transport:
@@ -151,8 +245,10 @@ class Client:
         )
 
     def list_tables(self) -> list[dict[str, object]]:
-        """Return table and stream metadata visible through Gateway."""
-        return self.gateway.list_streams()
+        """Return table and stream metadata visible through the control plane."""
+        if self._gateway is not None:
+            return self._gateway.list_streams()
+        return self.control.list_streams(status=True)
 
     def read_table(
         self,
@@ -161,32 +257,75 @@ class Client:
         wait: bool = False,
         timeout: float | str | None = None,
         snapshot: bool = True,
+        namespace: str = "default",
     ) -> Table:
-        """Open a lazy Gateway table query."""
+        """Open a lazy server-owned table query."""
         self._ensure_open()
         if wait:
             self._wait_for_source(source, timeout)
-        return Table(source, self, snapshot=snapshot)
+        return Table(source, self, snapshot=snapshot, namespace=namespace)
 
     def read_sql(
         self,
         sql: str,
         *,
         parameters: dict[str, object] | None = None,
+        bindings: dict[str, object] | None = None,
         stream: bool = False,
+        priority: str = "interactive",
+        deadline_ns: int | None = None,
+        memory_limit_bytes: int | None = None,
+        spill_limit_bytes: int | None = 0,
+        result_batch_rows: int | None = None,
     ):
         """
         Execute server-side SQL and return a PyArrow table.
 
-        The API is stable before SQL rollout, but execution is allowed only when
-        the server advertises ``query_sql``. SQL is never parsed or executed in
-        the client process.
+        Flight requires explicit relation-to-catalog ``bindings`` and executes
+        the SQL in the server-owned DataFusion service. A legacy Gateway may
+        accept the original call without bindings when it advertises
+        ``query_sql``. SQL is never executed in the client process.
         """
         self._ensure_open()
         if not self.capabilities.query_sql:
             raise CapabilityError(
                 "connected server does not advertise query_sql; "
                 "upgrade or enable the server-owned DataFusion query service"
+            )
+        decision = self.router.select(Operation.SQL, self.default_transport)
+        if decision.selected in {Transport.FLIGHT_LOCAL, Transport.FLIGHT_REMOTE}:
+            if parameters:
+                raise CapabilityError(
+                    "Flight protocol version 1 does not encode SQL parameters; "
+                    "bind typed values in the Table expression API"
+                )
+            if not bindings:
+                if self._gateway is not None and self._gateway_query_sql:
+                    table, _ = self.gateway.read_sql(
+                        sql,
+                        parameters=parameters,
+                        stream=stream,
+                    )
+                    return table
+                raise CapabilityError(
+                    "Flight read_sql requires explicit bindings, for example "
+                    "bindings={'ticks': 'ticks'}"
+                )
+            table, _ = self.flight.read_sql(
+                sql,
+                bindings,
+                priority=priority,
+                deadline_ns=deadline_ns,
+                memory_limit_bytes=memory_limit_bytes,
+                spill_limit_bytes=spill_limit_bytes,
+                result_batch_rows=result_batch_rows,
+                stream=stream,
+            )
+            return table
+        if not self._gateway_query_sql:
+            raise CapabilityError(
+                "selected Gateway endpoint does not advertise query_sql; "
+                "use Flight with explicit bindings or upgrade the Gateway"
             )
         table, _ = self.gateway.read_sql(sql, parameters=parameters, stream=stream)
         return table
@@ -199,14 +338,37 @@ class Client:
         batch_size: int = 1024,
         flush_interval_ms: int | None = 5,
         transport: str | Transport | None = None,
-    ) -> GatewayWriter:
-        """Return a buffered Gateway writer."""
+    ) -> GatewayWriter | FlightWriter:
+        """Return a buffered Flight writer or Gateway compatibility writer."""
         self._ensure_open()
-        self.router.select(Operation.WRITE, transport or self.default_transport)
+        decision = self.router.select(Operation.WRITE, transport or self.default_transport)
+        if decision.selected in {Transport.FLIGHT_LOCAL, Transport.FLIGHT_REMOTE}:
+            if schema is None:
+                try:
+                    schema = self.flight.get_table_schema(stream_name)
+                except Exception as error:
+                    logger.debug(
+                        "failed to resolve writer schema stream=[{}] transport=[flight] error=[{}]",
+                        stream_name,
+                        error,
+                    )
+                    schema = None
+            return FlightWriter(
+                stream_name,
+                self.flight,
+                schema=schema,
+                batch_size=batch_size,
+                flush_interval_ms=flush_interval_ms,
+            )
         if schema is None:
             try:
                 _, schema = self.gateway.get_stream(stream_name)
-            except BaseException:
+            except Exception as error:
+                logger.debug(
+                    "failed to resolve writer schema stream=[{}] transport=[gateway] error=[{}]",
+                    stream_name,
+                    error,
+                )
                 schema = None
         return GatewayWriter(
             stream_name,
@@ -244,7 +406,7 @@ class Client:
             self._wait_for_source(source, timeout)
         requested = transport or self.default_transport
         stream_info = self._subscription_stream_info(source, requested)
-        allow_shm = filter is None
+        allow_shm = self._allow_auto_shm and filter is None
         decision = self.router.select(
             Operation.SUBSCRIBE,
             requested,
@@ -310,7 +472,9 @@ class Client:
             self._wait_for_source(source, timeout)
         requested = transport or self.default_transport
         stream_info = self._subscription_stream_info(source, requested)
-        allow_shm = filter is None and batch_size is None and throttle_ms is None
+        allow_shm = (
+            self._allow_auto_shm and filter is None and batch_size is None and throttle_ms is None
+        )
         decision = self.router.select(
             Operation.SUBSCRIBE,
             requested,
@@ -371,7 +535,16 @@ class Client:
             except BaseException as error:
                 first_error = first_error or error
                 logger.error("failed to stop client subscription error=[{}]", error)
-        self.control.close()
+        if self._flight is not None:
+            try:
+                self._flight.close()
+            except BaseException as error:
+                first_error = first_error or error
+                logger.error("failed to close Flight transport error=[{}]", error)
+        try:
+            self.control.close()
+        except BaseException as error:
+            first_error = first_error or error
         if first_error is not None:
             raise first_error
 
@@ -394,6 +567,8 @@ class Client:
         requested: str | Transport,
     ) -> dict[str, object] | None:
         requested_transport = Transport.parse(requested)
+        if not self._allow_auto_shm and requested_transport == Transport.AUTO:
+            return None
         if not self.control_endpoint.is_namespace_local:
             return None
         if requested_transport not in {Transport.AUTO, Transport.SHM}:
@@ -435,6 +610,12 @@ def connect(
     transport: str | Transport = Transport.AUTO,
     local: bool | None = None,
     token: str | None = None,
+    flight_token: str | None = None,
+    flight_writer_token: str | None = None,
+    flight_tls_root_cert_file: str | Path | None = None,
+    flight_tls_cert_chain_file: str | Path | None = None,
+    flight_tls_private_key_file: str | Path | None = None,
+    flight_tls_server_name: str | None = None,
 ) -> Client:
     """
     Connect and set the process-wide default client.
@@ -452,11 +633,23 @@ def connect(
     :param token: Optional Gateway authentication token. It overrides
         ``ZIPPY_GATEWAY_TOKEN`` and server-advertised configuration.
     :type token: str | None
+    :param flight_token: Optional Flight read bootstrap token.
+    :type flight_token: str | None
+    :param flight_writer_token: Optional Flight writer bootstrap token.
+    :type flight_writer_token: str | None
+    :param flight_tls_root_cert_file: Optional PEM trust roots for Flight TLS.
+    :type flight_tls_root_cert_file: str | Path | None
+    :param flight_tls_cert_chain_file: Optional mTLS client certificate chain.
+    :type flight_tls_cert_chain_file: str | Path | None
+    :param flight_tls_private_key_file: Optional mTLS client private key.
+    :type flight_tls_private_key_file: str | Path | None
+    :param flight_tls_server_name: Optional TLS server-name override.
+    :type flight_tls_server_name: str | None
     :returns: Connected default client.
     :rtype: Client
     """
     with _DEFAULT_CLIENT_CONNECT_LOCK:
-        force_gateway = local is False
+        disable_auto_shm = local is False
         if local is not None:
             if Transport.parse(transport) != Transport.AUTO:
                 raise ValueError("local and transport cannot be specified together")
@@ -466,13 +659,16 @@ def connect(
             app=app,
             transport=transport,
             token=token,
+            flight_token=flight_token,
+            flight_writer_token=flight_writer_token,
+            flight_tls_root_cert_file=flight_tls_root_cert_file,
+            flight_tls_cert_chain_file=flight_tls_cert_chain_file,
+            flight_tls_private_key_file=flight_tls_private_key_file,
+            flight_tls_server_name=flight_tls_server_name,
             heartbeat_interval_sec=heartbeat_interval_sec,
         )
-        if force_gateway:
-            connected.default_transport = connected.router.select(
-                Operation.QUERY,
-                Transport.AUTO,
-            ).selected
+        if disable_auto_shm:
+            connected._allow_auto_shm = False
         global _DEFAULT_CLIENT
         with _DEFAULT_CLIENT_LOCK:
             previous, _DEFAULT_CLIENT = _DEFAULT_CLIENT, connected
@@ -501,6 +697,7 @@ def read_table(
     wait: bool = False,
     timeout: float | str | None = None,
     snapshot: bool = True,
+    namespace: str = "default",
 ) -> Table:
     """Open a lazy table query using the process-wide client.
 
@@ -512,6 +709,7 @@ def read_table(
         wait=wait,
         timeout=timeout,
         snapshot=snapshot,
+        namespace=namespace,
     )
 
 
@@ -520,7 +718,13 @@ def read_sql(
     master: Client | None = None,
     *,
     parameters: dict[str, object] | None = None,
+    bindings: dict[str, object] | None = None,
     stream: bool = False,
+    priority: str = "interactive",
+    deadline_ns: int | None = None,
+    memory_limit_bytes: int | None = None,
+    spill_limit_bytes: int | None = 0,
+    result_batch_rows: int | None = None,
 ):
     """Execute server-owned SQL using the process-wide client.
 
@@ -530,7 +734,13 @@ def read_sql(
     return (master or client()).read_sql(
         sql,
         parameters=parameters,
+        bindings=bindings,
         stream=stream,
+        priority=priority,
+        deadline_ns=deadline_ns,
+        memory_limit_bytes=memory_limit_bytes,
+        spill_limit_bytes=spill_limit_bytes,
+        result_batch_rows=result_batch_rows,
     )
 
 
@@ -542,7 +752,7 @@ def get_writer(
     batch_size: int = 1024,
     flush_interval_ms: int | None = 5,
     transport: str | Transport | None = None,
-) -> GatewayWriter:
+) -> GatewayWriter | FlightWriter:
     """Return a buffered writer using the process-wide client.
 
     ``master`` is retained only for source compatibility with the full package.
@@ -588,19 +798,49 @@ def subscribe_table(
 def _capabilities(
     config: dict[str, object],
     gateway_config: dict[str, object],
+    flight_config: dict[str, object] | None = None,
+    flight: FlightTransport | None = None,
 ) -> ServerCapabilities:
+    flight_config = flight_config or {}
+    return ServerCapabilities(
+        flight=flight is not None,
+        flight_protocol_version=(
+            flight.capabilities.protocol_version
+            if flight is not None
+            else _int_config(flight_config.get("protocol_version"), 1)
+        ),
+        flight_ingest=bool(flight and flight.capabilities.memory_ingest),
+        gateway=bool(gateway_config.get("endpoint")) and gateway_config.get("enabled") is not False,
+        gateway_protocol_version=_int_config(gateway_config.get("protocol_version"), 1),
+        query_sql=bool(flight) or _gateway_query_sql_enabled(config),
+        resume_cursor=bool(_capability_config(config).get("subscribe_resume_cursor", False)),
+    )
+
+
+def _gateway_query_sql_enabled(config: dict[str, object]) -> bool:
+    return bool(_capability_config(config).get("query_sql", False))
+
+
+def _capability_config(config: dict[str, object]) -> dict[str, object]:
     capability_config = config.get("capabilities", {})
     if not isinstance(capability_config, dict):
         capability_config = {}
     server_config = config.get("server", {})
     if isinstance(server_config, dict) and isinstance(server_config.get("capabilities"), dict):
         capability_config = {**capability_config, **server_config["capabilities"]}
-    return ServerCapabilities(
-        gateway=bool(gateway_config.get("endpoint")) and gateway_config.get("enabled") is not False,
-        gateway_protocol_version=_int_config(gateway_config.get("protocol_version"), 1),
-        query_sql=bool(capability_config.get("query_sql", False)),
-        resume_cursor=bool(capability_config.get("subscribe_resume_cursor", False)),
-    )
+    return capability_config
+
+
+def _read_optional_file(value: str | Path | None) -> bytes | None:
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise ZippyConnectionError(
+            f"failed to read Flight TLS file path=[{path}] error=[{error}]"
+        ) from error
 
 
 def _parse_timeout(value: float | str | None) -> float | None:

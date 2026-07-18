@@ -297,6 +297,7 @@ listener 在后台继续清理，不会用无界 `join` 突破调用方 deadline
 
 ## 后续阶段
 
-1. Stage 6.5：Python/Rust connector 切换 Flight query/DoPut，legacy Gateway 变为 compatibility adapter。
+1. Stage 6.5 Python connector 已完成：`zippy-client` 默认使用 Flight query/DoPut，解析稳定错误，
+   并保留 legacy Gateway compatibility adapter。Rust connector 后续单独发布。
 2. Phase 7：把 `DoPut` backend 切到 producer epoch/sequence + WAL，并实现 `DoExchange` durable
    subscription、offset/ack 和 replay。

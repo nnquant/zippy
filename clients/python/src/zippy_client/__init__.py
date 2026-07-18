@@ -12,11 +12,13 @@ from .client import (
     subscribe_table,
 )
 from .errors import (
+    AmbiguousWriteError,
     AuthenticationError,
     CapabilityError,
     ContinuityError,
     ProtocolError,
     QueryError,
+    ServerError,
     TransportUnavailableError,
     ZippyClientError,
     ZippyConnectionError,
@@ -25,16 +27,18 @@ from .expressions import Expr, col, lit
 from .models import Operation, ServerCapabilities, Transport, TransportDecision
 from .query import Table
 from .subscriber import GatewaySubscriber, Row, ShmSubscriber, shm_available
-from .writer import GatewayWriter
+from .writer import FlightWriter, GatewayWriter
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "AmbiguousWriteError",
     "AuthenticationError",
     "CapabilityError",
     "Client",
     "ContinuityError",
     "Expr",
+    "FlightWriter",
     "GatewaySubscriber",
     "GatewayWriter",
     "Operation",
@@ -42,6 +46,7 @@ __all__ = [
     "QueryError",
     "Row",
     "ServerCapabilities",
+    "ServerError",
     "ShmSubscriber",
     "Table",
     "Transport",

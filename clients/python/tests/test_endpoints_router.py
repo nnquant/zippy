@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from zippy_client.client import Client, _source_ready
 from zippy_client.control import ControlClient
 from zippy_client.endpoints import ControlEndpoint, resolve_control_endpoint
-from zippy_client.errors import ProtocolError, TransportUnavailableError
+from zippy_client.errors import CapabilityError, ProtocolError, TransportUnavailableError
 from zippy_client.models import Operation, Transport
 from zippy_client.router import TransportRouter
 from zippy_client.transports.gateway import GatewayTransport
@@ -97,6 +99,103 @@ def test_read_sql_forwards_to_server_when_capability_is_advertised(
         "parameters": {"instrument_id": "110001.SH"},
         "stream": True,
     }
+
+
+def test_client_prefers_discovered_flight_and_preserves_read_sql_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = object()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        ControlClient,
+        "get_config",
+        lambda self: {
+            "gateway": {
+                "enabled": True,
+                "endpoint": "127.0.0.1:17666",
+                "protocol_version": 1,
+            },
+            "flight": {
+                "enabled": True,
+                "endpoint": "127.0.0.1:17667",
+                "protocol_version": 1,
+                "max_message_bytes": 2 * 1024 * 1024,
+                "tls": {"enabled": False},
+            },
+        },
+    )
+
+    class DummyFlight:
+        def __init__(self, endpoint: str, **kwargs: object) -> None:
+            self.endpoint = endpoint
+            self.kwargs = kwargs
+            self.capabilities = SimpleNamespace(protocol_version=1, memory_ingest=True)
+
+        def read_sql(self, sql: str, bindings: object, **kwargs: object):
+            captured.update(sql=sql, bindings=bindings, kwargs=kwargs)
+            return expected, {"executor": "flight"}
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    client_module = importlib.import_module("zippy_client.client")
+    monkeypatch.setattr(client_module, "FlightTransport", DummyFlight)
+    connected = Client("tcp://127.0.0.1:17690")
+    try:
+        assert connected.query_transport == Transport.FLIGHT_LOCAL
+        result = connected.read_sql(
+            "SELECT * FROM ticks",
+            bindings={"ticks": "ticks"},
+        )
+    finally:
+        connected.close()
+
+    assert result is expected
+    assert captured["sql"] == "SELECT * FROM ticks"
+    assert captured["bindings"] == {"ticks": "ticks"}
+    assert captured["closed"] is True
+
+
+def test_explicit_gateway_sql_requires_gateway_query_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ControlClient,
+        "get_config",
+        lambda self: {
+            "gateway": {
+                "enabled": True,
+                "endpoint": "127.0.0.1:17666",
+                "protocol_version": 1,
+            },
+            "flight": {
+                "enabled": True,
+                "endpoint": "127.0.0.1:17667",
+                "protocol_version": 1,
+                "tls": {"enabled": False},
+            },
+        },
+    )
+
+    class QueryOnlyFlight:
+        def __init__(self, endpoint: str, **kwargs: object) -> None:
+            del endpoint, kwargs
+            self.capabilities = SimpleNamespace(protocol_version=1, memory_ingest=False)
+
+        def close(self) -> None:
+            pass
+
+    client_module = importlib.import_module("zippy_client.client")
+    monkeypatch.setattr(client_module, "FlightTransport", QueryOnlyFlight)
+    connected = Client(
+        "tcp://127.0.0.1:17690",
+        transport=Transport.GATEWAY_LOCAL,
+    )
+    try:
+        with pytest.raises(CapabilityError, match="selected Gateway endpoint"):
+            connected.read_sql("SELECT * FROM ticks", bindings={"ticks": "ticks"})
+    finally:
+        connected.close()
 
 
 def test_remote_zippy_uri_resolves_tcp_control_endpoint() -> None:

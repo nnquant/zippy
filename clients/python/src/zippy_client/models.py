@@ -11,6 +11,8 @@ class Transport(str, Enum):
 
     AUTO = "auto"
     SHM = "shm"
+    FLIGHT_LOCAL = "flight_local"
+    FLIGHT_REMOTE = "flight_remote"
     GATEWAY_LOCAL = "gateway_local"
     GATEWAY_REMOTE = "gateway_remote"
 
@@ -50,6 +52,12 @@ class ServerCapabilities:
     """
     Capabilities discovered from the connected Zippy server.
 
+    :param flight: Whether an Arrow Flight data endpoint is available.
+    :type flight: bool
+    :param flight_protocol_version: Zippy Flight application protocol version.
+    :type flight_protocol_version: int
+    :param flight_ingest: Whether append + memory DoPut is available.
+    :type flight_ingest: bool
     :param gateway: Whether a Gateway data endpoint is available.
     :type gateway: bool
     :param gateway_protocol_version: Gateway wire protocol version.
@@ -60,10 +68,13 @@ class ServerCapabilities:
     :type resume_cursor: bool
     """
 
-    gateway: bool
-    gateway_protocol_version: int
-    query_sql: bool
-    resume_cursor: bool
+    flight: bool = False
+    flight_protocol_version: int = 0
+    flight_ingest: bool = False
+    gateway: bool = False
+    gateway_protocol_version: int = 0
+    query_sql: bool = False
+    resume_cursor: bool = False
 
 
 @dataclass(frozen=True)
