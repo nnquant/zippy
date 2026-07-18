@@ -63,6 +63,16 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_FLIGHT_PROTOCOL_VERSION",
     "ZIPPY_FLIGHT_MAX_MESSAGE_BYTES",
     "ZIPPY_FLIGHT_MAX_PENDING_TICKETS",
+    "ZIPPY_FLIGHT_TLS_ENABLED",
+    "ZIPPY_FLIGHT_TLS_CERT_FILE",
+    "ZIPPY_FLIGHT_TLS_KEY_FILE",
+    "ZIPPY_FLIGHT_TLS_CLIENT_CA_FILE",
+    "ZIPPY_FLIGHT_TLS_REQUIRE_CLIENT_CERTIFICATE",
+    "ZIPPY_FLIGHT_AUTH_ENABLED",
+    "ZIPPY_FLIGHT_AUTH_TOKEN_FILE",
+    "ZIPPY_FLIGHT_AUTH_TOKEN",
+    "ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS",
+    "ZIPPY_FLIGHT_AUTH_MAX_SESSIONS",
     "ZIPPY_MASTER_HOST",
     "ZIPPY_MASTER_PORT",
     "ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS",
@@ -1522,7 +1532,7 @@ enabled = true
 }
 
 #[test]
-fn zippy_config_rejects_non_loopback_flight_before_tls() {
+fn zippy_config_rejects_non_loopback_flight_without_tls_and_authentication() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     fs::write(
@@ -1548,7 +1558,148 @@ endpoint = "0.0.0.0:17692"
 
     assert!(error
         .to_string()
-        .contains("flight endpoint must be loopback until TLS and authentication are enabled"));
+        .contains("non-loopback flight endpoint requires both TLS and authentication"));
+}
+
+#[test]
+fn zippy_config_accepts_non_loopback_flight_with_tls_and_file_authentication() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[flight]
+enabled = true
+endpoint = "0.0.0.0:17692"
+
+[flight.tls]
+enabled = true
+cert_file = "credentials/server.pem"
+key_file = "credentials/server.key"
+
+[flight.auth]
+enabled = true
+token_file = "credentials/flight.token"
+session_ttl_ms = 60000
+max_sessions = 17
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(
+        config.flight.tls.cert_file.as_deref(),
+        Some(temp.path().join("credentials/server.pem").as_path())
+    );
+    assert_eq!(
+        config.flight.auth.token_file.as_deref(),
+        Some(temp.path().join("credentials/flight.token").as_path())
+    );
+    assert_eq!(config.flight.auth.max_sessions, 17);
+}
+
+#[test]
+fn zippy_config_keeps_environment_flight_token_out_of_debug_and_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+
+[flight.auth]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let token = "test-only-flight-bootstrap-token-0001";
+
+    let config = with_env(&[("ZIPPY_FLIGHT_AUTH_TOKEN", token)], || {
+        ZippyConfig::load_from_path(Some(&config_path))
+    })
+    .unwrap();
+
+    assert_eq!(config.flight.auth.bootstrap_token(), Some(token));
+    assert!(!format!("{config:?}").contains(token));
+    let json = config.to_json_value().to_string();
+    assert!(!json.contains(token));
+    assert!(!json.contains("bootstrap_token"));
+}
+
+#[test]
+fn zippy_config_rejects_plaintext_flight_token_in_toml() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[flight.auth]
+enabled = true
+token = "test-only-flight-bootstrap-token-0001"
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error.to_string().contains("unknown field `token`"));
+}
+
+#[test]
+fn zippy_config_rejects_flight_session_shorter_than_query_plan() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+plan_ttl_ms = 30000
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+
+[flight.auth]
+enabled = true
+token_file = "flight.token"
+session_ttl_ms = 29999
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("session_ttl_ms must cover query plan_ttl_ms"));
 }
 
 #[test]

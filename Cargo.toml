@@ -43,11 +43,12 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["raw_value"] }
 sha2 = "0.10.9"
+subtle = "2.6.1"
 thiserror = "2.0.12"
 tokio = { version = "1.48", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 toml = "0.8"
-tonic = "=0.12.3"
+tonic = { version = "=0.12.3", features = ["tls"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "json", "env-filter"] }
 

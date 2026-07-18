@@ -2,6 +2,17 @@ syntax = "proto3";
 
 package zippy.flight.v1;
 
+message SessionOpenRequest {
+  uint32 protocol_version = 1;
+}
+
+message SessionOpenResponse {
+  uint32 protocol_version = 1;
+  bytes session_id = 2;
+  string bearer_token = 3;
+  uint64 expires_at_ns = 4;
+}
+
 message QueryCommand {
   uint32 protocol_version = 1;
   bytes query_id = 2;
@@ -145,4 +156,6 @@ message CapabilitiesResponse {
   repeated string capabilities = 3;
   uint64 max_message_bytes = 4;
   uint64 max_pending_tickets = 5;
+  bool authentication_required = 6;
+  uint64 session_ttl_ms = 7;
 }

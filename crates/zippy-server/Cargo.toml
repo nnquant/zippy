@@ -10,6 +10,7 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+rustix.workspace = true
 signal-hook = { version = "0.3", features = ["iterator"] }
 tokio.workspace = true
 tracing.workspace = true
@@ -28,7 +29,9 @@ zippy-types = { path = "../zippy-types" }
 arrow-flight.workspace = true
 parquet.workspace = true
 prost.workspace = true
+rcgen = "0.12.1"
 tempfile = "3"
+time = "=0.3.36"
 tonic.workspace = true
 
 [lints]

@@ -21,6 +21,8 @@ use arrow_flight::FlightClient;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use prost::Message;
+use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
+use tonic::transport::{Certificate as TonicCertificate, ClientTlsConfig};
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::{
     canonical_schema_hash, schema_metadata, ControlEndpoint, DataDirectoryError,
@@ -35,8 +37,8 @@ use zippy_protocol::error::status_to_server_error;
 use zippy_protocol::query::{
     encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
 };
-use zippy_protocol::wire::QueryInfo;
-use zippy_protocol::SESSION_METADATA_KEY;
+use zippy_protocol::wire::{QueryInfo, SessionOpenRequest, SessionOpenResponse};
+use zippy_protocol::{AUTHORIZATION_METADATA_KEY, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY};
 use zippy_server::{
     LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationState,
     LegacyCatalogShadowShutdownOutcome, LegacyCatalogShadowState, LegacyServerMode,
@@ -1037,6 +1039,121 @@ async fn flight_only_runtime_streams_real_native_snapshot_and_releases_ticket() 
             .reserved_bytes,
         0
     );
+
+    assert!(runtime.shutdown().is_clean());
+    wait_until_bindable(flight_addr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_runtime_loads_protected_credentials_and_issues_tls_flight_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let flight_addr = reserve_tcp_addr();
+    let config = runtime_config_with_native_flight_frontend_and_persist_root(
+        &temp,
+        &data_dir,
+        flight_addr,
+        &persist_root,
+    );
+    let config_path = config
+        .master()
+        .config_path
+        .as_ref()
+        .expect("secure Flight test has a config file");
+
+    let mut ca_params = CertificateParams::new(Vec::new());
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+    ];
+    let ca = rcgen::Certificate::from_params(ca_params).unwrap();
+    let ca_pem = ca.serialize_pem().unwrap();
+    let mut server_params = CertificateParams::new(vec!["localhost".to_owned()]);
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server = rcgen::Certificate::from_params(server_params).unwrap();
+    let cert_path = temp.path().join("flight-server.pem");
+    let key_path = temp.path().join("flight-server.key");
+    let token_path = temp.path().join("flight.token");
+    fs::write(
+        &cert_path,
+        format!("{}{ca_pem}", server.serialize_pem_with_signer(&ca).unwrap()),
+    )
+    .unwrap();
+    fs::write(&key_path, server.serialize_private_key_pem()).unwrap();
+    fs::write(&token_path, "test-only-flight-bootstrap-token-0001\n").unwrap();
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut source = fs::read_to_string(config_path).unwrap();
+    source.push_str(&format!(
+        concat!(
+            "\n[flight.tls]\n",
+            "enabled = true\n",
+            "cert_file = {:?}\n",
+            "key_file = {:?}\n\n",
+            "[flight.auth]\n",
+            "enabled = true\n",
+            "token_file = {:?}\n",
+            "session_ttl_ms = 60000\n",
+            "max_sessions = 8\n"
+        ),
+        cert_path.display().to_string(),
+        key_path.display().to_string(),
+        token_path.display().to_string(),
+    ));
+    fs::write(config_path, source).unwrap();
+
+    let mut runtime = LegacyServerRuntime::start(config).expect("start secure Flight runtime");
+    let tls_status = runtime
+        .flight_tls_status()
+        .expect("secure Flight runtime exposes TLS status");
+    assert_eq!(tls_status.certificate_sha256().len(), 64);
+    assert!(!tls_status.client_certificate_required());
+    let status = runtime.flight_status().unwrap();
+    assert!(status.authentication_required);
+    assert_eq!(status.active_sessions, 0);
+
+    let channel = tonic::transport::Endpoint::from_shared(format!(
+        "https://127.0.0.1:{}",
+        flight_addr.port()
+    ))
+    .unwrap()
+    .tls_config(
+        ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(TonicCertificate::from_pem(ca_pem)),
+    )
+    .unwrap()
+    .connect()
+    .await
+    .unwrap();
+    let mut client = FlightClient::new(channel);
+    client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            "Bearer test-only-flight-bootstrap-token-0001",
+        )
+        .unwrap();
+    let response = client
+        .handshake(
+            SessionOpenRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+    let opened = SessionOpenResponse::decode(response).unwrap();
+    assert_eq!(opened.protocol_version, CURRENT_PROTOCOL_VERSION);
+    assert!(SessionId::from_bytes(opened.session_id.as_ref().try_into().unwrap()).is_ok());
+    assert!(opened.bearer_token.starts_with("zfs1_"));
+    assert_eq!(runtime.flight_status().unwrap().active_sessions, 1);
 
     assert!(runtime.shutdown().is_clean());
     wait_until_bindable(flight_addr);

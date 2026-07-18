@@ -2526,11 +2526,12 @@ descriptor 若缺少该字段，仍留在 legacy live route。persisted native �
 
 目标：用标准 Arrow 协议替换自定义远端查询/写入 framing。
 
-当前进度（2026-07-18）：Stage 6.1 查询 frontend 已完成。`zippy-protocol` 已拥有 version 1
+当前进度（2026-07-18）：Stage 6.2 查询安全边界已完成。`zippy-protocol` 已拥有 version 1
 Protobuf、稳定 error envelope、capability discovery、单次 ticket 和有界 Flight transport；
 Server 可在 Gateway 关闭时独立启动 Flight，并直接复用 Phase 5 `NativeQueryEngine` 的固定快照、
-资源账本和取消生命周期。当前 endpoint 强制为 loopback，尚不能视为远程生产入口。配置、协议边界和
-验收方法见 [`flight-query-service.md`](flight-query-service.md)。
+资源账本和取消生命周期。TLS、可选 mTLS、Bearer Handshake、服务端 session authority、凭据文件约束
+和重启证书轮换已经完成；非 loopback endpoint 必须同时启用 TLS 与认证。配置、协议边界和验收方法见
+[`flight-query-service.md`](flight-query-service.md)。
 
 任务：
 
@@ -2539,19 +2540,21 @@ Server 可在 Gateway 关闭时独立启动 Flight，并直接复用 Phase 5 `Na
 3. 实现 Flight ingest `DoPut`。
 4. 实现 query cancel/admin actions。
 5. 实现 Flight SQL catalog metadata。
-6. 实现 TLS/auth middleware。
+6. 实现 TLS/auth middleware。（Stage 6.2 已完成）
 7. Python remote client 切 Flight。
 8. 旧 Gateway endpoint 转为 compatibility adapter。
 9. 增加 protocol version negotiation 和 capability discovery。（查询 capability discovery 已完成；
    多版本协商待后续版本出现时实施）
 
-Stage 6.1 自动化证据：
+Stage 6.1/6.2 自动化证据：
 
 - `zippy-protocol` TCP tests 验证固定 snapshot、single-use ticket、session 绑定、ticket expiry 和
   客户端断连释放；
 - `zippy-server` runtime E2E 使用真实 SQLite Catalog、legacy import 和 Parquet scan 验证
   `GetFlightInfo -> DoGet`，并断言重复消费失败、operator memory 归零；
-- Flight listener 已纳入 schema version 3 ready record、动态健康检查和 Gateway 之前的有序 shutdown。
+- Flight listener 已纳入 schema version 4 ready record、动态健康检查和 Gateway 之前的有序 shutdown；
+- TLS 测试验证明文/不受信 CA 失败、受信 CA 成功、mTLS client identity 和重启证书轮换；认证测试验证
+  服务端签发 session、防伪造、容量上限、过期和 pending ticket 回收。
 
 验收：
 

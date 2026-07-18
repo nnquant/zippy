@@ -56,6 +56,18 @@ pub const DEFAULT_FLIGHT_MAX_PENDING_TICKETS: usize = DEFAULT_QUERY_MAX_CONCURRE
 pub const MIN_FLIGHT_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Largest supported Flight message ceiling before TLS and WAN hardening.
 pub const MAX_FLIGHT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Default lifetime of one server-issued Flight session credential.
+pub const DEFAULT_FLIGHT_SESSION_TTL_MS: u64 = 60 * 60 * 1_000;
+/// Longest supported lifetime of one Flight session credential.
+pub const MAX_FLIGHT_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Default number of simultaneously valid Flight sessions.
+pub const DEFAULT_FLIGHT_MAX_SESSIONS: usize = 1_024;
+/// Maximum number of simultaneously valid Flight sessions.
+pub const MAX_FLIGHT_SESSIONS: usize = 65_536;
+/// Minimum entropy-bearing length accepted for a Flight bootstrap bearer token.
+pub const MIN_FLIGHT_BOOTSTRAP_TOKEN_BYTES: usize = 32;
+/// Maximum bootstrap bearer token size accepted from environment or credential file.
+pub const MAX_FLIGHT_BOOTSTRAP_TOKEN_BYTES: usize = 4 * 1024;
 /// Backward-compatible canary default, independent from a configured production override.
 pub const DEFAULT_QUERY_CANARY_OPERATOR_MEMORY_BYTES: u64 = DEFAULT_QUERY_OPERATOR_MEMORY_BYTES;
 pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
@@ -433,6 +445,10 @@ pub struct ZippyFlightConfig {
     pub max_message_bytes: usize,
     /// Maximum physically prepared queries waiting for `DoGet`.
     pub max_pending_tickets: usize,
+    /// TLS listener identity and optional client-certificate policy.
+    pub tls: ZippyFlightTlsConfig,
+    /// Bootstrap authentication and server-issued session policy.
+    pub auth: ZippyFlightAuthConfig,
 }
 
 impl Default for ZippyFlightConfig {
@@ -443,7 +459,75 @@ impl Default for ZippyFlightConfig {
             protocol_version: 1,
             max_message_bytes: DEFAULT_FLIGHT_MAX_MESSAGE_BYTES,
             max_pending_tickets: DEFAULT_FLIGHT_MAX_PENDING_TICKETS,
+            tls: ZippyFlightTlsConfig::default(),
+            auth: ZippyFlightAuthConfig::default(),
         }
+    }
+}
+
+/// TLS files and mutual-TLS policy for the Flight listener.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyFlightTlsConfig {
+    /// Enables TLS on the Flight listener.
+    pub enabled: bool,
+    /// PEM certificate chain loaded at server startup.
+    pub cert_file: Option<PathBuf>,
+    /// PEM private key loaded at server startup.
+    pub key_file: Option<PathBuf>,
+    /// Optional PEM CA roots used to verify client certificates.
+    pub client_ca_file: Option<PathBuf>,
+    /// Requires every TLS client to present a certificate trusted by `client_ca_file`.
+    pub require_client_certificate: bool,
+}
+
+/// Bearer bootstrap credential and bounded server session policy for Flight.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyFlightAuthConfig {
+    /// Enables bearer bootstrap authentication and server-issued sessions.
+    pub enabled: bool,
+    /// Owner-only file containing the bootstrap bearer token.
+    pub token_file: Option<PathBuf>,
+    /// Lifetime of one server-issued session credential.
+    pub session_ttl_ms: u64,
+    /// Maximum number of simultaneously valid server-issued sessions.
+    pub max_sessions: usize,
+    #[serde(skip)]
+    bootstrap_token: Option<String>,
+}
+
+impl std::fmt::Debug for ZippyFlightAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ZippyFlightAuthConfig")
+            .field("enabled", &self.enabled)
+            .field("token_file", &self.token_file)
+            .field("session_ttl_ms", &self.session_ttl_ms)
+            .field("max_sessions", &self.max_sessions)
+            .field(
+                "bootstrap_token_configured",
+                &self.bootstrap_token.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl Default for ZippyFlightAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_file: None,
+            session_ttl_ms: DEFAULT_FLIGHT_SESSION_TTL_MS,
+            max_sessions: DEFAULT_FLIGHT_MAX_SESSIONS,
+            bootstrap_token: None,
+        }
+    }
+}
+
+impl ZippyFlightAuthConfig {
+    /// Returns the environment-sourced bootstrap token without exposing it in serialization.
+    #[must_use]
+    pub fn bootstrap_token(&self) -> Option<&str> {
+        self.bootstrap_token.as_deref()
     }
 }
 
@@ -585,12 +669,34 @@ struct PartialGatewayConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PartialFlightConfig {
     enabled: Option<bool>,
     endpoint: Option<String>,
     protocol_version: Option<u16>,
     max_message_bytes: Option<usize>,
     max_pending_tickets: Option<usize>,
+    tls: Option<PartialFlightTlsConfig>,
+    auth: Option<PartialFlightAuthConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFlightTlsConfig {
+    enabled: Option<bool>,
+    cert_file: Option<String>,
+    key_file: Option<String>,
+    client_ca_file: Option<String>,
+    require_client_certificate: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialFlightAuthConfig {
+    enabled: Option<bool>,
+    token_file: Option<String>,
+    session_ttl_ms: Option<u64>,
+    max_sessions: Option<usize>,
 }
 
 impl Default for ZippyConfig {
@@ -899,6 +1005,44 @@ impl ZippyConfig {
             }
             if let Some(max_pending_tickets) = flight.max_pending_tickets {
                 self.flight.max_pending_tickets = max_pending_tickets;
+            }
+            if let Some(tls) = flight.tls {
+                if let Some(enabled) = tls.enabled {
+                    self.flight.tls.enabled = enabled;
+                }
+                if let Some(cert_file) = tls.cert_file {
+                    let cert_file = non_empty(cert_file, "flight.tls.cert_file")?;
+                    self.flight.tls.cert_file = Some(resolve_config_path(&cert_file, config_base));
+                }
+                if let Some(key_file) = tls.key_file {
+                    let key_file = non_empty(key_file, "flight.tls.key_file")?;
+                    self.flight.tls.key_file = Some(resolve_config_path(&key_file, config_base));
+                }
+                if let Some(client_ca_file) = tls.client_ca_file {
+                    let client_ca_file = non_empty(client_ca_file, "flight.tls.client_ca_file")?;
+                    self.flight.tls.client_ca_file =
+                        Some(resolve_config_path(&client_ca_file, config_base));
+                }
+                if let Some(require_client_certificate) = tls.require_client_certificate {
+                    self.flight.tls.require_client_certificate = require_client_certificate;
+                }
+            }
+            if let Some(auth) = flight.auth {
+                if let Some(enabled) = auth.enabled {
+                    self.flight.auth.enabled = enabled;
+                }
+                if let Some(token_file) = auth.token_file {
+                    let token_file = non_empty(token_file, "flight.auth.token_file")?;
+                    self.flight.auth.token_file =
+                        Some(resolve_config_path(&token_file, config_base));
+                    self.flight.auth.bootstrap_token = None;
+                }
+                if let Some(session_ttl_ms) = auth.session_ttl_ms {
+                    self.flight.auth.session_ttl_ms = session_ttl_ms;
+                }
+                if let Some(max_sessions) = auth.max_sessions {
+                    self.flight.auth.max_sessions = max_sessions;
+                }
             }
         }
         if let Some(query) = partial.query {
@@ -1256,6 +1400,61 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_FLIGHT_MAX_PENDING_TICKETS") {
             self.flight.max_pending_tickets =
                 parse_usize_env("ZIPPY_FLIGHT_MAX_PENDING_TICKETS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_TLS_ENABLED") {
+            self.flight.tls.enabled = parse_bool_env("ZIPPY_FLIGHT_TLS_ENABLED", &value)?;
+        }
+        if let Some(path) = env_string("ZIPPY_FLIGHT_TLS_CERT_FILE") {
+            self.flight.tls.cert_file = Some(resolve_env_absolute_path(
+                "ZIPPY_FLIGHT_TLS_CERT_FILE",
+                path,
+            )?);
+        }
+        if let Some(path) = env_string("ZIPPY_FLIGHT_TLS_KEY_FILE") {
+            self.flight.tls.key_file = Some(resolve_env_absolute_path(
+                "ZIPPY_FLIGHT_TLS_KEY_FILE",
+                path,
+            )?);
+        }
+        if let Some(path) = env_string("ZIPPY_FLIGHT_TLS_CLIENT_CA_FILE") {
+            self.flight.tls.client_ca_file = Some(resolve_env_absolute_path(
+                "ZIPPY_FLIGHT_TLS_CLIENT_CA_FILE",
+                path,
+            )?);
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_TLS_REQUIRE_CLIENT_CERTIFICATE") {
+            self.flight.tls.require_client_certificate =
+                parse_bool_env("ZIPPY_FLIGHT_TLS_REQUIRE_CLIENT_CERTIFICATE", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_AUTH_ENABLED") {
+            self.flight.auth.enabled = parse_bool_env("ZIPPY_FLIGHT_AUTH_ENABLED", &value)?;
+        }
+        let auth_token_file = env_string("ZIPPY_FLIGHT_AUTH_TOKEN_FILE");
+        let auth_token = env_string("ZIPPY_FLIGHT_AUTH_TOKEN");
+        if auth_token_file.is_some() && auth_token.is_some() {
+            return Err(ZippyError::InvalidConfig {
+                reason: "only one of ZIPPY_FLIGHT_AUTH_TOKEN_FILE and ZIPPY_FLIGHT_AUTH_TOKEN may be set"
+                    .to_string(),
+            });
+        }
+        if let Some(path) = auth_token_file {
+            self.flight.auth.token_file = Some(resolve_env_absolute_path(
+                "ZIPPY_FLIGHT_AUTH_TOKEN_FILE",
+                path,
+            )?);
+            self.flight.auth.bootstrap_token = None;
+        }
+        if let Some(token) = auth_token {
+            self.flight.auth.bootstrap_token = Some(non_empty(token, "ZIPPY_FLIGHT_AUTH_TOKEN")?);
+            self.flight.auth.token_file = None;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS") {
+            self.flight.auth.session_ttl_ms =
+                parse_u64_env("ZIPPY_FLIGHT_AUTH_SESSION_TTL_MS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_FLIGHT_AUTH_MAX_SESSIONS") {
+            self.flight.auth.max_sessions =
+                parse_usize_env("ZIPPY_FLIGHT_AUTH_MAX_SESSIONS", &value)?;
         }
         Ok(())
     }
@@ -1925,6 +2124,63 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
             reason: "flight max_pending_tickets must be greater than zero".to_string(),
         });
     }
+    if !(1..=MAX_FLIGHT_SESSIONS).contains(&config.flight.auth.max_sessions) {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight auth max_sessions must be between 1 and {} value=[{}]",
+                MAX_FLIGHT_SESSIONS, config.flight.auth.max_sessions
+            ),
+        });
+    }
+    if config.flight.auth.session_ttl_ms > MAX_FLIGHT_SESSION_TTL_MS {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight auth session_ttl_ms must not exceed {} value=[{}]",
+                MAX_FLIGHT_SESSION_TTL_MS, config.flight.auth.session_ttl_ms
+            ),
+        });
+    }
+    if config.flight.tls.require_client_certificate
+        && (!config.flight.tls.enabled || config.flight.tls.client_ca_file.is_none())
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: "flight TLS client certificates require TLS and client_ca_file".to_string(),
+        });
+    }
+    validate_absolute_optional_path("flight.tls.cert_file", &config.flight.tls.cert_file)?;
+    validate_absolute_optional_path("flight.tls.key_file", &config.flight.tls.key_file)?;
+    validate_absolute_optional_path(
+        "flight.tls.client_ca_file",
+        &config.flight.tls.client_ca_file,
+    )?;
+    validate_absolute_optional_path("flight.auth.token_file", &config.flight.auth.token_file)?;
+    if config.flight.tls.enabled
+        && (config.flight.tls.cert_file.is_none() || config.flight.tls.key_file.is_none())
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: "flight TLS requires both cert_file and key_file".to_string(),
+        });
+    }
+    if let Some(token) = config.flight.auth.bootstrap_token() {
+        validate_flight_bootstrap_token(token)?;
+    }
+    if config.flight.auth.enabled {
+        let credential_sources = usize::from(config.flight.auth.token_file.is_some())
+            + usize::from(config.flight.auth.bootstrap_token().is_some());
+        if credential_sources != 1 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "flight auth requires exactly one bootstrap token source".to_string(),
+            });
+        }
+        if config.flight.auth.session_ttl_ms < config.query.plan_ttl_ms {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "flight auth session_ttl_ms must cover query plan_ttl_ms session_ttl_ms=[{}] plan_ttl_ms=[{}]",
+                    config.flight.auth.session_ttl_ms, config.query.plan_ttl_ms
+                ),
+            });
+        }
+    }
     if !config.flight.enabled {
         return Ok(());
     }
@@ -1971,10 +2227,34 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
             reason: "flight port must be greater than zero".to_string(),
         });
     }
-    if !endpoint.ip().is_loopback() {
+    if !endpoint.ip().is_loopback() && (!config.flight.tls.enabled || !config.flight.auth.enabled) {
         return Err(ZippyError::InvalidConfig {
-            reason: "flight endpoint must be loopback until TLS and authentication are enabled"
-                .to_string(),
+            reason: "non-loopback flight endpoint requires both TLS and authentication".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_absolute_optional_path(name: &str, path: &Option<PathBuf>) -> Result<()> {
+    if path.as_ref().is_some_and(|path| !path.is_absolute()) {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight credential path must resolve to an absolute path name=[{name}]"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_flight_bootstrap_token(token: &str) -> Result<()> {
+    if !(MIN_FLIGHT_BOOTSTRAP_TOKEN_BYTES..=MAX_FLIGHT_BOOTSTRAP_TOKEN_BYTES).contains(&token.len())
+        || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "flight bootstrap token must contain {}..={} visible ASCII bytes",
+                MIN_FLIGHT_BOOTSTRAP_TOKEN_BYTES, MAX_FLIGHT_BOOTSTRAP_TOKEN_BYTES
+            ),
         });
     }
     Ok(())
@@ -2001,6 +2281,17 @@ fn resolve_config_path(path: &str, config_base: &Path) -> PathBuf {
     } else {
         config_base.join(path)
     }
+}
+
+fn resolve_env_absolute_path(name: &str, value: String) -> Result<PathBuf> {
+    let value = non_empty(value, name)?;
+    let path = expand_home_config_path(&value);
+    if !path.is_absolute() {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!("environment credential path must be absolute name=[{name}]"),
+        });
+    }
+    Ok(path)
 }
 
 fn absolute_parent(path: &Path) -> Result<PathBuf> {

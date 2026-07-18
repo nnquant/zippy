@@ -6,10 +6,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arrow_flight::flight_service_server::FlightServiceServer;
+use sha2::{Digest, Sha256};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 use crate::server::{FlightServiceStatus, ZippyFlightService};
@@ -23,6 +24,104 @@ pub struct FlightShutdownOutcome {
     pub released_pending_tickets: usize,
 }
 
+/// In-memory TLS identity loaded from protected credential files before listener startup.
+#[derive(Clone)]
+pub struct FlightServerTlsConfig {
+    certificate_chain_pem: Vec<u8>,
+    private_key_pem: Vec<u8>,
+    client_ca_pem: Option<Vec<u8>>,
+    require_client_certificate: bool,
+    certificate_sha256: String,
+}
+
+impl std::fmt::Debug for FlightServerTlsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FlightServerTlsConfig")
+            .field("certificate_sha256", &self.certificate_sha256)
+            .field("private_key", &"[REDACTED]")
+            .field("client_ca_configured", &self.client_ca_pem.is_some())
+            .field(
+                "require_client_certificate",
+                &self.require_client_certificate,
+            )
+            .finish()
+    }
+}
+
+impl FlightServerTlsConfig {
+    /// Validates non-empty PEM payloads and computes the public certificate fingerprint.
+    pub fn try_new(
+        certificate_chain_pem: Vec<u8>,
+        private_key_pem: Vec<u8>,
+        client_ca_pem: Option<Vec<u8>>,
+        require_client_certificate: bool,
+    ) -> Result<Self> {
+        if certificate_chain_pem.is_empty() || private_key_pem.is_empty() {
+            return Err(invalid(
+                "Flight TLS certificate chain and private key must not be empty",
+            ));
+        }
+        if client_ca_pem.as_ref().is_some_and(Vec::is_empty) {
+            return Err(invalid("Flight TLS client CA must not be empty"));
+        }
+        if require_client_certificate && client_ca_pem.is_none() {
+            return Err(invalid(
+                "Flight TLS client certificate enforcement requires a client CA",
+            ));
+        }
+        let certificate_sha256 = format!("{:x}", Sha256::digest(&certificate_chain_pem));
+        Ok(Self {
+            certificate_chain_pem,
+            private_key_pem,
+            client_ca_pem,
+            require_client_certificate,
+            certificate_sha256,
+        })
+    }
+
+    fn status(&self) -> FlightTlsStatus {
+        FlightTlsStatus {
+            certificate_sha256: self.certificate_sha256.clone(),
+            client_certificate_required: self.require_client_certificate,
+        }
+    }
+
+    fn into_tonic(self) -> ServerTlsConfig {
+        let mut config = ServerTlsConfig::new().identity(Identity::from_pem(
+            self.certificate_chain_pem,
+            self.private_key_pem,
+        ));
+        if let Some(client_ca_pem) = self.client_ca_pem {
+            config = config
+                .client_ca_root(Certificate::from_pem(client_ca_pem))
+                .client_auth_optional(!self.require_client_certificate);
+        }
+        config
+    }
+}
+
+/// Non-secret TLS diagnostics for one running Flight listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlightTlsStatus {
+    certificate_sha256: String,
+    client_certificate_required: bool,
+}
+
+impl FlightTlsStatus {
+    /// Returns the SHA-256 fingerprint of the configured certificate-chain PEM payload.
+    #[must_use]
+    pub fn certificate_sha256(&self) -> &str {
+        &self.certificate_sha256
+    }
+
+    /// Returns whether the listener requires a trusted client certificate.
+    #[must_use]
+    pub const fn client_certificate_required(&self) -> bool {
+        self.client_certificate_required
+    }
+}
+
 /// One independently bound Arrow Flight listener and its owning runtime thread.
 pub struct FlightServerRuntime {
     endpoint: SocketAddr,
@@ -30,6 +129,7 @@ pub struct FlightServerRuntime {
     shutdown: watch::Sender<bool>,
     completed: Receiver<Result<()>>,
     thread: Option<JoinHandle<()>>,
+    tls_status: Option<FlightTlsStatus>,
 }
 
 impl FlightServerRuntime {
@@ -37,6 +137,25 @@ impl FlightServerRuntime {
     pub fn start(
         endpoint: SocketAddr,
         service: ZippyFlightService,
+        startup_timeout: Duration,
+    ) -> Result<Self> {
+        Self::start_configured(endpoint, service, None, startup_timeout)
+    }
+
+    /// Starts a TLS-protected Flight listener with an optional client-certificate requirement.
+    pub fn start_with_tls(
+        endpoint: SocketAddr,
+        service: ZippyFlightService,
+        tls: FlightServerTlsConfig,
+        startup_timeout: Duration,
+    ) -> Result<Self> {
+        Self::start_configured(endpoint, service, Some(tls), startup_timeout)
+    }
+
+    fn start_configured(
+        endpoint: SocketAddr,
+        service: ZippyFlightService,
+        tls: Option<FlightServerTlsConfig>,
         startup_timeout: Duration,
     ) -> Result<Self> {
         if startup_timeout.is_zero() {
@@ -60,6 +179,7 @@ impl FlightServerRuntime {
         let (completed_tx, completed) = mpsc::sync_channel(1);
         let thread_service = service.clone();
         let max_message_bytes = service_configured_message_bytes(&service);
+        let tls_status = tls.as_ref().map(FlightServerTlsConfig::status);
         let thread = thread::Builder::new()
             .name(FLIGHT_THREAD_NAME.to_owned())
             .spawn(move || {
@@ -67,6 +187,7 @@ impl FlightServerRuntime {
                     listener,
                     thread_service,
                     max_message_bytes,
+                    tls,
                     shutdown_rx,
                     ready_tx,
                     completed_tx,
@@ -84,6 +205,7 @@ impl FlightServerRuntime {
                 shutdown,
                 completed,
                 thread: Some(thread),
+                tls_status,
             }),
             Ok(Err(error)) => {
                 service.close_admission();
@@ -116,6 +238,12 @@ impl FlightServerRuntime {
     #[must_use]
     pub fn status(&self) -> FlightServiceStatus {
         self.service.status()
+    }
+
+    /// Returns TLS diagnostics, or `None` for a plaintext loopback listener.
+    #[must_use]
+    pub fn tls_status(&self) -> Option<&FlightTlsStatus> {
+        self.tls_status.as_ref()
     }
 
     /// Closes query and ticket admission while leaving the listener alive for
@@ -216,6 +344,7 @@ fn run_listener(
     listener: TcpListener,
     service: ZippyFlightService,
     max_message_bytes: usize,
+    tls: Option<FlightServerTlsConfig>,
     mut shutdown: watch::Receiver<bool>,
     ready: SyncSender<Result<()>>,
     completed: SyncSender<Result<()>>,
@@ -235,19 +364,34 @@ fn run_listener(
         }
     };
     let result = runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
-            unavailable(format!("adopt Flight listener failed error=[{error}]"))
-        })?;
-        let incoming = TcpListenerStream::new(listener);
-        let flight = FlightServiceServer::new(service.clone())
-            .max_decoding_message_size(max_message_bytes)
-            .max_encoding_message_size(max_message_bytes);
+        let startup = (|| -> Result<_> {
+            let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
+                unavailable(format!("adopt Flight listener failed error=[{error}]"))
+            })?;
+            let incoming = TcpListenerStream::new(listener);
+            let flight = FlightServiceServer::new(service.clone())
+                .max_decoding_message_size(max_message_bytes)
+                .max_encoding_message_size(max_message_bytes);
+            let mut server = Server::builder();
+            if let Some(tls) = tls {
+                server = server.tls_config(tls.into_tonic()).map_err(|error| {
+                    invalid(format!(
+                        "configure Flight TLS identity failed error=[{error}]"
+                    ))
+                })?;
+            }
+            Ok(server.add_service(flight).serve_with_incoming(incoming))
+        })();
+        let server = match startup {
+            Ok(server) => server,
+            Err(error) => {
+                let _ = ready.send(Err(error.clone()));
+                return Err(error);
+            }
+        };
         ready
             .send(Ok(()))
             .map_err(|_| internal("Flight startup readiness receiver disconnected"))?;
-        let server = Server::builder()
-            .add_service(flight)
-            .serve_with_incoming(incoming);
         tokio::pin!(server);
         let mut sweep = tokio::time::interval(Duration::from_millis(100));
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

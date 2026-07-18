@@ -270,7 +270,7 @@ enabled = true
 endpoint = "0.0.0.0:17666"
 
 [flight]
-# Optional Stage 6.1 query frontend. Loopback-only until TLS/auth lands.
+# Optional Stage 6.2 query frontend. Non-loopback requires both TLS and auth.
 enabled = false
 endpoint = "127.0.0.1:17667"
 protocol_version = 1
@@ -316,9 +316,10 @@ persistence probes the complete command before final publication, moves an affin
 into the Catalog actor, and takes an exclusive publication exclusion before rejected-candidate
 cleanup. Exact, conflicting, and missing historical replays therefore never publish final
 candidates. Snapshot leases, runtime pins, QueryService integration, safe-GC claims, and bounded
-Gateway transport are implemented. Physical GC, Flight write/subscription/metadata,
-authentication/TLS and the final removal of legacy metadata authority remain later phases. Standard
-Flight `GetFlightInfo`/`DoGet` query transport is implemented behind the opt-in `[flight]` gate.
+Gateway transport are implemented. Physical GC, Flight write/subscription/metadata and the final
+removal of legacy metadata authority remain later phases. Flight query TLS, bearer authentication
+and server-issued sessions are implemented behind explicit configuration. Standard Flight
+`GetFlightInfo`/`DoGet` query transport is implemented behind the opt-in `[flight]` gate.
 Legacy live descriptors without exact logical-offset provenance are intentionally not promoted into
 native active snapshots.
 

@@ -12,6 +12,7 @@ mod catalog_command_shadow;
 mod catalog_shadow;
 mod composition;
 mod flight_query;
+mod flight_security;
 mod gateway_query;
 mod health;
 mod legacy_catalog_migration;

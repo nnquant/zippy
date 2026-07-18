@@ -1,6 +1,24 @@
 //! Checked-in prost definitions generated from the canonical protocol schema.
 
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionOpenRequest {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionOpenResponse {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub session_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "3")]
+    pub bearer_token: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub expires_at_ns: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryCommand {
     #[prost(uint32, tag = "1")]
     pub protocol_version: u32,
@@ -258,4 +276,8 @@ pub struct CapabilitiesResponse {
     pub max_message_bytes: u64,
     #[prost(uint64, tag = "5")]
     pub max_pending_tickets: u64,
+    #[prost(bool, tag = "6")]
+    pub authentication_required: bool,
+    #[prost(uint64, tag = "7")]
+    pub session_ttl_ms: u64,
 }

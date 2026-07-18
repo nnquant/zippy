@@ -10,20 +10,27 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::error::FlightError;
-use arrow_flight::{Action, FlightClient};
+use arrow_flight::flight_service_client::FlightServiceClient as RawFlightClient;
+use arrow_flight::{Action, FlightClient, HandshakeRequest};
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
+use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Certificate as TonicCertificate, ClientTlsConfig, Identity};
+use zippy_protocol::auth::FlightBearerAuthConfig;
 use zippy_protocol::error::status_to_server_error;
 use zippy_protocol::query::{
     encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
 };
-use zippy_protocol::runtime::FlightServerRuntime;
+use zippy_protocol::runtime::{FlightServerRuntime, FlightServerTlsConfig};
 use zippy_protocol::server::{
     FlightQueryFrontend, FlightServiceConfig, OpaquePreparedFlightQuery, PreparedFlightQuery,
     ZippyFlightService,
 };
-use zippy_protocol::wire::CapabilitiesResponse;
-use zippy_protocol::{CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY};
+use zippy_protocol::wire::{CapabilitiesResponse, SessionOpenRequest, SessionOpenResponse};
+use zippy_protocol::{
+    AUTHORIZATION_METADATA_KEY, CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY,
+};
 use zippy_types::query::{
     QueryInput, QueryInstanceId, QueryPlanInfo, QueryPriority, QueryRequest, QueryResultBatch,
     RecordBatchStream, SendableRecordBatchStream,
@@ -33,6 +40,7 @@ use zippy_types::{BoxFuture, ErrorCode, QueryId, ResourceLimit, Result, SessionI
 
 const TEST_MESSAGE_BYTES: usize = 64 * 1024;
 const TEST_TRANSPORT_BYTES: usize = 4 * TEST_MESSAGE_BYTES;
+const TEST_BOOTSTRAP_TOKEN: &str = "test-only-flight-bootstrap-token-0001";
 
 struct FakeFrontend {
     next_generation: AtomicU64,
@@ -242,6 +250,320 @@ async fn flight_round_trip_is_snapshot_fixed_and_ticket_is_single_use() {
     assert_eq!(flight_error_code(error), ErrorCode::NotFound);
     assert_eq!(service.status().pending_tickets, 0);
     wait_for_count(&lease_drops, 1).await;
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_handshake_issues_authoritative_session_and_rejects_spoofing() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::clone(&lease_drops),
+        Duration::from_secs(5),
+        false,
+    ));
+    let (service, mut runtime) =
+        start_authenticated_frontend(frontend, 4, Duration::from_secs(60), 4);
+    let (mut client, session, bearer_token) =
+        authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
+    assert_eq!(service.status().active_sessions, 1);
+    assert_eq!(service.status().opened_sessions, 1);
+
+    let spoofed_value = if session.as_u128() == 1 {
+        2
+    } else {
+        session.as_u128() - 1
+    };
+    let spoofed = SessionId::from_u128(spoofed_value).unwrap();
+    let error = client
+        .get_flight_info(descriptor(spoofed, QueryId::from_u128(101).unwrap()))
+        .await
+        .expect_err("client-chosen session cannot replace the server authority");
+    assert_eq!(flight_error_code(error), ErrorCode::PermissionDenied);
+
+    let info = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(102).unwrap()))
+        .await
+        .unwrap();
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            "Bearer zfs1_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .unwrap();
+    let error = client
+        .do_get(ticket.clone())
+        .await
+        .expect_err("invalid bearer cannot consume a ticket");
+    assert_eq!(flight_error_code(error), ErrorCode::Unauthenticated);
+    assert_eq!(service.status().pending_tickets, 1);
+
+    client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {bearer_token}"),
+        )
+        .unwrap();
+    let batches: Vec<RecordBatch> = client
+        .do_get(ticket)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches[0].num_rows(), 3);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_sessions_are_bounded_and_expiry_revokes_pending_tickets() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::clone(&lease_drops),
+        Duration::from_secs(5),
+        false,
+    ));
+    let (service, mut runtime) =
+        start_authenticated_frontend(frontend, 4, Duration::from_secs(1), 1);
+    let (mut client, session, bearer_token) =
+        authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
+    let info = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(111).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(service.status().pending_tickets, 1);
+
+    let mut second = raw_client(&runtime).await;
+    second
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {TEST_BOOTSTRAP_TOKEN}"),
+        )
+        .unwrap();
+    let error = second
+        .handshake(
+            SessionOpenRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .expect_err("session capacity is enforced");
+    assert_eq!(flight_error_code(error), ErrorCode::ResourceExhausted);
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let _ = service.sweep_expired();
+    wait_for_count(&lease_drops, 1).await;
+    assert_eq!(service.status().active_sessions, 0);
+    assert_eq!(service.status().pending_tickets, 0);
+    assert_eq!(service.status().session_revoked_tickets, 1);
+    assert_eq!(service.status().session_capacity_rejections, 1);
+
+    client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {bearer_token}"),
+        )
+        .unwrap();
+    let error = client
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .expect_err("expired session cannot consume its former ticket");
+    assert_eq!(flight_error_code(error), ErrorCode::Unauthenticated);
+
+    let _ = authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
+    assert_eq!(service.status().active_sessions, 1);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_handshake_does_not_wait_for_client_stream_eof() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        lease_drops,
+        Duration::from_secs(5),
+        false,
+    ));
+    let (_service, mut runtime) =
+        start_authenticated_frontend(frontend, 4, Duration::from_secs(60), 4);
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", runtime.endpoint()))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = RawFlightClient::new(channel);
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .send(HandshakeRequest {
+            protocol_version: 0,
+            payload: SessionOpenRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec()
+            .into(),
+        })
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(ReceiverStream::new(receiver));
+    request.metadata_mut().insert(
+        AUTHORIZATION_METADATA_KEY,
+        format!("Bearer {TEST_BOOTSTRAP_TOKEN}").parse().unwrap(),
+    );
+
+    let response = tokio::time::timeout(Duration::from_secs(1), client.handshake(request))
+        .await
+        .expect("server responds without waiting for the client stream EOF")
+        .unwrap();
+    let mut responses = response.into_inner();
+    let opened = responses.message().await.unwrap().unwrap();
+    assert_eq!(opened.protocol_version, u64::from(CURRENT_PROTOCOL_VERSION));
+    assert!(SessionOpenResponse::decode(opened.payload).is_ok());
+    drop(sender);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_listener_rejects_plaintext_and_untrusted_clients() {
+    let material = test_tls_material();
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        lease_drops,
+        Duration::from_secs(5),
+        false,
+    ));
+    let (_service, mut runtime) = start_tls_frontend(frontend, &material, false);
+
+    let plaintext_channel =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", runtime.endpoint()))
+            .unwrap()
+            .connect()
+            .await;
+    if let Ok(plaintext_channel) = plaintext_channel {
+        let mut plaintext = FlightClient::new(plaintext_channel);
+        assert!(plaintext.list_actions().await.is_err());
+    }
+
+    let untrusted = tonic::transport::Endpoint::from_shared(format!(
+        "https://127.0.0.1:{}",
+        runtime.endpoint().port()
+    ))
+    .unwrap()
+    .tls_config(ClientTlsConfig::new().domain_name("localhost"))
+    .unwrap()
+    .connect()
+    .await;
+    assert!(untrusted.is_err());
+
+    let mut trusted = tls_client(&runtime, &material, false).await;
+    assert!(trusted.list_actions().await.is_ok());
+    assert!(runtime.tls_status().is_some());
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn invalid_tls_identity_fails_before_startup_readiness() {
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::new(AtomicUsize::new(0)),
+        Duration::from_secs(5),
+        false,
+    ));
+    let service = ZippyFlightService::try_new(service_config(4), frontend).unwrap();
+    let tls = FlightServerTlsConfig::try_new(
+        b"not-a-certificate".to_vec(),
+        b"not-a-private-key".to_vec(),
+        None,
+        false,
+    )
+    .unwrap();
+
+    let error = FlightServerRuntime::start_with_tls(
+        "127.0.0.1:0".parse().unwrap(),
+        service,
+        tls,
+        Duration::from_secs(5),
+    )
+    .err()
+    .expect("invalid TLS identity must fail listener startup");
+
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error
+        .message()
+        .contains("configure Flight TLS identity failed"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutual_tls_requires_a_trusted_client_identity() {
+    let material = test_tls_material();
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        lease_drops,
+        Duration::from_secs(5),
+        false,
+    ));
+    let (_service, mut runtime) = start_tls_frontend(frontend, &material, true);
+
+    let without_identity = tls_channel(&runtime, &material, false).await;
+    if let Ok(channel) = without_identity {
+        let mut client = FlightClient::new(channel);
+        assert!(client.list_actions().await.is_err());
+    }
+    let mut with_identity = tls_client(&runtime, &material, true).await;
+    assert!(with_identity.list_actions().await.is_ok());
+    assert!(runtime.tls_status().unwrap().client_certificate_required());
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certificate_rotation_takes_effect_after_bounded_listener_restart() {
+    let first = test_tls_material();
+    let second = test_tls_material();
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::clone(&lease_drops),
+        Duration::from_secs(5),
+        false,
+    ));
+    let (_service, mut runtime) = start_tls_frontend(frontend, &first, false);
+    let endpoint = runtime.endpoint();
+    let first_fingerprint = runtime
+        .tls_status()
+        .unwrap()
+        .certificate_sha256()
+        .to_owned();
+    assert!(tls_client(&runtime, &first, false)
+        .await
+        .list_actions()
+        .await
+        .is_ok());
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+
+    let frontend = Arc::new(FakeFrontend::new(
+        lease_drops,
+        Duration::from_secs(5),
+        false,
+    ));
+    let config = service_config(4);
+    let service = ZippyFlightService::try_new(config, frontend).unwrap();
+    let tls = FlightServerTlsConfig::try_new(
+        second.server_chain.clone(),
+        second.server_key.clone(),
+        None,
+        false,
+    )
+    .unwrap();
+    let mut runtime =
+        FlightServerRuntime::start_with_tls(endpoint, service, tls, Duration::from_secs(5))
+            .unwrap();
+    assert_ne!(
+        runtime.tls_status().unwrap().certificate_sha256(),
+        first_fingerprint
+    );
+    assert!(tls_channel(&runtime, &first, false).await.is_err());
+    assert!(tls_client(&runtime, &second, false)
+        .await
+        .list_actions()
+        .await
+        .is_ok());
     runtime.shutdown(Duration::from_secs(5)).unwrap();
 }
 
@@ -457,13 +779,7 @@ fn start_frontend(
     frontend: Arc<dyn FlightQueryFrontend>,
     max_pending_tickets: usize,
 ) -> (ZippyFlightService, FlightServerRuntime) {
-    let config = FlightServiceConfig::try_new(
-        "test-0.5.0",
-        TEST_MESSAGE_BYTES,
-        max_pending_tickets,
-        TEST_TRANSPORT_BYTES,
-    )
-    .unwrap();
+    let config = service_config(max_pending_tickets);
     let service = ZippyFlightService::try_new(config, frontend).unwrap();
     let runtime = FlightServerRuntime::start(
         "127.0.0.1:0".parse().unwrap(),
@@ -474,13 +790,186 @@ fn start_frontend(
     (service, runtime)
 }
 
-async fn client(runtime: &FlightServerRuntime, session: SessionId) -> FlightClient {
+fn service_config(max_pending_tickets: usize) -> FlightServiceConfig {
+    FlightServiceConfig::try_new(
+        "test-0.5.0",
+        TEST_MESSAGE_BYTES,
+        max_pending_tickets,
+        TEST_TRANSPORT_BYTES,
+    )
+    .unwrap()
+}
+
+struct TestTlsMaterial {
+    server_chain: Vec<u8>,
+    server_key: Vec<u8>,
+    ca: Vec<u8>,
+    client_chain: Vec<u8>,
+    client_key: Vec<u8>,
+}
+
+fn test_tls_material() -> TestTlsMaterial {
+    let mut ca_params = CertificateParams::new(Vec::new());
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca = rcgen::Certificate::from_params(ca_params).unwrap();
+    let ca_pem = ca.serialize_pem().unwrap();
+
+    let mut server_params = CertificateParams::new(vec!["localhost".to_owned()]);
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server = rcgen::Certificate::from_params(server_params).unwrap();
+    let server_pem = server.serialize_pem_with_signer(&ca).unwrap();
+
+    let mut client_params = CertificateParams::new(vec!["zippy-test-client".to_owned()]);
+    client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client = rcgen::Certificate::from_params(client_params).unwrap();
+    let client_pem = client.serialize_pem_with_signer(&ca).unwrap();
+
+    TestTlsMaterial {
+        server_chain: format!("{server_pem}{ca_pem}").into_bytes(),
+        server_key: server.serialize_private_key_pem().into_bytes(),
+        ca: ca_pem.into_bytes(),
+        client_chain: client_pem.into_bytes(),
+        client_key: client.serialize_private_key_pem().into_bytes(),
+    }
+}
+
+fn start_tls_frontend(
+    frontend: Arc<dyn FlightQueryFrontend>,
+    material: &TestTlsMaterial,
+    require_client_certificate: bool,
+) -> (ZippyFlightService, FlightServerRuntime) {
+    let service = ZippyFlightService::try_new(service_config(4), frontend).unwrap();
+    let tls = FlightServerTlsConfig::try_new(
+        material.server_chain.clone(),
+        material.server_key.clone(),
+        require_client_certificate.then(|| material.ca.clone()),
+        require_client_certificate,
+    )
+    .unwrap();
+    let runtime = FlightServerRuntime::start_with_tls(
+        "127.0.0.1:0".parse().unwrap(),
+        service.clone(),
+        tls,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    (service, runtime)
+}
+
+async fn tls_channel(
+    runtime: &FlightServerRuntime,
+    material: &TestTlsMaterial,
+    with_client_identity: bool,
+) -> std::result::Result<tonic::transport::Channel, tonic::transport::Error> {
+    let mut tls = ClientTlsConfig::new()
+        .domain_name("localhost")
+        .ca_certificate(TonicCertificate::from_pem(&material.ca));
+    if with_client_identity {
+        tls = tls.identity(Identity::from_pem(
+            &material.client_chain,
+            &material.client_key,
+        ));
+    }
+    tonic::transport::Endpoint::from_shared(format!(
+        "https://127.0.0.1:{}",
+        runtime.endpoint().port()
+    ))
+    .unwrap()
+    .tls_config(tls)
+    .unwrap()
+    .connect()
+    .await
+}
+
+async fn tls_client(
+    runtime: &FlightServerRuntime,
+    material: &TestTlsMaterial,
+    with_client_identity: bool,
+) -> FlightClient {
+    FlightClient::new(
+        tls_channel(runtime, material, with_client_identity)
+            .await
+            .unwrap(),
+    )
+}
+
+fn start_authenticated_frontend(
+    frontend: Arc<dyn FlightQueryFrontend>,
+    max_pending_tickets: usize,
+    session_ttl: Duration,
+    max_sessions: usize,
+) -> (ZippyFlightService, FlightServerRuntime) {
+    let auth =
+        FlightBearerAuthConfig::try_new(TEST_BOOTSTRAP_TOKEN.as_bytes(), session_ttl, max_sessions)
+            .unwrap();
+    let config = FlightServiceConfig::try_new(
+        "test-0.5.0",
+        TEST_MESSAGE_BYTES,
+        max_pending_tickets,
+        TEST_TRANSPORT_BYTES,
+    )
+    .unwrap()
+    .with_bearer_auth(auth);
+    let service = ZippyFlightService::try_new(config, frontend).unwrap();
+    let runtime = FlightServerRuntime::start(
+        "127.0.0.1:0".parse().unwrap(),
+        service.clone(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    (service, runtime)
+}
+
+async fn authenticated_client(
+    runtime: &FlightServerRuntime,
+    bootstrap_token: &str,
+) -> (FlightClient, SessionId, String) {
+    let mut client = raw_client(runtime).await;
+    client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {bootstrap_token}"),
+        )
+        .unwrap();
+    let payload = client
+        .handshake(
+            SessionOpenRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec(),
+        )
+        .await
+        .unwrap();
+    let opened = SessionOpenResponse::decode(payload).unwrap();
+    assert_eq!(opened.protocol_version, CURRENT_PROTOCOL_VERSION);
+    let session_id = SessionId::from_bytes(opened.session_id.as_ref().try_into().unwrap()).unwrap();
+    client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {}", opened.bearer_token),
+        )
+        .unwrap();
+    (client, session_id, opened.bearer_token)
+}
+
+async fn raw_client(runtime: &FlightServerRuntime) -> FlightClient {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", runtime.endpoint()))
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let mut client = FlightClient::new(channel);
+    FlightClient::new(channel)
+}
+
+async fn client(runtime: &FlightServerRuntime, session: SessionId) -> FlightClient {
+    let mut client = raw_client(runtime).await;
     client
         .add_header(SESSION_METADATA_KEY, &session.to_string())
         .unwrap();

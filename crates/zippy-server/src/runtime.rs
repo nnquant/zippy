@@ -32,7 +32,7 @@ use zippy_master::daemon::{
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
 use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use zippy_master::server::MasterServer;
-use zippy_protocol::runtime::{FlightServerRuntime, FlightShutdownOutcome};
+use zippy_protocol::runtime::{FlightServerRuntime, FlightShutdownOutcome, FlightTlsStatus};
 use zippy_protocol::server::{FlightServiceConfig, FlightServiceStatus, ZippyFlightService};
 use zippy_storage::{PersistControllerConfig, MAX_PERSIST_PARALLEL_WRITERS};
 use zippy_types::{ErrorCode, ServerError};
@@ -40,6 +40,7 @@ use zippy_types::{ErrorCode, ServerError};
 #[cfg(test)]
 use crate::catalog_command_shadow::LegacyCatalogShadowTestFault;
 use crate::flight_query::NativeFlightQueryFrontend;
+use crate::flight_security::load_flight_security;
 use crate::gateway_query::NativeGatewayQueryFrontend;
 use crate::legacy_catalog_migration::{
     plan_legacy_catalog_metadata_import, LegacyCatalogMetadataImportPlan,
@@ -57,7 +58,7 @@ use crate::{
 const DEFAULT_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SERVER_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-const SERVER_READY_SCHEMA_VERSION: u8 = 3;
+const SERVER_READY_SCHEMA_VERSION: u8 = 4;
 
 /// Runs the server-owned legacy runtime until shutdown or dynamic readiness loss.
 ///
@@ -600,6 +601,10 @@ struct ServerReadyFlight<'a> {
     enabled: bool,
     endpoint: Option<&'a str>,
     protocol_version: u16,
+    tls_enabled: bool,
+    authentication_required: bool,
+    certificate_sha256: Option<&'a str>,
+    client_certificate_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -805,6 +810,11 @@ fn publish_ready_record(
     let log_file = current_log_snapshot()
         .and_then(|snapshot| snapshot.file_path)
         .map(|path| path.display().to_string());
+    let flight_tls = runtime
+        .flight
+        .as_ref()
+        .and_then(FlightServerRuntime::tls_status);
+    let flight_status = runtime.flight_status();
     let record = ServerReadyRecord {
         schema_version: SERVER_READY_SCHEMA_VERSION,
         status: "ready",
@@ -822,6 +832,12 @@ fn publish_ready_record(
             enabled: runtime.flight_endpoint().is_some(),
             endpoint: runtime.flight_endpoint(),
             protocol_version: runtime.runtime_config().flight.protocol_version,
+            tls_enabled: flight_tls.is_some(),
+            authentication_required: flight_status
+                .is_some_and(|status| status.authentication_required),
+            certificate_sha256: flight_tls.map(|status| status.certificate_sha256()),
+            client_certificate_required: flight_tls
+                .is_some_and(|status| status.client_certificate_required()),
         },
         mode: runtime.mode(),
         health: runtime.health(),
@@ -1477,6 +1493,14 @@ impl LegacyServerRuntime {
     #[must_use]
     pub fn flight_status(&self) -> Option<FlightServiceStatus> {
         self.flight.as_ref().map(FlightServerRuntime::status)
+    }
+
+    /// Returns non-secret TLS diagnostics for the Flight listener when configured.
+    #[must_use]
+    pub fn flight_tls_status(&self) -> Option<&FlightTlsStatus> {
+        self.flight
+            .as_ref()
+            .and_then(FlightServerRuntime::tls_status)
     }
 
     /// Returns a point-in-time Gateway metrics snapshot when the listener is enabled.
@@ -2234,18 +2258,26 @@ fn start_flight_if_enabled(
         .query
         .max_buffered_bytes
         .unwrap_or(runtime_config.runtime.max_query_buffer_bytes);
-    let config = FlightServiceConfig::try_new(
+    let security = load_flight_security(&runtime_config.flight)?;
+    let mut config = FlightServiceConfig::try_new(
         env!("CARGO_PKG_VERSION"),
         runtime_config.flight.max_message_bytes,
         runtime_config.flight.max_pending_tickets,
         transport_buffer_bytes,
     )?;
+    if let Some(bearer_auth) = security.bearer_auth {
+        config = config.with_bearer_auth(bearer_auth);
+    }
     let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> = Arc::new(
         NativeFlightQueryFrontend::new(native_storage.query_engine()),
     );
     let service = ZippyFlightService::try_new(config, frontend)?;
     let startup_timeout = remaining_before(startup_deadline, "start Flight listener")?;
-    FlightServerRuntime::start(endpoint, service, startup_timeout).map(Some)
+    match security.tls {
+        Some(tls) => FlightServerRuntime::start_with_tls(endpoint, service, tls, startup_timeout),
+        None => FlightServerRuntime::start(endpoint, service, startup_timeout),
+    }
+    .map(Some)
 }
 
 fn stop_flight_until(
@@ -3262,6 +3294,10 @@ token = "must-not-appear-in-ready-record"
             );
             assert_eq!(record["launcher"]["webui"]["managed"], false);
             assert_eq!(record["health"]["readiness"]["admission_open"], true);
+            assert_eq!(record["flight"]["tls_enabled"], false);
+            assert_eq!(record["flight"]["authentication_required"], false);
+            assert!(record["flight"]["certificate_sha256"].is_null());
+            assert_eq!(record["flight"]["client_certificate_required"], false);
             assert!(!payload.contains("must-not-appear-in-ready-record"));
             assert_eq!(
                 fs::metadata(&ready_path).unwrap().permissions().mode() & 0o077,

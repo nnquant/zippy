@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod error;
 pub mod query;
 pub mod runtime;
@@ -28,6 +29,9 @@ pub const ERROR_METADATA_KEY: &str = "x-zippy-error-bin";
 
 /// Request metadata key that identifies the owning Zippy client session.
 pub const SESSION_METADATA_KEY: &str = "x-zippy-session-id";
+
+/// Standard request metadata key carrying bootstrap or session bearer credentials.
+pub const AUTHORIZATION_METADATA_KEY: &str = "authorization";
 
 /// Flight action returning server protocol capabilities.
 pub const CAPABILITIES_ACTION: &str = "zippy.capabilities.v1";

@@ -1,6 +1,6 @@
 //! Bounded Arrow Flight query service and transport-neutral frontend contract.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,12 +32,15 @@ use zippy_types::{
     BoxFuture, ErrorCode, QueryId, Result, ServerError, ServerErrorDetails, SessionId,
 };
 
+use crate::auth::{FlightBearerAuthConfig, SessionAuthority};
 use crate::error::server_error_to_status;
 use crate::query::{
     decode_query_descriptor, decode_query_ticket, encode_query_ticket, query_info,
     FlightQueryRequest, OPAQUE_TICKET_ID_BYTES,
 };
-use crate::wire::{CapabilitiesRequest, CapabilitiesResponse, QueryTicket};
+use crate::wire::{
+    CapabilitiesRequest, CapabilitiesResponse, QueryTicket, SessionOpenRequest, SessionOpenResponse,
+};
 use crate::{CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY};
 
 const MIN_FLIGHT_MESSAGE_BYTES: usize = 64 * 1024;
@@ -46,6 +49,9 @@ const ENCODED_MESSAGE_OVERHEAD_BYTES: usize = 256;
 const QUERY_CAPABILITY: &str = "query.get_flight_info_do_get.v1";
 const STRUCTURED_ERROR_CAPABILITY: &str = "error.details.v1";
 const SINGLE_USE_TICKET_CAPABILITY: &str = "query.single_use_ticket.v1";
+const SERVER_SESSION_CAPABILITY: &str = "session.server_authority.v1";
+const BEARER_HANDSHAKE_CAPABILITY: &str = "auth.bearer_handshake.v1";
+const MAX_HANDSHAKE_PAYLOAD_BYTES: usize = 4 * 1024;
 
 /// A prepared query whose exact snapshot and output schema are already fixed.
 ///
@@ -85,6 +91,7 @@ pub struct FlightServiceConfig {
     max_message_bytes: usize,
     max_pending_tickets: usize,
     transport_buffer_bytes: usize,
+    bearer_auth: Option<FlightBearerAuthConfig>,
 }
 
 impl FlightServiceConfig {
@@ -120,7 +127,15 @@ impl FlightServiceConfig {
             max_message_bytes,
             max_pending_tickets,
             transport_buffer_bytes,
+            bearer_auth: None,
         })
+    }
+
+    /// Enables bearer bootstrap authentication and server-issued sessions.
+    #[must_use]
+    pub fn with_bearer_auth(mut self, auth: FlightBearerAuthConfig) -> Self {
+        self.bearer_auth = Some(auth);
+        self
     }
 
     /// Returns the maximum approximate encoded Flight message size.
@@ -161,6 +176,22 @@ pub struct FlightServiceStatus {
     pub admission_rejections: u64,
     /// Encoded Flight bytes handed to gRPC streams.
     pub encoded_bytes: u64,
+    /// Whether query RPCs require a server-issued bearer session.
+    pub authentication_required: bool,
+    /// Whether new authenticated sessions may still be issued.
+    pub session_admission_open: bool,
+    /// Server-issued sessions that have not expired or been closed.
+    pub active_sessions: usize,
+    /// Server-issued sessions created since service construction.
+    pub opened_sessions: u64,
+    /// Server-issued sessions removed after their fixed expiry.
+    pub expired_sessions: u64,
+    /// Bootstrap or session bearer validation failures.
+    pub authentication_failures: u64,
+    /// Handshakes rejected by the bounded session registry.
+    pub session_capacity_rejections: u64,
+    /// Pending tickets revoked because their owning session expired.
+    pub session_revoked_tickets: u64,
 }
 
 /// Arrow Flight implementation for bounded, snapshot-fixed Zippy queries.
@@ -173,6 +204,7 @@ struct FlightServiceInner {
     config: FlightServiceConfig,
     frontend: Arc<dyn FlightQueryFrontend>,
     tickets: TicketRegistry,
+    sessions: Option<SessionAuthority>,
     transport_budget: Arc<Semaphore>,
     metrics: FlightMetrics,
 }
@@ -184,6 +216,7 @@ struct FlightMetrics {
     expired_tickets: AtomicU64,
     admission_rejections: AtomicU64,
     encoded_bytes: AtomicU64,
+    session_revoked_tickets: AtomicU64,
 }
 
 impl ZippyFlightService {
@@ -194,10 +227,12 @@ impl ZippyFlightService {
     ) -> Result<Self> {
         let mut server_instance_id = [0_u8; OPAQUE_TICKET_ID_BYTES];
         fill_random_nonzero(&mut server_instance_id)?;
+        let sessions = config.bearer_auth.clone().map(SessionAuthority::new);
         Ok(Self {
             inner: Arc::new(FlightServiceInner {
                 tickets: TicketRegistry::new(server_instance_id, config.max_pending_tickets),
                 transport_budget: Arc::new(Semaphore::new(config.transport_buffer_bytes)),
+                sessions,
                 config,
                 frontend,
                 metrics: FlightMetrics::default(),
@@ -207,6 +242,14 @@ impl ZippyFlightService {
 
     /// Stops new plans and releases every unconsumed prepared query.
     pub fn close_admission(&self) {
+        if let Some(sessions) = &self.inner.sessions {
+            let closed = sessions.close();
+            let revoked = self.inner.tickets.revoke_sessions(&closed);
+            self.inner
+                .metrics
+                .session_revoked_tickets
+                .fetch_add(revoked as u64, Ordering::Relaxed);
+        }
         self.inner.tickets.close();
         self.inner.transport_budget.close();
     }
@@ -214,18 +257,21 @@ impl ZippyFlightService {
     /// Releases every prepared query whose one-use ticket has expired.
     #[must_use]
     pub fn sweep_expired(&self) -> usize {
-        let expired = self.inner.tickets.sweep_expired(unix_time_ns());
+        let now_ns = unix_time_ns();
+        let revoked = self.sweep_expired_sessions_at(now_ns);
+        let expired = self.inner.tickets.sweep_expired(now_ns);
         self.inner
             .metrics
             .expired_tickets
             .fetch_add(expired as u64, Ordering::Relaxed);
-        expired
+        expired.saturating_add(revoked)
     }
 
     /// Returns bounded ticket and transport counters for readiness diagnostics.
     #[must_use]
     pub fn status(&self) -> FlightServiceStatus {
         let registry = self.inner.tickets.status();
+        let sessions = self.inner.sessions.as_ref().map(SessionAuthority::status);
         FlightServiceStatus {
             admission_open: registry.admission_open,
             preparing_queries: registry.preparing_queries,
@@ -239,6 +285,18 @@ impl ZippyFlightService {
                 .admission_rejections
                 .load(Ordering::Relaxed),
             encoded_bytes: self.inner.metrics.encoded_bytes.load(Ordering::Relaxed),
+            authentication_required: sessions.is_some(),
+            session_admission_open: sessions.is_none_or(|status| status.admission_open),
+            active_sessions: sessions.map_or(0, |status| status.active_sessions),
+            opened_sessions: sessions.map_or(0, |status| status.opened_sessions),
+            expired_sessions: sessions.map_or(0, |status| status.expired_sessions),
+            authentication_failures: sessions.map_or(0, |status| status.auth_failures),
+            session_capacity_rejections: sessions.map_or(0, |status| status.capacity_rejections),
+            session_revoked_tickets: self
+                .inner
+                .metrics
+                .session_revoked_tickets
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -249,17 +307,62 @@ impl ZippyFlightService {
     }
 
     fn capabilities(&self) -> CapabilitiesResponse {
+        let authentication_required = self.inner.sessions.is_some();
+        let mut capabilities = vec![
+            QUERY_CAPABILITY.to_owned(),
+            SINGLE_USE_TICKET_CAPABILITY.to_owned(),
+            STRUCTURED_ERROR_CAPABILITY.to_owned(),
+        ];
+        if authentication_required {
+            capabilities.push(SERVER_SESSION_CAPABILITY.to_owned());
+            capabilities.push(BEARER_HANDSHAKE_CAPABILITY.to_owned());
+        }
         CapabilitiesResponse {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             server_version: self.inner.config.server_version.clone(),
-            capabilities: vec![
-                QUERY_CAPABILITY.to_owned(),
-                SINGLE_USE_TICKET_CAPABILITY.to_owned(),
-                STRUCTURED_ERROR_CAPABILITY.to_owned(),
-            ],
+            capabilities,
             max_message_bytes: self.inner.config.max_message_bytes as u64,
             max_pending_tickets: self.inner.config.max_pending_tickets as u64,
+            authentication_required,
+            session_ttl_ms: self
+                .inner
+                .sessions
+                .as_ref()
+                .map(|sessions| {
+                    u64::try_from(sessions.session_ttl().as_millis()).unwrap_or(u64::MAX)
+                })
+                .unwrap_or(0),
         }
+    }
+
+    fn request_session(&self, metadata: &MetadataMap) -> std::result::Result<SessionId, Status> {
+        match &self.inner.sessions {
+            Some(sessions) => {
+                let now_ns = unix_time_ns();
+                let _ = self.sweep_expired_sessions_at(now_ns);
+                sessions
+                    .authenticate(metadata, now_ns)
+                    .map_err(|error| server_error_to_status(&error))
+            }
+            None => legacy_request_session(metadata),
+        }
+    }
+
+    fn sweep_expired_sessions_at(&self, now_ns: u64) -> usize {
+        let revoked = self
+            .inner
+            .sessions
+            .as_ref()
+            .map(|sessions| {
+                let expired_sessions = sessions.sweep_expired(now_ns);
+                self.inner.tickets.revoke_sessions(&expired_sessions)
+            })
+            .unwrap_or(0);
+        self.inner
+            .metrics
+            .session_revoked_tickets
+            .fetch_add(revoked as u64, Ordering::Relaxed);
+        revoked
     }
 
     fn encoded_stream(
@@ -308,9 +411,52 @@ impl FlightService for ZippyFlightService {
 
     async fn handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> std::result::Result<Response<Self::HandshakeStream>, Status> {
-        Err(unsupported_status("Handshake"))
+        let sessions = self
+            .inner
+            .sessions
+            .as_ref()
+            .ok_or_else(|| unsupported_status("Handshake"))?;
+        let metadata = request.metadata().clone();
+        let mut requests = request.into_inner();
+        let request = requests
+            .message()
+            .await?
+            .ok_or_else(|| server_error_to_status(&invalid("Flight handshake is empty")))?;
+        if request.protocol_version != 0 || request.payload.len() > MAX_HANDSHAKE_PAYLOAD_BYTES {
+            return Err(server_error_to_status(&invalid(
+                "Flight handshake envelope is unsupported or too large",
+            )));
+        }
+        let open = SessionOpenRequest::decode(request.payload)
+            .map_err(|_| server_error_to_status(&invalid("Flight session request is malformed")))?;
+        if open.protocol_version != CURRENT_PROTOCOL_VERSION {
+            return Err(server_error_to_status(&invalid(
+                "Flight session protocol version is unsupported",
+            )));
+        }
+        let now_ns = unix_time_ns();
+        let _ = self.sweep_expired_sessions_at(now_ns);
+        let opened = sessions
+            .open(&metadata, now_ns)
+            .map_err(|error| server_error_to_status(&error))?;
+        let payload = SessionOpenResponse {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            session_id: Bytes::copy_from_slice(&opened.session_id.into_bytes()),
+            bearer_token: opened.bearer_token,
+            expires_at_ns: opened.expires_at_ns,
+        }
+        .encode_to_vec();
+        Ok(Response::new(
+            futures::stream::once(async move {
+                Ok(HandshakeResponse {
+                    protocol_version: u64::from(CURRENT_PROTOCOL_VERSION),
+                    payload: Bytes::from(payload),
+                })
+            })
+            .boxed(),
+        ))
     }
 
     async fn list_flights(
@@ -324,7 +470,7 @@ impl FlightService for ZippyFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> std::result::Result<Response<FlightInfo>, Status> {
-        let session_id = request_session(request.metadata())?;
+        let session_id = self.request_session(request.metadata())?;
         let descriptor = request.into_inner();
         let query =
             decode_query_descriptor(&descriptor).map_err(|error| server_error_to_status(&error))?;
@@ -405,7 +551,7 @@ impl FlightService for ZippyFlightService {
         &self,
         request: Request<Ticket>,
     ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
-        let session_id = request_session(request.metadata())?;
+        let session_id = self.request_session(request.metadata())?;
         let ticket = decode_query_ticket(request.get_ref())
             .map_err(|error| server_error_to_status(&error))?;
         let prepared = self
@@ -645,6 +791,32 @@ impl TicketRegistry {
         expired_count
     }
 
+    fn revoke_sessions(&self, session_ids: &[SessionId]) -> usize {
+        if session_ids.is_empty() {
+            return 0;
+        }
+        let session_ids = session_ids.iter().copied().collect::<HashSet<_>>();
+        let revoked = {
+            let mut state = self.lock();
+            let ticket_ids = state
+                .entries
+                .iter()
+                .filter_map(|(ticket_id, entry)| {
+                    session_ids
+                        .contains(&entry.session_id)
+                        .then_some(*ticket_id)
+                })
+                .collect::<Vec<_>>();
+            ticket_ids
+                .into_iter()
+                .filter_map(|ticket_id| state.entries.remove(&ticket_id))
+                .collect::<Vec<_>>()
+        };
+        let revoked_count = revoked.len();
+        drop(revoked);
+        revoked_count
+    }
+
     fn close(&self) {
         let entries = {
             let mut state = self.lock();
@@ -783,7 +955,7 @@ async fn budget_flight_data(
     Ok(data)
 }
 
-fn request_session(metadata: &MetadataMap) -> std::result::Result<SessionId, Status> {
+fn legacy_request_session(metadata: &MetadataMap) -> std::result::Result<SessionId, Status> {
     let value = metadata
         .get(SESSION_METADATA_KEY)
         .ok_or_else(|| {
@@ -839,7 +1011,7 @@ fn flight_error_to_status(error: FlightError) -> Status {
 fn unsupported_status(operation: &str) -> Status {
     let error = ServerError::new(
         ErrorCode::UnsupportedPlan,
-        format!("Flight operation is not enabled in protocol stage 6.1 operation=[{operation}]"),
+        format!("Flight operation is not enabled in protocol stage 6.2 operation=[{operation}]"),
     )
     .with_retryable(false)
     .with_details(ServerErrorDetails::UnsupportedPlan {
