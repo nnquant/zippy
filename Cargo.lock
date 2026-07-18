@@ -3497,6 +3497,7 @@ dependencies = [
  "zippy-engines",
  "zippy-master",
  "zippy-segment-store",
+ "zippy-types",
 ]
 
 [[package]]
@@ -3505,6 +3506,7 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "tokio",
+ "zippy-segment-store",
  "zippy-storage",
  "zippy-types",
 ]
@@ -3601,6 +3603,7 @@ dependencies = [
  "arrow",
  "bytes",
  "datafusion",
+ "futures",
  "parquet",
  "sha2",
  "tokio",
@@ -3627,6 +3630,8 @@ name = "zippy-server"
 version = "0.5.0"
 dependencies = [
  "arrow",
+ "datafusion",
+ "futures",
  "parquet",
  "serde",
  "serde_json",
@@ -3641,6 +3646,7 @@ dependencies = [
  "zippy-ingest",
  "zippy-master",
  "zippy-query",
+ "zippy-segment-store",
  "zippy-storage",
  "zippy-types",
 ]

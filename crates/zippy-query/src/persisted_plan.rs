@@ -4,7 +4,7 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Weak};
 
@@ -30,13 +30,16 @@ use zippy_types::schema_hash::canonical_catalog_schema_digest_v1;
 use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
 use zippy_types::{FileId, TableId};
 
+use crate::active_plan::{ActiveSegmentExec, PersistedAndActiveExec};
+use crate::{ActiveSegmentDescription, ActiveSegmentOpener, ActiveSegmentRole};
+
 const PERSISTED_OBJECT_STORE_URL: &str = "zippy-query://persisted";
 const NORMALIZED_PERSISTED_OBJECT_STORE_URL: &str = "zippy-query://persisted/";
 const PLANNING_ONLY_READER_ERROR: &str =
     "planning-only Zippy Parquet scan has no snapshot-bound reader factory";
 const EXPIRED_EXECUTION_LEASE_ERROR: &str =
     "snapshot-bound Zippy Parquet scan execution lease has expired";
-const PERSISTED_SNAPSHOT_DIGEST_VERSION: u32 = 1;
+const PERSISTED_SNAPSHOT_DIGEST_VERSION: u32 = 2;
 
 static PLANNING_READER_FACTORY: LazyLock<Arc<dyn ParquetFileReaderFactory>> =
     LazyLock::new(|| Arc::new(PlanningOnlyParquetReaderFactory));
@@ -233,7 +236,9 @@ pub struct PersistedTableDescription {
     schema_digest: [u8; 32],
     retained_schema_bytes: NonZeroU64,
     files: Arc<[PersistedFileDescription]>,
+    active_segments: Arc<[ActiveSegmentDescription]>,
     total_file_size_bytes: usize,
+    total_persisted_rows: usize,
     total_rows: usize,
 }
 
@@ -247,6 +252,8 @@ pub struct PersistedSnapshotDescription {
     tables: Arc<[PersistedTableDescription]>,
     total_file_count: usize,
     max_files_per_table: usize,
+    total_active_segment_count: usize,
+    max_active_segments_per_table: usize,
     total_retained_schema_bytes: u64,
     max_retained_schema_bytes: u64,
     max_columns_per_table: usize,
@@ -268,8 +275,15 @@ impl PersistedSnapshotDescription {
                 .checked_add(table.file_count())
                 .ok_or_else(|| binding_error("persisted snapshot file count overflowed usize"))
         })?;
+        let total_active_segment_count = tables.iter().try_fold(0_usize, |total, table| {
+            total
+                .checked_add(table.active_segment_count())
+                .ok_or_else(|| binding_error("active snapshot segment count overflowed usize"))
+        })?;
         let mut file_ids = HashSet::with_capacity(total_file_count);
+        let mut active_identities = HashSet::with_capacity(total_active_segment_count);
         let mut max_files_per_table = 0_usize;
+        let mut max_active_segments_per_table = 0_usize;
         let mut total_retained_schema_bytes = 0_u64;
         let mut max_retained_schema_bytes = 0_u64;
         let mut max_columns_per_table = 0_usize;
@@ -289,6 +303,8 @@ impl PersistedSnapshotDescription {
             }
 
             max_files_per_table = max_files_per_table.max(table.file_count());
+            max_active_segments_per_table =
+                max_active_segments_per_table.max(table.active_segment_count());
             let retained_schema_bytes = table.retained_schema_bytes().get();
             total_retained_schema_bytes = total_retained_schema_bytes
                 .checked_add(retained_schema_bytes)
@@ -314,6 +330,27 @@ impl PersistedSnapshotDescription {
                     )));
                 }
             }
+            for (expected_segment_index, segment) in table.active_segments().iter().enumerate() {
+                if segment.table_index() != expected_table_index
+                    || segment.segment_index() != expected_segment_index
+                    || segment.table_id() != table.table_id()
+                    || segment.snapshot_version() != table.snapshot_version()
+                    || segment.schema_version() != table.schema_version()
+                {
+                    return Err(binding_error(
+                        "active snapshot segment description is inconsistent",
+                    ));
+                }
+                if !active_identities.insert((table.table_id(), segment.source())) {
+                    return Err(binding_error(format!(
+                        "active snapshot contains duplicate source identity table_id=[{}] segment_id=[{}] generation=[{}] writer_epoch=[{}]",
+                        table.table_id().as_u128(),
+                        segment.source().segment_id,
+                        segment.source().generation,
+                        segment.source().writer_epoch
+                    )));
+                }
+            }
         }
 
         let manifest_digest = persisted_snapshot_digest(&tables)?;
@@ -321,6 +358,8 @@ impl PersistedSnapshotDescription {
             tables: tables.into(),
             total_file_count,
             max_files_per_table,
+            total_active_segment_count,
+            max_active_segments_per_table,
             total_retained_schema_bytes,
             max_retained_schema_bytes,
             max_columns_per_table,
@@ -352,6 +391,14 @@ impl PersistedSnapshotDescription {
 
     pub(crate) const fn max_files_per_table(&self) -> usize {
         self.max_files_per_table
+    }
+
+    pub(crate) const fn total_active_segment_count(&self) -> usize {
+        self.total_active_segment_count
+    }
+
+    pub(crate) const fn max_active_segments_per_table(&self) -> usize {
+        self.max_active_segments_per_table
     }
 
     pub(crate) const fn total_retained_schema_bytes(&self) -> u64 {
@@ -407,6 +454,29 @@ fn persisted_snapshot_digest(tables: &[PersistedTableDescription]) -> Result<[u8
             digest.update(file.file_size_bytes().get().to_le_bytes());
             digest.update(file.row_count().get().to_le_bytes());
         }
+        digest.update(
+            u64::try_from(table.active_segment_count())
+                .map_err(|_| binding_error("active snapshot segment count exceeds u64"))?
+                .to_le_bytes(),
+        );
+        for segment in table.active_segments() {
+            digest.update(
+                u64::try_from(segment.segment_index())
+                    .map_err(|_| binding_error("active snapshot segment ordinal exceeds u64"))?
+                    .to_le_bytes(),
+            );
+            digest.update(segment.source().segment_id.to_le_bytes());
+            digest.update(segment.source().generation.to_le_bytes());
+            digest.update(segment.source().writer_epoch.to_le_bytes());
+            digest.update(match segment.role() {
+                ActiveSegmentRole::RetainedSealed => [0_u8],
+                ActiveSegmentRole::Active => [1_u8],
+            });
+            digest.update(segment.schema_version().get().to_le_bytes());
+            digest.update(segment.offsets().first().get().to_le_bytes());
+            digest.update(segment.offsets().last().get().to_le_bytes());
+            digest.update(segment.row_count().get().to_le_bytes());
+        }
     }
     Ok(digest.finalize().into())
 }
@@ -420,6 +490,28 @@ impl PersistedTableDescription {
         schema_version: NonZeroU64,
         schema: SchemaRef,
         files: Vec<PersistedFileDescription>,
+    ) -> Result<Self> {
+        Self::try_new_with_active_segments(
+            table_index,
+            table_id,
+            snapshot_version,
+            schema_version,
+            schema,
+            files,
+            Vec::new(),
+        )
+    }
+
+    /// Creates one exact persisted/live table snapshot from capability-free metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_active_segments(
+        table_index: usize,
+        table_id: TableId,
+        snapshot_version: NonZeroU64,
+        schema_version: NonZeroU64,
+        schema: SchemaRef,
+        files: Vec<PersistedFileDescription>,
+        active_segments: Vec<ActiveSegmentDescription>,
     ) -> Result<Self> {
         let retained_schema_bytes = conservative_arrow_schema_retained_bytes(schema.as_ref())
             .map_err(|error| {
@@ -494,6 +586,57 @@ impl PersistedTableDescription {
             })?;
         }
 
+        let total_persisted_rows = total_rows;
+        let mut previous_last_offset = None;
+        let mut source_identities = HashSet::with_capacity(active_segments.len());
+        for (expected_segment_index, segment) in active_segments.iter().enumerate() {
+            if segment.table_index() != table_index
+                || segment.segment_index() != expected_segment_index
+                || segment.table_id() != table_id
+            {
+                return Err(DataFusionError::Plan(
+                    "active segment key differs from its table snapshot".to_owned(),
+                ));
+            }
+            if segment.snapshot_version() != snapshot_version
+                || segment.schema_version() != schema_version
+            {
+                return Err(DataFusionError::Plan(
+                    "active segment version differs from its table snapshot".to_owned(),
+                ));
+            }
+            if segment.role() == ActiveSegmentRole::Active
+                && expected_segment_index + 1 != active_segments.len()
+            {
+                return Err(DataFusionError::Plan(
+                    "active segment must be final in live scan order".to_owned(),
+                ));
+            }
+            if !source_identities.insert(segment.source()) {
+                return Err(DataFusionError::Plan(
+                    "active table snapshot contains duplicate source identity".to_owned(),
+                ));
+            }
+            if previous_last_offset.is_some_and(|previous: u64| {
+                previous.checked_add(1) != Some(segment.offsets().first().get())
+            }) {
+                return Err(DataFusionError::Plan(
+                    "active table snapshot logical offsets are not contiguous".to_owned(),
+                ));
+            }
+            previous_last_offset = Some(segment.offsets().last().get());
+            let row_count = usize::try_from(segment.row_count().get()).map_err(|_| {
+                DataFusionError::Plan(
+                    "active segment row count does not fit this platform".to_owned(),
+                )
+            })?;
+            total_rows = total_rows.checked_add(row_count).ok_or_else(|| {
+                DataFusionError::Plan(
+                    "persisted/live manifest total row count exceeds this platform".to_owned(),
+                )
+            })?;
+        }
+
         Ok(Self {
             table_index,
             table_id,
@@ -503,7 +646,9 @@ impl PersistedTableDescription {
             schema_digest,
             retained_schema_bytes,
             files: files.into(),
+            active_segments: active_segments.into(),
             total_file_size_bytes,
+            total_persisted_rows,
             total_rows,
         })
     }
@@ -562,9 +707,34 @@ impl PersistedTableDescription {
         self.files.len()
     }
 
+    /// Returns live segment descriptions in deterministic source order.
+    #[must_use]
+    pub fn active_segments(&self) -> &[ActiveSegmentDescription] {
+        &self.active_segments
+    }
+
+    /// Returns the number of retained sealed and active segment spans.
+    #[must_use]
+    pub fn active_segment_count(&self) -> usize {
+        self.active_segments.len()
+    }
+
+    #[cfg(test)]
     fn statistics(&self) -> Statistics {
         Statistics {
             num_rows: Precision::Exact(self.total_rows),
+            total_byte_size: if self.active_segments.is_empty() {
+                Precision::Exact(self.total_file_size_bytes)
+            } else {
+                Precision::Absent
+            },
+            column_statistics: Statistics::unknown_column(&self.schema),
+        }
+    }
+
+    fn persisted_statistics(&self) -> Statistics {
+        Statistics {
+            num_rows: Precision::Exact(self.total_persisted_rows),
             total_byte_size: Precision::Exact(self.total_file_size_bytes),
             column_statistics: Statistics::unknown_column(&self.schema),
         }
@@ -627,6 +797,7 @@ pub trait PersistedFileOpener: Send + Sync + 'static {
 pub struct BoundPersistedPlan {
     plan: Arc<dyn ExecutionPlan>,
     bound_scan_count: usize,
+    bound_active_scan_count: usize,
 }
 
 impl fmt::Debug for BoundPersistedPlan {
@@ -635,6 +806,7 @@ impl fmt::Debug for BoundPersistedPlan {
             .debug_struct("BoundPersistedPlan")
             .field("root", &self.plan.name())
             .field("bound_scan_count", &self.bound_scan_count)
+            .field("bound_active_scan_count", &self.bound_active_scan_count)
             .finish_non_exhaustive()
     }
 }
@@ -650,6 +822,42 @@ impl BoundPersistedPlan {
     pub const fn bound_scan_count(&self) -> usize {
         self.bound_scan_count
     }
+
+    /// Returns how many active-segment scan nodes were bound in the complete plan tree.
+    #[must_use]
+    pub const fn bound_active_scan_count(&self) -> usize {
+        self.bound_active_scan_count
+    }
+
+    /// Returns the immutable output schema of the fully bound physical plan.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        self.plan.schema()
+    }
+
+    /// Profiles the first fail-closed streaming output subset before any file is decoded.
+    ///
+    /// The accepted plan contains at most one fixed-width Parquet scan (an empty table may optimize
+    /// to no scan) and only direct projection, fixed-width filtering, and limit/slice operators.
+    /// More general analytical operators remain unsupported until their decoded output
+    /// participates in the global memory pool and quota-enforced spill path.
+    pub fn streaming_output_admission(
+        &self,
+        batch_size: std::num::NonZeroUsize,
+    ) -> Result<crate::PersistedDecodedOutputAdmission> {
+        crate::output_admission::profile_streaming_output_plan(&self.plan, batch_size)
+    }
+
+    /// Starts this snapshot-bound physical plan in the supplied bounded runtime.
+    ///
+    /// The returned stream owns DataFusion's execution tasks. Dropping it aborts execution and
+    /// releases operator allocations from the runtime memory pool.
+    pub fn execute_stream(
+        &self,
+        context: &crate::PersistedExecutionContext,
+    ) -> Result<crate::PersistedRecordBatchStream> {
+        datafusion::physical_plan::execute_stream(Arc::clone(&self.plan), context.task_context())
+    }
 }
 
 /// Validates and atomically binds every persisted scan in a complete physical plan tree.
@@ -663,10 +871,26 @@ pub(crate) fn bind_persisted_snapshot_plan(
     plan: Arc<dyn ExecutionPlan>,
     expected_snapshot: &PersistedSnapshotDescription,
     opener: &Arc<dyn PersistedFileOpener>,
+    active_opener: Option<&Arc<dyn ActiveSegmentOpener>>,
 ) -> Result<BoundPersistedPlan> {
     if opener.snapshot_description() != expected_snapshot {
         return Err(binding_error(
             "persisted file opener belongs to another snapshot description",
+        ));
+    }
+    if expected_snapshot.total_active_segment_count() > 0 {
+        let active_opener = active_opener.ok_or_else(|| {
+            binding_error("active snapshot requires a server-owned segment opener")
+        })?;
+        if active_opener.snapshot_description() != expected_snapshot {
+            return Err(binding_error(
+                "active segment opener belongs to another snapshot description",
+            ));
+        }
+    } else if active_opener.is_some_and(|opener| opener.snapshot_description() != expected_snapshot)
+    {
+        return Err(binding_error(
+            "active segment opener belongs to another snapshot description",
         ));
     }
     let expected_tables = expected_snapshot.tables();
@@ -675,39 +899,65 @@ pub(crate) fn bind_persisted_snapshot_plan(
     });
     let mut visited_marker_nodes = HashSet::new();
     let mut bound_scan_count = 0_usize;
+    let mut bound_active_scan_count = 0_usize;
+    let bound_active_opener = active_opener.map(Arc::downgrade);
 
     let plan = plan
         .transform_up(|node| {
-            let Some(parquet) = node.as_any().downcast_ref::<ParquetExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let has_marker = has_factory(parquet, &PLANNING_READER_FACTORY);
-            let has_reserved_signal = is_reserved_zippy_scan(parquet);
-            if !has_marker {
-                if has_reserved_signal {
+            if let Some(parquet) = node.as_any().downcast_ref::<ParquetExec>() {
+                let has_marker = has_factory(parquet, &PLANNING_READER_FACTORY);
+                let has_reserved_signal = is_reserved_zippy_scan(parquet);
+                if !has_marker {
+                    if has_reserved_signal {
+                        return Err(binding_error(
+                            "persisted Parquet scan is missing the exact planning marker",
+                        ));
+                    }
+                    return Ok(Transformed::no(node));
+                }
+
+                let node_identity = Arc::as_ptr(&node) as *const () as usize;
+                if !visited_marker_nodes.insert(node_identity) {
                     return Err(binding_error(
-                        "persisted Parquet scan is missing the exact planning marker",
+                        "persisted planning scan node is reused as a physical-plan DAG child",
                     ));
                 }
-                return Ok(Transformed::no(node));
+                validate_planning_scan(parquet, expected_tables)?;
+                bound_scan_count = bound_scan_count.checked_add(1).ok_or_else(|| {
+                    binding_error("persisted physical plan scan count overflowed")
+                })?;
+                let replacement: Arc<dyn ExecutionPlan> = Arc::new(
+                    parquet
+                        .clone()
+                        .with_parquet_file_reader_factory(Arc::clone(&bound_factory)),
+                );
+                return Ok(Transformed::yes(replacement));
             }
 
+            let Some(active) = node.as_any().downcast_ref::<ActiveSegmentExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            if !active.is_planning() {
+                return Err(binding_error(
+                    "active segment scan is missing its exact planning marker",
+                ));
+            }
             let node_identity = Arc::as_ptr(&node) as *const () as usize;
             if !visited_marker_nodes.insert(node_identity) {
                 return Err(binding_error(
-                    "persisted planning scan node is reused as a physical-plan DAG child",
+                    "active planning scan node is reused as a physical-plan DAG child",
                 ));
             }
-            validate_planning_scan(parquet, expected_tables)?;
-            bound_scan_count = bound_scan_count
+            validate_planning_active_scan(active, expected_tables)?;
+            let opener = bound_active_opener
+                .as_ref()
+                .ok_or_else(|| binding_error("active planning scan has no server-owned opener"))?;
+            bound_active_scan_count = bound_active_scan_count
                 .checked_add(1)
-                .ok_or_else(|| binding_error("persisted physical plan scan count overflowed"))?;
-            let replacement: Arc<dyn ExecutionPlan> = Arc::new(
-                parquet
-                    .clone()
-                    .with_parquet_file_reader_factory(Arc::clone(&bound_factory)),
-            );
-            Ok(Transformed::yes(replacement))
+                .ok_or_else(|| binding_error("active physical plan scan count overflowed"))?;
+            Ok(Transformed::yes(
+                Arc::new(active.bind(opener.clone())) as Arc<dyn ExecutionPlan>
+            ))
         })?
         .data;
 
@@ -715,6 +965,7 @@ pub(crate) fn bind_persisted_snapshot_plan(
     Ok(BoundPersistedPlan {
         plan,
         bound_scan_count,
+        bound_active_scan_count,
     })
 }
 
@@ -765,7 +1016,7 @@ fn validate_planning_scan(
             expected_table.table_id().as_u128()
         )));
     }
-    if config.statistics != expected_table.statistics() {
+    if config.statistics != expected_table.persisted_statistics() {
         return Err(binding_error(format!(
             "persisted scan statistics mismatch table_id=[{}]",
             expected_table.table_id().as_u128()
@@ -792,6 +1043,49 @@ fn validate_planning_scan(
     }
     for (partitioned, expected_file) in files.iter().zip(expected_table.files()) {
         validate_partitioned_file(partitioned, *expected_file)?;
+    }
+    Ok(())
+}
+
+fn validate_planning_active_scan(
+    active: &ActiveSegmentExec,
+    expected_tables: &[PersistedTableDescription],
+) -> Result<()> {
+    let first = active
+        .descriptions()
+        .first()
+        .ok_or_else(|| binding_error("active planning scan has no segment descriptions"))?;
+    let expected_table = expected_tables.get(first.table_index()).ok_or_else(|| {
+        binding_error(format!(
+            "active scan table ordinal is out of bounds actual=[{}]",
+            first.table_index()
+        ))
+    })?;
+    if active.descriptions() != expected_table.active_segments() {
+        return Err(binding_error(format!(
+            "active scan descriptions differ from snapshot table_id=[{}]",
+            expected_table.table_id().as_u128()
+        )));
+    }
+    if let Some(projection) = active.projection() {
+        if let Some(index) = projection
+            .iter()
+            .copied()
+            .find(|&index| index >= expected_table.schema().fields().len())
+        {
+            return Err(binding_error(format!(
+                "active scan projection index is out of bounds index=[{index}]"
+            )));
+        }
+        let projected = expected_table
+            .schema()
+            .project(projection)
+            .map_err(DataFusionError::from)?;
+        if active.schema().as_ref() != &projected {
+            return Err(binding_error("active scan projected schema mismatch"));
+        }
+    } else if active.schema().as_ref() != expected_table.schema().as_ref() {
+        return Err(binding_error("active scan schema mismatch"));
     }
     Ok(())
 }
@@ -892,6 +1186,14 @@ fn validate_bound_tree(
             ));
         }
     }
+    if let Some(active) = plan.as_any().downcast_ref::<ActiveSegmentExec>() {
+        if !active.is_bound() {
+            return Err(binding_error(
+                "active physical plan retained a planning-only opener marker",
+            ));
+        }
+        validate_planning_active_scan(active, expected_tables)?;
+    }
     for child in plan.children() {
         validate_bound_tree(child, expected_tables, bound_factory)?;
     }
@@ -926,6 +1228,10 @@ fn is_reserved_zippy_scan(parquet: &ParquetExec) -> bool {
 
 pub(crate) fn is_exact_planning_parquet(parquet: &ParquetExec) -> bool {
     has_factory(parquet, &PLANNING_READER_FACTORY) && is_reserved_zippy_scan(parquet)
+}
+
+pub(crate) fn is_exact_planning_active(active: &ActiveSegmentExec) -> bool {
+    active.is_planning()
 }
 
 fn binding_error(message: impl Into<String>) -> DataFusionError {
@@ -1043,54 +1349,87 @@ impl TableProvider for ZippyTableProvider {
                 }
             }
 
-            if self.table.files.is_empty() {
-                let projected_schema = projection.map_or_else(
-                    || Ok(Arc::clone(&self.table.schema)),
-                    |projection| {
-                        self.table
-                            .schema
-                            .project(projection)
-                            .map(Arc::new)
-                            .map_err(DataFusionError::from)
-                    },
-                )?;
+            let projected_schema = projection.map_or_else(
+                || Ok(Arc::clone(&self.table.schema)),
+                |projection| {
+                    self.table
+                        .schema
+                        .project(projection)
+                        .map(Arc::new)
+                        .map_err(DataFusionError::from)
+                },
+            )?;
+            if self.table.files.is_empty() && self.table.active_segments.is_empty() {
                 return Ok(Arc::new(EmptyExec::new(projected_schema)) as Arc<dyn ExecutionPlan>);
             }
 
-            let files = self
-                .table
-                .files
-                .iter()
-                .copied()
-                .map(PersistedFileDescription::into_partitioned_file)
-                .collect::<Vec<_>>();
-            // One group keeps the scan in one partition. DataFusion may pre-open its next file,
-            // so the server's file-task admission remains the physical concurrency boundary.
-            let file_groups = vec![files];
-            let object_store_url = ObjectStoreUrl::parse(PERSISTED_OBJECT_STORE_URL)?;
-            // An inexact predicate must be evaluated by an exact FilterExec before LIMIT. Pushing
-            // the limit into ParquetExec here could return too few matching rows.
-            let scan_limit = if filters.is_empty() { limit } else { None };
-            let file_scan_config =
-                FileScanConfig::new(object_store_url, Arc::clone(&self.table.schema))
-                    .with_file_groups(file_groups)
-                    .with_statistics(self.table.statistics())
-                    .with_projection(projection.cloned())
-                    .with_limit(scan_limit);
-            let mut builder = ParquetExec::builder(file_scan_config)
-                .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY));
-            if let Some(predicate) = conjunction(filters.iter().cloned()) {
-                let table_schema = DFSchema::try_from(self.table.schema.as_ref().clone())?;
-                builder =
-                    builder.with_predicate(state.create_physical_expr(predicate, &table_schema)?);
+            let persisted_plan = if self.table.files.is_empty() {
+                None
+            } else {
+                let files = self
+                    .table
+                    .files
+                    .iter()
+                    .copied()
+                    .map(PersistedFileDescription::into_partitioned_file)
+                    .collect::<Vec<_>>();
+                // One group keeps the scan in one partition. DataFusion may pre-open its next
+                // file, so the server's file-task admission remains the concurrency boundary.
+                let file_groups = vec![files];
+                let object_store_url = ObjectStoreUrl::parse(PERSISTED_OBJECT_STORE_URL)?;
+                // A hybrid scan cannot push a table limit into only the persisted child. The
+                // logical limit remains above this provider and applies to the concatenated rows.
+                let scan_limit = if self.table.active_segments.is_empty() && filters.is_empty() {
+                    limit
+                } else {
+                    None
+                };
+                let file_scan_config =
+                    FileScanConfig::new(object_store_url, Arc::clone(&self.table.schema))
+                        .with_file_groups(file_groups)
+                        .with_statistics(self.table.persisted_statistics())
+                        .with_projection(projection.cloned())
+                        .with_limit(scan_limit);
+                let mut builder = ParquetExec::builder(file_scan_config)
+                    .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY));
+                if let Some(predicate) = conjunction(filters.iter().cloned()) {
+                    let table_schema = DFSchema::try_from(self.table.schema.as_ref().clone())?;
+                    builder = builder
+                        .with_predicate(state.create_physical_expr(predicate, &table_schema)?);
+                }
+                Some(Arc::new(
+                    builder
+                        .build()
+                        .with_enable_page_index(false)
+                        .with_bloom_filter_on_read(false),
+                ) as Arc<dyn ExecutionPlan>)
+            };
+            let active_plan = if self.table.active_segments.is_empty() {
+                None
+            } else {
+                let batch_size =
+                    NonZeroUsize::new(state.config().batch_size()).ok_or_else(|| {
+                        DataFusionError::Plan("active segment scan batch size is zero".to_owned())
+                    })?;
+                Some(Arc::new(ActiveSegmentExec::try_planning(
+                    Arc::clone(&self.table.active_segments),
+                    Arc::clone(&self.table.schema),
+                    projection.cloned(),
+                    batch_size,
+                )?) as Arc<dyn ExecutionPlan>)
+            };
+
+            match (persisted_plan, active_plan) {
+                (Some(persisted), Some(active)) => Ok(Arc::new(PersistedAndActiveExec::try_new(
+                    persisted, active,
+                )?)
+                    as Arc<dyn ExecutionPlan>),
+                (Some(persisted), None) => Ok(persisted),
+                (None, Some(active)) => Ok(active),
+                (None, None) => {
+                    Ok(Arc::new(EmptyExec::new(projected_schema)) as Arc<dyn ExecutionPlan>)
+                }
             }
-            let plan: Arc<dyn ExecutionPlan> = Arc::new(
-                builder
-                    .build()
-                    .with_enable_page_index(false)
-                    .with_bloom_filter_on_read(false),
-            );
-            Ok(plan)
         })
     }
 
@@ -1121,7 +1460,7 @@ impl ParquetFileReaderFactory for PlanningOnlyParquetReaderFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -1138,6 +1477,9 @@ mod tests {
     use datafusion::datasource::physical_plan::{FileMeta, FileScanConfig};
     use datafusion::datasource::TableProvider;
     use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::physical_expr::expressions::{Column, InListExpr, Literal};
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::physical_plan::union::UnionExec;
@@ -1231,6 +1573,33 @@ mod tests {
         .expect("build persisted test table")
     }
 
+    fn fixed_width_table(
+        table_index: usize,
+        id: u128,
+        snapshot_version: u64,
+        file_ids: &[u128],
+    ) -> PersistedTableDescription {
+        let table_id = table_id(id);
+        PersistedTableDescription::try_new(
+            table_index,
+            table_id,
+            nonzero(snapshot_version),
+            nonzero(2),
+            Arc::new(Schema::new(vec![
+                Field::new("price", DataType::Int64, false),
+                Field::new("volume", DataType::UInt32, true),
+            ])),
+            file_ids
+                .iter()
+                .enumerate()
+                .map(|(file_index, &id)| {
+                    file(table_index, file_index, table_id, snapshot_version, id)
+                })
+                .collect(),
+        )
+        .expect("build fixed-width persisted test table")
+    }
+
     fn recording_opener(
         tables: &[PersistedTableDescription],
     ) -> (
@@ -1252,7 +1621,7 @@ mod tests {
         opener: &Arc<dyn PersistedFileOpener>,
     ) -> datafusion::common::Result<super::BoundPersistedPlan> {
         let snapshot = PersistedSnapshotDescription::try_new(tables.to_vec())?;
-        bind_validated_snapshot_plan(plan, &snapshot, opener)
+        bind_validated_snapshot_plan(plan, &snapshot, opener, None)
     }
 
     fn planning_config(table: &PersistedTableDescription) -> FileScanConfig {
@@ -1279,6 +1648,17 @@ mod tests {
                 .with_enable_page_index(false)
                 .with_bloom_filter_on_read(false),
         )
+    }
+
+    fn fixed_width_in_list_predicate() -> Arc<dyn PhysicalExpr> {
+        Arc::new(InListExpr::new(
+            Arc::new(Column::new("price", 0)),
+            vec![Arc::new(Literal::new(
+                datafusion::common::ScalarValue::Int64(Some(42)),
+            ))],
+            false,
+            None,
+        ))
     }
 
     fn file_meta(partitioned: &PartitionedFile) -> FileMeta {
@@ -1437,6 +1817,7 @@ mod tests {
             marked_plan(planning_config(&expected)),
             &expected_snapshot,
             &foreign_opener,
+            None,
         )
         .expect_err("foreign snapshot opener must fail during binding");
         assert!(error.to_string().contains("another snapshot"));
@@ -1927,5 +2308,108 @@ mod tests {
         let error = reader_error(factory, 0, file_meta(partitioned));
         assert!(error.contains("execution lease has expired"));
         assert_eq!(requests.lock().expect("request log lock").len(), 1);
+    }
+
+    #[test]
+    fn streaming_output_admission_accepts_only_bounded_plan_subset() {
+        let fixed = fixed_width_table(0, 1, 7, &[10]);
+        let (opener, _) = recording_opener(std::slice::from_ref(&fixed));
+        let bound = bind_persisted_snapshot_plan(
+            marked_plan(planning_config(&fixed)),
+            std::slice::from_ref(&fixed),
+            &opener,
+        )
+        .expect("bind one fixed-width persisted scan");
+        let admission = bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect("profile one fixed-width streaming scan");
+        assert_eq!(admission.batch_size().get(), 4096);
+        assert_eq!(admission.scan_column_count().get(), 2);
+
+        let variable = table(0, 2, 7, &[20]);
+        let (variable_opener, _) = recording_opener(std::slice::from_ref(&variable));
+        let variable_bound = bind_persisted_snapshot_plan(
+            marked_plan(planning_config(&variable)),
+            std::slice::from_ref(&variable),
+            &variable_opener,
+        )
+        .expect("binding remains independent from output admission");
+        let error = variable_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("variable-width scan must fail closed before reader creation");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let union_plan: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(vec![
+            marked_plan(planning_config(&fixed)),
+            marked_plan(planning_config(&fixed)),
+        ]));
+        let union_bound =
+            bind_persisted_snapshot_plan(union_plan, std::slice::from_ref(&fixed), &opener)
+                .expect("bind both self-scan markers before output validation");
+        let error = union_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("multi-scan union must remain outside the streaming subset");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let coalesce_plan: Arc<dyn ExecutionPlan> = Arc::new(CoalesceBatchesExec::new(
+            marked_plan(planning_config(&fixed)),
+            4096,
+        ));
+        let coalesce_bound =
+            bind_persisted_snapshot_plan(coalesce_plan, std::slice::from_ref(&fixed), &opener)
+                .expect("bind scan before coalesce output validation");
+        let error = coalesce_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("unbounded tiny-batch coalescing must fail closed");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let in_list_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(
+                fixed_width_in_list_predicate(),
+                marked_plan(planning_config(&fixed)),
+            )
+            .expect("build fixed-width IN-list filter"),
+        );
+        let in_list_bound =
+            bind_persisted_snapshot_plan(in_list_plan, std::slice::from_ref(&fixed), &opener)
+                .expect("bind scan before filter-expression output validation");
+        let error = in_list_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("fixed-width IN list has separately unaccounted runtime state");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
+
+        let pushed_predicate_scan: Arc<dyn ExecutionPlan> = Arc::new(
+            ParquetExec::builder(planning_config(&fixed))
+                .with_predicate(fixed_width_in_list_predicate())
+                .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY))
+                .build()
+                .with_enable_page_index(false)
+                .with_bloom_filter_on_read(false),
+        );
+        let pushed_predicate_bound = bind_persisted_snapshot_plan(
+            pushed_predicate_scan,
+            std::slice::from_ref(&fixed),
+            &opener,
+        )
+        .expect("bind scan before pushed-predicate output validation");
+        let error = pushed_predicate_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
+            .expect_err("pushed fixed-width IN list cannot bypass expression admission");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
     }
 }

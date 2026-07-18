@@ -13,22 +13,39 @@ use datafusion::datasource::physical_plan::parquet::ParquetExec;
 use datafusion::datasource::source_as_provider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec, SymmetricHashJoinExec,
+};
+use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::partial_sort::PartialSortExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::parser::{DFParser, Statement as DataFusionStatement};
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, Distinct, Expr as SqlExpr, FunctionArgumentClause, FunctionArguments,
     GroupByExpr, Ident, JoinConstraint, JoinOperator, Query as SqlQuery, SelectItem, SetExpr,
-    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, Visitor,
+    Statement as SqlStatement, TableFactor, Value as SqlValue, Visit, Visitor, WindowType,
 };
 use sha2::{Digest, Sha256};
 
-use crate::persisted_plan::{bind_persisted_snapshot_plan, is_exact_planning_parquet};
+use crate::active_plan::{ActiveSegmentExec, PersistedAndActiveExec};
+use crate::persisted_plan::{
+    bind_persisted_snapshot_plan, is_exact_planning_active, is_exact_planning_parquet,
+};
 use crate::{
-    BoundPersistedPlan, PersistedFileOpener, PersistedSnapshotDescription,
+    ActiveSegmentOpener, BoundPersistedPlan, PersistedFileOpener, PersistedSnapshotDescription,
     PersistedTableDescription, QuerySessionPolicy, ZippyTableProvider,
 };
 
-const PROFILE_FORMAT_VERSION: u32 = 8;
+const PROFILE_FORMAT_VERSION: u32 = 10;
 const PREFLIGHT_FIXED_TRANSIENT_BYTES: u64 = 2 * 1024 * 1024;
 const PREFLIGHT_BYTES_PER_SQL_BYTE: u64 = 1024;
 const PREFLIGHT_BYTES_PER_BINDING: u64 = 64 * 1024;
@@ -238,6 +255,130 @@ pub struct PersistedPlanProfile {
     retained_plan_bytes: NonZeroU64,
 }
 
+/// Stable, allocation-free metrics for one prepared persisted physical plan.
+///
+/// The metric names emitted by [`Self::visit_stable_metrics`] are part of the Phase 5 query
+/// profile contract. They describe the admitted plan without retaining DataFusion plan objects or
+/// exposing version-specific operator internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedPlanMetrics {
+    profile_format_version: u32,
+    sql_bytes: usize,
+    binding_count: usize,
+    expanded_input_count: usize,
+    max_plan_schema_bytes: u64,
+    logical_node_count: usize,
+    expression_node_count: usize,
+    physical_node_count: usize,
+    relation_occurrence_count: usize,
+    planning_scan_count: usize,
+    planning_active_scan_count: usize,
+    build_peak_bytes: NonZeroU64,
+    retained_plan_bytes: NonZeroU64,
+    operators: PhysicalOperatorCounts,
+}
+
+impl PersistedPlanMetrics {
+    /// Visits every stable metric as a bounded name/value pair without allocating a map.
+    ///
+    /// Names use the `plan.*` and `operator.*.count` namespaces. Counts that cannot fit `u64` on
+    /// an exotic platform are saturated instead of wrapping.
+    pub fn visit_stable_metrics(self, mut visit: impl FnMut(&'static str, u64)) {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        visit(
+            "plan.profile_format_version",
+            u64::from(self.profile_format_version),
+        );
+        visit("plan.sql_bytes", count(self.sql_bytes));
+        visit("plan.bindings", count(self.binding_count));
+        visit("plan.expanded_inputs", count(self.expanded_input_count));
+        visit("plan.max_schema_bytes", self.max_plan_schema_bytes);
+        visit("plan.logical_nodes", count(self.logical_node_count));
+        visit("plan.expression_nodes", count(self.expression_node_count));
+        visit("plan.physical_nodes", count(self.physical_node_count));
+        visit(
+            "plan.relation_occurrences",
+            count(self.relation_occurrence_count),
+        );
+        visit("plan.persisted_scans", count(self.planning_scan_count));
+        visit("plan.active_scans", count(self.planning_active_scan_count));
+        visit("plan.build_peak_bytes", self.build_peak_bytes.get());
+        visit("plan.retained_bytes", self.retained_plan_bytes.get());
+        self.operators.visit_stable_metrics(visit);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PhysicalOperatorCounts {
+    scan: usize,
+    filter: usize,
+    projection: usize,
+    sort: usize,
+    aggregate: usize,
+    join: usize,
+    window: usize,
+    limit: usize,
+    union: usize,
+    exchange: usize,
+    other: usize,
+}
+
+impl PhysicalOperatorCounts {
+    fn record(&mut self, operator: &Arc<dyn ExecutionPlan>) -> Result<()> {
+        let kind = operator.as_any();
+        let counter = if kind.is::<ParquetExec>() || kind.is::<ActiveSegmentExec>() {
+            &mut self.scan
+        } else if kind.is::<FilterExec>() {
+            &mut self.filter
+        } else if kind.is::<ProjectionExec>() {
+            &mut self.projection
+        } else if kind.is::<SortExec>()
+            || kind.is::<PartialSortExec>()
+            || kind.is::<SortPreservingMergeExec>()
+        {
+            &mut self.sort
+        } else if kind.is::<AggregateExec>() {
+            &mut self.aggregate
+        } else if kind.is::<CrossJoinExec>()
+            || kind.is::<HashJoinExec>()
+            || kind.is::<NestedLoopJoinExec>()
+            || kind.is::<SortMergeJoinExec>()
+            || kind.is::<SymmetricHashJoinExec>()
+        {
+            &mut self.join
+        } else if kind.is::<BoundedWindowAggExec>() || kind.is::<WindowAggExec>() {
+            &mut self.window
+        } else if kind.is::<GlobalLimitExec>() || kind.is::<LocalLimitExec>() {
+            &mut self.limit
+        } else if kind.is::<UnionExec>() || kind.is::<PersistedAndActiveExec>() {
+            &mut self.union
+        } else if kind.is::<RepartitionExec>() || kind.is::<CoalescePartitionsExec>() {
+            &mut self.exchange
+        } else {
+            &mut self.other
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or_else(|| exhausted("physical operator metric count overflowed usize"))?;
+        Ok(())
+    }
+
+    fn visit_stable_metrics(self, mut visit: impl FnMut(&'static str, u64)) {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        visit("operator.scan.count", count(self.scan));
+        visit("operator.filter.count", count(self.filter));
+        visit("operator.projection.count", count(self.projection));
+        visit("operator.sort.count", count(self.sort));
+        visit("operator.aggregate.count", count(self.aggregate));
+        visit("operator.join.count", count(self.join));
+        visit("operator.window.count", count(self.window));
+        visit("operator.limit.count", count(self.limit));
+        visit("operator.union.count", count(self.union));
+        visit("operator.exchange.count", count(self.exchange));
+        visit("operator.other.count", count(self.other));
+    }
+}
+
 /// Stable server-facing classification of a persisted-plan failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistedPlanErrorClass {
@@ -317,6 +458,8 @@ pub struct PreparedPersistedPlan {
     expression_node_count: usize,
     physical_node_count: usize,
     planning_scan_count: usize,
+    planning_active_scan_count: usize,
+    operator_counts: PhysicalOperatorCounts,
 }
 
 impl fmt::Debug for PreparedPersistedPlan {
@@ -328,6 +471,11 @@ impl fmt::Debug for PreparedPersistedPlan {
             .field("expression_node_count", &self.expression_node_count)
             .field("physical_node_count", &self.physical_node_count)
             .field("planning_scan_count", &self.planning_scan_count)
+            .field(
+                "planning_active_scan_count",
+                &self.planning_active_scan_count,
+            )
+            .field("operator_counts", &self.operator_counts)
             .finish_non_exhaustive()
     }
 }
@@ -339,6 +487,27 @@ impl PreparedPersistedPlan {
         self.profile
     }
 
+    /// Returns the immutable, stable plan and physical-operator metric profile.
+    #[must_use]
+    pub fn metrics(&self) -> PersistedPlanMetrics {
+        PersistedPlanMetrics {
+            profile_format_version: self.profile.format_version,
+            sql_bytes: self.profile.sql_bytes,
+            binding_count: self.profile.binding_count,
+            expanded_input_count: self.profile.expanded_file_count,
+            max_plan_schema_bytes: self.profile.max_plan_schema_bytes,
+            logical_node_count: self.logical_node_count,
+            expression_node_count: self.expression_node_count,
+            physical_node_count: self.physical_node_count,
+            relation_occurrence_count: self.referenced_table_indices.len(),
+            planning_scan_count: self.planning_scan_count,
+            planning_active_scan_count: self.planning_active_scan_count,
+            build_peak_bytes: self.profile.build_peak_bytes,
+            retained_plan_bytes: self.profile.retained_plan_bytes,
+            operators: self.operator_counts,
+        }
+    }
+
     /// Returns the number of pre-optimization persisted relation occurrences.
     #[must_use]
     pub fn relation_occurrence_count(&self) -> usize {
@@ -347,7 +516,21 @@ impl PreparedPersistedPlan {
 
     /// Consumes the planning-only plan and binds every remaining persisted scan to one opener.
     pub fn bind(self, opener: &Arc<dyn PersistedFileOpener>) -> Result<BoundPersistedPlan> {
-        bind_persisted_snapshot_plan(self.plan, &self.expected_snapshot, opener)
+        bind_persisted_snapshot_plan(self.plan, &self.expected_snapshot, opener, None)
+    }
+
+    /// Consumes the planning-only plan and binds persisted and active scan capabilities.
+    pub fn bind_with_active(
+        self,
+        opener: &Arc<dyn PersistedFileOpener>,
+        active_opener: &Arc<dyn ActiveSegmentOpener>,
+    ) -> Result<BoundPersistedPlan> {
+        bind_persisted_snapshot_plan(
+            self.plan,
+            &self.expected_snapshot,
+            opener,
+            Some(active_opener),
+        )
     }
 }
 
@@ -380,9 +563,17 @@ pub fn profile_persisted_plan(
         .relation_occurrence_count
         .checked_sub(bindings.len())
         .ok_or_else(|| plan_error("SQL relation count is below the admitted binding count"))?;
+    let max_inputs_per_table = snapshot
+        .max_files_per_table()
+        .checked_add(snapshot.max_active_segments_per_table())
+        .ok_or_else(|| exhausted("maximum per-table input count overflowed usize"))?;
+    let base_input_count = snapshot
+        .total_file_count()
+        .checked_add(snapshot.total_active_segment_count())
+        .ok_or_else(|| exhausted("snapshot input count overflowed usize"))?;
     let expanded_file_count = extra_occurrences
-        .checked_mul(snapshot.max_files_per_table())
-        .and_then(|extra| snapshot.total_file_count().checked_add(extra))
+        .checked_mul(max_inputs_per_table)
+        .and_then(|extra| base_input_count.checked_add(extra))
         .ok_or_else(|| exhausted("expanded persisted file count overflowed usize"))?;
     let expanded_input_schema_bytes = u64::try_from(extra_occurrences)
         .ok()
@@ -503,8 +694,7 @@ pub async fn prepare_persisted_plan(
         .query_planner()
         .create_physical_plan(&optimized, &state)
         .await?;
-    let (physical_node_count, planning_scan_count) =
-        validate_physical_plan(&plan, admitted.limits)?;
+    let physical = validate_physical_plan(&plan, admitted.limits)?;
     drop(state);
     drop(context);
 
@@ -517,8 +707,10 @@ pub async fn prepare_persisted_plan(
         expression_node_count: logical_stats
             .expression_node_count
             .max(optimized_stats.expression_node_count),
-        physical_node_count,
-        planning_scan_count,
+        physical_node_count: physical.node_count,
+        planning_scan_count: physical.planning_scan_count,
+        planning_active_scan_count: physical.planning_active_scan_count,
+        operator_counts: physical.operators,
     })
 }
 
@@ -642,9 +834,11 @@ fn is_allowed_logical_node(plan: &LogicalPlan) -> bool {
 fn validate_physical_plan(
     plan: &Arc<dyn ExecutionPlan>,
     limits: PersistedPlanLimits,
-) -> Result<(usize, usize)> {
+) -> Result<PhysicalPlanStats> {
     let mut node_count = 0_usize;
     let mut planning_scan_count = 0_usize;
+    let mut planning_active_scan_count = 0_usize;
+    let mut operators = PhysicalOperatorCounts::default();
     plan.apply(|node| {
         node_count =
             checked_increment(node_count, limits.max_physical_nodes, "physical plan nodes")?;
@@ -657,10 +851,32 @@ fn validate_physical_plan(
             planning_scan_count = planning_scan_count
                 .checked_add(1)
                 .ok_or_else(|| exhausted("planning Parquet scan count overflowed usize"))?;
+        } else if let Some(active) = node.as_any().downcast_ref::<ActiveSegmentExec>() {
+            if !is_exact_planning_active(active) {
+                return Err(plan_error(
+                    "prepared persisted plan contains an already-bound active segment scan",
+                ));
+            }
+            planning_active_scan_count = planning_active_scan_count
+                .checked_add(1)
+                .ok_or_else(|| exhausted("planning active scan count overflowed usize"))?;
         }
+        operators.record(node)?;
         Ok(TreeNodeRecursion::Continue)
     })?;
-    Ok((node_count, planning_scan_count))
+    Ok(PhysicalPlanStats {
+        node_count,
+        planning_scan_count,
+        planning_active_scan_count,
+        operators,
+    })
+}
+
+struct PhysicalPlanStats {
+    node_count: usize,
+    planning_scan_count: usize,
+    planning_active_scan_count: usize,
+    operators: PhysicalOperatorCounts,
 }
 
 fn register_bindings(
@@ -832,10 +1048,20 @@ impl SqlPreflightVisitor {
             || query.with.is_some()
             || query.fetch.is_some()
             || !query.limit_by.is_empty()
-            || query.order_by.is_some()
         {
             return Err(plan_error(
-                "persisted SQL query contains unsupported CTE, ordering, or control clauses",
+                "persisted SQL query contains unsupported CTE or control clauses",
+            ));
+        }
+        if query.order_by.as_ref().is_some_and(|order_by| {
+            order_by.interpolate.is_some()
+                || order_by
+                    .exprs
+                    .iter()
+                    .any(|expression| expression.with_fill.is_some())
+        }) {
+            return Err(plan_error(
+                "persisted SQL ORDER BY interpolation and fill clauses are unsupported",
             ));
         }
         let subquery_expansion =
@@ -958,11 +1184,6 @@ impl SqlPreflightVisitor {
             ));
         }
         if let SqlExpr::Function(function) = expression {
-            if function.over.is_some() {
-                return Err(plan_error(
-                    "persisted SQL WINDOW expressions are unsupported because physical ordering expansion is not pre-admissible",
-                ));
-            }
             if function
                 .name
                 .0
@@ -987,16 +1208,63 @@ impl SqlPreflightVisitor {
                     "persisted SQL ordered aggregate expressions are unsupported because physical ordering expansion is not pre-admissible",
                 ));
             }
-            let is_bounded_aggregate = function.name.0.len() == 1
-                && function.name.0.last().is_some_and(|identifier| {
+            let function_name = function
+                .name
+                .0
+                .last()
+                .filter(|_| function.name.0.len() == 1)
+                .map(|identifier| identifier.value.as_str());
+            if let Some(window) = &function.over {
+                match window {
+                    WindowType::WindowSpec(spec)
+                        if spec.window_name.is_none()
+                            && spec
+                                .order_by
+                                .iter()
+                                .all(|expression| expression.with_fill.is_none()) => {}
+                    WindowType::WindowSpec(_) => {
+                        return Err(plan_error(
+                            "persisted SQL WINDOW inheritance and fill clauses are unsupported",
+                        ));
+                    }
+                    WindowType::NamedWindow(_) => {
+                        return Err(plan_error(
+                            "persisted SQL named WINDOW references are unsupported",
+                        ));
+                    }
+                }
+                let is_bounded_window = function_name.is_some_and(|identifier| {
+                    [
+                        "row_number",
+                        "rank",
+                        "dense_rank",
+                        "lag",
+                        "lead",
+                        "count",
+                        "min",
+                        "max",
+                        "sum",
+                        "avg",
+                    ]
+                    .iter()
+                    .any(|name| identifier.eq_ignore_ascii_case(name))
+                });
+                if !is_bounded_window {
+                    return Err(plan_error(
+                        "persisted SQL function is outside the bounded window allowlist",
+                    ));
+                }
+            } else {
+                let is_bounded_aggregate = function_name.is_some_and(|identifier| {
                     ["count", "min", "max", "sum", "avg"]
                         .iter()
-                        .any(|name| identifier.value.eq_ignore_ascii_case(name))
+                        .any(|name| identifier.eq_ignore_ascii_case(name))
                 });
-            if !is_bounded_aggregate {
-                return Err(plan_error(
-                    "persisted SQL function is outside the bounded aggregate allowlist",
-                ));
+                if !is_bounded_aggregate {
+                    return Err(plan_error(
+                        "persisted SQL function is outside the bounded aggregate allowlist",
+                    ));
+                }
             }
         }
         self.expression_node_count = checked_increment(
@@ -1623,6 +1891,26 @@ mod tests {
         prepare_validated_persisted_plan(policy, sql, bindings, &snapshot, admitted).await
     }
 
+    async fn assert_sql_output_admitted(
+        sql: &str,
+        bindings: &[PersistedTableBinding],
+        tables: &[PersistedTableDescription],
+    ) {
+        let profile = profile_persisted_plan(sql, bindings, tables, limits())
+            .expect("profile bounded analytical SQL");
+        let prepared = prepare_persisted_plan(policy(), sql, bindings, tables, profile)
+            .await
+            .expect("prepare bounded analytical SQL");
+        let opener: Arc<dyn PersistedFileOpener> = Arc::new(RejectingOpener {
+            snapshot: PersistedSnapshotDescription::try_new(tables.to_vec())
+                .expect("build analytical output snapshot"),
+        });
+        let bound = prepared.bind(&opener).expect("bind analytical output plan");
+        bound
+            .streaming_output_admission(NonZeroUsize::new(1024).unwrap())
+            .expect("admit bounded analytical output plan");
+    }
+
     #[tokio::test]
     async fn qualified_self_join_retains_preoptimization_relations_and_consumes_into_binding() {
         let tables = vec![table(0, 1, 1)];
@@ -1746,7 +2034,7 @@ mod tests {
 
     #[tokio::test]
     async fn constant_function_outputs_fail_before_optimizer_materialization() {
-        let tables = vec![table(0, 1, 0)];
+        let tables = vec![table(0, 1, 1)];
         let bindings = vec![binding("ticks", 0)];
         for sql in [
             "select repeat('x', 1000000000) from ticks",
@@ -1770,20 +2058,40 @@ mod tests {
         ] {
             let profile = profile_persisted_plan(sql, &bindings, &tables, limits())
                 .expect("profile bounded aggregate function");
-            prepare_persisted_plan(policy(), sql, &bindings, &tables, profile)
+            let prepared = prepare_persisted_plan(policy(), sql, &bindings, &tables, profile)
                 .await
                 .expect("prepare bounded aggregate function");
+            let mut metrics = Vec::new();
+            prepared
+                .metrics()
+                .visit_stable_metrics(|name, value| metrics.push((name, value)));
+            assert!(
+                metrics
+                    .iter()
+                    .any(|(name, _)| *name == "operator.aggregate.count"),
+                "unexpected aggregate plan metrics: {metrics:?}"
+            );
+            assert!(metrics
+                .iter()
+                .any(|(name, value)| *name == "plan.physical_nodes" && *value >= 1));
         }
     }
 
-    #[test]
-    fn all_window_forms_fail_closed() {
+    #[tokio::test]
+    async fn bounded_inline_windows_are_admitted_and_named_or_unknown_forms_fail_closed() {
         let tables = vec![table(0, 1, 1)];
         let bindings = vec![binding("ticks", 0)];
-        let inline_sql = "select row_number() over (order by price) from ticks";
-        let inline_error = profile_persisted_plan(inline_sql, &bindings, &tables, limits())
-            .expect_err("inline WINDOW must fail before DataFusion planning");
-        assert!(inline_error.to_string().contains("WINDOW expressions"));
+        for inline_sql in [
+            "select row_number() over (order by price) from ticks",
+            "select sum(price) over (order by price rows unbounded preceding) from ticks",
+            "select lag(price) over (order by price) from ticks",
+        ] {
+            let profile = profile_persisted_plan(inline_sql, &bindings, &tables, limits())
+                .expect("profile bounded inline window");
+            prepare_persisted_plan(policy(), inline_sql, &bindings, &tables, profile)
+                .await
+                .expect("prepare bounded inline window");
+        }
 
         let named_sql = concat!(
             "select row_number() over w as row_number from ticks ",
@@ -1792,6 +2100,15 @@ mod tests {
         let error = profile_persisted_plan(named_sql, &bindings, &tables, limits())
             .expect_err("named WINDOW must fail before DataFusion planning");
         assert!(error.to_string().contains("unsupported semantic clause"));
+
+        let unknown = profile_persisted_plan(
+            "select ntile(4) over (order by price) from ticks",
+            &bindings,
+            &tables,
+            limits(),
+        )
+        .expect_err("unknown window function must fail before DataFusion planning");
+        assert!(unknown.to_string().contains("bounded window allowlist"));
 
         for sql in [
             "select array_agg(price order by symbol) from ticks",
@@ -1806,6 +2123,41 @@ mod tests {
                 "unexpected ordered aggregate error for SQL [{sql}]: {ordered_error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fixed_width_sort_aggregate_join_and_window_reach_output_admission() {
+        let fixed_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let one = vec![table_with_schema(0, 1, 1, Arc::clone(&fixed_schema))];
+        let one_binding = vec![binding("ticks", 0)];
+        for sql in [
+            "select key, value from ticks order by value desc limit 10",
+            "select key, sum(value) as total from ticks group by key order by total",
+            concat!(
+                "select key, row_number() over (partition by key order by value) as row_no ",
+                "from ticks order by key, row_no"
+            ),
+        ] {
+            assert_sql_output_admitted(sql, &one_binding, &one).await;
+        }
+
+        let joined = vec![
+            table_with_schema(0, 1, 1, Arc::clone(&fixed_schema)),
+            table_with_schema(1, 2, 1, fixed_schema),
+        ];
+        let joined_bindings = vec![binding("ticks", 0), binding("quotes", 1)];
+        assert_sql_output_admitted(
+            concat!(
+                "select ticks.key, ticks.value, quotes.value as quote_value ",
+                "from ticks join quotes on ticks.key = quotes.key"
+            ),
+            &joined_bindings,
+            &joined,
+        )
+        .await;
     }
 
     #[test]
@@ -2117,7 +2469,6 @@ mod tests {
             "select price from ticks qualify row_number() over () = 1",
             "select price from ticks cluster by symbol",
             "select price from ticks sort by symbol",
-            "select price from ticks order by price",
             "select distinct on (symbol) symbol, price from ticks",
             "with quoted as (select price from ticks) select price from quoted",
             concat!(
@@ -2131,6 +2482,14 @@ mod tests {
                 "SQL must be rejected: {sql}"
             );
         }
+
+        profile_persisted_plan(
+            "select price from ticks order by price desc nulls last",
+            &bindings,
+            &tables,
+            limits(),
+        )
+        .expect("ordinary ORDER BY remains inside the bounded sort profile");
 
         for sql in [
             "select count(*) from ticks group by cube(price, symbol)",

@@ -85,8 +85,42 @@ parses metadata. A rejected growth leaves every ledger unchanged. Page indexes a
 remain disabled, which bounds this charge to the retained footer model while preserving row-group
 statistics pruning.
 
-This boundary does not yet expose a public native result stream. Decoded Arrow batches, execution
-operator arenas, result delivery, the global DataFusion memory pool, spill, and temporary-disk quota
-still require separate admission before native execution can replace the legacy query engine. The
-footer multiplier covers valid Zippy-managed Parquet files; treating arbitrary hostile local files
-as input would additionally require a bounded Thrift decoder or process/allocator isolation.
+The server now has an internal pull-based native persisted result stream. Each execution reserves a
+QueryService `OperatorArena` permit covering the configured pool plus execution-context overhead,
+and constructs it under an additional transient build allowance. DataFusion runs with a
+`GreedyMemoryPool` exactly matching the configured operator pool; spill is disabled, so an operator
+that exceeds the admitted pool fails instead of writing to an uncontrolled directory. The server
+also retains an execution-driver task permit whose CPU slots equal the session's target partition
+count. Every returned Arrow batch receives its own conservative array, schema,
+and control-memory permit and keeps that permit until the downstream owner drops the batch.
+Reaching EOF first drops
+the DataFusion stream and operator arena, then marks execution complete; the query becomes
+`Finished` only after already-delivered batches drain. Dropping the stream publishes cancellation
+before releasing execution resources.
+
+Decoded-output admission remains fail closed. Session batch size is explicitly 8192 rows and
+DataFusion batch coalescing is disabled. Before any reader can be opened, every physical node and
+intermediate schema must fit the fixed-width allowlist. Direct/computed fixed-width projection,
+primitive predicates, limit/slice, sort, aggregate, join, union and window are admitted; variable
+width intermediates, unknown UDF/expression nodes, `CoalesceBatchesExec`, or unknown physical
+operators return `UNSUPPORTED_PLAN`. Both exact `FilterExec` and Parquet's pushed predicate are
+checked.
+
+The blocking file open parses Parquet metadata once under the existing footer reservation,
+validates the footer row count against the Catalog, then atomically grows the same file task to
+cover twice the largest row group's declared uncompressed size, fixed decoder overhead, and every
+simultaneously live fixed-width Arrow/expression batch in the accepted pipeline. The cached metadata
+is returned to DataFusion only after that growth succeeds. Compressed page ranges keep their exact
+independent result permits, and a produced batch still receives its downstream result permit for
+the caller-owned lifetime. This deliberately double-counts the handoff interval instead of leaving
+an allocation gap.
+
+The result stream is exposed through a non-cloneable public `QueryResultBatch` whose opaque owner
+retains the exact QueryService result permit. All executions share one process-wide DataFusion pool
+and each query has a child limit with peak/rejection counters. Snapshot-bound active segments use a
+weak server opener and can join the same fixed-width plan when their publication carries exact
+logical-offset provenance. Gateway applies one-batch-at-a-time transport backpressure and cancels
+the stream on peer disconnect. Quota-enforced spill/temp storage is not installed: the disk manager
+is disabled and over-budget complex operators return `RESOURCE_EXHAUSTED`. The footer and row-group
+envelopes cover valid Zippy-managed Parquet files; treating arbitrary hostile local files as input
+would additionally require a bounded Thrift/page decoder or process/allocator isolation.

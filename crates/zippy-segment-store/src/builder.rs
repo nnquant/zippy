@@ -106,6 +106,26 @@ impl ActiveSegmentWriter {
         )
     }
 
+    /// 构造带生产者 fencing 信息的 runtime active segment writer。
+    pub fn new_for_runtime_with_epoch(
+        schema: CompiledSchema,
+        layout: LayoutPlan,
+        segment_id: u64,
+        generation: u64,
+        writer_epoch: u64,
+        descriptor_generation: u64,
+    ) -> Result<Self, &'static str> {
+        Self::new_with_origin_for_test(
+            schema,
+            layout,
+            segment_id,
+            generation,
+            writer_epoch,
+            descriptor_generation,
+            format!("segment-{segment_id}-generation-{generation}-epoch-{writer_epoch}"),
+        )
+    }
+
     /// 构造指定 segment 标识的最小 active segment writer。
     pub fn new_with_ids_for_test(
         schema: CompiledSchema,

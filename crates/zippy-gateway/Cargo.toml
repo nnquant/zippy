@@ -14,6 +14,7 @@ tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-engines = { path = "../zippy-engines" }
 zippy-segment-store = { path = "../zippy-segment-store" }
+zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
 zippy-master = { path = "../zippy-master" }

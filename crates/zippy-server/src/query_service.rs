@@ -296,6 +296,7 @@ pub(crate) struct QueryRuntimeStatus {
     pub active_result_permits: usize,
     pub active_result_memory_bytes: u64,
     pub active_memory_bytes: u64,
+    pub execution_complete: bool,
     pub cancellation_requested: bool,
     pub finished_at_ns: Option<u64>,
     pub error: Option<ServerError>,
@@ -1966,6 +1967,13 @@ impl CoordinatorInner {
                     .with_query_id(control.query_id),
             );
         }
+        if query.execution_complete {
+            return Err(ServerError::new(
+                ErrorCode::Conflict,
+                "query execution is complete and cannot admit another task",
+            )
+            .with_query_id(control.query_id));
+        }
         if global.lifecycle != QueryServiceLifecycle::Accepting {
             return Err(unavailable(control.query_id));
         }
@@ -1984,7 +1992,19 @@ impl CoordinatorInner {
         {
             return Err(exhausted(
                 control.query_id,
-                "per-query task resources are exhausted",
+                format!(
+                    concat!(
+                        "per-query task resources are exhausted ",
+                        "tasks_after=[{}] tasks_limit=[{}] cpu_after=[{}] cpu_limit=[{}] ",
+                        "memory_after=[{}] memory_limit=[{}]"
+                    ),
+                    query.active_tasks.saturating_add(1),
+                    control.budget.max_active_tasks,
+                    query_cpu_after.unwrap_or(u32::MAX),
+                    control.budget.max_cpu_slots,
+                    query_memory_after.unwrap_or(u64::MAX),
+                    control.budget.max_memory_bytes,
+                ),
             ));
         }
         let global_cpu_after = global.active_cpu_slots.checked_add(cpu_slots);
@@ -1999,7 +2019,19 @@ impl CoordinatorInner {
         {
             return Err(exhausted(
                 control.query_id,
-                "global task resources are exhausted",
+                format!(
+                    concat!(
+                        "global task resources are exhausted ",
+                        "tasks_after=[{}] tasks_limit=[{}] cpu_after=[{}] cpu_limit=[{}] ",
+                        "memory_after=[{}] memory_limit=[{}]"
+                    ),
+                    global.active_tasks.saturating_add(1),
+                    self.config.max_active_tasks,
+                    global_cpu_after.unwrap_or(u32::MAX),
+                    self.config.max_cpu_slots,
+                    global_memory_after.unwrap_or(u64::MAX),
+                    self.config.max_memory_bytes,
+                ),
             ));
         }
 
@@ -2166,6 +2198,13 @@ impl CoordinatorInner {
                 ServerError::new(ErrorCode::Conflict, "query is not running")
                     .with_query_id(control.query_id),
             );
+        }
+        if query.execution_complete {
+            return Err(ServerError::new(
+                ErrorCode::Conflict,
+                "query execution is complete and cannot deliver another result",
+            )
+            .with_query_id(control.query_id));
         }
         if global.lifecycle != QueryServiceLifecycle::Accepting {
             return Err(unavailable(control.query_id));
@@ -2612,11 +2651,29 @@ impl CoordinatorInner {
         debug_assert!(session.active_result_permits > 0);
         session.active_result_permits -= 1;
         session.active_result_memory_bytes -= memory_bytes;
+        let signal = if query.execution_complete
+            && query.state == QueryState::Running
+            && query.active_tasks == 0
+            && query.active_retained_permits == 0
+            && query.active_result_permits == 0
+        {
+            Self::terminate_locked(
+                &mut global,
+                control,
+                &mut query,
+                QueryState::Finished,
+                None,
+                now_ns(),
+            )
+        } else {
+            None
+        };
         let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
         global.remove_idle_session(control.owner_session_id);
         global.refresh_shutdown();
         drop(query);
         drop(global);
+        control.publish_terminal(signal);
         release_snapshot_root(snapshot_root);
     }
 
@@ -2636,16 +2693,10 @@ impl CoordinatorInner {
                     .with_query_id(control.query_id)
             }));
         }
-        if query.active_tasks != 0
-            || query.active_retained_permits != 0
-            || query.active_result_permits != 0
-        {
+        if query.active_tasks != 0 || query.active_retained_permits != 0 {
             return Err(ServerError::new(
                 ErrorCode::Conflict,
-                concat!(
-                    "query cannot finish while physical tasks, retained resources, or result ",
-                    "delivery remain active"
-                ),
+                "query cannot finish while physical tasks or retained resources remain active",
             )
             .with_query_id(control.query_id));
         }
@@ -2655,14 +2706,26 @@ impl CoordinatorInner {
                     .with_query_id(control.query_id),
             );
         }
-        let signal = Self::terminate_locked(
-            &mut global,
-            control,
-            &mut query,
-            QueryState::Finished,
-            None,
-            now_ns(),
-        );
+        if query.execution_complete {
+            return Err(ServerError::new(
+                ErrorCode::Conflict,
+                "query execution is already complete",
+            )
+            .with_query_id(control.query_id));
+        }
+        query.execution_complete = true;
+        let signal = if query.active_result_permits == 0 {
+            Self::terminate_locked(
+                &mut global,
+                control,
+                &mut query,
+                QueryState::Finished,
+                None,
+                now_ns(),
+            )
+        } else {
+            None
+        };
         let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
         drop(query);
         drop(global);
@@ -2942,6 +3005,7 @@ impl CoordinatorInner {
                 .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes))
                 .and_then(|memory| memory.checked_add(query.active_result_memory_bytes))
                 .expect("query memory accounting remains within configured budget"),
+            execution_complete: query.execution_complete,
             cancellation_requested: control.cancelled.load(Ordering::Acquire),
             finished_at_ns: query.finished_at_ns,
             error: query.error.clone(),
@@ -3024,6 +3088,7 @@ struct QueryControlState {
     active_retained_memory_bytes: u64,
     active_result_permits: usize,
     active_result_memory_bytes: u64,
+    execution_complete: bool,
     finished_at_ns: Option<u64>,
     retention_scheduled: bool,
     error: Option<ServerError>,
@@ -3046,6 +3111,7 @@ impl Default for QueryControlState {
             active_retained_memory_bytes: 0,
             active_result_permits: 0,
             active_result_memory_bytes: 0,
+            execution_complete: false,
             finished_at_ns: None,
             retention_scheduled: false,
             error: None,
@@ -3650,14 +3716,12 @@ pub(crate) struct QueryTaskPermit<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> QueryTaskPermit<R> {
-    #[cfg(test)]
     pub(crate) fn resource(&self) -> &R {
         self.resource
             .as_ref()
             .expect("live task permit retains its physical resource")
     }
 
-    #[cfg(test)]
     pub(crate) fn resource_mut(&mut self) -> &mut R {
         self.resource
             .as_mut()
@@ -7193,7 +7257,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_rejects_outstanding_result_delivery_and_cancels_on_scope_drop() {
+    fn finish_waits_for_outstanding_result_delivery() {
         let coordinator = coordinator(config());
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
@@ -7209,19 +7273,42 @@ mod tests {
             .unwrap();
         let instance_id = token.instance_id();
         let execution = coordinator.begin_execution(token, 11).unwrap();
+        let control = Arc::clone(&execution.control);
+        let owner = control.owner.upgrade().expect("live execution coordinator");
         let result = execution.admit_result(result_charge(20), ()).unwrap();
 
-        let error = execution
-            .finish()
-            .expect_err("result delivery must drain before Finished");
-        assert_eq!(error.code(), ErrorCode::Conflict);
+        execution.finish().unwrap();
         let status = coordinator.admin_handle().status(instance_id).unwrap();
-        assert_eq!(status.state, QueryState::Cancelled);
-        assert!(status.cancellation_requested);
-        assert!(result.is_cancelled());
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(status.state, QueryState::Running);
+        assert!(status.logical_admitted);
+        assert!(status.execution_complete);
+        assert!(!status.cancellation_requested);
+        assert!(!result.is_cancelled());
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            owner
+                .reserve_task(&control, charge(1, 1))
+                .err()
+                .expect("completed execution rejects another task")
+                .code(),
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            owner
+                .reserve_result(&control, result_charge(1))
+                .err()
+                .expect("completed execution rejects another result")
+                .code(),
+            ErrorCode::Conflict
+        );
 
         drop(result);
+        let status = coordinator.admin_handle().status(instance_id).unwrap();
+        assert_eq!(status.state, QueryState::Finished);
+        assert!(!status.logical_admitted);
+        assert!(status.execution_complete);
+        assert!(!status.cancellation_requested);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_result_permits, 0);
         assert_eq!(coordinator.status().tracked_sessions, 0);
     }

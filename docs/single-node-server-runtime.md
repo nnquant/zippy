@@ -130,8 +130,24 @@ query/process count ceiling. Task-to-result and
 task-to-retained handoffs reclassify charges atomically; retained memory may only shrink from the
 task peak that covered its construction. A query cannot enter `Finished` until retained execution
 metadata and result delivery reservations are gone. This is usage accounting only; per-session
-quotas wait for a trusted connection/session authority. The native result permit is not yet attached
-to the public `RecordBatchStream`, so this does not make the native query frontend production-ready.
+quotas wait for a trusted connection/session authority. Native `RecordBatchStream` batches now carry
+their non-cloneable result permit through Gateway encoding and socket write; Gateway releases one
+batch before polling the next and additionally holds a bounded transport-byte reservation.
+Planning, transport admission, and every pending batch poll race the client connection, so disconnect
+drops the stream and releases query, operator, snapshot and active-segment ownership.
+An explicitly enabled `[query.canary]` now provides a Server-internal persisted-only execution
+entry point without weakening that boundary. It submits through the same QueryService, pins and
+projects one immutable native snapshot, prepares the bounded DataFusion plan, and consumes one
+accounted result batch at a time. The caller receives only a digest report, never a bare native
+batch. Row, batch, combined Arrow/canonical byte, operator, task, CPU, memory, cancellation, and
+deadline limits remain active through digest delivery. A fixed-memory multiset digest ignores
+batch and row scheduling while preserving schema and duplicate-row counts, so a legacy stream can
+build golden evidence incrementally. This first digest contract accepts flat scalar columns and
+rejects nested or encoded result types explicitly. Runtime health exposes canary admission and
+aggregate metrics. The separate `[query].native_enabled` gate now enables Gateway `query_sql` and
+`query_explain` only when native storage, SQLite shadow Catalog and Gateway are all ready. It remains
+disabled by default. See [`native-query-canary.md`](native-query-canary.md) and
+[`native-query-service.md`](native-query-service.md).
 Before any Catalog resolution or snapshot copy starts, native planning reserves one conservative
 peak from this ledger. It is the checked sum of Catalog table-resolution ownership, exact pinned
 snapshot ownership, and a bounded server coordination envelope. The initial exact-snapshot guardrail
@@ -163,8 +179,10 @@ The server verifies Catalog revision, query-wide table order and uniqueness, sel
 ownership and charge, file visibility, scan ordinals, versions, sizes, and duplicate identities
 before atomically shrinking the task into one `ProjectedSnapshotManifest` retained permit. The
 result contains no path, reader, pin, callback, or runtime capability. Physical-plan objects and
-execution/operator allocations are deliberately excluded and require separate `PhysicalPlan` and
-`OperatorArena` reservations in the next binding stage.
+execution/operator allocations are separately charged as `PhysicalPlan` and `OperatorArena`
+reservations. DataFusion operators also consume one process-wide memory pool with a query-scoped
+child limit. Disk spilling remains disabled; an over-budget operator returns
+`RESOURCE_EXHAUSTED` without creating an untracked temporary file.
 Physical executors now have one consuming `QueryExecutionScope::fail(error)` boundary: it records a
 `Running -> Failed` transition, preserves the original structured error, wakes cancellation waiters,
 and leaves task/retained/result reservations to drain through RAII. Concurrent cancellation,
@@ -242,6 +260,15 @@ max_files_per_comparison = 4096
 max_metadata_bytes_per_comparison = 8388608
 comparison_timeout_ms = 5000
 dedup_capacity = 1024
+
+[gateway]
+enabled = true
+endpoint = "0.0.0.0:17666"
+
+[query]
+# Explicit opt-in; requires all dependencies above.
+native_enabled = true
+operator_memory_bytes = 67108864
 ```
 
 The runtime snapshot pin limits bound process-local query lifetime state used to protect physical
@@ -271,16 +298,15 @@ cleanup actually completes. If the process cannot create the reaper because of O
 exhaustion, startup still returns on time and logs a detached-cleanup error; the original supervisor
 continues to retain the Catalog and data-root capability until it exits.
 
-This phase establishes process ownership, crash-safe publication, gated recovery, and the internal
-native table persistence state machine. The production runtime still uses the legacy metadata and
-Gateway authorities. Native staged persistence now probes the complete command before final
-publication, moves an affine publication permit into the Catalog actor, and takes an exclusive
-publication exclusion before rejected-candidate cleanup. Exact, conflicting, and missing historical
-replays therefore never publish final candidates. Snapshot leases, runtime pins, safe-GC claim,
-and bounded Gateway shadow comparison are now implemented internally. Public ingest wiring, exact
-legacy-manifest Server planning around the available V2 import primitive and its dedicated permanent
-replay table, a physical GC worker, QueryService integration, and the explicit authority cutover
-remain required before the native path becomes the production authority.
+The runtime now supports an explicit native query authority over the SQLite shadow Catalog after
+legacy metadata import has produced exact native table/snapshot identities. Native staged
+persistence probes the complete command before final publication, moves an affine publication permit
+into the Catalog actor, and takes an exclusive publication exclusion before rejected-candidate
+cleanup. Exact, conflicting, and missing historical replays therefore never publish final
+candidates. Snapshot leases, runtime pins, QueryService integration, safe-GC claims, and bounded
+Gateway transport are implemented. Physical GC, standard Flight transport, authentication/TLS and
+the final removal of legacy metadata authority remain later phases. Legacy live descriptors without
+exact logical-offset provenance are intentionally not promoted into native active snapshots.
 
 `catalog.backend=sqlite_shadow` keeps the legacy persisted-file view authoritative and installs a
 single bounded comparison worker behind Gateway. Query threads never wait for SQLite shadow reads;

@@ -22,6 +22,7 @@ import struct
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -397,7 +398,9 @@ _BUILTIN_CONFIG: dict[str, object] = {
         "level": "info",
     },
     "query": {
+        "native_enabled": False,
         "parallelism": None,
+        "operator_memory_bytes": None,
         "max_buffered_bytes": None,
         "plan_ttl_ms": _DEFAULT_QUERY_PLAN_TTL_MS,
     },
@@ -1204,6 +1207,406 @@ def _query_plan_to_json(plan_ops: list[tuple[str, object]]) -> list[dict[str, ob
         else:
             raise ValueError(f"unsupported table plan operation=[{kind}]")
     return plan
+
+
+@dataclass(frozen=True)
+class _NativeSqlPlan:
+    sql: str
+    bindings: list[dict[str, object]]
+
+
+@dataclass
+class _NativeSqlRelation:
+    sql: str
+    columns: list[str]
+    ordering: list[tuple[str, bool]]
+
+
+class _NativeSqlCompiler:
+    def __init__(self) -> None:
+        self.bindings: list[dict[str, object]] = []
+        self._source_aliases: dict[tuple[str, str], str] = {}
+        self._active_tables: set[int] = set()
+
+    def compile(self, table: Table) -> _NativeSqlPlan:
+        relation = self._compile_table(table)
+        sql = relation.sql
+        if relation.ordering:
+            sql = self._ordered_sql(sql, relation.ordering)
+        return _NativeSqlPlan(sql=sql, bindings=list(self.bindings))
+
+    def _compile_table(self, table: Table) -> _NativeSqlRelation:
+        table_identity = id(table)
+        if table_identity in self._active_tables:
+            raise ValueError("native query plan contains a cyclic table join")
+        native_enabled = getattr(table._inner, "native_query_enabled", None)
+        if not callable(native_enabled) or not native_enabled():
+            raise RuntimeError(
+                f"native query plan contains a non-native table source=[{table.source}]"
+            )
+        self._active_tables.add(table_identity)
+        try:
+            schema = table.schema()
+            columns = [str(name) for name in getattr(schema, "names", [])]
+            if not columns:
+                raise ValueError(f"native query source has no columns source=[{table.source}]")
+            shard_names = table._logical_shard_names_for_collect()
+            sources = shard_names or [str(table.source)]
+            scans = [f"SELECT * FROM {self._bind_source(source)}" for source in sources]
+            relation = _NativeSqlRelation(
+                sql=" UNION ALL ".join(scans),
+                columns=columns,
+                ordering=[],
+            )
+            plan_ops = _normalize_temporal_plan_ops(table._optimized_plan_ops(), schema)
+            for kind, value in plan_ops:
+                relation = self._apply_op(relation, kind, value)
+            return relation
+        finally:
+            self._active_tables.remove(table_identity)
+
+    def _bind_source(self, source: str, namespace: str = "default") -> str:
+        key = (str(namespace), str(source))
+        alias = self._source_aliases.get(key)
+        if alias is None:
+            alias = f"zippy_source_{len(self.bindings)}"
+            self._source_aliases[key] = alias
+            self.bindings.append(_native_query_binding(alias, source, namespace=namespace))
+        return _sql_quote_identifier(alias)
+
+    def _apply_op(
+        self,
+        relation: _NativeSqlRelation,
+        kind: str,
+        value: object,
+    ) -> _NativeSqlRelation:
+        if kind == "filter":
+            predicate = _query_expr_to_sql(value)
+            relation.sql = f"SELECT * FROM ({relation.sql}) AS _zippy_q WHERE {predicate}"
+            return relation
+        if kind == "select":
+            expressions = list(value)
+            names = [_query_expr_output_name(expr) for expr in expressions]
+            if any(name is None for name in names):
+                raise ValueError("native computed select expressions require explicit aliases")
+            relation.sql = (
+                "SELECT "
+                + ", ".join(_query_expr_to_sql(expr, include_alias=True) for expr in expressions)
+                + f" FROM ({relation.sql}) AS _zippy_q"
+            )
+            relation.columns = [str(name) for name in names]
+            relation.ordering = [item for item in relation.ordering if item[0] in relation.columns]
+            return relation
+        if kind == "with_columns":
+            expressions = list(value)
+            names = [_query_expr_output_name(expr) for expr in expressions]
+            if any(name is None for name in names):
+                raise ValueError("native with_columns expressions require explicit aliases")
+            replacement_names = [str(name) for name in names]
+            if len(set(replacement_names)) != len(replacement_names):
+                raise ValueError("native with_columns output names must be unique")
+            preserved = [name for name in relation.columns if name not in replacement_names]
+            select_items = [_sql_quote_identifier(name) for name in preserved]
+            select_items.extend(
+                _query_expr_to_sql(expr, include_alias=True) for expr in expressions
+            )
+            relation.sql = f"SELECT {', '.join(select_items)} FROM ({relation.sql}) AS _zippy_q"
+            relation.columns = [*preserved, *replacement_names]
+            relation.ordering = [
+                item for item in relation.ordering if item[0] not in replacement_names
+            ]
+            return relation
+        if kind == "drop":
+            dropped = {str(name) for name in value}
+            missing = dropped - set(relation.columns)
+            if missing:
+                raise ValueError(f"native drop references missing columns={sorted(missing)}")
+            relation.columns = [name for name in relation.columns if name not in dropped]
+            if not relation.columns:
+                raise ValueError("native drop cannot remove every result column")
+            relation.sql = (
+                "SELECT "
+                + ", ".join(_sql_quote_identifier(name) for name in relation.columns)
+                + f" FROM ({relation.sql}) AS _zippy_q"
+            )
+            relation.ordering = [item for item in relation.ordering if item[0] not in dropped]
+            return relation
+        if kind == "rename":
+            mapping = {str(source): str(target) for source, target in dict(value).items()}
+            missing = set(mapping) - set(relation.columns)
+            if missing:
+                raise ValueError(f"native rename references missing columns={sorted(missing)}")
+            renamed = [mapping.get(name, name) for name in relation.columns]
+            if len(set(renamed)) != len(renamed):
+                raise ValueError("native rename produces duplicate columns")
+            relation.sql = (
+                "SELECT "
+                + ", ".join(
+                    (
+                        _sql_quote_identifier(source)
+                        if source == target
+                        else f"{_sql_quote_identifier(source)} AS {_sql_quote_identifier(target)}"
+                    )
+                    for source, target in zip(relation.columns, renamed)
+                )
+                + f" FROM ({relation.sql}) AS _zippy_q"
+            )
+            relation.columns = renamed
+            relation.ordering = [
+                (mapping.get(name, name), descending) for name, descending in relation.ordering
+            ]
+            return relation
+        if kind == "sort":
+            keys = [_simple_sort_column_name(expr) for expr in value.get("by", [])]
+            if not keys:
+                raise ValueError("native sort requires at least one simple column key")
+            missing = set(keys) - set(relation.columns)
+            if missing:
+                raise ValueError(f"native sort references missing columns={sorted(missing)}")
+            descending = value.get("descending", False)
+            if isinstance(descending, (list, tuple)):
+                directions = [bool(item) for item in descending]
+                if len(directions) != len(keys):
+                    raise ValueError("native sort directions must match sort keys")
+            else:
+                directions = [bool(descending)] * len(keys)
+            relation.ordering = list(zip(keys, directions))
+            relation.sql = self._ordered_sql(relation.sql, relation.ordering)
+            return relation
+        if kind == "head":
+            count = _non_negative_native_row_count("head", value)
+            relation.sql = f"SELECT * FROM ({relation.sql}) AS _zippy_q LIMIT {count}"
+            return relation
+        if kind == "slice":
+            offset = int(value.get("offset", 0))
+            length = value.get("length")
+            if offset < 0:
+                raise ValueError("native slice offset must be non-negative")
+            if length is None:
+                relation.sql = f"SELECT * FROM ({relation.sql}) AS _zippy_q OFFSET {offset}"
+            else:
+                count = _non_negative_native_row_count("slice length", length)
+                relation.sql = (
+                    f"SELECT * FROM ({relation.sql}) AS _zippy_q " f"LIMIT {count} OFFSET {offset}"
+                )
+            return relation
+        if kind == "tail":
+            count = _non_negative_native_row_count("tail", value)
+            if not relation.ordering:
+                raise ValueError("native tail requires an explicit preceding sort")
+            reversed_order = [(name, not descending) for name, descending in relation.ordering]
+            limited = self._ordered_sql(relation.sql, reversed_order)
+            relation.sql = f"SELECT * FROM ({limited}) AS _zippy_tail LIMIT {count}"
+            relation.sql = self._ordered_sql(relation.sql, relation.ordering)
+            return relation
+        if kind == "join":
+            return self._join(relation, value)
+        raise ValueError(f"unsupported native table plan operation=[{kind}]")
+
+    def _join(self, left: _NativeSqlRelation, value: object) -> _NativeSqlRelation:
+        other = value.get("other")
+        if not isinstance(other, Table):
+            raise ValueError("native join requires another zippy.Table")
+        right = self._compile_table(other)
+        keys = [str(key) for key in value.get("on", [])]
+        if not keys:
+            raise ValueError("native join requires at least one key")
+        missing_left = set(keys) - set(left.columns)
+        missing_right = set(keys) - set(right.columns)
+        if missing_left or missing_right:
+            raise ValueError(
+                "native join key is missing "
+                f"left={sorted(missing_left)} right={sorted(missing_right)}"
+            )
+        join_mode = {
+            "inner": "INNER JOIN",
+            "left": "LEFT JOIN",
+            "right": "RIGHT JOIN",
+            "full": "FULL OUTER JOIN",
+            "outer": "FULL OUTER JOIN",
+        }.get(str(value.get("how", "inner")).lower())
+        if join_mode is None:
+            raise ValueError(f"unsupported native join mode=[{value.get('how')}]")
+        suffix = str(value.get("suffix", "_right"))
+        output_columns = list(left.columns)
+        select_items = [
+            f"_zippy_left.{_sql_quote_identifier(name)} AS {_sql_quote_identifier(name)}"
+            for name in left.columns
+        ]
+        for name in right.columns:
+            if name in keys:
+                continue
+            output_name = f"{name}{suffix}" if name in output_columns else name
+            if output_name in output_columns:
+                raise ValueError(f"native join produces duplicate column=[{output_name}]")
+            output_columns.append(output_name)
+            select_items.append(
+                f"_zippy_right.{_sql_quote_identifier(name)} "
+                f"AS {_sql_quote_identifier(output_name)}"
+            )
+        predicate = " AND ".join(
+            f"_zippy_left.{_sql_quote_identifier(key)} = "
+            f"_zippy_right.{_sql_quote_identifier(key)}"
+            for key in keys
+        )
+        sql = (
+            f"SELECT {', '.join(select_items)} "
+            f"FROM ({left.sql}) AS _zippy_left {join_mode} "
+            f"({right.sql}) AS _zippy_right ON {predicate}"
+        )
+        return _NativeSqlRelation(sql=sql, columns=output_columns, ordering=[])
+
+    @staticmethod
+    def _ordered_sql(sql: str, ordering: list[tuple[str, bool]]) -> str:
+        order = ", ".join(
+            f"{_sql_quote_identifier(name)} {'DESC' if descending else 'ASC'}"
+            for name, descending in ordering
+        )
+        return f"SELECT * FROM ({sql}) AS _zippy_ordered ORDER BY {order}"
+
+
+def _compile_native_table_sql(table: Table) -> _NativeSqlPlan:
+    return _NativeSqlCompiler().compile(table)
+
+
+def _native_query_binding(
+    sql_name: str,
+    table: str,
+    *,
+    namespace: str = "default",
+) -> dict[str, object]:
+    return {
+        "sql_name": str(sql_name),
+        "table": {
+            "type": "name",
+            "namespace": str(namespace),
+            "table": str(table),
+        },
+    }
+
+
+def _sql_quote_identifier(value: object) -> str:
+    text = str(value)
+    if not text or "\x00" in text:
+        raise ValueError("SQL identifiers must be non-empty and must not contain NUL")
+    return f'"{text.replace(chr(34), chr(34) * 2)}"'
+
+
+def _simple_sort_column_name(expr: object) -> str:
+    if isinstance(expr, str):
+        return expr
+    if isinstance(expr, _QueryExpr) and expr._kind == "col":
+        return str(expr._value)
+    raise ValueError("native sort currently requires simple column keys")
+
+
+def _non_negative_native_row_count(name: str, value: object) -> int:
+    count = int(value)
+    if count < 0:
+        raise ValueError(f"native {name} must be non-negative")
+    return count
+
+
+def _query_expr_to_sql(expr: object, *, include_alias: bool = False) -> str:
+    if isinstance(expr, str):
+        return _sql_quote_identifier(expr)
+    if not isinstance(expr, _QueryExpr):
+        return _query_literal_to_sql(expr)
+    if expr._kind == "col":
+        return _sql_quote_identifier(expr._value)
+    if expr._kind == "literal":
+        return _query_literal_to_sql(expr._value)
+    if expr._kind == "alias":
+        value = _query_expr_to_sql(expr._args[0])
+        if include_alias:
+            return f"{value} AS {_sql_quote_identifier(expr._value)}"
+        return value
+    if expr._kind == "is_in":
+        values = list(expr._args[1])
+        if not values:
+            return "FALSE"
+        return (
+            f"({_query_expr_to_sql(expr._args[0])} IN "
+            f"({', '.join(_query_literal_to_sql(value) for value in values)}))"
+        )
+    if expr._kind == "is_null":
+        return f"({_query_expr_to_sql(expr._args[0])} IS NULL)"
+    if expr._kind == "is_not_null":
+        return f"({_query_expr_to_sql(expr._args[0])} IS NOT NULL)"
+    if expr._kind == "is_between":
+        return (
+            f"({_query_expr_to_sql(expr._args[0])} BETWEEN "
+            f"{_query_expr_to_sql(expr._args[1])} AND "
+            f"{_query_expr_to_sql(expr._args[2])})"
+        )
+    if expr._kind == "unary":
+        value = _query_expr_to_sql(expr._args[0])
+        if expr._value == "not":
+            return f"(NOT {value})"
+        if expr._value == "neg":
+            return f"(-{value})"
+        raise ValueError(f"unsupported native query unary operator=[{expr._value}]")
+    if expr._kind != "binary":
+        raise ValueError(f"unsupported native query expression kind=[{expr._kind}]")
+    left, right = expr._args
+    if expr._value in {"eq", "ne"} and (
+        _is_query_null_literal(left) or _is_query_null_literal(right)
+    ):
+        target = right if _is_query_null_literal(left) else left
+        operator = "IS NULL" if expr._value == "eq" else "IS NOT NULL"
+        return f"({_query_expr_to_sql(target)} {operator})"
+    operator = {
+        "eq": "=",
+        "ne": "<>",
+        "gt": ">",
+        "ge": ">=",
+        "lt": "<",
+        "le": "<=",
+        "and": "AND",
+        "or": "OR",
+        "add": "+",
+        "sub": "-",
+        "mul": "*",
+        "div": "/",
+    }.get(str(expr._value))
+    if operator is None:
+        raise ValueError(f"unsupported native query binary operator=[{expr._value}]")
+    return f"({_query_expr_to_sql(left)} {operator} {_query_expr_to_sql(right)})"
+
+
+def _is_query_null_literal(expr: object) -> bool:
+    return (
+        expr is None
+        or isinstance(expr, _QueryExpr)
+        and expr._kind == "literal"
+        and expr._value is None
+    )
+
+
+def _query_literal_to_sql(value: object) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, _TemporalInstantLiteral):
+        return f"to_timestamp_nanos({value.epoch_ns})"
+    if isinstance(value, datetime):
+        return f"to_timestamp_nanos({_datetime_to_epoch_ns(value)})"
+    if isinstance(value, date):
+        return f"DATE '{value.isoformat()}'"
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("native SQL decimal literals must be finite")
+        return format(value, "f")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("native SQL floating-point literals must be finite")
+        return repr(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    raise ValueError(f"unsupported native SQL literal type=[{type(value).__name__}]")
 
 
 def _remote_filter_expr_supported(expr: object) -> bool:
@@ -2924,6 +3327,21 @@ def _remote_gateway_endpoint_for_data(master: object) -> str | None:
     return _remote_gateway_endpoint(master)
 
 
+def _remote_native_query_enabled(master: object) -> bool:
+    get_config = getattr(master, "get_config", None)
+    if callable(get_config):
+        config = get_config()
+        query = config.get("query", {}) if isinstance(config, dict) else {}
+        if isinstance(query, dict) and "native_enabled" in query:
+            return query.get("native_enabled") is True
+    gateway_metrics = getattr(master, "gateway_metrics", None)
+    if callable(gateway_metrics):
+        metrics = gateway_metrics()
+        if isinstance(metrics, dict):
+            return metrics.get("native_query_enabled") is True
+    return False
+
+
 def _remote_gateway_token(master: object) -> str | None:
     token = getattr(master, "remote_gateway_token", None)
     if callable(token):
@@ -3037,7 +3455,9 @@ def _remote_request(
         ) from error
     if response.get("status") != "ok":
         reason = response.get("reason", "unknown remote gateway error")
-        raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
+        error_code = response.get("error_code")
+        code = f" code=[{error_code}]" if error_code else ""
+        raise RuntimeError(f"remote gateway request failed{code} reason=[{reason}]")
     return response, response_payload
 
 
@@ -3047,13 +3467,14 @@ def _remote_collect_stream_request(
     *,
     token: str | None = None,
     timeout_sec: float | None = None,
+    request_kind: str = "collect_stream",
 ):
     import pyarrow as pa
 
     host, port = _parse_remote_endpoint(endpoint)
     timeout_sec = _remote_gateway_timeout_sec() if timeout_sec is None else float(timeout_sec)
     header = dict(header)
-    header["kind"] = "collect_stream"
+    header["kind"] = str(request_kind)
     if token is not None:
         header["token"] = token
     try:
@@ -3076,10 +3497,14 @@ def _remote_collect_stream_request(
                 kind = response.get("kind")
                 if kind == "collect_error":
                     reason = response.get("reason", "remote collect stream failed")
-                    raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
+                    error_code = response.get("error_code")
+                    code = f" code=[{error_code}]" if error_code else ""
+                    raise RuntimeError(f"remote gateway request failed{code} reason=[{reason}]")
                 if response.get("status") != "ok":
                     reason = response.get("reason", "unknown remote gateway error")
-                    raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
+                    error_code = response.get("error_code")
+                    code = f" code=[{error_code}]" if error_code else ""
+                    raise RuntimeError(f"remote gateway request failed{code} reason=[{reason}]")
                 if kind == "collect_start":
                     if payload:
                         schema = _pyarrow_schema_from_ipc(payload)
@@ -3118,6 +3543,105 @@ def _remote_collect_stream_request(
     if table is None:
         table = pa.Table.from_batches([])
     return table, metrics
+
+
+def _remote_native_query_request(
+    endpoint: str,
+    sql: str,
+    bindings: list[dict[str, object]],
+    *,
+    token: str | None = None,
+    timeout_sec: float | None = None,
+    session_id: str | None = None,
+    memory_limit_bytes: int | None = None,
+    result_batch_rows: int | None = None,
+    priority: str = "normal",
+):
+    header = _native_query_request_header(
+        sql,
+        bindings,
+        session_id=session_id,
+        memory_limit_bytes=memory_limit_bytes,
+        result_batch_rows=result_batch_rows,
+        priority=priority,
+        timeout_sec=timeout_sec,
+    )
+    return _remote_collect_stream_request(
+        endpoint,
+        header,
+        token=token,
+        timeout_sec=timeout_sec,
+        request_kind="query_sql",
+    )
+
+
+def _remote_native_query_explain_request(
+    endpoint: str,
+    sql: str,
+    bindings: list[dict[str, object]],
+    *,
+    token: str | None = None,
+    timeout_sec: float | None = None,
+    session_id: str | None = None,
+) -> dict[str, object]:
+    header = _native_query_request_header(
+        sql,
+        bindings,
+        session_id=session_id,
+        timeout_sec=timeout_sec,
+    )
+    header["kind"] = "query_explain"
+    response, _ = _remote_request(
+        endpoint,
+        header,
+        token=token,
+        timeout_sec=timeout_sec,
+    )
+    explanation = response.get("explanation")
+    if not isinstance(explanation, dict):
+        raise RuntimeError("remote native query explain response is missing explanation")
+    return dict(explanation)
+
+
+def _native_query_request_header(
+    sql: str,
+    bindings: list[dict[str, object]],
+    *,
+    session_id: str | None,
+    memory_limit_bytes: int | None = None,
+    result_batch_rows: int | None = None,
+    priority: str = "normal",
+    timeout_sec: float | None = None,
+) -> dict[str, object]:
+    if not str(sql).strip():
+        raise ValueError("native query SQL must not be empty")
+    if not bindings:
+        raise ValueError("native query requires at least one table binding")
+    if memory_limit_bytes is not None and int(memory_limit_bytes) <= 0:
+        raise ValueError("memory_limit_bytes must be positive")
+    if result_batch_rows is not None and int(result_batch_rows) <= 0:
+        raise ValueError("result_batch_rows must be positive")
+    normalized_priority = str(priority).lower()
+    if normalized_priority not in {"interactive", "normal", "maintenance"}:
+        raise ValueError(f"unsupported native query priority=[{priority}]")
+    header: dict[str, object] = {
+        "query_id": str(uuid.uuid4()),
+        "session_id": session_id or str(uuid.uuid4()),
+        "sql": str(sql),
+        "bindings": bindings,
+        "priority": normalized_priority,
+        "memory_limit_bytes": (
+            {"type": "server_default"}
+            if memory_limit_bytes is None
+            else {"type": "bytes", "value": int(memory_limit_bytes)}
+        ),
+        "spill_limit_bytes": {"type": "disabled"},
+    }
+    if result_batch_rows is not None:
+        header["result_batch_rows"] = int(result_batch_rows)
+    if timeout_sec is not None:
+        header["deadline_ns"] = time.time_ns() + int(float(timeout_sec) * 1_000_000_000)
+    return header
 
 
 def _remote_master_get_config(endpoint: str, timeout_sec: float = 5.0) -> dict[str, object]:
@@ -3341,6 +3865,8 @@ class _RemoteQuery:
         self.master = master
         self.endpoint = endpoint or _remote_gateway_endpoint(master)
         self.token = token if token is not None else _remote_gateway_token(master)
+        self._native_query_enabled = _remote_native_query_enabled(master)
+        self._native_query_session_id = str(uuid.uuid4())
         self._last_collect_metrics: dict[str, object] = {}
         self._snapshot_ids: set[str] = set()
         if self.endpoint is None:
@@ -3431,6 +3957,47 @@ class _RemoteQuery:
         metrics = response.get("metrics", {})
         self._last_collect_metrics = dict(metrics) if isinstance(metrics, dict) else {}
         return _pyarrow_table_from_ipc(payload)
+
+    def native_query_enabled(self) -> bool:
+        return self._native_query_enabled
+
+    def collect_sql(
+        self,
+        sql: str,
+        bindings: list[dict[str, object]],
+        *,
+        timeout_sec: float | None = None,
+    ):
+        if not self._native_query_enabled:
+            raise RuntimeError("remote native query capability is disabled")
+        table, metrics = _remote_native_query_request(
+            self.endpoint,
+            sql,
+            bindings,
+            token=self.token,
+            timeout_sec=timeout_sec,
+            session_id=self._native_query_session_id,
+        )
+        self._last_collect_metrics = metrics
+        return table
+
+    def explain_sql(
+        self,
+        sql: str,
+        bindings: list[dict[str, object]],
+        *,
+        timeout_sec: float | None = None,
+    ) -> dict[str, object]:
+        if not self._native_query_enabled:
+            raise RuntimeError("remote native query capability is disabled")
+        return _remote_native_query_explain_request(
+            self.endpoint,
+            sql,
+            bindings,
+            token=self.token,
+            timeout_sec=timeout_sec,
+            session_id=self._native_query_session_id,
+        )
 
     def last_collect_metrics(self) -> dict[str, object]:
         return dict(self._last_collect_metrics)
@@ -4301,13 +4868,25 @@ class Table:
         return {"result": result, "metrics": metrics}
 
     def _collect_query(self, metrics: dict[str, object] | None, stream: bool = False):
+        remote_collect = getattr(self._inner, "collect_plan", None)
+        native_query_enabled = getattr(self._inner, "native_query_enabled", None)
+        use_native_query = (
+            callable(remote_collect) and callable(native_query_enabled) and native_query_enabled()
+        )
         shard_names = self._logical_shard_names_for_collect()
-        if shard_names:
+        if shard_names and not use_native_query:
             return self._collect_logical_shards(shard_names, metrics=metrics, stream=stream)
 
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
-        remote_collect = getattr(self._inner, "collect_plan", None)
+        if use_native_query:
+            native_plan = _compile_native_table_sql(self)
+            result = self._inner.collect_sql(native_plan.sql, native_plan.bindings)
+            if metrics is not None:
+                metrics["returned_rows"] = result.num_rows
+                metrics["query_authority"] = "native"
+                _merge_remote_collect_metrics(metrics, self._inner)
+            return result
         if callable(remote_collect):
             remote_plan, residual_plan = _remote_gateway_plan_split(optimized_plan)
             snapshot = self.snapshot() if self._snapshot_enabled else False
@@ -4388,6 +4967,31 @@ class Table:
         """
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        native_query_enabled = getattr(self._inner, "native_query_enabled", None)
+        native_explain = getattr(self._inner, "explain_sql", None)
+        if callable(native_query_enabled) and native_query_enabled() and callable(native_explain):
+            native_plan = _compile_native_table_sql(self)
+            server_plan = native_explain(native_plan.sql, native_plan.bindings)
+            return {
+                "source": self.source,
+                "snapshot": True,
+                "executor": "remote_native",
+                "query_authority": "native",
+                "original_plan": _query_plan_to_json(self._plan_ops),
+                "optimized_plan": _query_plan_to_json(optimized_plan),
+                "native_sql": native_plan.sql,
+                "native_bindings": list(native_plan.bindings),
+                "server_plan": server_plan,
+                "output_fields": list(server_plan.get("output_fields", [])),
+                "profile": dict(server_plan.get("metrics", {})),
+                "residual_plan": [],
+                "capability": {
+                    "executor": "remote_native",
+                    "server_plan": "complete_sql",
+                    "residual_execution": "disabled",
+                    "unsupported_gateway_ops": [],
+                },
+            }
         shard_names = self._logical_shard_names_for_collect()
         if shard_names:
             shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
@@ -4618,6 +5222,25 @@ class Table:
     def _new_query_metrics(self) -> dict[str, object]:
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        native_query_enabled = getattr(self._inner, "native_query_enabled", None)
+        if callable(native_query_enabled) and native_query_enabled():
+            native_plan = _compile_native_table_sql(self)
+            return {
+                "executor": "remote_native",
+                "query_authority": "native",
+                "original_plan": _query_plan_to_json(self._plan_ops),
+                "optimized_plan": _query_plan_to_json(optimized_plan),
+                "native_sql": native_plan.sql,
+                "native_bindings": list(native_plan.bindings),
+                "residual_plan": [],
+                "scanned_files": [],
+                "scanned_rows": 0,
+                "scanned_live_rows": 0,
+                "returned_rows": None,
+                "elapsed_ms": None,
+                "query_parallelism": self._query_parallelism,
+                "max_parallelism": self._max_parallelism,
+            }
         shard_names = self._logical_shard_names_for_collect()
         if shard_names:
             shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
@@ -5142,8 +5765,9 @@ def read_table(
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"500ms"``,
         ``"30s"`` or ``"2m"``. ``None`` waits indefinitely.
     :type timeout: float | str | None
-    :param snapshot: When true, reuse one query snapshot for repeated terminal operations. When
-        false, each terminal operation resolves the latest table snapshot.
+    :param snapshot: For local and legacy remote reads, reuse one query snapshot across repeated
+        terminal operations when true. Native remote queries always fix one server snapshot per
+        terminal request; they do not reuse a cross-request snapshot token in Phase 5.
     :type snapshot: bool
     :returns: Table object for further operations such as ``tail``.
     :rtype: Table
@@ -5158,6 +5782,104 @@ def read_table(
     if _force_local:
         kwargs["_force_local"] = True
     return Table(**kwargs)
+
+
+def read_sql(
+    sql: str,
+    tables: dict[str, object] | list[str] | tuple[str, ...] | str | None = None,
+    master: MasterClient | RemoteMasterClient | None = None,
+    *,
+    timeout: float | None = None,
+    memory_limit_bytes: int | None = None,
+    result_batch_rows: int | None = None,
+    priority: str = "normal",
+):
+    """
+    Execute SQL entirely in the server-owned native query engine.
+
+    Simple ``FROM`` and ``JOIN`` table names are inferred when ``tables`` is omitted. Complex SQL,
+    quoted aliases, or namespace mappings should pass an explicit ``alias -> table`` dictionary.
+    This API never falls back to downloading full tables for Python-side execution.
+
+    :param sql: DataFusion SQL text.
+    :type sql: str
+    :param tables: Table name, sequence of names, or SQL alias mapping. A mapping value may be a
+        table name or ``{"namespace": "...", "table": "..."}``.
+    :type tables: dict[str, object] | list[str] | tuple[str, ...] | str | None
+    :param master: Optional explicit master connection.
+    :type master: MasterClient | RemoteMasterClient | None
+    :param timeout: Optional socket and absolute server deadline in seconds.
+    :type timeout: float | None
+    :param memory_limit_bytes: Optional explicit native query memory ceiling.
+    :type memory_limit_bytes: int | None
+    :param result_batch_rows: Optional preferred Arrow result batch row count.
+    :type result_batch_rows: int | None
+    :param priority: ``interactive``, ``normal``, or ``maintenance`` admission class.
+    :type priority: str
+    :returns: Query result assembled from bounded streamed Arrow batches.
+    :rtype: pyarrow.Table
+    :raises RuntimeError: If the connected server does not advertise native query authority.
+    """
+    selected_master = master or _default_master()
+    _ensure_master_process(selected_master, "read_sql")
+    endpoint = _remote_gateway_endpoint(selected_master)
+    if endpoint is None:
+        raise RuntimeError("read_sql requires a server Gateway endpoint")
+    if not _remote_native_query_enabled(selected_master):
+        raise RuntimeError("read_sql requires query.native_enabled on the connected server")
+    bindings = _normalize_native_sql_bindings(str(sql), tables)
+    table, _metrics = _remote_native_query_request(
+        endpoint,
+        str(sql),
+        bindings,
+        token=_remote_gateway_token(selected_master),
+        timeout_sec=timeout,
+        memory_limit_bytes=memory_limit_bytes,
+        result_batch_rows=result_batch_rows,
+        priority=priority,
+    )
+    return table
+
+
+def _normalize_native_sql_bindings(
+    sql: str,
+    tables: dict[str, object] | list[str] | tuple[str, ...] | str | None,
+) -> list[dict[str, object]]:
+    if tables is None:
+        inferred = []
+        pattern = re.compile(
+            r'\b(?:FROM|JOIN)\s+(?:"((?:[^"]|"")+)"|([A-Za-z_][A-Za-z0-9_]*))',
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(sql):
+            name = (match.group(1) or match.group(2) or "").replace('""', '"')
+            if name and name not in inferred:
+                inferred.append(name)
+        if not inferred:
+            raise ValueError("read_sql could not infer tables; pass an explicit tables mapping")
+        tables = inferred
+    if isinstance(tables, str):
+        tables = [tables]
+    if isinstance(tables, (list, tuple)):
+        tables = {str(name): str(name) for name in tables}
+    if not isinstance(tables, dict) or not tables:
+        raise ValueError("read_sql tables must be a non-empty name, sequence, or mapping")
+    bindings: list[dict[str, object]] = []
+    for sql_name, reference in tables.items():
+        if isinstance(reference, str):
+            namespace = "default"
+            table_name = reference
+        elif isinstance(reference, dict):
+            namespace = str(reference.get("namespace", "default"))
+            table_name = str(reference.get("table", ""))
+        else:
+            raise TypeError(
+                "read_sql table mapping values must be names or namespace/table dictionaries"
+            )
+        if not table_name:
+            raise ValueError(f"read_sql table mapping is empty alias=[{sql_name}]")
+        bindings.append(_native_query_binding(str(sql_name), table_name, namespace=namespace))
+    return bindings
 
 
 def compare_replay(
@@ -5583,6 +6305,9 @@ def _merge_remote_collect_metrics(metrics: dict[str, object], remote_query: obje
     if not isinstance(gateway_metrics, dict):
         return
     metrics["gateway"] = dict(gateway_metrics)
+    for key, value in gateway_metrics.items():
+        if str(key).startswith(("plan.", "operator.", "result.", "transport.")):
+            metrics[str(key)] = value
     for key in ("scanned_rows", "scanned_live_rows", "returned_rows"):
         if key in gateway_metrics:
             metrics[key] = gateway_metrics[key]
@@ -11539,6 +12264,7 @@ __all__ = [
     "needs_rebuild",
     "ops",
     "read_table",
+    "read_sql",
     "replay",
     "raise_if_failed",
     "subscribe",

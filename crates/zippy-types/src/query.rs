@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -306,11 +307,72 @@ pub trait QueryExecutionToken: Any + Send {
 /// ```
 pub type OpaqueQueryExecutionToken = Box<dyn QueryExecutionToken>;
 
+/// One non-cloneable Arrow result batch and its implementation-owned memory lease.
+///
+/// Native engines place their exact result-memory permit in the opaque owner. Transport code
+/// must keep this value alive while reading or encoding [`Self::record_batch`]. Dropping the
+/// value releases both the Arrow batch and its accounting owner together.
+///
+/// ```compile_fail
+/// fn duplicate(batch: zippy_types::query::QueryResultBatch) {
+///     let _copy = batch.clone();
+/// }
+/// ```
+pub struct QueryResultBatch {
+    batch: RecordBatch,
+    owner: Option<Box<dyn Any + Send>>,
+}
+
+impl QueryResultBatch {
+    /// Wraps a batch produced by an engine that has no separate accounting owner.
+    #[must_use]
+    pub fn unaccounted(batch: RecordBatch) -> Self {
+        Self { batch, owner: None }
+    }
+
+    /// Wraps a batch together with an opaque owner released after the batch itself.
+    ///
+    /// Engine implementations use this constructor to transfer a permit across an object-safe
+    /// query boundary without exposing or making that permit cloneable.
+    #[must_use]
+    pub fn with_owner<T>(batch: RecordBatch, owner: T) -> Self
+    where
+        T: Any + Send,
+    {
+        Self {
+            batch,
+            owner: Some(Box::new(owner)),
+        }
+    }
+
+    /// Borrows the Arrow batch while retaining its opaque owner.
+    #[must_use]
+    pub const fn record_batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    /// Returns whether this batch carries a separate implementation-owned lease.
+    #[must_use]
+    pub const fn has_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+}
+
+impl fmt::Debug for QueryResultBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryResultBatch")
+            .field("rows", &self.batch.num_rows())
+            .field("columns", &self.batch.num_columns())
+            .field("has_owner", &self.has_owner())
+            .finish()
+    }
+}
+
 /// A type-safe asynchronous stream of Arrow record batches.
 ///
-/// Implementations return Arrow batches directly, preserving shared buffers
-/// across in-process services. Reaching EOF, observing an execution error, or
-/// dropping the stream must cancel remaining operators and release query
+/// Implementations return non-cloneable permit-owned Arrow batches. Reaching EOF, observing an
+/// execution error, or dropping the stream must cancel remaining operators and release query
 /// snapshot leases exactly once.
 pub trait RecordBatchStream: Send {
     /// Returns the exact query whose lease ownership was transferred to this stream.
@@ -324,11 +386,19 @@ pub trait RecordBatchStream: Send {
     /// Returns the stable schema shared by every batch in the stream.
     fn schema(&self) -> SchemaRef;
 
+    /// Returns a bounded point-in-time query profile using stable metric names.
+    ///
+    /// Implementations that do not expose native plan or operator metrics return an empty map.
+    /// Transport code should call this only for low-frequency profile or terminal frames.
+    fn metrics(&self) -> BTreeMap<String, u64> {
+        BTreeMap::new()
+    }
+
     /// Polls the next batch without allocating a future per result batch.
     fn poll_next(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch>>>;
+    ) -> Poll<Option<Result<QueryResultBatch>>>;
 }
 
 /// A sendable, type-erased Arrow record batch stream.
@@ -409,11 +479,17 @@ pub trait QueryEngine: Send + Sync {
 mod tests {
     use std::any::Any;
     use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
 
     use super::{
         LogicalPlanEnvelope, OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryEngine,
         QueryExecutionToken, QueryInput, QueryInstanceId, QueryOwnerCapability, QueryPlanInfo,
-        QueryPriority, QueryRequest, QueryState, QueryTableVersion, SendableRecordBatchStream,
+        QueryPriority, QueryRequest, QueryResultBatch, QueryState, QueryTableVersion,
+        SendableRecordBatchStream,
     };
     use crate::{QueryId, ResourceLimit, SessionId};
 
@@ -433,6 +509,14 @@ mod tests {
     }
 
     struct ForeignOwner(SessionId);
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     impl QueryOwnerCapability for ForeignOwner {
         fn session_id(&self) -> SessionId {
@@ -531,6 +615,18 @@ mod tests {
             instance_nonce: 7,
         });
         assert_eq!(capability.session_id(), SessionId::from_u128(1).unwrap());
+    }
+
+    #[test]
+    fn result_batch_releases_opaque_owner_with_the_batch() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let owned = QueryResultBatch::with_owner(batch, DropProbe(Arc::clone(&drops)));
+        assert!(owned.has_owner());
+        assert_eq!(owned.record_batch().num_rows(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(owned);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

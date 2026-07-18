@@ -5,7 +5,8 @@ mod support;
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::net::TcpListener;
+use std::io::{Cursor, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
@@ -40,7 +42,7 @@ use zippy_types::catalog::{
 };
 use zippy_types::runtime::RuntimeRegistry;
 use zippy_types::table::{CatalogName, DataFileLocation};
-use zippy_types::{ErrorCode, NamespaceId, RequestId};
+use zippy_types::{ErrorCode, NamespaceId, QueryId, RequestId, SessionId};
 
 use support::{reserve_tcp_addr, wait_until_bindable};
 
@@ -230,6 +232,50 @@ fn runtime_config_with_shadow_catalog(
     runtime_config_with_shadow_catalog_and_persist_root(temp, data_dir, gateway_endpoint, None)
 }
 
+fn runtime_config_with_native_query_frontend(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+    gateway_endpoint: std::net::SocketAddr,
+) -> LegacyServerRuntimeConfig {
+    let runtime = runtime_config_with_shadow_catalog(temp, data_dir, gateway_endpoint);
+    let config_path = runtime
+        .master()
+        .config_path
+        .as_ref()
+        .expect("test runtime config has an explicit path");
+    let mut source = fs::read_to_string(config_path).unwrap();
+    source.push_str("\n[query]\nnative_enabled = true\n");
+    fs::write(config_path, source).unwrap();
+    runtime
+}
+
+fn runtime_config_with_native_query_frontend_and_persist_root(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+    gateway_endpoint: std::net::SocketAddr,
+    persist_root: &Path,
+) -> LegacyServerRuntimeConfig {
+    let runtime = runtime_config_with_shadow_catalog_and_persist_root(
+        temp,
+        data_dir,
+        gateway_endpoint,
+        Some(persist_root),
+    );
+    let config_path = runtime
+        .master()
+        .config_path
+        .as_ref()
+        .expect("test runtime config has an explicit path");
+    let mut source = fs::read_to_string(config_path).unwrap();
+    source.push_str(concat!(
+        "\n[query]\nnative_enabled = true\n",
+        "operator_memory_bytes = 268435456\n\n",
+        "[query.resources]\nmax_memory_bytes = 1073741824\n"
+    ));
+    fs::write(config_path, source).unwrap();
+    runtime
+}
+
 fn runtime_config_with_shadow_catalog_and_persist_root(
     temp: &tempfile::TempDir,
     data_dir: &std::path::Path,
@@ -344,6 +390,7 @@ fn seed_legacy_append_table(
     data_dir: &Path,
     persist_root: &Path,
     initial_file: &Path,
+    row_count: usize,
 ) -> std::path::PathBuf {
     let schema = append_table_schema();
     let schema_hash = canonical_schema_hash(&schema);
@@ -372,7 +419,7 @@ fn seed_legacy_append_table(
                     "stream_name": "events",
                     "schema_hash": schema_hash,
                     "writer_epoch": 1,
-                    "row_count": 2,
+                    "row_count": row_count,
                     "created_at": 1,
                 })],
                 persist_events: Vec::new(),
@@ -406,6 +453,71 @@ fn seed_legacy_append_table(
     .unwrap();
     drop(ownership);
     snapshot_path
+}
+
+fn write_gateway_request(stream: &mut TcpStream, header: &serde_json::Value) {
+    let header = serde_json::to_vec(header).unwrap();
+    stream
+        .write_all(&(header.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&0_u64.to_be_bytes()).unwrap();
+    stream.write_all(&header).unwrap();
+}
+
+fn read_gateway_frame(stream: &mut TcpStream) -> (serde_json::Value, Vec<u8>) {
+    let mut prefix = [0_u8; 12];
+    stream.read_exact(&mut prefix).unwrap();
+    let header_len = u32::from_be_bytes(prefix[..4].try_into().unwrap()) as usize;
+    let payload_len = u64::from_be_bytes(prefix[4..].try_into().unwrap()) as usize;
+    let mut header = vec![0_u8; header_len];
+    stream.read_exact(&mut header).unwrap();
+    let mut payload = vec![0_u8; payload_len];
+    stream.read_exact(&mut payload).unwrap();
+    (serde_json::from_slice(&header).unwrap(), payload)
+}
+
+fn gateway_stream_frames(
+    endpoint: &str,
+    header: serde_json::Value,
+) -> Vec<(serde_json::Value, Vec<u8>)> {
+    let mut stream = TcpStream::connect(endpoint).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write_gateway_request(&mut stream, &header);
+    let mut frames = Vec::new();
+    loop {
+        let frame = read_gateway_frame(&mut stream);
+        let kind = frame.0.get("kind").and_then(serde_json::Value::as_str);
+        let terminal =
+            frame.0["status"] == "error" || matches!(kind, Some("collect_end" | "query_explain"));
+        frames.push(frame);
+        if terminal {
+            return frames;
+        }
+    }
+}
+
+fn gateway_i64_values(frames: &[(serde_json::Value, Vec<u8>)]) -> Vec<i64> {
+    let mut values = Vec::new();
+    for (_, payload) in frames
+        .iter()
+        .filter(|(header, _)| header["kind"] == "collect_chunk")
+    {
+        let reader = StreamReader::try_new(Cursor::new(payload), None).unwrap();
+        for batch in reader {
+            values.extend_from_slice(
+                batch
+                    .unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+    }
+    values
 }
 
 async fn seed_incompatible_native_catalog_revision(data_dir: &std::path::Path) {
@@ -519,6 +631,229 @@ fn configured_native_storage_recovers_before_server_readiness() {
     assert!(data_dir.join("catalog/catalog.db").is_file());
 
     assert!(runtime.shutdown().is_clean());
+}
+
+#[test]
+fn native_query_frontend_is_advertised_only_while_its_runtime_is_ready() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let gateway_endpoint = reserve_tcp_addr();
+    let mut runtime = LegacyServerRuntime::start(runtime_config_with_native_query_frontend(
+        &temp,
+        &data_dir,
+        gateway_endpoint,
+    ))
+    .unwrap();
+
+    let health = runtime.health();
+    assert!(health.readiness.is_ready());
+    assert_eq!(health.services.query, ServiceHealth::Ready);
+    assert!(health.services.capabilities.query_sql);
+    assert!(health.services.capabilities.query_manifest_snapshot_pinning);
+    assert_eq!(
+        runtime.gateway_metrics().unwrap()["native_query_enabled"],
+        true
+    );
+
+    runtime.begin_shutdown();
+    let health = runtime.health();
+    assert!(!health.services.capabilities.query_sql);
+    assert!(!health.services.capabilities.query_manifest_snapshot_pinning);
+    assert_eq!(health.services.query, ServiceHealth::Unavailable);
+    assert!(runtime.shutdown().is_clean());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_gateway_query_matches_legacy_and_releases_on_budget_or_disconnect() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let parquet_path = persist_root.join("events.parquet");
+    let values = (0_i64..2_048).collect::<Vec<_>>();
+    write_test_parquet(&parquet_path, values.clone());
+    seed_legacy_append_table(&data_dir, &persist_root, &parquet_path, values.len());
+    let gateway_addr = reserve_tcp_addr();
+    let mut runtime =
+        LegacyServerRuntime::start(runtime_config_with_native_query_frontend_and_persist_root(
+            &temp,
+            &data_dir,
+            gateway_addr,
+            &persist_root,
+        ))
+        .expect("start native query Gateway over a migrated persisted table");
+    let endpoint = runtime.gateway_endpoint().unwrap().to_string();
+
+    let legacy = gateway_stream_frames(
+        &endpoint,
+        serde_json::json!({
+            "kind": "collect_stream",
+            "token": "shadow-catalog-test",
+            "source": "events",
+            "plan": [],
+            "snapshot": true,
+        }),
+    );
+    let explained = gateway_stream_frames(
+        &endpoint,
+        serde_json::json!({
+            "kind": "query_explain",
+            "token": "shadow-catalog-test",
+            "query_id": QueryId::from_u128(999).unwrap(),
+            "session_id": SessionId::from_u128(1000).unwrap(),
+            "sql": concat!(
+                "SELECT value, count(*) AS copies FROM events ",
+                "GROUP BY value ORDER BY value LIMIT 10"
+            ),
+            "bindings": [{
+                "sql_name": "events",
+                "table": {"type": "name", "namespace": "default", "table": "events"},
+            }],
+        }),
+    );
+    assert_eq!(explained.len(), 1);
+    assert_eq!(explained[0].0["kind"], "query_explain");
+    assert_eq!(
+        explained[0].0["explanation"]["output_fields"][0]["name"],
+        "value"
+    );
+    assert!(
+        explained[0].0["explanation"]["metrics"]["operator.sort.count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        explained[0].0["explanation"]["metrics"]["operator.aggregate.count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    let native = gateway_stream_frames(
+        &endpoint,
+        serde_json::json!({
+            "kind": "query_sql",
+            "token": "shadow-catalog-test",
+            "query_id": QueryId::from_u128(1001).unwrap(),
+            "session_id": SessionId::from_u128(1002).unwrap(),
+            "sql": "SELECT value FROM events",
+            "bindings": [{
+                "sql_name": "events",
+                "table": {"type": "name", "namespace": "default", "table": "events"},
+            }],
+        }),
+    );
+    assert_eq!(legacy.last().unwrap().0["kind"], "collect_end");
+    assert_eq!(
+        native.last().unwrap().0["kind"],
+        "collect_end",
+        "native frames: {native:?}"
+    );
+    assert_eq!(native[0].0["query_authority"], "native");
+    assert!(
+        native.last().unwrap().0["metrics"]["operator.scan.count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        native.last().unwrap().0["metrics"]["operator.memory_reserved_bytes"],
+        0
+    );
+    assert_eq!(gateway_i64_values(&legacy), values);
+    assert_eq!(gateway_i64_values(&native), values);
+
+    let over_budget = gateway_stream_frames(
+        &endpoint,
+        serde_json::json!({
+            "kind": "query_sql",
+            "token": "shadow-catalog-test",
+            "query_id": QueryId::from_u128(1003).unwrap(),
+            "session_id": SessionId::from_u128(1004).unwrap(),
+            "sql": "SELECT value FROM events ORDER BY value",
+            "bindings": [{
+                "sql_name": "events",
+                "table": {"type": "name", "namespace": "default", "table": "events"},
+            }],
+            "memory_limit_bytes": {"type": "bytes", "value": 1},
+        }),
+    );
+    assert_eq!(over_budget.len(), 1);
+    assert_eq!(over_budget[0].0["kind"], "query_error");
+    assert_eq!(over_budget[0].0["error_code"], "RESOURCE_EXHAUSTED");
+
+    let query_id = QueryId::from_u128(1005).unwrap();
+    let session_id = SessionId::from_u128(1006).unwrap();
+    let mut disconnected = TcpStream::connect(&endpoint).unwrap();
+    disconnected
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write_gateway_request(
+        &mut disconnected,
+        &serde_json::json!({
+            "kind": "query_sql",
+            "token": "shadow-catalog-test",
+            "query_id": query_id,
+            "session_id": session_id,
+            "sql": concat!(
+                "SELECT left_events.value AS left_value, ",
+                "right_events.value AS right_value ",
+                "FROM events AS left_events CROSS JOIN events AS right_events ",
+                "ORDER BY left_value, right_value"
+            ),
+            "bindings": [{
+                "sql_name": "events",
+                "table": {"type": "name", "namespace": "default", "table": "events"},
+            }],
+            "result_batch_rows": 256,
+        }),
+    );
+    let (start, _) = read_gateway_frame(&mut disconnected);
+    assert_eq!(start["kind"], "collect_start", "start frame: {start}");
+    let (first_chunk, _) = read_gateway_frame(&mut disconnected);
+    assert_eq!(
+        first_chunk["kind"], "collect_chunk",
+        "chunk frame: {first_chunk}"
+    );
+    disconnected.shutdown(Shutdown::Both).unwrap();
+    drop(disconnected);
+
+    let engine = runtime.native_query_engine().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let gateway = runtime.gateway_metrics().unwrap();
+        let pins = runtime
+            .health()
+            .catalog_runtime_snapshot_pins
+            .expect("native query runtime exposes snapshot pin accounting");
+        if gateway["native_query_requests_active"] == 0
+            && gateway["native_query_transport_failures_total"]
+                .as_u64()
+                .unwrap()
+                >= 1
+            && engine.process_memory_status().reserved_bytes == 0
+            && pins.active_pins == 0
+            && pins.active_tables == 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnected query did not release transport, operator, and snapshot resources"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(engine.process_memory_status().reserved_bytes, 0);
+    let metrics = runtime.gateway_metrics().unwrap();
+    assert!(
+        metrics["native_query_transport_failures_total"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+
+    assert!(runtime.shutdown().is_clean());
+    wait_until_bindable(gateway_addr);
 }
 
 #[test]
@@ -778,7 +1113,7 @@ async fn legacy_snapshot_without_catalog_revision_rebuilds_v4_shadow_baseline() 
     fs::create_dir_all(&persist_root).unwrap();
     let parquet_path = persist_root.join("events-0.parquet");
     write_test_parquet(&parquet_path, vec![1, 2]);
-    let snapshot_path = seed_legacy_append_table(&data_dir, &persist_root, &parquet_path);
+    let snapshot_path = seed_legacy_append_table(&data_dir, &persist_root, &parquet_path, 2);
     let mut snapshot =
         serde_json::from_slice::<serde_json::Value>(&fs::read(&snapshot_path).unwrap()).unwrap();
     snapshot
@@ -833,7 +1168,7 @@ async fn persisted_file_commit_reconciles_native_exact_snapshot_through_shadow_w
     fs::create_dir_all(&persist_root).unwrap();
     let initial_parquet_path = persist_root.join("events-0.parquet");
     write_test_parquet(&initial_parquet_path, vec![1, 2]);
-    seed_legacy_append_table(&data_dir, &persist_root, &initial_parquet_path);
+    seed_legacy_append_table(&data_dir, &persist_root, &initial_parquet_path, 2);
     let gateway_addr = reserve_tcp_addr();
     let mut runtime =
         LegacyServerRuntime::start(runtime_config_with_shadow_catalog_and_persist_root(

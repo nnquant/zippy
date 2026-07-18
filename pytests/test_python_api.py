@@ -11127,6 +11127,180 @@ def test_python_datetime_date_and_optional_pandas_timestamp_temporal_filters(
     ).to_pylist() == [2]
 
 
+def test_remote_native_table_plan_pushes_join_sort_and_tail_to_server(monkeypatch) -> None:
+    schemas = {
+        "ticks": pa.schema(
+            [("instrument_id", pa.string()), ("ts", pa.int64()), ("price", pa.float64())]
+        ),
+        "instruments": pa.schema([("instrument_id", pa.string()), ("multiplier", pa.float64())]),
+    }
+    captured: dict[str, object] = {}
+
+    class FakeMaster:
+        def remote_gateway_endpoint(self) -> str:
+            return "127.0.0.1:17666"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "query": {"native_enabled": True},
+                "gateway": {"enabled": True, "endpoint": "127.0.0.1:17666"},
+            }
+
+    class FakeRemoteQuery:
+        def __init__(self, source: str, master: object, **_kwargs: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schemas[self.source]
+
+        def stream_info(self) -> dict[str, object]:
+            return {"stream_name": self.source}
+
+        def native_query_enabled(self) -> bool:
+            return True
+
+        def collect_sql(self, sql: str, bindings: list[dict[str, object]]) -> pa.Table:
+            captured["sql"] = sql
+            captured["bindings"] = bindings
+            return pa.table({"instrument_id": ["CB001"], "ts": [2], "notional": [30.0]})
+
+        def explain_sql(self, sql: str, bindings: list[dict[str, object]]) -> dict[str, object]:
+            captured["explain_sql"] = sql
+            captured["explain_bindings"] = bindings
+            return {
+                "catalog_revision": 7,
+                "output_fields": [{"name": "notional", "data_type": "Float64"}],
+                "metrics": {
+                    "plan.physical_nodes": 9,
+                    "operator.join.count": 1,
+                    "operator.sort.count": 2,
+                },
+            }
+
+        def collect_plan(self, *_args: object, **_kwargs: object) -> pa.Table:
+            raise AssertionError("native query mode must not use legacy collect or residual plans")
+
+        def last_collect_metrics(self) -> dict[str, object]:
+            return {
+                "query_authority": "native",
+                "returned_rows": 1,
+                "plan.physical_nodes": 9,
+                "operator.join.count": 1,
+                "operator.memory_peak_bytes": 4096,
+            }
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+    master = FakeMaster()
+    ticks = zippy.read_table("ticks", master=master, snapshot=False)
+    instruments = zippy.read_table("instruments", master=master, snapshot=False)
+
+    query = (
+        ticks.filter(zippy.col("price") > 10.0)
+        .join(instruments, on="instrument_id")
+        .with_columns((zippy.col("price") * zippy.col("multiplier")).alias("notional"))
+        .select("instrument_id", "ts", "notional")
+        .sort("ts")
+        .tail(2)
+    )
+    result = query.collect()
+    explanation = query.explain()
+    profile = query.profile()
+
+    assert result.column("notional").to_pylist() == [30.0]
+    sql = str(captured["sql"])
+    assert "INNER JOIN" in sql
+    assert '"price" * "multiplier"' in sql
+    assert "ORDER BY" in sql
+    assert "LIMIT 2" in sql
+    bindings = captured["bindings"]
+    assert [binding["table"]["table"] for binding in bindings] == ["ticks", "instruments"]
+    assert explanation["executor"] == "remote_native"
+    assert explanation["residual_plan"] == []
+    assert explanation["profile"]["operator.join.count"] == 1
+    assert captured["explain_sql"] == sql
+    assert profile["metrics"]["operator.join.count"] == 1
+    assert profile["metrics"]["operator.memory_peak_bytes"] == 4096
+
+
+def test_remote_native_table_tail_without_sort_fails_without_legacy_fallback(monkeypatch) -> None:
+    class FakeRemoteQuery:
+        def __init__(self, source: str, master: object, **_kwargs: object) -> None:
+            self.source = source
+
+        def schema(self) -> pa.Schema:
+            return pa.schema([("value", pa.int64())])
+
+        def stream_info(self) -> dict[str, object]:
+            return {"stream_name": self.source}
+
+        def native_query_enabled(self) -> bool:
+            return True
+
+        def collect_plan(self, *_args: object, **_kwargs: object) -> pa.Table:
+            raise AssertionError("native query must not fall back to legacy collect")
+
+    class FakeMaster:
+        def remote_gateway_endpoint(self) -> str:
+            return "127.0.0.1:17666"
+
+        def get_config(self) -> dict[str, object]:
+            return {"query": {"native_enabled": True}}
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+
+    with pytest.raises(ValueError, match="native tail requires an explicit preceding sort"):
+        zippy.read_table("ticks", master=FakeMaster(), snapshot=False).tail(1).collect()
+
+
+def test_read_sql_uses_native_gateway_and_infers_aggregate_table_binding(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    expected = pa.table({"rows": [3]})
+
+    class FakeMaster:
+        def remote_gateway_endpoint(self) -> str:
+            return "127.0.0.1:17666"
+
+        def remote_gateway_token(self) -> str:
+            return "query-token"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "query": {"native_enabled": True},
+                "gateway": {"enabled": True, "endpoint": "127.0.0.1:17666"},
+            }
+
+    def fake_native_query(
+        endpoint: str,
+        sql: str,
+        bindings: list[dict[str, object]],
+        **kwargs: object,
+    ) -> tuple[pa.Table, dict[str, object]]:
+        captured.update(endpoint=endpoint, sql=sql, bindings=bindings, kwargs=kwargs)
+        return expected, {"returned_rows": 1}
+
+    monkeypatch.setattr(zippy, "_remote_native_query_request", fake_native_query)
+
+    result = zippy.read_sql(
+        "SELECT count(*) AS rows FROM ticks",
+        master=FakeMaster(),
+        memory_limit_bytes=8 * 1024 * 1024,
+        result_batch_rows=512,
+    )
+
+    assert result is expected
+    assert captured["endpoint"] == "127.0.0.1:17666"
+    assert captured["bindings"] == [
+        {
+            "sql_name": "ticks",
+            "table": {"type": "name", "namespace": "default", "table": "ticks"},
+        }
+    ]
+    assert captured["kwargs"]["token"] == "query-token"
+    assert captured["kwargs"]["memory_limit_bytes"] == 8 * 1024 * 1024
+    assert captured["kwargs"]["result_batch_rows"] == 512
+
+
 def _start_native_gateway_stack(
     *,
     token: str | None = None,

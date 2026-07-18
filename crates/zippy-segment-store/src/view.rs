@@ -31,6 +31,7 @@ pub(crate) enum RowSpanBacking {
 pub(crate) struct ActiveSegmentAttachment {
     pub(crate) descriptor: ActiveSegmentDescriptor,
     pub(crate) shm_region: Arc<ShmRegion>,
+    pub(crate) expected_payload_version: Option<u64>,
 }
 
 const ACTIVE_PAYLOAD_READ_MAX_RETRIES: usize = 8;
@@ -56,13 +57,26 @@ where
         if before % 2 != 0 {
             continue;
         }
+        if attachment
+            .expected_payload_version
+            .is_some_and(|expected| before != expected)
+        {
+            return Err(map_error(ZippySegmentStoreError::Lifecycle(
+                "active payload version differs from pinned snapshot",
+            )));
+        }
 
         let result = read_fn()?;
         let after = attachment
             .shm_region
             .load_u64_acquire(offset)
             .map_err(|error| map_error(ZippySegmentStoreError::Shmem(error.to_string())))?;
-        if before == after && after % 2 == 0 {
+        if before == after
+            && after % 2 == 0
+            && attachment
+                .expected_payload_version
+                .is_none_or(|expected| after == expected)
+        {
             return Ok(result);
         }
     }
@@ -128,6 +142,45 @@ impl RowSpanView {
             backing: RowSpanBacking::Active(ActiveSegmentAttachment {
                 descriptor,
                 shm_region,
+                expected_payload_version: None,
+            }),
+            start_row,
+            end_row,
+        })
+    }
+
+    /// 通过 active descriptor 构造固定 payload 版本和行高水位的查询快照。
+    ///
+    /// 普通 append 不改变 payload version，因此不会使已固定的前缀失效；任何原地
+    /// rewrite 都会改变版本，并使后续读取明确失败，避免一次查询混合两个物理版本。
+    pub fn snapshot_from_active_descriptor(
+        descriptor: ActiveSegmentDescriptor,
+        start_row: usize,
+        end_row: usize,
+    ) -> Result<Self, &'static str> {
+        if start_row > end_row {
+            return Err("start row exceeds end row");
+        }
+        let shm_region =
+            Arc::new(ShmRegion::open(descriptor.shm_os_id()).map_err(|_| {
+                "failed to reopen shared memory region from active segment descriptor"
+            })?);
+        validate_active_descriptor_header(&descriptor, &shm_region)?;
+        let committed = shm_region
+            .load_u64_acquire(descriptor.committed_row_count_offset())
+            .map_err(|_| "failed to read active segment committed row count")?;
+        let committed = usize::try_from(committed)
+            .map_err(|_| "active segment committed row count overflows usize")?;
+        if end_row > committed {
+            return Err("row span out of bounds");
+        }
+        let expected_payload_version = pin_active_payload_version(&descriptor, &shm_region)?;
+
+        Ok(Self {
+            backing: RowSpanBacking::Active(ActiveSegmentAttachment {
+                descriptor,
+                shm_region,
+                expected_payload_version: Some(expected_payload_version),
             }),
             start_row,
             end_row,
@@ -157,10 +210,53 @@ impl RowSpanView {
             backing: RowSpanBacking::Active(ActiveSegmentAttachment {
                 descriptor,
                 shm_region,
+                expected_payload_version: None,
             }),
             start_row,
             end_row,
         })
+    }
+
+    /// 返回当前范围内的相对行切片，并保留底层 segment 和 payload-version 租约。
+    pub fn slice_rows(&self, start_offset: usize, end_offset: usize) -> Result<Self, &'static str> {
+        if start_offset > end_offset || end_offset > self.row_count() {
+            return Err("row span slice is out of bounds");
+        }
+        Ok(Self {
+            backing: self.backing.clone(),
+            start_row: self.start_row + start_offset,
+            end_row: self.start_row + end_offset,
+        })
+    }
+
+    /// 返回查询快照钉住的 payload version；动态订阅读返回 `None`。
+    #[must_use]
+    pub fn pinned_payload_version(&self) -> Option<u64> {
+        match &self.backing {
+            RowSpanBacking::Sealed(_) => None,
+            RowSpanBacking::Active(attachment) => attachment.expected_payload_version,
+        }
+    }
+
+    /// 返回共享内存 active backing 当前是否已 seal；进程内 sealed backing 返回 `None`。
+    pub fn active_segment_is_sealed(&self) -> Result<Option<bool>, ZippySegmentStoreError> {
+        match &self.backing {
+            RowSpanBacking::Sealed(_) => Ok(None),
+            RowSpanBacking::Active(attachment) => {
+                let mut sealed = [0_u8; 1];
+                attachment
+                    .shm_region
+                    .read_at(SHM_SEALED_OFFSET, &mut sealed)
+                    .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
+                match sealed[0] {
+                    0 => Ok(Some(false)),
+                    1 => Ok(Some(true)),
+                    _ => Err(ZippySegmentStoreError::Layout(
+                        "active segment sealed flag is invalid",
+                    )),
+                }
+            }
+        }
     }
 
     /// 返回起始行。
@@ -468,6 +564,25 @@ impl RowSpanView {
 
         read_active_utf8_slice(attachment, layout, row).map(Some)
     }
+}
+
+fn pin_active_payload_version(
+    descriptor: &ActiveSegmentDescriptor,
+    shm_region: &ShmRegion,
+) -> Result<u64, &'static str> {
+    let offset = descriptor
+        .payload_version_offset()
+        .ok_or("active query snapshot requires payload version capability")?;
+    for _ in 0..ACTIVE_PAYLOAD_READ_MAX_RETRIES {
+        let version = shm_region
+            .load_u64_acquire(offset)
+            .map_err(|_| "failed to read active segment payload version")?;
+        if version % 2 == 0 {
+            return Ok(version);
+        }
+        std::hint::spin_loop();
+    }
+    Err("active payload mutation did not stabilize while pinning snapshot")
 }
 
 fn read_active_validity(

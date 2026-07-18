@@ -12,6 +12,8 @@ mod registry;
 
 pub use actor::{
     TableActorAdmissionControl, TableActorFailureMonitor, TableActorHandle,
+    TableActorLiveSegmentPublication, TableActorLiveSegmentRole, TableActorLiveSegmentSnapshot,
+    TableActorLiveSegmentsPublication, TableActorLiveSegmentsPublishRequest,
     TableActorPersistRequest, TableActorRegistry, TableActorRegistryConfig,
     TableActorRegistryHandle, TableActorSnapshot, TableActorSnapshotRequest,
     TablePersistenceStatus,

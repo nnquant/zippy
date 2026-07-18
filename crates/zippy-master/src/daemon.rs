@@ -20,8 +20,8 @@ use zippy_core::{
     ManagedDataDirectory, OwnedDataDirectory, ZippyConfig, ZippyError,
 };
 use zippy_gateway::{
-    GatewayServer, GatewayServerConfig, LegacyPersistedReadSnapshotSource,
-    PersistedReadSnapshotSource,
+    GatewayNativeQueryFrontend, GatewayServer, GatewayServerConfig,
+    LegacyPersistedReadSnapshotSource, PersistedReadSnapshotSource,
 };
 
 use crate::server::MasterServer;
@@ -549,8 +549,29 @@ pub fn start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
     control_endpoint: &ControlEndpoint,
     persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
 ) -> zippy_core::Result<Option<GatewayServer>> {
+    start_legacy_gateway_with_query_frontend_if_enabled(
+        runtime_config,
+        control_endpoint,
+        persisted_read_snapshot_source,
+        None,
+    )
+}
+
+/// Starts the compatibility Gateway with explicit persisted and native-query authorities.
+pub fn start_legacy_gateway_with_query_frontend_if_enabled(
+    runtime_config: &ZippyConfig,
+    control_endpoint: &ControlEndpoint,
+    persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
+    native_query_frontend: Option<Arc<dyn GatewayNativeQueryFrontend>>,
+) -> zippy_core::Result<Option<GatewayServer>> {
     if !runtime_config.gateway.enabled {
         return Ok(None);
+    }
+    if runtime_config.query.native_enabled && native_query_frontend.is_none() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "native query is enabled but no server-owned frontend was installed"
+                .to_string(),
+        });
     }
     let endpoint =
         runtime_config
@@ -560,7 +581,7 @@ pub fn start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "gateway endpoint is required when gateway is enabled".to_string(),
             })?;
-    let gateway = GatewayServer::new_with_query_limits_and_persisted_read_snapshot_source(
+    let mut gateway = GatewayServer::new_with_query_limits_and_persisted_read_snapshot_source(
         GatewayServerConfig {
             endpoint,
             master_endpoint: control_endpoint.clone(),
@@ -576,8 +597,11 @@ pub fn start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
         runtime_config.runtime.max_query_buffer_bytes,
         runtime_config.query_max_buffered_bytes(),
         persisted_read_snapshot_source,
-    )?
-    .start()?;
+    )?;
+    if let Some(frontend) = native_query_frontend {
+        gateway = gateway.with_native_query_frontend(frontend)?;
+    }
+    let gateway = gateway.start()?;
     let (host, port) = gateway_endpoint_host_port(gateway.endpoint());
     tracing::info!(
         component = "gateway",

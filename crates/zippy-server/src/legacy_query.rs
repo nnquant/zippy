@@ -22,7 +22,8 @@ use zippy_types::catalog::CatalogRead;
 use zippy_types::query::{
     LogicalPlanEnvelope, OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryEngine,
     QueryExecutionToken, QueryInput, QueryInstanceId, QueryOwnerCapability, QueryPlanInfo,
-    QueryRequest, QueryState, QueryStatus, RecordBatchStream, SendableRecordBatchStream,
+    QueryRequest, QueryResultBatch, QueryState, QueryStatus, RecordBatchStream,
+    SendableRecordBatchStream,
 };
 use zippy_types::{
     BoxFuture, ErrorCode, QueryId, ResourceLimit, Result, ServerError, ServerErrorDetails,
@@ -1468,7 +1469,7 @@ impl RecordBatchStream for LegacyRecordBatchStream {
     fn poll_next(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch>>> {
+    ) -> Poll<Option<Result<QueryResultBatch>>> {
         if self.terminal_observed {
             return Poll::Ready(None);
         }
@@ -1483,7 +1484,7 @@ impl RecordBatchStream for LegacyRecordBatchStream {
                 match state.item.take() {
                     Some(DeliveryItem::Batch(batch)) => {
                         self.shared.changed.notify_one();
-                        Poll::Ready(Some(Ok(batch)))
+                        Poll::Ready(Some(Ok(QueryResultBatch::unaccounted(batch))))
                     }
                     Some(DeliveryItem::Eof) => {
                         self.shared.changed.notify_one();
@@ -2967,9 +2968,10 @@ mod tests {
             .transpose()
             .unwrap()
         {
-            assert!(batch.num_rows() <= 128);
+            assert!(batch.record_batch().num_rows() <= 128);
             values.extend_from_slice(
                 batch
+                    .record_batch()
                     .column(0)
                     .as_any()
                     .downcast_ref::<Int64Array>()

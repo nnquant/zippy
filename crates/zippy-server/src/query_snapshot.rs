@@ -19,20 +19,27 @@ use zippy_catalog::{
     SqliteCatalogReadHandle, SqliteCatalogSnapshotReadLimits,
     PERSISTED_SCHEMA_DECODE_TRANSIENT_BYTES,
 };
-use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
-use zippy_query::{
-    BoxedAsyncFileReader, PersistedFileDescription, PersistedFileKey, PersistedSnapshotDescription,
-    PersistedTableDescription,
+use zippy_ingest::{
+    TableActorLiveSegmentRole, TableActorLiveSegmentSnapshot, TableActorRegistryHandle,
+    TableActorSnapshot,
 };
+use zippy_query::{
+    ActiveSegmentDescription, ActiveSegmentKey, ActiveSegmentOpenRequest, ActiveSegmentRole,
+    BoxedAsyncFileReader, PersistedDecodedOutputAdmission, PersistedFileDescription,
+    PersistedFileKey, PersistedSnapshotDescription, PersistedTableDescription,
+};
+use zippy_segment_store::RowSpanView;
 use zippy_types::catalog::CatalogSnapshotSelector;
 use zippy_types::query::{QueryInstanceId, QueryTableVersion};
 use zippy_types::storage::{
     CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseDescriptor, OpaqueQueryReadSnapshot,
-    QueryReadSnapshotDescriptor, QueryReadSnapshotGuard, TableReadSnapshotDescriptor,
+    QueryReadSnapshotDescriptor, QueryReadSnapshotGuard, SegmentReadSnapshotDescriptor,
+    TableReadSnapshotDescriptor,
 };
 use zippy_types::table::{DataFileState, TableDescriptor, TableRef};
 use zippy_types::{
-    BoxFuture, ErrorCode, LeaseId, OffsetWatermark, QueryId, Result, ServerError, TableId,
+    BoxFuture, ErrorCode, LeaseId, LogOffset, OffsetRange, OffsetWatermark, QueryId, Result,
+    ServerError, TableId,
 };
 
 use crate::query_physical::AdmittedPinnedParquetFile;
@@ -54,9 +61,11 @@ const PROJECTED_SCHEMA_DECODE_TRANSIENT_BYTES: u64 = PERSISTED_SCHEMA_DECODE_TRA
 const PROJECTED_MANIFEST_FIXED_RETAINED_BYTES: u64 = 64 * 1024;
 const PROJECTED_MANIFEST_BYTES_PER_TABLE: u64 = 4 * 1024;
 const PROJECTED_MANIFEST_BYTES_PER_FILE: u64 = 256;
+const PROJECTED_MANIFEST_BYTES_PER_ACTIVE_SEGMENT: u64 = 256;
 const PROJECTED_MANIFEST_FIXED_TASK_MARGIN_BYTES: u64 = 1024 * 1024;
 const PROJECTED_MANIFEST_TASK_BYTES_PER_TABLE: u64 = 512;
 const PROJECTED_MANIFEST_TASK_BYTES_PER_FILE: u64 = 512;
+const PROJECTED_MANIFEST_TASK_BYTES_PER_ACTIVE_SEGMENT: u64 = 512;
 static NEXT_SNAPSHOT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn conservative_query_snapshot_planning_peak_bytes(reference_count: usize) -> Result<NonZeroU64> {
@@ -115,6 +124,22 @@ pub(crate) struct ProjectedSnapshotManifest {
     retained_memory_bytes: NonZeroU64,
 }
 
+/// Snapshot-owned shared-memory spans cloned only after physical task admission.
+pub(crate) struct PinnedActiveSegmentSet {
+    table_id: TableId,
+    spans: Vec<RowSpanView>,
+}
+
+impl PinnedActiveSegmentSet {
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    pub(crate) fn spans(&self) -> &[RowSpanView] {
+        &self.spans
+    }
+}
+
 impl ProjectedSnapshotManifest {
     pub(crate) const fn query_id(&self) -> QueryId {
         self.query_id
@@ -144,13 +169,14 @@ impl ProjectedSnapshotManifest {
 struct PinnedProjectionInput {
     query_id: QueryId,
     catalog_revision: u64,
-    tables: Box<[QueryTableVersion]>,
+    tables: Box<[TableReadSnapshotDescriptor]>,
     pinned: SqliteCatalogPinnedQuerySnapshot,
     charges: ProjectedSnapshotCharges,
 }
 
 fn projected_snapshot_charges(
     pinned: &SqliteCatalogPinnedQuerySnapshot,
+    active_segment_count: u64,
 ) -> Result<ProjectedSnapshotCharges> {
     let profile = pinned.projection_profile();
     let table_count = profile.table_count();
@@ -181,6 +207,15 @@ fn projected_snapshot_charges(
             "file descriptions",
         )?,
         "file descriptions",
+    )?;
+    let retained = checked_projection_add(
+        retained,
+        checked_projection_mul(
+            active_segment_count,
+            PROJECTED_MANIFEST_BYTES_PER_ACTIVE_SEGMENT,
+            "active segment descriptions",
+        )?,
+        "active segment descriptions",
     )?;
     let retained_bytes = NonZeroU64::new(retained)
         .ok_or_else(|| projection_exhausted("projected retained charge must be nonzero"))?;
@@ -213,11 +248,31 @@ fn projected_snapshot_charges(
         )?,
         "transient file validation",
     )?;
+    let task_peak = checked_projection_add(
+        task_peak,
+        checked_projection_mul(
+            active_segment_count,
+            PROJECTED_MANIFEST_TASK_BYTES_PER_ACTIVE_SEGMENT,
+            "transient active segment validation",
+        )?,
+        "transient active segment validation",
+    )?;
     let task_peak_bytes = NonZeroU64::new(task_peak)
         .ok_or_else(|| projection_exhausted("projected task peak must be nonzero"))?;
     Ok(ProjectedSnapshotCharges {
         task_peak_bytes,
         retained_bytes,
+    })
+}
+
+fn snapshot_active_segment_count(tables: &[TableReadSnapshotDescriptor]) -> Result<u64> {
+    tables.iter().try_fold(0_u64, |total, table| {
+        let retained = u64::try_from(table.retained_sealed_segments.len())
+            .map_err(|_| projection_exhausted("retained live segment count exceeds u64"))?;
+        total
+            .checked_add(retained)
+            .and_then(|count| count.checked_add(u64::from(table.active_segment.is_some())))
+            .ok_or_else(|| projection_exhausted("active snapshot segment count overflowed u64"))
     })
 }
 
@@ -628,9 +683,105 @@ impl NativeQuerySnapshotCoordinator {
         execution: &QueryExecutionScope,
         charge: QueryTaskCharge,
         description: PersistedFileDescription,
+        output_admission: PersistedDecodedOutputAdmission,
     ) -> Result<BoxedAsyncFileReader> {
         let task = self.admit_described_file_task(execution, charge, description)?;
-        Ok(AdmittedPinnedParquetFile::deferred(task))
+        Ok(AdmittedPinnedParquetFile::deferred(task, output_admission))
+    }
+
+    /// Admits one active scan task before cloning any shared-memory capability from the guard.
+    pub(crate) fn admit_described_active_task(
+        &self,
+        execution: &QueryExecutionScope,
+        charge: QueryTaskCharge,
+        request: &ActiveSegmentOpenRequest,
+    ) -> Result<QueryTaskPermit<PinnedActiveSegmentSet>> {
+        let query_id = execution.query_id();
+        let first = request.descriptions().first().copied().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::InvalidArgument,
+                "active segment execution request is empty",
+            )
+            .with_query_id(query_id)
+            .with_retryable(false)
+        })?;
+        execution.admit_snapshot_task::<NativeQueryReadSnapshot, PinnedActiveSegmentSet>(
+            charge,
+            |snapshot| {
+                self.validate_origin(snapshot)?;
+                if snapshot.descriptor.query_id != query_id {
+                    return Err(corruption(
+                        query_id,
+                        "active segment request belongs to another native query snapshot",
+                    ));
+                }
+                let table = snapshot
+                    .descriptor
+                    .tables
+                    .get(first.table_index())
+                    .ok_or_else(|| {
+                        corruption(query_id, "active segment table ordinal is out of bounds")
+                    })?;
+                let capabilities =
+                    snapshot
+                        .live_segments
+                        .get(first.table_index())
+                        .ok_or_else(|| {
+                            corruption(query_id, "active segment capability table is absent")
+                        })?;
+                if table.table_id != first.table_id()
+                    || table.persisted_snapshot_version != first.snapshot_version().get()
+                    || table.schema_version != first.schema_version().get()
+                    || capabilities.len() != request.descriptions().len()
+                {
+                    return Err(corruption(
+                        query_id,
+                        "active segment request differs from its table snapshot",
+                    )
+                    .with_table_id(table.table_id));
+                }
+
+                let mut spans = Vec::with_capacity(capabilities.len());
+                for (expected_index, (capability, description)) in
+                    capabilities.iter().zip(request.descriptions()).enumerate()
+                {
+                    let expected_role = match capability.role() {
+                        TableActorLiveSegmentRole::RetainedSealed => {
+                            ActiveSegmentRole::RetainedSealed
+                        }
+                        TableActorLiveSegmentRole::Active => ActiveSegmentRole::Active,
+                    };
+                    if description.table_index() != first.table_index()
+                        || description.segment_index() != expected_index
+                        || description.table_id() != table.table_id
+                        || description.snapshot_version().get() != table.persisted_snapshot_version
+                        || description.schema_version().get() != capability.schema_version()
+                        || description.source() != capability.identity()
+                        || description.role() != expected_role
+                        || description.offsets() != capability.offsets()
+                        || description.row_count().get()
+                            != u64::try_from(capability.span().row_count()).map_err(|_| {
+                                corruption(
+                                    query_id,
+                                    "active segment capability row count exceeds u64",
+                                )
+                                .with_table_id(table.table_id)
+                            })?
+                    {
+                        return Err(corruption(
+                            query_id,
+                            "active segment request differs from its pinned capability",
+                        )
+                        .with_table_id(table.table_id));
+                    }
+                    spans.push(capability.span().clone());
+                }
+                Ok(PinnedActiveSegmentSet {
+                    table_id: table.table_id,
+                    spans,
+                })
+            },
+        )
     }
 
     /// Projects the exact pinned snapshot into capability-free persisted query metadata.
@@ -647,8 +798,12 @@ impl NativeQuerySnapshotCoordinator {
             .admit_snapshot_task_with_charge::<NativeQueryReadSnapshot, PinnedProjectionInput>(
                 |snapshot| {
                     self.validate_origin(snapshot)?;
-                    let charges = projected_snapshot_charges(&snapshot.pinned)
-                        .map_err(|error| error.with_query_id(query_id))?;
+                    let active_segment_count =
+                        snapshot_active_segment_count(&snapshot.descriptor.tables)
+                            .map_err(|error| error.with_query_id(query_id))?;
+                    let charges =
+                        projected_snapshot_charges(&snapshot.pinned, active_segment_count)
+                            .map_err(|error| error.with_query_id(query_id))?;
                     Ok(QueryTaskCharge {
                         cpu_slots: NonZeroU32::new(1).expect("projection CPU charge is nonzero"),
                         memory_bytes: charges.task_peak_bytes,
@@ -662,8 +817,12 @@ impl NativeQuerySnapshotCoordinator {
                             "native query snapshot identity changed during persisted projection",
                         ));
                     }
-                    let charges = projected_snapshot_charges(&snapshot.pinned)
-                        .map_err(|error| error.with_query_id(query_id))?;
+                    let active_segment_count =
+                        snapshot_active_segment_count(&snapshot.descriptor.tables)
+                            .map_err(|error| error.with_query_id(query_id))?;
+                    let charges =
+                        projected_snapshot_charges(&snapshot.pinned, active_segment_count)
+                            .map_err(|error| error.with_query_id(query_id))?;
                     if admitted_charge
                         != (QueryTaskCharge {
                             cpu_slots: NonZeroU32::new(1)
@@ -676,17 +835,7 @@ impl NativeQuerySnapshotCoordinator {
                             "persisted projection charge changed after task admission",
                         ));
                     }
-                    let tables = snapshot
-                        .descriptor
-                        .tables
-                        .iter()
-                        .map(|table| QueryTableVersion {
-                            table_id: table.table_id,
-                            snapshot_version: table.persisted_snapshot_version,
-                            schema_version: table.schema_version,
-                        })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
+                    let tables = snapshot.descriptor.tables.to_vec().into_boxed_slice();
                     Ok(PinnedProjectionInput {
                         query_id,
                         catalog_revision: snapshot.descriptor.catalog_revision,
@@ -722,6 +871,13 @@ impl NativeQuerySnapshotCoordinator {
             .await?;
         let resolved = resolved_with_lease.0;
         snapshot_memory_lease = resolved_with_lease.1;
+        if resolved.len() != tables.len() {
+            return Err(corruption(
+                query_id,
+                "Catalog table resolution count does not match the requested reference count",
+            ));
+        }
+        let requested_table_ids = resolved.iter().map(|table| table.table_id).collect();
         let resolved = canonicalize_tables(resolved)?;
         let mut pending = Vec::with_capacity(resolved.len());
         for table in resolved.values() {
@@ -759,6 +915,8 @@ impl NativeQuerySnapshotCoordinator {
                     persisted_snapshot_version,
                     writer_epoch,
                     actor_committed_log_offset: None,
+                    live_segments: Arc::from([]),
+                    live_high_watermark: None,
                 },
             });
         }
@@ -784,6 +942,11 @@ impl NativeQuerySnapshotCoordinator {
         #[cfg(test)]
         self.wait_for_pin_stall(TestPinStage::AfterCatalogPin).await;
         let tables = self.finalize_descriptors(query_id, &boundaries, &pin_requests, &pinned)?;
+        let live_segments = boundaries
+            .iter()
+            .map(|boundary| Arc::clone(&boundary.live_segments))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let descriptor = QueryReadSnapshotDescriptor {
             query_id,
             catalog_revision: pinned.catalog_revision(),
@@ -793,6 +956,8 @@ impl NativeQuerySnapshotCoordinator {
             descriptor,
             pinned,
             coordinator_nonce: self.inner.nonce,
+            requested_table_ids,
+            live_segments,
         })
     }
 
@@ -863,16 +1028,18 @@ impl NativeQuerySnapshotCoordinator {
                 .with_table_id(boundary.table_id)
                 .with_retryable(true));
             }
+            let (active_segment, retained_sealed_segments) =
+                project_live_read_descriptors(query_id, boundary)?;
             let max_log_offset = boundary
-                .actor_committed_log_offset
+                .live_high_watermark
                 .unwrap_or(manifest.snapshot_metadata().committed_log_offset);
             descriptors.push(TableReadSnapshotDescriptor {
                 table_id: boundary.table_id,
                 schema_version: boundary.schema_version,
                 persisted_snapshot_version: boundary.persisted_snapshot_version,
                 writer_epoch: boundary.writer_epoch,
-                active_segment: None,
-                retained_sealed_segments: Vec::new(),
+                active_segment,
+                retained_sealed_segments,
                 max_log_offset,
                 lease_id: pin_request.lease_id,
             });
@@ -904,6 +1071,89 @@ impl Drop for SnapshotPlanningAdmission {
     }
 }
 
+fn project_live_read_descriptors(
+    query_id: QueryId,
+    boundary: &TableBoundary,
+) -> Result<(
+    Option<SegmentReadSnapshotDescriptor>,
+    Vec<SegmentReadSnapshotDescriptor>,
+)> {
+    if boundary.live_high_watermark.is_none() {
+        if !boundary.live_segments.is_empty() || boundary.actor_committed_log_offset.is_some() {
+            return Err(corruption(
+                query_id,
+                "persisted-only boundary unexpectedly owns actor live state",
+            )
+            .with_table_id(boundary.table_id));
+        }
+        return Ok((None, Vec::new()));
+    }
+    let mut active_segment = None;
+    let mut retained = Vec::with_capacity(boundary.live_segments.len());
+    for (index, segment) in boundary.live_segments.iter().enumerate() {
+        if segment.schema_version() != boundary.schema_version
+            || segment.identity().writer_epoch != boundary.writer_epoch
+            || segment.offsets().len() != segment.span().row_count() as u128
+        {
+            return Err(corruption(
+                query_id,
+                "actor live segment differs from its serialized table boundary",
+            )
+            .with_table_id(boundary.table_id));
+        }
+        let committed_rows = u64::try_from(segment.span().row_count()).map_err(|_| {
+            corruption(query_id, "actor live segment row count exceeds u64")
+                .with_table_id(boundary.table_id)
+        })?;
+        if committed_rows == 0 {
+            return Err(
+                corruption(query_id, "actor live segment snapshot contains zero rows")
+                    .with_table_id(boundary.table_id),
+            );
+        }
+        let descriptor = SegmentReadSnapshotDescriptor {
+            identity: segment.identity(),
+            schema_version: segment.schema_version(),
+            committed_rows,
+            committed_log_offset: OffsetWatermark::Known(segment.offsets().last()),
+        };
+        match segment.role() {
+            TableActorLiveSegmentRole::RetainedSealed if active_segment.is_none() => {
+                retained.push(descriptor);
+            }
+            TableActorLiveSegmentRole::Active
+                if active_segment.is_none() && index + 1 == boundary.live_segments.len() =>
+            {
+                active_segment = Some(descriptor);
+            }
+            TableActorLiveSegmentRole::RetainedSealed | TableActorLiveSegmentRole::Active => {
+                return Err(corruption(
+                    query_id,
+                    "actor live segment roles are not in retained-then-active order",
+                )
+                .with_table_id(boundary.table_id));
+            }
+        }
+    }
+    let expected_high_watermark = boundary
+        .live_segments
+        .last()
+        .map(|segment| OffsetWatermark::Known(segment.offsets().last()))
+        .unwrap_or_else(|| {
+            boundary
+                .actor_committed_log_offset
+                .expect("actor live boundary always has persisted watermark")
+        });
+    if boundary.live_high_watermark != Some(expected_high_watermark) {
+        return Err(corruption(
+            query_id,
+            "actor live high watermark differs from its segment boundary",
+        )
+        .with_table_id(boundary.table_id));
+    }
+    Ok((active_segment, retained))
+}
+
 enum PendingTableBoundary {
     Actor(zippy_ingest::TableActorSnapshotRequest),
     PersistedOnly {
@@ -914,13 +1164,15 @@ enum PendingTableBoundary {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TableBoundary {
     table_id: TableId,
     schema_version: u64,
     persisted_snapshot_version: u64,
     writer_epoch: u64,
     actor_committed_log_offset: Option<OffsetWatermark>,
+    live_segments: Arc<[TableActorLiveSegmentSnapshot]>,
+    live_high_watermark: Option<OffsetWatermark>,
 }
 
 impl TableBoundary {
@@ -931,6 +1183,8 @@ impl TableBoundary {
             persisted_snapshot_version: snapshot.persisted_snapshot_version,
             writer_epoch: snapshot.writer_epoch,
             actor_committed_log_offset: Some(snapshot.committed_log_offset),
+            live_segments: snapshot.live_segments,
+            live_high_watermark: Some(snapshot.max_log_offset),
         }
     }
 }
@@ -940,6 +1194,8 @@ pub(crate) struct NativeQueryReadSnapshot {
     descriptor: QueryReadSnapshotDescriptor,
     pinned: SqliteCatalogPinnedQuerySnapshot,
     coordinator_nonce: u64,
+    requested_table_ids: Vec<TableId>,
+    live_segments: Box<[Arc<[TableActorLiveSegmentSnapshot]>]>,
 }
 
 impl NativeQueryReadSnapshot {
@@ -958,6 +1214,31 @@ impl NativeQueryReadSnapshot {
                 })
                 .collect(),
         )
+    }
+
+    /// Maps each original table reference to its canonical snapshot ordinal.
+    pub(crate) fn requested_table_ordinals(&self) -> Result<Vec<usize>> {
+        let canonical = self
+            .descriptor
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(index, table)| (table.table_id, index))
+            .collect::<BTreeMap<_, _>>();
+        self.requested_table_ids
+            .iter()
+            .map(|table_id| {
+                canonical.get(table_id).copied().ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::DataCorruption,
+                        "resolved request table is absent from the canonical query snapshot",
+                    )
+                    .with_query_id(self.descriptor.query_id)
+                    .with_table_id(*table_id)
+                    .with_retryable(false)
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn into_opaque(self) -> OpaqueQueryReadSnapshot {
@@ -1091,8 +1372,10 @@ fn project_pinned_snapshot(
             "pinned Catalog table count differs from the query snapshot audit",
         ));
     }
-    let actual_charges =
-        projected_snapshot_charges(&pinned).map_err(|error| error.with_query_id(query_id))?;
+    let active_segment_count = snapshot_active_segment_count(&audit_tables)
+        .map_err(|error| error.with_query_id(query_id))?;
+    let actual_charges = projected_snapshot_charges(&pinned, active_segment_count)
+        .map_err(|error| error.with_query_id(query_id))?;
     if actual_charges != charges {
         return Err(corruption(
             query_id,
@@ -1121,7 +1404,7 @@ fn project_pinned_snapshot(
 
         let selector = table.selector();
         if selector.table_id != audit.table_id
-            || selector.snapshot_version != audit.snapshot_version
+            || selector.snapshot_version != audit.persisted_snapshot_version
             || selector.schema_version != audit.schema_version
         {
             return Err(corruption(
@@ -1134,12 +1417,12 @@ fn project_pinned_snapshot(
         let schema_descriptor = table.schema();
         let snapshot_metadata = table.snapshot_metadata();
         if table_descriptor.table_id != audit.table_id
-            || table_descriptor.current_snapshot_version < audit.snapshot_version
+            || table_descriptor.current_snapshot_version < audit.persisted_snapshot_version
             || table_descriptor.current_schema_version < audit.schema_version
             || schema_descriptor.table_id != audit.table_id
             || schema_descriptor.schema_version != audit.schema_version
             || snapshot_metadata.table_id != audit.table_id
-            || snapshot_metadata.snapshot_version != audit.snapshot_version
+            || snapshot_metadata.snapshot_version != audit.persisted_snapshot_version
         {
             return Err(corruption(
                 query_id,
@@ -1150,7 +1433,7 @@ fn project_pinned_snapshot(
         let snapshot_version = nonzero_projection_version(
             query_id,
             audit.table_id,
-            audit.snapshot_version,
+            audit.persisted_snapshot_version,
             "snapshot",
         )?;
         let schema_version =
@@ -1186,13 +1469,22 @@ fn project_pinned_snapshot(
                 &file,
             )?);
         }
-        let projected = PersistedTableDescription::try_new(
+        let active_segments = project_active_segment_descriptions(
+            query_id,
+            table_index,
+            audit,
+            snapshot_version,
+            schema_version,
+            snapshot_metadata.committed_log_offset,
+        )?;
+        let projected = PersistedTableDescription::try_new_with_active_segments(
             table_index,
             audit.table_id,
             snapshot_version,
             schema_version,
             decoded.into_schema(),
             files,
+            active_segments,
         )
         .map_err(|error| {
             corruption(
@@ -1224,6 +1516,117 @@ fn project_pinned_snapshot(
         catalog_revision,
         description,
         retained_memory_bytes: charges.retained_bytes,
+    })
+}
+
+fn project_active_segment_descriptions(
+    query_id: QueryId,
+    table_index: usize,
+    audit: &TableReadSnapshotDescriptor,
+    snapshot_version: NonZeroU64,
+    schema_version: NonZeroU64,
+    persisted_watermark: OffsetWatermark,
+) -> Result<Vec<ActiveSegmentDescription>> {
+    let capacity = audit
+        .retained_sealed_segments
+        .len()
+        .checked_add(usize::from(audit.active_segment.is_some()))
+        .ok_or_else(|| projection_exhausted("active segment description count overflowed usize"))?;
+    let mut descriptions = Vec::with_capacity(capacity);
+    for segment in &audit.retained_sealed_segments {
+        descriptions.push(project_active_segment_description(
+            query_id,
+            table_index,
+            descriptions.len(),
+            audit,
+            segment,
+            ActiveSegmentRole::RetainedSealed,
+            snapshot_version,
+            schema_version,
+        )?);
+    }
+    if let Some(segment) = &audit.active_segment {
+        descriptions.push(project_active_segment_description(
+            query_id,
+            table_index,
+            descriptions.len(),
+            audit,
+            segment,
+            ActiveSegmentRole::Active,
+            snapshot_version,
+            schema_version,
+        )?);
+    }
+    let expected_high_watermark = descriptions
+        .last()
+        .map(|segment| OffsetWatermark::Known(segment.offsets().last()))
+        .unwrap_or(persisted_watermark);
+    if audit.max_log_offset != expected_high_watermark {
+        return Err(corruption(
+            query_id,
+            "query snapshot max log offset differs from persisted/live descriptions",
+        )
+        .with_table_id(audit.table_id));
+    }
+    Ok(descriptions)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_active_segment_description(
+    query_id: QueryId,
+    table_index: usize,
+    segment_index: usize,
+    audit: &TableReadSnapshotDescriptor,
+    segment: &SegmentReadSnapshotDescriptor,
+    role: ActiveSegmentRole,
+    snapshot_version: NonZeroU64,
+    schema_version: NonZeroU64,
+) -> Result<ActiveSegmentDescription> {
+    if segment.schema_version != audit.schema_version
+        || segment.identity.writer_epoch != audit.writer_epoch
+        || segment.committed_rows == 0
+    {
+        return Err(corruption(
+            query_id,
+            "live segment audit differs from table schema or writer epoch",
+        )
+        .with_table_id(audit.table_id));
+    }
+    let last = segment.committed_log_offset.known().ok_or_else(|| {
+        corruption(
+            query_id,
+            "live segment audit requires a known committed log offset",
+        )
+        .with_table_id(audit.table_id)
+    })?;
+    let first_value = last
+        .get()
+        .checked_sub(segment.committed_rows - 1)
+        .ok_or_else(|| {
+            corruption(query_id, "live segment logical offset range underflowed")
+                .with_table_id(audit.table_id)
+        })?;
+    let offsets = OffsetRange::new(LogOffset::new(first_value), last).map_err(|error| {
+        corruption(
+            query_id,
+            format!("live segment logical offsets are invalid error=[{error}]"),
+        )
+        .with_table_id(audit.table_id)
+    })?;
+    ActiveSegmentDescription::try_new(
+        ActiveSegmentKey::new(table_index, segment_index, audit.table_id, segment.identity),
+        role,
+        snapshot_version,
+        schema_version,
+        offsets,
+        NonZeroU64::new(segment.committed_rows).expect("zero live rows rejected above"),
+    )
+    .map_err(|error| {
+        corruption(
+            query_id,
+            format!("active segment projection is invalid error=[{error}]"),
+        )
+        .with_table_id(audit.table_id)
     })
 }
 
@@ -1330,7 +1733,7 @@ fn corruption(query_id: QueryId, message: impl Into<String>) -> ServerError {
 mod tests {
     use std::collections::BTreeMap;
     use std::io::Read;
-    use std::num::{NonZeroU32, NonZeroU64};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1344,8 +1747,9 @@ mod tests {
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::{OwnedDataDirectory, DEFAULT_QUERY_MAX_MEMORY_BYTES};
     use zippy_query::{
-        parquet_metadata_memory_charge, AdmittedAsyncParquetReader, PersistedFileDescription,
-        PersistedFileKey, PARQUET_TRAILER_SIZE_BYTES,
+        parquet_metadata_memory_charge, AdmittedAsyncParquetReader,
+        PersistedDecodedOutputAdmission, PersistedFileDescription, PersistedFileKey,
+        PARQUET_TRAILER_SIZE_BYTES,
     };
     use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
@@ -1437,6 +1841,15 @@ mod tests {
             DataType::Int64,
             false,
         )]))
+    }
+
+    fn output_admission() -> PersistedDecodedOutputAdmission {
+        PersistedDecodedOutputAdmission::try_for_fixed_width_schema(
+            NonZeroUsize::new(8192).expect("nonzero test batch size"),
+            arrow_schema().as_ref(),
+            NonZeroUsize::new(4).expect("nonzero test batch copies"),
+        )
+        .expect("build fixed-width test output admission")
     }
 
     fn persist_request() -> PersistRequest {
@@ -1656,6 +2069,12 @@ mod tests {
             .pin_persisted(&planning, &mixed_refs())
             .await
             .expect("pin mixed query snapshot");
+        assert_eq!(
+            snapshot
+                .requested_table_ordinals()
+                .expect("map request references to canonical ordinals"),
+            vec![1, 0, 0]
+        );
         let snapshot_memory_bytes = snapshot_peak_bytes(mixed_refs().len());
         let resource_status = resources.status();
         assert_eq!(resource_status.active_snapshot_memory_permits, 1);
@@ -1785,7 +2204,7 @@ mod tests {
             .await
             .expect("pin mixed projected snapshot");
         let expected_charges =
-            super::projected_snapshot_charges(&snapshot.pinned).expect("estimate projection");
+            super::projected_snapshot_charges(&snapshot.pinned, 0).expect("estimate projection");
         assert!(
             expected_charges.task_peak_bytes.get()
                 >= expected_charges
@@ -1996,7 +2415,12 @@ mod tests {
         ];
         for description in forged {
             let error = snapshot_coordinator
-                .deferred_described_file_reader(&execution, charge(), description)
+                .deferred_described_file_reader(
+                    &execution,
+                    charge(),
+                    description,
+                    output_admission(),
+                )
                 .err()
                 .expect("forged persisted file description must be rejected");
             assert_eq!(error.code(), zippy_types::ErrorCode::DataCorruption);
@@ -2004,7 +2428,7 @@ mod tests {
         }
 
         let mut reader = snapshot_coordinator
-            .deferred_described_file_reader(&execution, charge(), file)
+            .deferred_described_file_reader(&execution, charge(), file, output_admission())
             .expect("admit exact projected file description");
         assert_eq!(resources.status().active_tasks, 1);
         assert_eq!(
@@ -2028,7 +2452,7 @@ mod tests {
         assert_eq!(resources.status().active_tasks, 0);
 
         let mut cancelled_reader = snapshot_coordinator
-            .deferred_described_file_reader(&execution, charge(), file)
+            .deferred_described_file_reader(&execution, charge(), file, output_admission())
             .expect("admit exact file before cancellation");
         resources
             .cancel_current_for_test(query)
@@ -2317,11 +2741,13 @@ mod tests {
         let file_task = snapshot_coordinator
             .admit_file_task(&execution, charge(), 0, 0)
             .expect("admit exact pinned file task");
-        let source =
-            tokio::task::spawn_blocking(move || AdmittedPinnedParquetFile::open(file_task))
-                .await
-                .expect("join bounded file opener")
-                .expect("open admitted Parquet source");
+        let admission = output_admission();
+        let (source, parsed_metadata) = tokio::task::spawn_blocking(move || {
+            AdmittedPinnedParquetFile::open(file_task, admission)
+        })
+        .await
+        .expect("join bounded file opener")
+        .expect("open admitted Parquet source");
         assert_eq!(resources.status().active_tasks, 1);
         assert_eq!(resources.status().active_result_permits, 0);
 
@@ -2341,6 +2767,13 @@ mod tests {
         let expected_metadata_memory_bytes =
             parquet_metadata_memory_charge(file_size_bytes, &trailer)
                 .expect("compute admitted Parquet metadata charge");
+        let expected_decode_memory_bytes = output_admission()
+            .file_decode_memory_bytes(&parsed_metadata)
+            .expect("compute admitted decoded output charge");
+        let expected_file_task_memory_bytes = expected_metadata_memory_bytes
+            .get()
+            .checked_add(expected_decode_memory_bytes.get())
+            .expect("test file task memory charge fits u64");
         drop(trailer_bytes);
         assert_eq!(resources.status().active_result_permits, 0);
 
@@ -2367,7 +2800,8 @@ mod tests {
         assert_eq!(resources.status().active_result_permits, 0);
         assert_eq!(resources.status().active_result_memory_bytes, 0);
 
-        let mut async_reader = AdmittedAsyncParquetReader::new(source.clone());
+        let mut async_reader =
+            AdmittedAsyncParquetReader::new_with_metadata(source.clone(), parsed_metadata);
         let metadata = async_reader
             .get_metadata()
             .await
@@ -2376,7 +2810,7 @@ mod tests {
         assert_eq!(metadata.file_metadata().num_rows(), 1);
         assert_eq!(
             resources.status().active_task_memory_bytes,
-            expected_metadata_memory_bytes.get()
+            expected_file_task_memory_bytes
         );
         drop(async_reader);
         assert_eq!(resources.status().active_result_permits, 0);

@@ -1,27 +1,64 @@
 //! Lifecycle-bound execution of persisted native query plans.
 
 use std::num::{NonZeroU32, NonZeroU64};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+use datafusion::physical_plan::RecordBatchStream;
+use futures::Stream;
 use zippy_query::{
-    classify_persisted_plan_error, prepare_persisted_plan, profile_persisted_plan,
-    BoundPersistedPlan, BoxedAsyncFileReader, PersistedFileDescription, PersistedFileOpenRequest,
-    PersistedFileOpener, PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile,
-    PersistedSnapshotDescription, PersistedTableBinding, PreparedPersistedPlan, QuerySessionPolicy,
+    classify_persisted_execution_error, classify_persisted_plan_error, next_persisted_batch,
+    prepare_persisted_plan, profile_persisted_plan, structured_persisted_execution_error,
+    ActiveSegmentOpenRequest, ActiveSegmentOpener, BoundPersistedPlan, BoxedAsyncFileReader,
+    PersistedDecodedOutputAdmission, PersistedExecutionContext, PersistedExecutionError,
+    PersistedExecutionErrorClass, PersistedFileDescription, PersistedFileOpenRequest,
+    PersistedFileOpener, PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanMetrics,
+    PersistedPlanProfile, PersistedRecordBatchStream, PersistedSnapshotDescription,
+    PersistedTableBinding, PreparedPersistedPlan, QueryOperatorMemoryStatus,
+    QueryProcessMemoryPool, QuerySessionPolicy,
 };
-use zippy_types::query::QueryInstanceId;
+use zippy_segment_store::RowSpanBatchReader;
+use zippy_types::query::{QueryInstanceId, QueryResultBatch};
+use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
 use zippy_types::{ErrorCode, QueryId, Result, ServerError};
 
 use crate::query_service::{
-    QueryExecutionScope, QueryRetainedCharge, QueryRetainedKind, QueryRetainedPermit,
-    QueryTaskCharge, QueryTaskPermit,
+    QueryCancellation, QueryExecutionScope, QueryResultCharge, QueryResultPermit,
+    QueryRetainedCharge, QueryRetainedKind, QueryRetainedPermit, QueryTaskCharge, QueryTaskPermit,
+    QueryTerminalSignal,
 };
-use crate::query_snapshot::{NativeQuerySnapshotCoordinator, ProjectedSnapshotManifest};
+use crate::query_snapshot::{
+    NativeQuerySnapshotCoordinator, PinnedActiveSegmentSet, ProjectedSnapshotManifest,
+};
 
 const PHYSICAL_BUILD_CPU_SLOTS: u32 = 1;
 const PERSISTED_FILE_TASK_CPU_SLOTS: u32 = 1;
 const PERSISTED_FILE_TASK_MEMORY_BYTES: u64 = 64 * 1024;
+const ACTIVE_SEGMENT_TASK_CPU_SLOTS: u32 = 1;
+const ACTIVE_SEGMENT_TASK_BYTES_PER_SEGMENT: u64 = 1024;
+const EXECUTION_DRIVER_CPU_SLOTS: u32 = 1;
+const OPERATOR_CONTEXT_RETAINED_MEMORY_BYTES: u64 = 1024 * 1024;
+const OPERATOR_CONTEXT_BUILD_TRANSIENT_MEMORY_BYTES: u64 = 1024 * 1024;
+const EXECUTION_DRIVER_MEMORY_BYTES: u64 = 64 * 1024;
+const RESULT_BATCH_FIXED_MEMORY_BYTES: u64 = 4 * 1024;
+
+/// Resource limits for one native persisted execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeQueryExecutionConfig {
+    operator_pool_memory_bytes: NonZeroU64,
+}
+
+impl NativeQueryExecutionConfig {
+    pub(crate) const fn new(operator_pool_memory_bytes: NonZeroU64) -> Self {
+        Self {
+            operator_pool_memory_bytes,
+        }
+    }
+}
 
 /// A prepared plan whose complete asynchronous construction retained its build reservation.
 ///
@@ -117,8 +154,10 @@ impl AdmittedPreparedPersistedPlan {
         QueryTaskPermit<()>,
         PreparedPersistedPlan,
         PersistedPlanProfile,
+        PersistedPlanMetrics,
     ) {
-        (self.task, self.prepared, self.profile)
+        let metrics = self.prepared.metrics();
+        (self.task, self.prepared, self.profile, metrics)
     }
 }
 
@@ -133,6 +172,7 @@ struct NativeExecutionAuthority {
     snapshot_coordinator: NativeQuerySnapshotCoordinator,
     accepting_readers: AtomicBool,
     execution: Mutex<Option<QueryExecutionScope>>,
+    output_admission: Mutex<Option<PersistedDecodedOutputAdmission>>,
     #[cfg(test)]
     reader_admission_pause: Mutex<Option<Arc<ReaderAdmissionPause>>>,
 }
@@ -164,6 +204,7 @@ impl NativeExecutionAuthority {
             snapshot_coordinator,
             accepting_readers: AtomicBool::new(true),
             execution: Mutex::new(Some(execution)),
+            output_admission: Mutex::new(None),
             #[cfg(test)]
             reader_admission_pause: Mutex::new(None),
         }
@@ -178,6 +219,133 @@ impl NativeExecutionAuthority {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
+    }
+
+    fn cancellation(&self) -> Result<QueryCancellation> {
+        let execution = self
+            .execution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        execution
+            .as_ref()
+            .map(QueryExecutionScope::cancellation)
+            .ok_or_else(|| closed_execution(self.binding.instance_id))
+    }
+
+    fn install_output_admission(&self, admission: PersistedDecodedOutputAdmission) -> Result<()> {
+        let mut installed = self
+            .output_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if installed.is_some() {
+            return Err(ServerError::new(
+                ErrorCode::Internal,
+                "native persisted output admission was installed more than once",
+            )
+            .with_query_id(self.binding.instance_id.query_id())
+            .with_retryable(false));
+        }
+        *installed = Some(admission);
+        Ok(())
+    }
+
+    fn output_admission(&self) -> Result<PersistedDecodedOutputAdmission> {
+        self.output_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "native persisted reader has no decoded output admission",
+                )
+                .with_query_id(self.binding.instance_id.query_id())
+                .with_retryable(false)
+            })
+    }
+
+    fn admit_operator_context(
+        &self,
+        policy: QuerySessionPolicy,
+        operator_pool_memory_bytes: NonZeroU64,
+        process_memory: &QueryProcessMemoryPool,
+    ) -> Result<QueryRetainedPermit<PersistedExecutionContext>> {
+        let retained_memory_bytes = operator_pool_memory_bytes
+            .get()
+            .checked_add(OPERATOR_CONTEXT_RETAINED_MEMORY_BYTES)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| operator_context_charge_overflow(self.binding.instance_id))?;
+        let build_memory_bytes = retained_memory_bytes
+            .get()
+            .checked_add(OPERATOR_CONTEXT_BUILD_TRANSIENT_MEMORY_BYTES)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| operator_context_charge_overflow(self.binding.instance_id))?;
+        let task = {
+            let execution = self
+                .execution
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            execution
+                .as_ref()
+                .ok_or_else(|| closed_execution(self.binding.instance_id))?
+                .admit_build_task(QueryTaskCharge {
+                    cpu_slots: NonZeroU32::new(PHYSICAL_BUILD_CPU_SLOTS)
+                        .expect("operator runtime CPU charge is nonzero"),
+                    memory_bytes: build_memory_bytes,
+                })?
+        };
+        task.into_retained(|()| {
+            let context =
+                policy.create_execution_context_in(operator_pool_memory_bytes, process_memory)?;
+            Ok((
+                context,
+                QueryRetainedCharge {
+                    kind: QueryRetainedKind::OperatorArena,
+                    memory_bytes: retained_memory_bytes,
+                },
+            ))
+        })
+    }
+
+    fn admit_result_batch(&self, batch: RecordBatch) -> Result<NativeQueryBatch> {
+        let memory_bytes = result_batch_memory_bytes(&batch, self.binding.instance_id.query_id())?;
+        let permit = {
+            let execution = self
+                .execution
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            execution
+                .as_ref()
+                .ok_or_else(|| closed_execution(self.binding.instance_id))?
+                .admit_result(QueryResultCharge { memory_bytes }, batch)?
+        };
+        Ok(NativeQueryBatch {
+            permit,
+            memory_bytes,
+        })
+    }
+
+    fn admit_execution_driver(&self, policy: QuerySessionPolicy) -> Result<QueryTaskPermit<()>> {
+        let _target_partitions = policy.target_partitions();
+        // The driver is one orchestration task. Scan and active-segment workers each acquire
+        // their own CPU slots, which is the actual I/O/decode concurrency boundary. Charging the
+        // driver for every target partition would reserve the whole query budget before the first
+        // admitted reader could start.
+        let cpu_slots = NonZeroU32::new(EXECUTION_DRIVER_CPU_SLOTS)
+            .expect("execution driver CPU charge is nonzero");
+        let execution = self
+            .execution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        execution
+            .as_ref()
+            .ok_or_else(|| closed_execution(self.binding.instance_id))?
+            .admit_build_task(QueryTaskCharge {
+                cpu_slots,
+                memory_bytes: NonZeroU64::new(EXECUTION_DRIVER_MEMORY_BYTES)
+                    .expect("execution driver memory charge is nonzero"),
+            })
     }
 
     fn open_reader(&self, description: PersistedFileDescription) -> Result<BoxedAsyncFileReader> {
@@ -210,7 +378,83 @@ impl NativeExecutionAuthority {
                     .expect("persisted file memory charge is nonzero"),
             },
             description,
+            self.output_admission()?,
         )
+    }
+
+    fn open_active_segments(
+        &self,
+        request: ActiveSegmentOpenRequest,
+        output_schema: SchemaRef,
+        projection_columns: Option<Vec<String>>,
+    ) -> Result<PersistedRecordBatchStream> {
+        if !self.accepting_readers.load(Ordering::Acquire) {
+            return Err(closed_execution(self.binding.instance_id));
+        }
+        let output_admission = self.output_admission()?;
+        let base_memory_bytes = output_admission
+            .active_decode_memory_bytes()
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    format!("active decoded output charge failed error=[{error}]"),
+                )
+                .with_query_id(self.binding.instance_id.query_id())
+                .with_retryable(false)
+            })?
+            .get();
+        let segment_count = u64::try_from(request.descriptions().len()).map_err(|_| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "active segment task count exceeds u64",
+            )
+            .with_query_id(self.binding.instance_id.query_id())
+            .with_retryable(false)
+        })?;
+        let memory_bytes = segment_count
+            .checked_mul(ACTIVE_SEGMENT_TASK_BYTES_PER_SEGMENT)
+            .and_then(|bytes| bytes.checked_add(base_memory_bytes))
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "active segment task memory charge overflowed",
+                )
+                .with_query_id(self.binding.instance_id.query_id())
+                .with_retryable(false)
+            })?;
+        let execution = self
+            .execution
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.accepting_readers.load(Ordering::Acquire) {
+            return Err(closed_execution(self.binding.instance_id));
+        }
+        let execution = execution
+            .as_ref()
+            .ok_or_else(|| closed_execution(self.binding.instance_id))?;
+        self.snapshot_coordinator.validate_execution_binding(
+            execution,
+            self.binding.instance_id,
+            self.binding.catalog_revision,
+        )?;
+        let batch_size = request.batch_size();
+        let task = self.snapshot_coordinator.admit_described_active_task(
+            execution,
+            QueryTaskCharge {
+                cpu_slots: NonZeroU32::new(ACTIVE_SEGMENT_TASK_CPU_SLOTS)
+                    .expect("active segment CPU charge is nonzero"),
+                memory_bytes,
+            },
+            &request,
+        )?;
+        AdmittedActiveSegmentStream::try_new(
+            task,
+            batch_size.get(),
+            projection_columns,
+            output_schema,
+        )
+        .map(|stream| Box::pin(stream) as PersistedRecordBatchStream)
     }
 
     #[cfg(test)]
@@ -230,6 +474,176 @@ impl NativeExecutionAuthority {
 struct NativePersistedFileOpener {
     authority: Weak<NativeExecutionAuthority>,
     snapshot: PersistedSnapshotDescription,
+}
+
+struct NativeActiveSegmentOpener {
+    authority: Weak<NativeExecutionAuthority>,
+    snapshot: PersistedSnapshotDescription,
+}
+
+impl ActiveSegmentOpener for NativeActiveSegmentOpener {
+    fn snapshot_description(&self) -> &PersistedSnapshotDescription {
+        &self.snapshot
+    }
+
+    fn open_segments(
+        &self,
+        request: ActiveSegmentOpenRequest,
+    ) -> Result<PersistedRecordBatchStream> {
+        let first = request.descriptions().first().copied().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::InvalidArgument,
+                "active segment opener request is empty",
+            )
+            .with_retryable(false)
+        })?;
+        let table = self.snapshot.table(first.table_index()).ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::InvalidArgument,
+                "active segment opener table ordinal is out of bounds",
+            )
+            .with_table_id(first.table_id())
+            .with_retryable(false)
+        })?;
+        if table.active_segments() != request.descriptions() {
+            return Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "active segment opener request differs from the execution manifest",
+            )
+            .with_table_id(table.table_id())
+            .with_retryable(false));
+        }
+        let (projection_columns, output_schema) = match request.projection() {
+            Some(projection) => {
+                let mut columns = Vec::with_capacity(projection.len());
+                for &index in projection {
+                    let field = table.schema().fields().get(index).ok_or_else(|| {
+                        ServerError::new(
+                            ErrorCode::InvalidArgument,
+                            "active segment projection index is out of bounds",
+                        )
+                        .with_table_id(table.table_id())
+                        .with_retryable(false)
+                    })?;
+                    columns.push(field.name().clone());
+                }
+                let schema = table
+                    .schema()
+                    .project(projection)
+                    .map(Arc::new)
+                    .map_err(|error| {
+                        ServerError::new(
+                            ErrorCode::SchemaMismatch,
+                            format!("active segment projection failed error=[{error}]"),
+                        )
+                        .with_table_id(table.table_id())
+                        .with_retryable(false)
+                    })?;
+                (Some(columns), schema)
+            }
+            None => (None, Arc::clone(table.schema())),
+        };
+        let authority = self.authority.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Cancelled,
+                "native active query execution authority has expired",
+            )
+            .with_retryable(false)
+        })?;
+        authority.open_active_segments(request, output_schema, projection_columns)
+    }
+}
+
+struct AdmittedActiveSegmentStream {
+    task: QueryTaskPermit<PinnedActiveSegmentSet>,
+    readers: Vec<RowSpanBatchReader>,
+    reader_index: usize,
+    schema: SchemaRef,
+    finished: bool,
+}
+
+impl AdmittedActiveSegmentStream {
+    fn try_new(
+        task: QueryTaskPermit<PinnedActiveSegmentSet>,
+        batch_size: usize,
+        projection_columns: Option<Vec<String>>,
+        schema: SchemaRef,
+    ) -> Result<Self> {
+        let table_id = task.resource().table_id();
+        let readers = task
+            .resource()
+            .spans()
+            .iter()
+            .map(|span| span.batch_reader(batch_size, projection_columns.clone()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::SchemaMismatch,
+                    format!("build active segment batch reader failed error=[{error}]"),
+                )
+                .with_query_id(task.query_id())
+                .with_table_id(table_id)
+                .with_retryable(false)
+            })?;
+        if readers.is_empty() {
+            return Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "admitted active segment task contains no row spans",
+            )
+            .with_query_id(task.query_id())
+            .with_table_id(table_id)
+            .with_retryable(false));
+        }
+        Ok(Self {
+            task,
+            readers,
+            reader_index: 0,
+            schema,
+            finished: false,
+        })
+    }
+}
+
+impl Stream for AdmittedActiveSegmentStream {
+    type Item = std::result::Result<RecordBatch, PersistedExecutionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if self.task.is_cancelled() {
+            self.finished = true;
+            return Poll::Ready(Some(Err(PersistedExecutionError::External(Box::new(
+                ServerError::new(ErrorCode::Cancelled, "active segment task was cancelled")
+                    .with_query_id(self.task.query_id())
+                    .with_table_id(self.task.resource().table_id())
+                    .with_retryable(false),
+            )))));
+        }
+        loop {
+            let reader_index = self.reader_index;
+            let Some(reader) = self.readers.get_mut(reader_index) else {
+                self.finished = true;
+                return Poll::Ready(None);
+            };
+            match reader.next_batch() {
+                Ok(Some(batch)) => return Poll::Ready(Some(Ok(batch))),
+                Ok(None) => self.reader_index += 1,
+                Err(error) => {
+                    self.finished = true;
+                    return Poll::Ready(Some(Err(PersistedExecutionError::ArrowError(
+                        error, None,
+                    ))));
+                }
+            }
+        }
+    }
+}
+
+impl RecordBatchStream for AdmittedActiveSegmentStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 impl PersistedFileOpener for NativePersistedFileOpener {
@@ -270,11 +684,200 @@ impl PersistedFileOpener for NativePersistedFileOpener {
     }
 }
 
+/// One downstream-owned Arrow batch with an exact QueryService result reservation.
+pub(crate) struct NativeQueryBatch {
+    permit: QueryResultPermit<RecordBatch>,
+    memory_bytes: NonZeroU64,
+}
+
+impl NativeQueryBatch {
+    pub(crate) fn record_batch(&self) -> &RecordBatch {
+        self.permit.as_ref()
+    }
+
+    pub(crate) const fn memory_bytes(&self) -> NonZeroU64 {
+        self.memory_bytes
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.permit.is_cancelled()
+    }
+
+    pub(crate) fn into_public(self) -> QueryResultBatch {
+        let batch = self.permit.as_ref().clone();
+        QueryResultBatch::with_owner(batch, self)
+    }
+}
+
+enum NativeBatchPoll {
+    Terminal(Result<QueryTerminalSignal>),
+    Batch(std::result::Result<Option<RecordBatch>, PersistedExecutionError>),
+}
+
+/// Pull-based native persisted result stream with lifecycle-bound resource accounting.
+pub(crate) struct NativeQueryResultStream {
+    inner: Option<PersistedRecordBatchStream>,
+    execution_driver: Option<QueryTaskPermit<()>>,
+    operator_context: Option<QueryRetainedPermit<PersistedExecutionContext>>,
+    lease: Option<NativeExecutionLease>,
+    operator_memory_status: QueryOperatorMemoryStatus,
+    terminal: bool,
+}
+
+impl NativeQueryResultStream {
+    fn new(
+        inner: PersistedRecordBatchStream,
+        execution_driver: QueryTaskPermit<()>,
+        operator_context: QueryRetainedPermit<PersistedExecutionContext>,
+        lease: NativeExecutionLease,
+    ) -> Self {
+        let operator_memory_status = operator_context.resource().operator_memory_status();
+        Self {
+            inner: Some(inner),
+            execution_driver: Some(execution_driver),
+            operator_context: Some(operator_context),
+            lease: Some(lease),
+            operator_memory_status,
+            terminal: false,
+        }
+    }
+
+    pub(crate) fn operator_memory_status(&self) -> QueryOperatorMemoryStatus {
+        self.operator_context
+            .as_ref()
+            .map_or(self.operator_memory_status, |context| {
+                context.resource().operator_memory_status()
+            })
+    }
+
+    /// Returns the next accounted batch, or `None` after successful execution completion.
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<NativeQueryBatch>> {
+        if self.terminal {
+            return Ok(None);
+        }
+        let lease = self
+            .lease
+            .as_ref()
+            .expect("active native result stream owns its execution lease");
+        let mut cancellation = lease.authority.cancellation()?;
+        let outcome = {
+            let inner = self
+                .inner
+                .as_mut()
+                .expect("active native result stream owns its DataFusion stream");
+            tokio::select! {
+                biased;
+                terminal = cancellation.wait_terminal() => NativeBatchPoll::Terminal(terminal),
+                batch = next_persisted_batch(inner) => NativeBatchPoll::Batch(batch),
+            }
+        };
+        match outcome {
+            NativeBatchPoll::Terminal(terminal) => {
+                let error = terminal
+                    .map(terminal_execution_error)
+                    .unwrap_or_else(|error| error);
+                self.close_after_terminal();
+                Err(error)
+            }
+            NativeBatchPoll::Batch(Ok(Some(batch))) => {
+                let admitted = self
+                    .lease
+                    .as_ref()
+                    .expect("active native result stream owns its execution lease")
+                    .authority
+                    .admit_result_batch(batch);
+                match admitted {
+                    Ok(batch) => Ok(Some(batch)),
+                    Err(error) => Err(self.fail(error)),
+                }
+            }
+            NativeBatchPoll::Batch(Ok(None)) => {
+                self.finish_execution()?;
+                Ok(None)
+            }
+            NativeBatchPoll::Batch(Err(source)) => {
+                let query_id = self
+                    .lease
+                    .as_ref()
+                    .expect("active native result stream owns its execution lease")
+                    .instance_id()
+                    .query_id();
+                let error = persisted_execution_error(query_id, &source);
+                Err(self.fail(error))
+            }
+        }
+    }
+
+    fn finish_execution(&mut self) -> Result<()> {
+        self.terminal = true;
+        self.capture_operator_memory_status();
+        drop(self.inner.take());
+        drop(self.execution_driver.take());
+        self.release_operator_context();
+        self.lease
+            .take()
+            .expect("active native result stream owns its execution lease")
+            .finish()
+    }
+
+    pub(crate) fn fail(&mut self, error: ServerError) -> ServerError {
+        self.terminal = true;
+        self.capture_operator_memory_status();
+        let terminal = match self.lease.take() {
+            None => error,
+            Some(lease) => match lease.fail(error.clone()) {
+                Ok(()) => error,
+                Err(terminal) => terminal,
+            },
+        };
+        drop(self.inner.take());
+        drop(self.execution_driver.take());
+        self.release_operator_context();
+        terminal
+    }
+
+    fn close_after_terminal(&mut self) {
+        self.terminal = true;
+        self.capture_operator_memory_status();
+        drop(self.lease.take());
+        drop(self.inner.take());
+        drop(self.execution_driver.take());
+        self.release_operator_context();
+    }
+
+    fn capture_operator_memory_status(&mut self) {
+        if let Some(context) = self.operator_context.as_ref() {
+            self.operator_memory_status = context.resource().operator_memory_status();
+        }
+    }
+
+    fn release_operator_context(&mut self) {
+        if let Some(context) = self.operator_context.take() {
+            drop(context);
+            self.operator_memory_status.reserved_bytes = 0;
+        }
+    }
+}
+
+impl Drop for NativeQueryResultStream {
+    fn drop(&mut self) {
+        if !self.terminal {
+            // Lease drop publishes cancellation before DataFusion tasks and reservations vanish.
+            drop(self.lease.take());
+        }
+        drop(self.inner.take());
+        drop(self.execution_driver.take());
+        drop(self.operator_context.take());
+    }
+}
+
 /// Non-cloneable ownership of one bound persisted plan and its native execution authority.
 pub(crate) struct NativeExecutionLease {
     authority: Arc<NativeExecutionAuthority>,
     opener: Option<Arc<dyn PersistedFileOpener>>,
+    active_opener: Option<Arc<dyn ActiveSegmentOpener>>,
     retained_plan: Option<QueryRetainedPermit<BoundPersistedPlan>>,
+    plan_metrics: PersistedPlanMetrics,
 }
 
 impl NativeExecutionLease {
@@ -312,7 +915,7 @@ impl NativeExecutionLease {
             Ok(admitted) => admitted,
             Err(error) => return Err(publish_preparation_failure(execution, error)),
         };
-        Self::bind_admitted(snapshot_coordinator, execution, manifest, admitted)
+        Self::bind_admitted(snapshot_coordinator, execution, manifest, admitted, policy)
     }
 
     fn bind_admitted(
@@ -320,6 +923,7 @@ impl NativeExecutionLease {
         execution: QueryExecutionScope,
         manifest: QueryRetainedPermit<ProjectedSnapshotManifest>,
         admitted: AdmittedPreparedPersistedPlan,
+        policy: QuerySessionPolicy,
     ) -> Result<Self> {
         let instance_id = execution.instance_id();
         let catalog_revision = manifest.resource().catalog_revision();
@@ -346,11 +950,16 @@ impl NativeExecutionLease {
             authority: Arc::downgrade(&authority),
             snapshot: manifest.resource().description().clone(),
         });
-        let (task, prepared, profile) = admitted.into_parts();
+        let active_opener: Arc<dyn ActiveSegmentOpener> = Arc::new(NativeActiveSegmentOpener {
+            authority: Arc::downgrade(&authority),
+            snapshot: manifest.resource().description().clone(),
+        });
+        let (task, prepared, profile, plan_metrics) = admitted.into_parts();
         let retained_plan = manifest.rebuild_with_build_task(task, |manifest, ()| {
             if manifest.query_id() != instance_id.query_id()
                 || manifest.catalog_revision() != catalog_revision
                 || manifest.description() != opener.snapshot_description()
+                || manifest.description() != active_opener.snapshot_description()
             {
                 return Err(ServerError::new(
                     ErrorCode::DataCorruption,
@@ -359,14 +968,16 @@ impl NativeExecutionLease {
                 .with_query_id(instance_id.query_id())
                 .with_retryable(false));
             }
-            let bound = prepared.bind(&opener).map_err(|error| {
-                plan_error(
-                    instance_id.query_id(),
-                    PersistedPlanStage::Bind,
-                    classify_persisted_plan_error(&error),
-                    &error,
-                )
-            })?;
+            let bound = prepared
+                .bind_with_active(&opener, &active_opener)
+                .map_err(|error| {
+                    plan_error(
+                        instance_id.query_id(),
+                        PersistedPlanStage::Bind,
+                        classify_persisted_plan_error(&error),
+                        &error,
+                    )
+                })?;
             Ok((
                 bound,
                 QueryRetainedCharge {
@@ -385,13 +996,52 @@ impl NativeExecutionLease {
                         publish_preparation_failure(execution, error)
                     });
                 drop(opener);
+                drop(active_opener);
                 return Err(error);
             }
         };
+        let output_admission = match retained_plan
+            .resource()
+            .streaming_output_admission(policy.batch_size())
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                authority.close_reader_admission();
+                let error = plan_error(
+                    instance_id.query_id(),
+                    PersistedPlanStage::OutputAdmission,
+                    classify_persisted_plan_error(&error),
+                    &error,
+                );
+                let error = authority
+                    .take_execution()
+                    .map_or(error.clone(), |execution| {
+                        publish_preparation_failure(execution, error)
+                    });
+                drop(retained_plan);
+                drop(opener);
+                drop(active_opener);
+                return Err(error);
+            }
+        };
+        if let Err(error) = authority.install_output_admission(output_admission) {
+            authority.close_reader_admission();
+            let error = authority
+                .take_execution()
+                .map_or(error.clone(), |execution| {
+                    publish_preparation_failure(execution, error)
+                });
+            drop(retained_plan);
+            drop(opener);
+            drop(active_opener);
+            return Err(error);
+        }
         Ok(Self {
             authority,
             opener: Some(opener),
+            active_opener: Some(active_opener),
             retained_plan: Some(retained_plan),
+            plan_metrics,
         })
     }
 
@@ -410,11 +1060,71 @@ impl NativeExecutionLease {
             .resource()
     }
 
+    pub(crate) const fn plan_metrics(&self) -> PersistedPlanMetrics {
+        self.plan_metrics
+    }
+
+    /// Starts persisted execution under a hard DataFusion operator-memory reservation.
+    pub(crate) fn execute(
+        self,
+        policy: QuerySessionPolicy,
+        config: NativeQueryExecutionConfig,
+    ) -> Result<NativeQueryResultStream> {
+        let process_memory =
+            match QueryProcessMemoryPool::try_new(config.operator_pool_memory_bytes) {
+                Ok(process_memory) => process_memory,
+                Err(error) => return Err(publish_lease_failure(self, error)),
+            };
+        self.execute_in(policy, config, &process_memory)
+    }
+
+    /// Starts execution inside the process-wide DataFusion operator-memory pool.
+    pub(crate) fn execute_in(
+        self,
+        policy: QuerySessionPolicy,
+        config: NativeQueryExecutionConfig,
+        process_memory: &QueryProcessMemoryPool,
+    ) -> Result<NativeQueryResultStream> {
+        let operator_context = match self.authority.admit_operator_context(
+            policy,
+            config.operator_pool_memory_bytes,
+            process_memory,
+        ) {
+            Ok(context) => context,
+            Err(error) => return Err(publish_lease_failure(self, error)),
+        };
+        let execution_driver = match self.authority.admit_execution_driver(policy) {
+            Ok(driver) => driver,
+            Err(error) => {
+                let terminal = publish_lease_failure(self, error);
+                drop(operator_context);
+                return Err(terminal);
+            }
+        };
+        let inner = match self.plan().execute_stream(operator_context.resource()) {
+            Ok(inner) => inner,
+            Err(source) => {
+                let error = persisted_execution_error(self.instance_id().query_id(), &source);
+                let terminal = publish_lease_failure(self, error);
+                drop(execution_driver);
+                drop(operator_context);
+                return Err(terminal);
+            }
+        };
+        Ok(NativeQueryResultStream::new(
+            inner,
+            execution_driver,
+            operator_context,
+            self,
+        ))
+    }
+
     /// Closes file admission, releases the physical plan, and publishes successful completion.
     pub(crate) fn finish(mut self) -> Result<()> {
         self.authority.close_reader_admission();
         drop(self.opener.take());
-        // QueryService requires all retained resources to drain before entering Finished.
+        drop(self.active_opener.take());
+        // QueryService requires physical resources to drain before execution can complete.
         drop(self.retained_plan.take());
         let execution = self
             .authority
@@ -432,6 +1142,7 @@ impl NativeExecutionLease {
             .ok_or_else(|| closed_execution(self.instance_id()))?;
         let failed = execution.fail(error);
         drop(self.opener.take());
+        drop(self.active_opener.take());
         drop(self.retained_plan.take());
         failed
     }
@@ -443,6 +1154,7 @@ impl Drop for NativeExecutionLease {
         // Scope drop publishes cancellation before any physical-plan authority is released.
         drop(self.authority.take_execution());
         drop(self.opener.take());
+        drop(self.active_opener.take());
         drop(self.retained_plan.take());
     }
 }
@@ -479,11 +1191,87 @@ fn closed_execution(instance_id: QueryInstanceId) -> ServerError {
     .with_retryable(false)
 }
 
+fn operator_context_charge_overflow(instance_id: QueryInstanceId) -> ServerError {
+    ServerError::new(
+        ErrorCode::ResourceExhausted,
+        "native query operator context memory charge overflowed",
+    )
+    .with_query_id(instance_id.query_id())
+    .with_retryable(false)
+}
+
 fn publish_preparation_failure(execution: QueryExecutionScope, error: ServerError) -> ServerError {
     match execution.fail(error.clone()) {
         Ok(()) => error,
         Err(terminal) => terminal,
     }
+}
+
+fn publish_lease_failure(lease: NativeExecutionLease, error: ServerError) -> ServerError {
+    match lease.fail(error.clone()) {
+        Ok(()) => error,
+        Err(terminal) => terminal,
+    }
+}
+
+fn result_batch_memory_bytes(batch: &RecordBatch, query_id: QueryId) -> Result<NonZeroU64> {
+    let arrays = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+        ServerError::new(
+            ErrorCode::ResourceExhausted,
+            "native query result batch size does not fit the resource ledger",
+        )
+        .with_query_id(query_id)
+        .with_retryable(false)
+    })?;
+    let schema = conservative_arrow_schema_retained_bytes(batch.schema().as_ref())
+        .map_err(|error| error.with_query_id(query_id).with_retryable(false))?
+        .get();
+    let memory_bytes = arrays
+        .checked_add(schema)
+        .and_then(|bytes| bytes.checked_add(RESULT_BATCH_FIXED_MEMORY_BYTES))
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "native query result batch memory charge overflowed",
+            )
+            .with_query_id(query_id)
+            .with_retryable(false)
+        })?;
+    Ok(memory_bytes)
+}
+
+fn terminal_execution_error(signal: QueryTerminalSignal) -> ServerError {
+    signal.error.unwrap_or_else(|| {
+        ServerError::new(
+            ErrorCode::Cancelled,
+            format!(
+                "native persisted execution terminated before the next batch state=[{:?}]",
+                signal.state
+            ),
+        )
+        .with_query_id(signal.query_id)
+        .with_retryable(false)
+    })
+}
+
+fn persisted_execution_error(query_id: QueryId, error: &PersistedExecutionError) -> ServerError {
+    if let Some(error) = structured_persisted_execution_error(error) {
+        return error.with_query_id(query_id);
+    }
+    let class = classify_persisted_execution_error(error);
+    let code = match class {
+        PersistedExecutionErrorClass::ResourceExhausted => ErrorCode::ResourceExhausted,
+        PersistedExecutionErrorClass::DataCorruption => ErrorCode::DataCorruption,
+        PersistedExecutionErrorClass::Unsupported => ErrorCode::UnsupportedPlan,
+        PersistedExecutionErrorClass::Internal => ErrorCode::Internal,
+    };
+    ServerError::new(
+        code,
+        format!("persisted physical plan execution failed error=[{error}]"),
+    )
+    .with_query_id(query_id)
+    .with_retryable(class == PersistedExecutionErrorClass::ResourceExhausted)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +1280,7 @@ enum PersistedPlanStage {
     Profile,
     Prepare,
     Bind,
+    OutputAdmission,
 }
 
 impl PersistedPlanStage {
@@ -501,6 +1290,7 @@ impl PersistedPlanStage {
             Self::Profile => "profile",
             Self::Prepare => "prepare",
             Self::Bind => "bind",
+            Self::OutputAdmission => "output admission",
         }
     }
 }
@@ -545,9 +1335,16 @@ mod tests {
     use tempfile::TempDir;
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::{OwnedDataDirectory, DEFAULT_QUERY_MAX_MEMORY_BYTES};
+    use zippy_ingest::{
+        TableActorLiveSegmentPublication, TableActorLiveSegmentRole,
+        TableActorLiveSegmentsPublication,
+    };
     use zippy_query::{
         PersistedFileDescription, PersistedSnapshotDescription, PersistedTableBinding,
         PersistedTableDescription, QuerySessionPolicy,
+    };
+    use zippy_segment_store::{
+        compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan,
     };
     use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
@@ -566,8 +1363,10 @@ mod tests {
     };
 
     use super::{
-        AdmittedPreparedPersistedPlan, NativeExecutionLease, ReaderAdmissionPause,
-        PERSISTED_FILE_TASK_MEMORY_BYTES, PHYSICAL_BUILD_CPU_SLOTS,
+        AdmittedPreparedPersistedPlan, NativeExecutionLease, NativeQueryExecutionConfig,
+        ReaderAdmissionPause, EXECUTION_DRIVER_MEMORY_BYTES,
+        OPERATOR_CONTEXT_RETAINED_MEMORY_BYTES, PERSISTED_FILE_TASK_MEMORY_BYTES,
+        PHYSICAL_BUILD_CPU_SLOTS, RESULT_BATCH_FIXED_MEMORY_BYTES,
     };
     use crate::legacy_catalog_migration::LEGACY_STREAM_NAME_CONFIG_KEY;
     use crate::native_storage::{
@@ -789,6 +1588,53 @@ mod tests {
         test
     }
 
+    async fn start_runtime_with_file_and_live() -> (TestRuntime, ActiveSegmentWriter) {
+        let test = start_runtime_with_file().await;
+        let segment_schema =
+            compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
+        let layout = LayoutPlan::for_schema(&segment_schema, 8).unwrap();
+        let mut writer =
+            ActiveSegmentWriter::new_for_runtime_with_epoch(segment_schema, layout, 2, 1, 0, 1)
+                .unwrap();
+        for value in [43_i64, 44_i64] {
+            writer.begin_row().unwrap();
+            writer.write_i64("price", value).unwrap();
+            writer.commit_row().unwrap();
+        }
+        publish_live_prefix(&test, &writer, 2).await;
+        (test, writer)
+    }
+
+    async fn publish_live_prefix(
+        test: &TestRuntime,
+        writer: &ActiveSegmentWriter,
+        row_count: usize,
+    ) {
+        let row_count_u64 = u64::try_from(row_count).unwrap();
+        let offsets = OffsetRange::new(LogOffset::new(1), LogOffset::new(row_count_u64)).unwrap();
+        test.runtime
+            .table_actor(table_id(TABLE))
+            .unwrap()
+            .publish_live_segments(TableActorLiveSegmentsPublication::new(
+                table_id(TABLE),
+                vec![TableActorLiveSegmentPublication::new(
+                    TableActorLiveSegmentRole::Active,
+                    SourceSegmentIdentity {
+                        segment_id: 2,
+                        generation: 1,
+                        writer_epoch: 0,
+                    },
+                    1,
+                    offsets,
+                    writer.active_descriptor(),
+                    0,
+                    row_count,
+                )],
+            ))
+            .await
+            .unwrap();
+    }
+
     fn budget() -> QueryResourceBudget {
         QueryResourceBudget {
             max_active_tasks: 4,
@@ -799,6 +1645,12 @@ mod tests {
 
     fn policy() -> QuerySessionPolicy {
         QuerySessionPolicy::new(NonZeroUsize::new(1).expect("nonzero target partitions"))
+    }
+
+    fn execution_config() -> NativeQueryExecutionConfig {
+        NativeQueryExecutionConfig::new(
+            NonZeroU64::new(1024 * 1024).expect("nonzero operator memory limit"),
+        )
     }
 
     fn limits() -> zippy_query::PersistedPlanLimits {
@@ -855,13 +1707,17 @@ mod tests {
     }
 
     async fn prepare_lease(test: &TestRuntime, value: u128) -> NativeExecutionLease {
+        prepare_lease_sql(test, value, "select price from ticks").await
+    }
+
+    async fn prepare_lease_sql(test: &TestRuntime, value: u128, sql: &str) -> NativeExecutionLease {
         let (execution, manifest) = begin_query(test, value).await;
         NativeExecutionLease::prepare(
             test.runtime.query_snapshot_coordinator(),
             execution,
             manifest,
             policy(),
-            "select price from ticks",
+            sql,
             &bindings(),
             limits(),
         )
@@ -1095,6 +1951,323 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stream_accounts_batches_and_finishes_after_delivery_drains() {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease_sql(
+            &test,
+            121,
+            "select price from ticks where price >= 42 limit 1 offset 0",
+        )
+        .await;
+        let instance_id = lease.instance_id();
+        let admin = test.runtime.query_resource_coordinator().admin_handle();
+        let before_execute = admin
+            .status(instance_id)
+            .expect("read retained plan resources before execution");
+        let config = execution_config();
+        let mut stream = lease
+            .execute(policy(), config)
+            .expect("start bounded native persisted execution");
+        let executing = admin
+            .status(instance_id)
+            .expect("read bounded operator resources after execution starts");
+        assert_eq!(
+            executing.active_retained_permits,
+            before_execute.active_retained_permits + 1
+        );
+        assert_eq!(
+            executing.active_retained_memory_bytes,
+            before_execute.active_retained_memory_bytes
+                + config.operator_pool_memory_bytes.get()
+                + OPERATOR_CONTEXT_RETAINED_MEMORY_BYTES
+        );
+        assert_eq!(executing.active_tasks, 1);
+        assert_eq!(executing.active_cpu_slots, 1);
+        assert_eq!(
+            executing.active_task_memory_bytes,
+            EXECUTION_DRIVER_MEMORY_BYTES
+        );
+
+        let batch = stream
+            .next_batch()
+            .await
+            .expect("read first native batch")
+            .expect("persisted query returns one batch");
+        let values = batch
+            .record_batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("price column is Int64");
+        assert_eq!(values.values(), &[42]);
+        assert!(batch.memory_bytes().get() >= RESULT_BATCH_FIXED_MEMORY_BYTES);
+        assert!(!batch.is_cancelled());
+        let delivering = admin
+            .status(instance_id)
+            .expect("query remains visible while delivering a batch");
+        assert_eq!(delivering.state, QueryState::Running);
+        assert!(!delivering.execution_complete);
+        // The Parquet stream may still retain its final accounted positioned-read buffer.
+        assert!(delivering.active_result_permits >= 1);
+        assert!(delivering.active_result_memory_bytes >= batch.memory_bytes().get());
+        assert!(delivering.active_retained_permits >= 2);
+
+        assert!(stream
+            .next_batch()
+            .await
+            .expect("complete native persisted stream")
+            .is_none());
+        let draining = admin
+            .status(instance_id)
+            .expect("completed query remains visible until delivery drains");
+        assert_eq!(draining.state, QueryState::Running);
+        assert!(draining.execution_complete);
+        assert!(draining.logical_admitted);
+        assert_eq!(draining.active_tasks, 0);
+        assert_eq!(draining.active_retained_permits, 0);
+        assert_eq!(draining.active_result_permits, 1);
+        assert_eq!(
+            test.runtime
+                .runtime_query_snapshot_pins()
+                .expect("read delivery-held query snapshot pins")
+                .len(),
+            1
+        );
+        assert!(stream
+            .next_batch()
+            .await
+            .expect("completed stream remains fused")
+            .is_none());
+
+        drop(batch);
+        let finished = admin
+            .status(instance_id)
+            .expect("finished query remains available during terminal retention");
+        assert_eq!(finished.state, QueryState::Finished);
+        assert!(finished.execution_complete);
+        assert!(!finished.logical_admitted);
+        assert_eq!(finished.active_result_permits, 0);
+        assert_eq!(finished.active_memory_bytes, 0);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained query snapshot pins")
+            .is_empty());
+        assert_eq!(
+            test.runtime
+                .query_resource_coordinator()
+                .status()
+                .tracked_sessions,
+            0
+        );
+        test.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stream_reads_persisted_then_fixed_live_snapshot_without_overlap() {
+        let (mut test, mut writer) = start_runtime_with_file_and_live().await;
+        let (execution, manifest) = begin_query(&test, 131).await;
+        let table = manifest.resource().table(0).unwrap();
+        assert_eq!(table.file_count(), 1);
+        assert_eq!(table.active_segment_count(), 1);
+        assert_eq!(
+            table.active_segments()[0].offsets().first(),
+            LogOffset::new(1)
+        );
+        assert_eq!(
+            table.active_segments()[0].offsets().last(),
+            LogOffset::new(2)
+        );
+
+        // A later append and publication belong to future queries. The existing manifest and
+        // snapshot guard retain only rows 1..=2 from this segment.
+        writer.begin_row().unwrap();
+        writer.write_i64("price", 45).unwrap();
+        writer.commit_row().unwrap();
+        publish_live_prefix(&test, &writer, 3).await;
+
+        let lease = NativeExecutionLease::prepare(
+            test.runtime.query_snapshot_coordinator(),
+            execution,
+            manifest,
+            policy(),
+            "select price from ticks where price >= 42",
+            &bindings(),
+            limits(),
+        )
+        .await
+        .expect("prepare persisted/live execution");
+        assert_eq!(lease.plan().bound_scan_count(), 1);
+        assert_eq!(lease.plan().bound_active_scan_count(), 1);
+        let mut stream = lease
+            .execute(policy(), execution_config())
+            .expect("start persisted/live execution");
+        let mut values = Vec::new();
+        while let Some(batch) = stream
+            .next_batch()
+            .await
+            .expect("read persisted/live batch")
+        {
+            values.extend_from_slice(
+                batch
+                    .record_batch()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values(),
+            );
+            drop(batch);
+        }
+        assert_eq!(values, vec![42, 43, 44]);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained persisted/live pins")
+            .is_empty());
+        test.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_payload_rewrite_after_query_pin_fails_the_execution_closed() {
+        let (mut test, mut writer) = start_runtime_with_file_and_live().await;
+        let (execution, manifest) = begin_query(&test, 132).await;
+        writer.begin_payload_mutation_for_test().unwrap();
+        writer.finish_payload_mutation_for_test().unwrap();
+
+        let lease = NativeExecutionLease::prepare(
+            test.runtime.query_snapshot_coordinator(),
+            execution,
+            manifest,
+            policy(),
+            "select price from ticks",
+            &bindings(),
+            limits(),
+        )
+        .await
+        .expect("prepare pinned live rewrite execution");
+        let instance_id = lease.instance_id();
+        let mut stream = lease
+            .execute(policy(), execution_config())
+            .expect("start pinned live rewrite execution");
+        let persisted = stream
+            .next_batch()
+            .await
+            .expect("read persisted prefix")
+            .expect("persisted prefix batch");
+        drop(persisted);
+        let error = match stream.next_batch().await {
+            Ok(_) => panic!("rewritten live payload must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        let status = test
+            .runtime
+            .query_resource_coordinator()
+            .admin_handle()
+            .status(instance_id)
+            .expect("read failed live query status");
+        assert_eq!(status.state, QueryState::Failed);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read rewrite-failed query pins")
+            .is_empty());
+        test.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_native_stream_cancels_before_result_reservation_release() {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease(&test, 122).await;
+        let instance_id = lease.instance_id();
+        let admin = test.runtime.query_resource_coordinator().admin_handle();
+        let mut stream = lease
+            .execute(policy(), execution_config())
+            .expect("start bounded native persisted execution");
+        let batch = stream
+            .next_batch()
+            .await
+            .expect("read first native batch")
+            .expect("persisted query returns one batch");
+
+        drop(stream);
+        let cancelled = admin
+            .status(instance_id)
+            .expect("cancelled query remains visible while its batch is delivered");
+        assert_eq!(cancelled.state, QueryState::Cancelled);
+        assert!(cancelled.cancellation_requested);
+        assert_eq!(cancelled.active_tasks, 0);
+        assert_eq!(cancelled.active_retained_permits, 0);
+        assert_eq!(cancelled.active_result_permits, 1);
+        assert!(batch.is_cancelled());
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read cancelled query snapshot pins")
+            .is_empty());
+
+        drop(batch);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained query snapshot pins")
+            .is_empty());
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_result_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert_eq!(status.tracked_sessions, 0);
+        test.shutdown();
+    }
+
+    #[tokio::test]
+    async fn operator_context_budget_rejection_fails_and_releases_execution_lease() {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease(&test, 123).await;
+        let instance_id = lease.instance_id();
+        let cancellation = lease_cancellation(&lease);
+        let error = lease
+            .execute(
+                policy(),
+                NativeQueryExecutionConfig::new(
+                    NonZeroU64::new(DEFAULT_QUERY_MAX_MEMORY_BYTES)
+                        .expect("nonzero oversized operator pool"),
+                ),
+            )
+            .err()
+            .expect("operator context must share the existing query budget");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        let terminal = cancellation
+            .terminal_signal()
+            .expect("operator admission failure publishes a terminal signal");
+        assert_eq!(terminal.state, QueryState::Failed);
+        assert_eq!(terminal.error, Some(error));
+
+        let status = test
+            .runtime
+            .query_resource_coordinator()
+            .admin_handle()
+            .status(instance_id)
+            .expect("failed query remains visible during terminal retention");
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read failed query snapshot pins")
+            .is_empty());
+        assert_eq!(
+            test.runtime
+                .query_resource_coordinator()
+                .status()
+                .tracked_sessions,
+            0
+        );
+        test.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reader_admission_second_gate_linearizes_finish_fail_and_drop() {
         assert_second_reader_gate(LeaseTerminalAction::Finish, 151).await;
         assert_second_reader_gate(LeaseTerminalAction::Fail, 152).await;
@@ -1265,12 +2438,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_footer_growth_rejection_is_sticky_and_releases_task_and_pin() {
+    async fn decoded_output_growth_rejection_is_sticky_and_releases_task_and_pin() {
         let mut test = start_runtime_with_file().await;
         let lease = prepare_lease(&test, 253).await;
         let instance_id = lease.instance_id();
         let authority = Arc::clone(&lease.authority);
         let description = persisted_description(&lease);
+
+        let mut probe = authority
+            .open_reader(description)
+            .expect("admit metadata charge probe reader");
+        let metadata = probe
+            .get_metadata()
+            .await
+            .expect("open one reader with its complete decoded output window");
+        let decoded_memory_bytes = authority
+            .output_admission()
+            .expect("bound lease owns decoded output admission")
+            .file_decode_memory_bytes(&metadata)
+            .expect("compute decoded output component");
+        let probe_status = test
+            .runtime
+            .query_resource_coordinator()
+            .admin_handle()
+            .status(instance_id)
+            .expect("read complete probe task charge");
+        let metadata_memory_bytes = probe_status
+            .active_task_memory_bytes
+            .checked_sub(decoded_memory_bytes.get())
+            .expect("complete file task charge contains decoded output component");
+        assert!(metadata_memory_bytes >= PERSISTED_FILE_TASK_MEMORY_BYTES);
+        drop(probe);
+
         let mut reader = authority
             .open_reader(description)
             .expect("admit one real persisted reader");
@@ -1282,10 +2481,17 @@ mod tests {
             before_fill.active_task_memory_bytes,
             PERSISTED_FILE_TASK_MEMORY_BYTES
         );
+        let metadata_growth_memory_bytes = metadata_memory_bytes
+            .checked_sub(PERSISTED_FILE_TASK_MEMORY_BYTES)
+            .expect("metadata target covers initial file task reservation");
+        let metadata_range_memory_bytes = description.file_size_bytes().get();
+        assert!(decoded_memory_bytes.get() > metadata_range_memory_bytes);
         let filler_memory = DEFAULT_QUERY_MAX_MEMORY_BYTES
             .checked_sub(before_fill.active_memory_bytes)
+            .and_then(|remaining| remaining.checked_sub(metadata_growth_memory_bytes))
+            .and_then(|remaining| remaining.checked_sub(metadata_range_memory_bytes))
             .and_then(NonZeroU64::new)
-            .expect("query has positive memory remaining after reader admission");
+            .expect("query has room for metadata ranges but not decoded output after filler");
         let filler = {
             let execution = authority
                 .execution
@@ -1298,38 +2504,40 @@ mod tests {
                     cpu_slots: NonZeroU32::new(1).expect("nonzero filler CPU charge"),
                     memory_bytes: filler_memory,
                 })
-                .expect("fill the query memory budget after reader admission")
+                .expect("leave exactly the metadata growth available after reader admission")
         };
         assert_eq!(
             admin
                 .status(instance_id)
-                .expect("read full query memory budget")
+                .expect("read query memory before decoded output growth")
                 .active_memory_bytes,
             DEFAULT_QUERY_MAX_MEMORY_BYTES
+                - metadata_growth_memory_bytes
+                - metadata_range_memory_bytes
         );
 
         let first_error = reader
             .get_metadata()
             .await
-            .expect_err("footer charge growth must be rejected at the full budget");
+            .expect_err("decoded output growth must be rejected after metadata admission");
         assert_eq!(
             deferred_open_server_error(&first_error).code(),
             ErrorCode::ResourceExhausted
         );
         let after_first = admin
             .status(instance_id)
-            .expect("failed deferred open remains query-visible");
+            .expect("failed decoded output admission remains query-visible");
         assert_eq!(after_first.active_tasks, 1);
         assert_eq!(after_first.active_task_memory_bytes, filler_memory.get());
         assert_eq!(
             after_first.active_memory_bytes,
-            DEFAULT_QUERY_MAX_MEMORY_BYTES - PERSISTED_FILE_TASK_MEMORY_BYTES
+            DEFAULT_QUERY_MAX_MEMORY_BYTES - metadata_memory_bytes - metadata_range_memory_bytes
         );
 
         let second_error = reader
             .get_metadata()
             .await
-            .expect_err("deferred footer growth failure remains sticky");
+            .expect_err("deferred decoded output growth failure remains sticky");
         assert_eq!(
             deferred_open_server_error(&second_error).code(),
             ErrorCode::ResourceExhausted
@@ -1346,7 +2554,7 @@ mod tests {
             .fail(
                 ServerError::new(
                     ErrorCode::ResourceExhausted,
-                    "persisted Parquet metadata exceeded the query memory budget",
+                    "persisted Parquet decoded output exceeded the query memory budget",
                 )
                 .with_query_id(instance_id.query_id()),
             )
@@ -1540,6 +2748,7 @@ mod tests {
             execution,
             manifest,
             admitted,
+            policy(),
         )
         .err()
         .expect("snapshot mismatch must reject physical binding");

@@ -1,9 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,8 +20,329 @@ use zippy_core::{
     connect_control_endpoint, ControlEndpoint, Engine, MasterClient, SegmentTableView, ZippyConfig,
 };
 use zippy_engines::StreamTableMaterializer;
-use zippy_gateway::{GatewayServer, GatewayServerConfig};
+use zippy_gateway::{
+    GatewayNativeQueryExplanation, GatewayNativeQueryFrontend, GatewayNativeQueryOutputField,
+    GatewayNativeQueryRequest, GatewayServer, GatewayServerConfig,
+};
 use zippy_master::server::MasterServer;
+use zippy_types::query::{
+    QueryInstanceId, QueryResultBatch, RecordBatchStream, SendableRecordBatchStream,
+};
+use zippy_types::{BoxFuture, QueryId, SessionId};
+
+#[test]
+fn native_query_frontend_streams_one_owned_batch_at_a_time() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let seen = Arc::new(Mutex::new(None));
+    let stream_dropped = Arc::new(AtomicBool::new(false));
+    let frontend = Arc::new(TestNativeQueryFrontend {
+        seen: Arc::clone(&seen),
+        stream_dropped: Arc::clone(&stream_dropped),
+        block_after_batches: false,
+    });
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: format!("127.0.0.1:{}", reserve_tcp_port()),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("native-query-token".to_string()),
+        max_write_rows: None,
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+        write_timeout_ms: None,
+    })
+    .unwrap()
+    .with_native_query_frontend(frontend)
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let query_id = QueryId::from_u128(11).unwrap();
+    let session_id = SessionId::from_u128(12).unwrap();
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "query_sql",
+            "token": "native-query-token",
+            "query_id": query_id,
+            "session_id": session_id,
+            "sql": "SELECT value FROM ticks ORDER BY value",
+            "bindings": [{
+                "sql_name": "ticks",
+                "table": {
+                    "type": "name",
+                    "namespace": "default",
+                    "table": "ticks"
+                }
+            }]
+        }),
+        vec![],
+    );
+
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[0].0["kind"], "collect_start");
+    assert_eq!(frames[0].0["query_authority"], "native");
+    assert_eq!(frames[1].0["kind"], "collect_chunk");
+    assert_eq!(frames[1].0["rows"], 3);
+    assert_eq!(frames[2].0["kind"], "collect_end");
+    assert_eq!(frames[2].0["metrics"]["returned_rows"], 3);
+    assert_eq!(frames[2].0["metrics"]["operator.scan.count"], 1);
+    let values = decode_ipc_batch(&frames[1].1)
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(values, vec![1, 2, 3]);
+
+    let request = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(request.query_id, query_id);
+    assert_eq!(request.session_id, session_id);
+    assert_eq!(request.bindings[0].sql_name, "ticks");
+    let metrics = gateway.metrics();
+    assert_eq!(metrics["native_query_enabled"], true);
+    assert_eq!(metrics["native_query_requests_total"], 1);
+    assert_eq!(metrics["native_query_batches_delivered_total"], 1);
+    assert_eq!(metrics["native_query_rows_delivered_total"], 3);
+    assert!(stream_dropped.load(Ordering::Acquire));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_query_explain_returns_server_plan_without_result_execution() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let frontend = Arc::new(TestNativeQueryFrontend {
+        seen: Arc::new(Mutex::new(None)),
+        stream_dropped: Arc::new(AtomicBool::new(false)),
+        block_after_batches: false,
+    });
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: format!("127.0.0.1:{}", reserve_tcp_port()),
+        master_endpoint: master_endpoint.clone(),
+        token: None,
+        max_write_rows: None,
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+        write_timeout_ms: None,
+    })
+    .unwrap()
+    .with_native_query_frontend(frontend)
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "query_explain",
+            "query_id": QueryId::from_u128(31).unwrap(),
+            "session_id": SessionId::from_u128(32).unwrap(),
+            "sql": "SELECT value FROM ticks",
+            "bindings": [{
+                "sql_name": "ticks",
+                "table": {
+                    "type": "name",
+                    "namespace": "default",
+                    "table": "ticks"
+                }
+            }]
+        }),
+        vec![],
+    );
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0["kind"], "query_explain");
+    assert_eq!(frames[0].0["query_authority"], "native");
+    assert_eq!(
+        frames[0].0["explanation"]["metrics"]["operator.scan.count"],
+        1
+    );
+    assert_eq!(
+        frames[0].0["explanation"]["output_fields"][0]["name"],
+        "value"
+    );
+    assert_eq!(gateway.metrics()["native_query_explain_requests_total"], 1);
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_query_client_disconnect_drops_a_pending_result_stream() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let stream_dropped = Arc::new(AtomicBool::new(false));
+    let frontend = Arc::new(TestNativeQueryFrontend {
+        seen: Arc::new(Mutex::new(None)),
+        stream_dropped: Arc::clone(&stream_dropped),
+        block_after_batches: true,
+    });
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: format!("127.0.0.1:{}", reserve_tcp_port()),
+        master_endpoint: master_endpoint.clone(),
+        token: None,
+        max_write_rows: None,
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+        write_timeout_ms: Some(1_000),
+    })
+    .unwrap()
+    .with_native_query_frontend(frontend)
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let mut stream = TcpStream::connect(gateway.endpoint()).unwrap();
+    write_gateway_stream_request(
+        &mut stream,
+        json!({
+            "kind": "query_sql",
+            "query_id": QueryId::from_u128(21).unwrap(),
+            "session_id": SessionId::from_u128(22).unwrap(),
+            "sql": "SELECT value FROM ticks",
+            "bindings": [{
+                "sql_name": "ticks",
+                "table": {
+                    "type": "name",
+                    "namespace": "default",
+                    "table": "ticks"
+                }
+            }]
+        }),
+        vec![],
+    );
+    assert_eq!(
+        read_gateway_stream_frame(&mut stream).0["kind"],
+        "collect_start"
+    );
+    assert_eq!(
+        read_gateway_stream_frame(&mut stream).0["kind"],
+        "collect_chunk"
+    );
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(stream);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !stream_dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(stream_dropped.load(Ordering::Acquire));
+    let metrics = gateway.metrics();
+    assert_eq!(metrics["native_query_requests_active"], 0);
+    assert_eq!(metrics["native_query_transport_failures_total"], 1);
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[derive(Clone)]
+struct TestNativeQueryFrontend {
+    seen: Arc<Mutex<Option<GatewayNativeQueryRequest>>>,
+    stream_dropped: Arc<AtomicBool>,
+    block_after_batches: bool,
+}
+
+impl GatewayNativeQueryFrontend for TestNativeQueryFrontend {
+    fn execute(
+        &self,
+        request: GatewayNativeQueryRequest,
+    ) -> BoxFuture<'_, zippy_types::Result<SendableRecordBatchStream>> {
+        Box::pin(async move {
+            *self.seen.lock().unwrap() = Some(request.clone());
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            Ok(Box::pin(TestNativeQueryStream {
+                instance_id: QueryInstanceId::new(
+                    request.query_id,
+                    std::num::NonZeroU64::new(1).unwrap(),
+                ),
+                schema,
+                batches: VecDeque::from([QueryResultBatch::unaccounted(batch)]),
+                block_after_batches: self.block_after_batches,
+                dropped: Arc::clone(&self.stream_dropped),
+            }) as SendableRecordBatchStream)
+        })
+    }
+
+    fn explain(
+        &self,
+        request: GatewayNativeQueryRequest,
+    ) -> BoxFuture<'_, zippy_types::Result<GatewayNativeQueryExplanation>> {
+        Box::pin(async move {
+            *self.seen.lock().unwrap() = Some(request.clone());
+            Ok(GatewayNativeQueryExplanation {
+                query_id: request.query_id,
+                generation: std::num::NonZeroU64::new(1).unwrap(),
+                catalog_revision: 7,
+                snapshots: Vec::new(),
+                output_fields: vec![GatewayNativeQueryOutputField {
+                    name: "value".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                }],
+                metrics: BTreeMap::from([("operator.scan.count".to_string(), 1)]),
+            })
+        })
+    }
+}
+
+struct TestNativeQueryStream {
+    instance_id: QueryInstanceId,
+    schema: Arc<Schema>,
+    batches: VecDeque<QueryResultBatch>,
+    block_after_batches: bool,
+    dropped: Arc<AtomicBool>,
+}
+
+impl RecordBatchStream for TestNativeQueryStream {
+    fn instance_id(&self) -> QueryInstanceId {
+        self.instance_id
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+
+    fn metrics(&self) -> BTreeMap<String, u64> {
+        BTreeMap::from([("operator.scan.count".to_string(), 1)])
+    }
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<zippy_types::Result<QueryResultBatch>>> {
+        if let Some(batch) = self.batches.pop_front() {
+            return Poll::Ready(Some(Ok(batch)));
+        }
+        if self.block_after_batches {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+
+impl Drop for TestNativeQueryStream {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
 
 #[test]
 fn native_gateway_accepts_arrow_write_batch_and_publishes_descriptor() {
@@ -4562,7 +4885,8 @@ fn send_gateway_stream_frames(
         }
         let response = serde_json::from_slice::<serde_json::Value>(&response_header).unwrap();
         let kind = response.get("kind").and_then(serde_json::Value::as_str);
-        let is_terminal = matches!(kind, Some("collect_end")) || response["status"] == "error";
+        let is_terminal =
+            matches!(kind, Some("collect_end" | "query_explain")) || response["status"] == "error";
         frames.push((response, response_payload));
         if is_terminal {
             break;
