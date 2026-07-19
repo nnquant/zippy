@@ -9,7 +9,7 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Builder;
 use tokio::sync::watch;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use zippy_types::{ErrorCode, Result, ServerError};
 
@@ -368,7 +368,7 @@ fn run_listener(
             let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
                 unavailable(format!("adopt Flight listener failed error=[{error}]"))
             })?;
-            let incoming = TcpListenerStream::new(listener);
+            let incoming = flight_incoming(listener)?;
             let flight = FlightServiceServer::new(service.clone())
                 .max_decoding_message_size(max_message_bytes)
                 .max_encoding_message_size(max_message_bytes);
@@ -416,6 +416,14 @@ fn run_listener(
     let _ = completed.send(result);
 }
 
+fn flight_incoming(listener: tokio::net::TcpListener) -> Result<TcpIncoming> {
+    TcpIncoming::from_listener(listener, true, None).map_err(|error| {
+        unavailable(format!(
+            "configure Flight accepted sockets failed error=[{error}]"
+        ))
+    })
+}
+
 fn service_configured_message_bytes(service: &ZippyFlightService) -> usize {
     service.max_message_bytes()
 }
@@ -434,4 +442,41 @@ fn deadline_exceeded(message: impl Into<String>) -> ServerError {
 
 fn internal(message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::Internal, message).with_retryable(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use tokio_stream::StreamExt;
+
+    use super::{flight_incoming, Builder};
+
+    #[test]
+    fn accepted_flight_socket_disables_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Flight socket test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set Flight socket test listener nonblocking");
+        let endpoint = listener
+            .local_addr()
+            .expect("read Flight socket test endpoint");
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build Flight socket test runtime");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener)
+                .expect("adopt Flight socket test listener");
+            let mut incoming = flight_incoming(listener).expect("configure Flight socket incoming");
+            let connect = tokio::net::TcpStream::connect(endpoint);
+            let accept = incoming.next();
+            let (client, server) = tokio::join!(connect, accept);
+            let _client = client.expect("connect Flight socket test client");
+            let server = server
+                .expect("accept Flight socket test connection")
+                .expect("Flight socket test accept succeeds");
+            assert!(server.nodelay().expect("read server TCP_NODELAY"));
+        });
+    }
 }
