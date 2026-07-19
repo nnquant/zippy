@@ -22,6 +22,7 @@ mod legacy_reconcile_domain;
 mod manifest_domain;
 mod migration;
 mod pinned_snapshot;
+mod producer_domain;
 mod request_ledger;
 mod runtime_pins;
 mod service;

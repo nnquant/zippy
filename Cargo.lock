@@ -4131,6 +4131,9 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "zippy-core",
  "zippy-engines",

@@ -9,7 +9,9 @@
 
 mod actor;
 mod memory;
+mod native;
 mod registry;
+mod wal;
 
 pub use actor::{
     TableActorAdmissionControl, TableActorFailureMonitor, TableActorHandle,
@@ -25,4 +27,16 @@ pub use memory::{
     DEFAULT_MEMORY_INGEST_MAX_ACTIVE_TABLES, DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT,
     MAX_MEMORY_INGEST_ACTIVE_TABLES,
 };
+pub use native::{
+    NativeIngestApplyContext, NativeIngestConfig, NativeIngestHandle, NativeIngestRuntime,
+    NativeIngestShutdownOutcome, NativeIngestSink, NativeIngestStatus, NativeIngestTableBootstrap,
+    DEFAULT_NATIVE_INGEST_MAX_ACTIVE_OPERATIONS, DEFAULT_NATIVE_INGEST_MAX_PENDING_DURABLE_ACKS,
+    DEFAULT_NATIVE_INGEST_MAX_RECEIPTS_PER_EPOCH, MAX_NATIVE_INGEST_ACTIVE_OPERATIONS,
+    MAX_NATIVE_INGEST_PENDING_DURABLE_ACKS, MAX_NATIVE_INGEST_RECEIPTS_PER_EPOCH,
+};
 pub use registry::{TableRuntime, TableRuntimeBootstrap, TableRuntimeRegistry};
+pub use wal::{
+    recover_table_wal, ArrowIpcMutationFingerprintComputer, IngestWalConfig, IngestWalIdentity,
+    IngestWalRecovery, IngestWalWriter, RecoveredWalRecord, WalAppendPosition, WalCommitReceipt,
+    CURRENT_INGEST_WAL_FORMAT_VERSION,
+};

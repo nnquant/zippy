@@ -2,7 +2,7 @@
 
 日期：2026-07-13
 
-状态：实施中（Phase 0-5 已完成，Phase 6 Stage 6.4 有界内存写入已完成，Phase 7 durable ingest 待实施）
+状态：实施中（Phase 0-6 已完成，Phase 7 Stage 7.2 原生 durable ingest 核心已完成，协议接入待实施）
 
 适用范围：Zippy 单机部署模式。本文不设计集群、Raft、多副本、跨节点查询和分布式事务。
 
@@ -2592,17 +2592,25 @@ Stage 6.1/6.2/6.3/6.4 自动化证据：
 
 当前进度（2026-07-19）：Stage 7.0 已建立真实 Gateway/Flight query 与 memory-ACK write 性能门禁；
 Stage 7.1 已把进程内 compatibility materializer 从 Gateway 移到 `zippy-ingest::MemoryIngestRuntime`，
-由 Server 统一启动、监控和有界关闭。Flight ingest 已可在 Gateway 关闭时工作。该阶段只完成 ownership
-cutover，不改变 memory durability 语义；以下 producer fencing、WAL 和 stable offset 仍未完成。
+由 Server 统一启动、监控和有界关闭。Stage 7.2 已实现 Catalog `AcquireProducer`、table-wide epoch、
+boot connection fencing、严格 sequence/幂等 receipt、跨 epoch 稳定 log offset、WAL v1/CRC32C/Arrow
+IPC、commit marker + fsync、Memory/Wal ACK、有界恢复和未提交尾部截断。producer acquire 对调用方取消
+安全；全局 operation 与 per-table pending ACK 均有硬预算；atomic sink rejection 可回滚未提交 WAL，
+group commit completion 乱序不会误判 durable prefix；key-value delete 支持完整 row 和 key-only tombstone。
+
+Stage 7.2 当前是原生写入核心，不是公开协议切流：Gateway/Flight v1 仍使用 Stage 7.1 memory backend。
+native TableActor/materializer sink、manifest `Persisted` ACK、已持久 WAL checkpoint/回收、Flight durable
+command 和 subscription 属于后续 Stage 7.3+。磁盘格式和边界见
+[`ADR-0005`](adr/0005-ingest-wal-v1.md)。
 
 任务：
 
-1. 实现 producer acquire/epoch/sequence。
-2. 实现 per-table ingest actor。
-3. 实现 WAL record、CRC、group commit。
-4. 实现 memory/wal/persisted durability ACK。
-5. 实现 WAL recovery/checkpoint/truncation。
-6. 为所有表分配稳定 log offset。
+1. 实现 producer acquire/epoch/sequence。（Stage 7.2 已完成）
+2. 实现 per-table ingest actor。（Stage 7.2 authority 已完成；TableActor sink 接线待 Stage 7.3）
+3. 实现 WAL record、CRC、group commit。（Stage 7.2 record/CRC/commit group 已完成；定时批量 coordinator 待基准）
+4. 实现 memory/wal/persisted durability ACK。（Stage 7.2 Memory/Wal 已完成；Persisted 待 manifest 接线）
+5. 实现 WAL recovery/checkpoint/truncation。（Stage 7.2 recovery/tail truncation 已完成；checkpoint 回收待接线）
+6. 为所有表分配稳定 log offset。（Stage 7.2 已完成）
 7. 实现 Flight DoExchange subscription。
 8. 实现 consumer offset commit 和 replay。
 9. 实现 retention watermark/offset expired。
@@ -2610,10 +2618,10 @@ cutover，不改变 memory durability 语义；以下 producer fencing、WAL 和
 
 验收：
 
-- 响应丢失后重试不重复。
-- stale producer epoch 永远不能写入。
-- WAL 尾部 partial record 可检测并截断。
-- 重启后 active state 与 WAL replay 一致。
+- 响应丢失后重试不重复。（Stage 7.2 core 已验证）
+- stale producer epoch 永远不能写入。（Stage 7.2 core 已验证）
+- WAL 尾部 partial record 可检测并截断。（Stage 7.2 core 已验证）
+- 重启后 active state 与 WAL replay 一致。（Stage 7.2 core 已验证）
 - Subscriber 可从 committed offset 继续，允许重复但不跳行。
 
 回滚：按表保留 `durability=memory` 和 best-effort subscription；已写 WAL 不删除。

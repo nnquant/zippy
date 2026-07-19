@@ -178,14 +178,17 @@ binding 必须非空、有界且名称唯一。Server 不会根据 SQL 隐式猜
 `put_id` 和 `batch_sequence` 在 Stage 6.4 只用于关联请求和回执，**不提供服务端去重或 producer
 fencing**。若连接在部分 batch 成功后断开，客户端可能已经收到部分回执，也可能无法确定最后一批是否
 生效。此时不能盲目重试并期待 exactly-once。需要网络重试去重、重启恢复或 WAL/persisted ACK 的生产
-写入，应继续使用既有受控链路，或等待 Phase 7 durable ingest。
+写入，应继续使用既有受控链路。Stage 7.2 原生核心已经具备 fencing、幂等和 WAL ACK，但在 Flight
+durable command 完成切流前，不能把该能力推断到当前 v1 `DoPut`。
 
 Stage 7.1 backend 使用 server-owned `MemoryIngestRuntime`。Gateway 和 Flight 只持有同一个 cloneable
 handle，每个 stream 的 segment materializer 仅由该 runtime 创建一次，并在每批后完成现有 flush。
 因此 `[flight.ingest]` 不再要求 `[gateway]` 启用；Gateway 关闭时 Flight writer 仍可独立运行。
 该 backend 不会写 ingest WAL、登记 producer epoch、推进 durable sequence，也不会把 memory ACK 冒充
-磁盘提交。后续 Phase 7 会把协议适配器切到原生 durable ingest actor，不再修改 Flight command、Writer
-role 和资源边界。若仍需旧 remote client，可继续启用 Gateway compatibility listener；否则可直接关闭。
+磁盘提交。Stage 7.2 已在 `zippy-ingest::NativeIngestRuntime` 实现这些原生能力，但尚未接入当前 Flight
+command 和 table materializer。后续 Stage 7.3 会显式扩展 durable command 并切换 backend，同时保留
+Writer role 和已有资源边界。若仍需旧 remote client，可继续启用 Gateway compatibility listener；
+否则可直接关闭。
 
 ## 查询取消与管理员权限
 

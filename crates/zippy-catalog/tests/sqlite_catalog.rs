@@ -12,8 +12,8 @@ use tempfile::TempDir;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig, SqliteCatalogSnapshotReadLimits};
 use zippy_core::{DataDirectoryError, ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::catalog::{
-    AcquireSnapshotLeaseCommand, CatalogActor, CatalogActorKind, CatalogCodec,
-    CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogOutcomeV1, CatalogRead,
+    AcquireProducerCommand, AcquireSnapshotLeaseCommand, CatalogActor, CatalogActorKind,
+    CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogOutcomeV1, CatalogRead,
     CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, CreateTableCommand,
     ListNamespacesRequest, ListTablesRequest, NamespaceRef, ReleaseSnapshotLeaseCommand,
     VersionedCatalogCommand, VersionedCatalogResponse,
@@ -24,7 +24,10 @@ use zippy_types::table::{
     KeyValueTableDefinition, SchemaCompatibility, SchemaIpcPayload, SnapshotOperation,
     TableDefinition, TableRef, TableState,
 };
-use zippy_types::{ErrorCode, FileId, LeaseId, NamespaceId, RequestId, TableId};
+use zippy_types::{
+    ErrorCode, FileId, LeaseId, NamespaceId, OffsetWatermark, ProducerId, RequestId,
+    SequenceWatermark, ServerErrorDetails, TableId,
+};
 
 type RawInitialSnapshotRow = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
@@ -73,6 +76,30 @@ fn namespace_id(value: u128) -> NamespaceId {
 
 fn table_id(value: u128) -> TableId {
     TableId::from_u128(value).expect("test table id must be nonzero")
+}
+
+fn producer_id(value: u128) -> ProducerId {
+    ProducerId::from_u128(value).expect("test producer id must be nonzero")
+}
+
+fn acquire_producer(
+    request: u128,
+    table: u128,
+    producer: u128,
+    expected_writer_epoch: Option<u64>,
+) -> VersionedCatalogCommand {
+    CatalogCommandEnvelopeV1::new(
+        request_id(request),
+        None,
+        actor(),
+        CatalogCommandV1::AcquireProducer(AcquireProducerCommand {
+            table_id: table_id(table),
+            producer_id: producer_id(producer),
+            expected_writer_epoch,
+        }),
+    )
+    .expect("create producer acquisition command envelope")
+    .into()
 }
 
 fn file_id(value: u128) -> FileId {
@@ -578,6 +605,124 @@ async fn creates_table_atomically_and_replays_exactly_across_restart() {
     assert_eq!(by_name.table_id, table_id(1));
     assert_eq!(catalog.revision().await, Ok(2));
     catalog.close().expect("close reopened catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn producer_acquisition_fences_stale_epochs_and_replays_without_rollback() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+    catalog
+        .command(create_namespace(101, 101, "producer_test", Some(0)))
+        .await
+        .expect("create producer namespace");
+    catalog
+        .command(create_table(
+            102,
+            101,
+            101,
+            "ticks",
+            Some(1),
+            append_definition(),
+            schema_ipc(&table_schema()),
+        ))
+        .await
+        .expect("create producer table");
+
+    let first_command = acquire_producer(103, 101, 501, Some(0));
+    let first = catalog
+        .command(first_command.clone())
+        .await
+        .expect("acquire first producer epoch");
+    let VersionedCatalogResponse::V1(first) = &first;
+    let CatalogOutcomeV1::Producer(first_producer) = &first.outcome else {
+        panic!("AcquireProducer must return a producer descriptor");
+    };
+    assert_eq!(first.catalog_revision, 3);
+    assert_eq!(first_producer.table_id, table_id(101));
+    assert_eq!(first_producer.producer_id, producer_id(501));
+    assert_eq!(first_producer.producer_epoch, 1);
+    assert_eq!(first_producer.last_batch_sequence, SequenceWatermark::Empty);
+    assert_eq!(
+        first_producer.last_committed_log_offset,
+        OffsetWatermark::Empty
+    );
+
+    let replay = catalog
+        .command(first_command.clone())
+        .await
+        .expect("replay first producer acquisition");
+    assert_eq!(
+        CatalogCodec::encode_response(&replay).expect("encode producer replay"),
+        CatalogCodec::encode_response(&VersionedCatalogResponse::V1(first.clone()))
+            .expect("encode first producer response")
+    );
+    assert_eq!(catalog.revision().await, Ok(3));
+
+    let stale = catalog
+        .command(acquire_producer(104, 101, 501, Some(0)))
+        .await
+        .expect_err("stale producer epoch must be fenced");
+    assert_eq!(stale.code(), ErrorCode::StaleProducerEpoch);
+    assert_eq!(
+        stale.details(),
+        Some(&ServerErrorDetails::ProducerEpoch {
+            expected: 1,
+            actual: 0,
+        })
+    );
+    assert_eq!(catalog.revision().await, Ok(3));
+
+    let second = catalog
+        .command(acquire_producer(105, 101, 501, Some(1)))
+        .await
+        .expect("acquire second producer epoch");
+    let VersionedCatalogResponse::V1(second) = second;
+    let CatalogOutcomeV1::Producer(second_producer) = second.outcome else {
+        panic!("AcquireProducer must return a producer descriptor");
+    };
+    assert_eq!(second.catalog_revision, 4);
+    assert_eq!(second_producer.producer_epoch, 2);
+    assert_eq!(
+        second_producer.last_batch_sequence,
+        SequenceWatermark::Empty
+    );
+    assert_eq!(
+        catalog
+            .get_table(TableRef::Id {
+                table_id: table_id(101),
+            })
+            .await
+            .expect("read producer table")
+            .writer_epoch,
+        2
+    );
+    catalog.close().expect("close sqlite catalog");
+
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("reopen sqlite catalog");
+    let historical_replay = catalog
+        .command(first_command)
+        .await
+        .expect("replay historical producer acquisition");
+    let VersionedCatalogResponse::V1(historical_replay) = historical_replay;
+    let CatalogOutcomeV1::Producer(historical) = historical_replay.outcome else {
+        panic!("historical AcquireProducer replay must remain typed");
+    };
+    assert_eq!(historical.producer_epoch, 1);
+    assert_eq!(catalog.revision().await, Ok(4));
+    assert_eq!(
+        catalog
+            .get_table(TableRef::Id {
+                table_id: table_id(101),
+            })
+            .await
+            .expect("read reopened producer table")
+            .writer_epoch,
+        2
+    );
+    catalog.close().expect("close reopened sqlite catalog");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

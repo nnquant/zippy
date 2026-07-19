@@ -53,6 +53,29 @@ one-second heartbeat worker. The worker shares the same process credentials as d
 operations, has a one-second control-request timeout, and is joined before process unregister.
 Heartbeat and writer cleanup therefore remain inside the Server's absolute shutdown deadline.
 
-This cutover still acknowledges process-local memory visibility only. RecordBatch append into the
-native table actor, producer-session fencing, sequence idempotency, ingest WAL, stable logical
-offsets, restart recovery, and durable subscription remain subsequent Phase 7 stages.
+`NativeIngestRuntime` is the Stage 7.2 producer-fenced authority behind the next protocol cutover.
+It starts from the revision-consistent `TableRuntimeRegistry`, acquires table-wide producer epochs
+through the Catalog, binds each writer to one boot-scoped connection lease, and assigns contiguous
+zero-based logical offsets across producer epochs. Exact `(epoch, sequence, request, fingerprint)`
+retries return the retained receipt without applying the mutation twice; gaps, stale epochs, and
+conflicting retries fail with typed errors. Producer acquisition runs as server-owned work, so a
+cancelled caller cannot leave Catalog fencing ahead of the local table authority. Foreground calls
+and background acknowledgements share a 4,096-operation default budget; each table additionally
+limits pending WAL acknowledgements to 1,024 by default.
+
+Every newly accepted mutation is encoded into the versioned per-table WAL before it becomes visible.
+`Memory` returns without fsync and its uncommitted tail is discarded after a crash. `Wal` returns only
+after a checksum-protected commit marker and `sync_data`; startup replays only committed records after
+the Catalog persisted watermark. Recovery is bounded by configured record, byte, and file limits,
+truncates incomplete non-durable tails, and fails closed on checksum, fingerprint, identity, sequence,
+or offset corruption. A normal atomic sink rejection rolls back only its current uncommitted WAL
+append and may be retried; a sink panic or rollback failure terminally closes the table and shutdown
+will not commit its uncertain tail. Graceful shutdown closes admission, drains accepted work, and
+commits only healthy complete tails by one absolute deadline. Key-value deletes accept either a full
+table row or the exact ordered key-only tombstone schema.
+
+The current Gateway and Flight v1 adapters still use `MemoryIngestRuntime`; they do not yet route
+requests through `NativeIngestRuntime`. The native table materializer/TableActor sink, manifest-backed
+`Persisted` acknowledgement, WAL checkpoint reclamation, and durable subscription remain later Phase
+7 integration stages. Protocol clients must continue treating the current Flight `DoPut` receipt as
+process-local memory durability until that cutover is explicitly enabled.

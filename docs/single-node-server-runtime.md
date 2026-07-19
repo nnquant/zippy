@@ -327,6 +327,9 @@ server-issued read/admin/writer sessions, Catalog metadata, and bounded append +
 implemented behind explicit configuration. Standard Flight `GetFlightInfo`/`DoGet` query transport
 is implemented behind the opt-in `[flight]` gate. Stage 7.1 `DoPut` uses the server-owned process-local
 memory authority and no longer requires Gateway; it still does not provide WAL or persisted ACK.
+Stage 7.2 implements producer fencing, stable offsets, WAL acknowledgement, and bounded recovery in
+`NativeIngestRuntime`, but that authority is not yet wired to the Flight v1 command or native table
+materializer. Those public-path integrations remain Stage 7.3 work.
 Legacy live descriptors without exact logical-offset provenance are intentionally not promoted into
 native active snapshots.
 

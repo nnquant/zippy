@@ -342,6 +342,26 @@ pub trait MutationFingerprintComputer: Send + Sync {
         })
     }
 
+    /// Restores one WAL mutation and verifies its persisted canonical fingerprint.
+    fn restore(
+        &self,
+        request_id: RequestId,
+        schema_version: u64,
+        batch_sequence: u64,
+        mutation: TableMutation,
+        mutation_fingerprint: MutationFingerprint,
+    ) -> Result<WriteRequest> {
+        let request = WriteRequest {
+            request_id,
+            schema_version,
+            batch_sequence,
+            mutation,
+            mutation_fingerprint,
+        };
+        self.verify(&request)?;
+        Ok(request)
+    }
+
     /// Recomputes a WAL fingerprint using its historical format version.
     fn verify(&self, request: &WriteRequest) -> Result<()> {
         let actual = self.compute(

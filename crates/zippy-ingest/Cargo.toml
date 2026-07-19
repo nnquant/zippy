@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 arrow.workspace = true
 serde.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-engines = { path = "../zippy-engines" }
@@ -14,6 +15,8 @@ zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

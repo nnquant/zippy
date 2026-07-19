@@ -9,6 +9,7 @@
 - [ADR-0002：SQLite WAL 作为 Catalog](0002-sqlite-wal-catalog.md)
 - [ADR-0003：DataFusion 作为通用查询引擎](0003-datafusion-query-engine.md)
 - [ADR-0004：Arrow Flight 作为远端数据协议](0004-arrow-flight-protocol.md)
+- [ADR-0005：Producer fencing 与 ingest WAL v1](0005-ingest-wal-v1.md)
 
 相关总设计：
 
