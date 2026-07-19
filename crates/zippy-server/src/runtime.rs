@@ -23,12 +23,14 @@ use zippy_core::{
     OwnedDataDirectory, Result as CoreResult, ZippyCatalogBackend, ZippyConfig, ZippyError,
 };
 use zippy_gateway::{
-    GatewayServer, GatewayShutdownOutcome, LegacyPersistedReadSnapshotSource,
+    GatewayServer, GatewayServerConfig, GatewayShutdownOutcome, LegacyPersistedReadSnapshotSource,
     PersistedReadShadowConfig, PersistedReadSnapshotSource, ShadowPersistedReadSnapshotSource,
 };
-use zippy_master::daemon::{
-    prepare_master_runtime, start_legacy_gateway_with_query_frontend_if_enabled, MasterDaemonConfig,
+use zippy_ingest::{
+    MemoryIngestConfig, MemoryIngestHandle, MemoryIngestRuntime, MemoryIngestShutdownOutcome,
+    MemoryIngestStatus, DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT,
 };
+use zippy_master::daemon::{prepare_master_runtime, MasterDaemonConfig};
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
 use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use zippy_master::server::MasterServer;
@@ -48,6 +50,7 @@ use crate::legacy_catalog_migration::{
     plan_legacy_catalog_metadata_import, LegacyCatalogMetadataImportPlan,
     LegacyCatalogMigrationStartup,
 };
+use crate::memory_ingest::LegacyMasterMemoryIngestCatalog;
 use crate::{
     catalog_command_shadow::{LegacyCatalogShadowWorker, LegacyCatalogShadowWorkerConfig},
     catalog_shadow::SqliteCatalogPersistedReadShadowSource,
@@ -60,7 +63,7 @@ use crate::{
 const DEFAULT_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SERVER_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-const SERVER_READY_SCHEMA_VERSION: u8 = 6;
+const SERVER_READY_SCHEMA_VERSION: u8 = 7;
 
 /// Runs the server-owned legacy runtime until shutdown or dynamic readiness loss.
 ///
@@ -424,6 +427,34 @@ fn append_secondary_error(primary: ServerError, secondary: &ServerError) -> Serv
     combined
 }
 
+fn memory_ingest_shutdown_error(outcome: &MemoryIngestShutdownOutcome) -> Option<ServerError> {
+    if outcome.is_clean() {
+        return None;
+    }
+    let code = if outcome.deadline_exceeded {
+        ErrorCode::DeadlineExceeded
+    } else {
+        ErrorCode::Unavailable
+    };
+    Some(
+        ServerError::new(
+            code,
+            format!(
+                concat!(
+                    "memory ingest shutdown incomplete operations_drained=[{}] ",
+                    "writers_closed=[{}] writers_total=[{}] catalog_closed=[{}] failures=[{}]"
+                ),
+                outcome.active_operations_drained,
+                outcome.writers_closed,
+                outcome.writers_total,
+                outcome.catalog_closed,
+                outcome.writer_failures.join("; ")
+            ),
+        )
+        .with_retryable(true),
+    )
+}
+
 fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<ServerError> {
     if outcome.is_clean() {
         return None;
@@ -439,6 +470,14 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
             .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
         || outcome
             .flight_error
+            .as_ref()
+            .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
+        || outcome
+            .memory_ingest_outcome
+            .as_ref()
+            .is_some_and(|ingest| ingest.deadline_exceeded)
+        || outcome
+            .memory_ingest_error
             .as_ref()
             .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
         || outcome
@@ -470,6 +509,7 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
             .gateway_error
             .as_ref()
             .or(outcome.flight_error.as_ref())
+            .or(outcome.memory_ingest_error.as_ref())
             .or(outcome.master_error.as_ref())
             .or_else(|| {
                 outcome
@@ -490,6 +530,7 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
         format!(
             "server shutdown incomplete timed_out_processes=[{}] gateway_error=[{}] \
              gateway_outcome=[{:?}] flight_error=[{}] flight_outcome=[{:?}] \
+             memory_ingest_error=[{}] memory_ingest_outcome=[{:?}] \
              legacy_catalog_shadow_outcome=[{:?}] \
              native_storage_outcome=[{:?}] master_error=[{}]",
             outcome.timed_out_processes.join(","),
@@ -505,6 +546,12 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
                 .map(ToString::to_string)
                 .unwrap_or_default(),
             outcome.flight_outcome,
+            outcome
+                .memory_ingest_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            outcome.memory_ingest_outcome,
             outcome.legacy_catalog_shadow_outcome,
             outcome.native_storage_outcome,
             outcome
@@ -969,6 +1016,10 @@ pub struct LegacyServerReadiness {
     pub admission_open: bool,
     /// Whether the master listener crossed its explicit bind barrier.
     pub master_listener_ready: bool,
+    /// Whether Gateway writes or Flight DoPut require the shared memory ingest authority.
+    pub memory_ingest_configured: bool,
+    /// Whether the shared memory ingest authority still admits operations.
+    pub memory_ingest_ready: bool,
     /// Whether the effective configuration enables Gateway.
     pub gateway_configured: bool,
     /// Whether Gateway successfully bound its listener.
@@ -999,6 +1050,7 @@ impl LegacyServerReadiness {
     pub const fn is_ready(self) -> bool {
         self.admission_open
             && self.master_listener_ready
+            && (!self.memory_ingest_configured || self.memory_ingest_ready)
             && (!self.native_storage_configured
                 || (self.native_catalog_ready
                     && self.native_current_snapshot_files_ready
@@ -1026,6 +1078,9 @@ pub struct LegacyServerRuntimeHealth {
     pub legacy_catalog_shadow: Option<LegacyCatalogShadowStatus>,
     /// Process-local snapshot pin admission state when native storage is configured.
     pub catalog_runtime_snapshot_pins: Option<SqliteCatalogRuntimeSnapshotPinStatus>,
+    /// Server-owned compatibility memory ingest lifecycle and counters, when configured.
+    #[serde(default)]
+    pub memory_ingest: Option<MemoryIngestStatus>,
     /// Internal persisted-only native query canary state, when explicitly enabled.
     #[serde(default)]
     pub native_query_canary: Option<crate::NativeQueryCanaryStatus>,
@@ -1044,6 +1099,10 @@ pub struct LegacyServerShutdownOutcome {
     pub flight_error: Option<ServerError>,
     /// Structured Flight cleanup facts when the listener was configured.
     pub flight_outcome: Option<FlightShutdownOutcome>,
+    /// Shared memory ingest cleanup failure after both protocol frontends stopped.
+    pub memory_ingest_error: Option<ServerError>,
+    /// Structured shared memory ingest cleanup facts when configured.
+    pub memory_ingest_outcome: Option<MemoryIngestShutdownOutcome>,
     /// Master listener or final snapshot failure observed while joining.
     pub master_error: Option<ServerError>,
     /// Bounded event drain and final exact reconcile outcome, when shadowing was enabled.
@@ -1063,6 +1122,11 @@ impl LegacyServerShutdownOutcome {
                 .as_ref()
                 .is_none_or(GatewayShutdownOutcome::is_clean)
             && self.flight_error.is_none()
+            && self.memory_ingest_error.is_none()
+            && self
+                .memory_ingest_outcome
+                .as_ref()
+                .is_none_or(MemoryIngestShutdownOutcome::is_clean)
             && self.master_error.is_none()
             && self
                 .legacy_catalog_shadow_outcome
@@ -1155,6 +1219,7 @@ pub struct LegacyServerRuntime {
     gateway_endpoint: Option<String>,
     flight: Option<FlightServerRuntime>,
     flight_endpoint: Option<String>,
+    memory_ingest: Option<MemoryIngestRuntime>,
     services: LegacyServiceSet,
     readiness: LegacyServerReadiness,
     shutdown_outcome: Option<LegacyServerShutdownOutcome>,
@@ -1194,6 +1259,11 @@ impl LegacyServerRuntime {
             startup_deadline,
             legacy_catalog_migration,
         )?;
+        let mut memory_ingest = None;
+        let rollback_context = StartupRollbackContext {
+            master: &master,
+            shutdown_timeout,
+        };
         let mut legacy_catalog_shadow = match start_legacy_catalog_shadow_if_enabled(
             &runtime_config,
             &master,
@@ -1207,13 +1277,13 @@ impl LegacyServerRuntime {
                 let mut no_gateway = None;
                 let mut no_shadow = None;
                 let rollback = rollback_startup(
-                    &master,
+                    rollback_context,
                     &mut no_listener,
                     &mut no_gateway,
+                    &mut memory_ingest,
                     &mut no_shadow,
                     &mut native_storage,
                     None,
-                    shutdown_timeout,
                 );
                 return Err(with_startup_rollback(error, rollback));
             }
@@ -1223,13 +1293,13 @@ impl LegacyServerRuntime {
                 let mut no_listener = None;
                 let mut no_gateway = None;
                 let rollback = rollback_startup(
-                    &master,
+                    rollback_context,
                     &mut no_listener,
                     &mut no_gateway,
+                    &mut memory_ingest,
                     &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
-                    shutdown_timeout,
                 );
                 return Err(with_startup_rollback(error, rollback));
             }
@@ -1241,13 +1311,13 @@ impl LegacyServerRuntime {
             let mut no_listener = None;
             let mut no_gateway = None;
             let rollback = rollback_startup(
-                &master,
+                rollback_context,
                 &mut no_listener,
                 &mut no_gateway,
+                &mut memory_ingest,
                 &mut legacy_catalog_shadow,
                 &mut native_storage,
                 None,
-                shutdown_timeout,
             );
             return Err(with_startup_rollback(error, rollback));
         }
@@ -1262,13 +1332,33 @@ impl LegacyServerRuntime {
                 let mut no_listener = None;
                 let mut no_gateway = None;
                 let rollback = rollback_startup(
-                    &master,
+                    rollback_context,
                     &mut no_listener,
                     &mut no_gateway,
+                    &mut memory_ingest,
                     &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
-                    shutdown_timeout,
+                );
+                return Err(with_startup_rollback(error, rollback));
+            }
+        };
+        memory_ingest = match start_memory_ingest_if_required(
+            &runtime_config,
+            &control_endpoint,
+            startup_deadline,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let mut no_gateway = None;
+                let rollback = rollback_startup(
+                    rollback_context,
+                    &mut master_listener,
+                    &mut no_gateway,
+                    &mut memory_ingest,
+                    &mut legacy_catalog_shadow,
+                    &mut native_storage,
+                    None,
                 );
                 return Err(with_startup_rollback(error, rollback));
             }
@@ -1276,13 +1366,13 @@ impl LegacyServerRuntime {
         if let Err(error) = remaining_before(startup_deadline, "start gateway") {
             let mut no_gateway = None;
             let rollback = rollback_startup(
-                &master,
+                rollback_context,
                 &mut master_listener,
                 &mut no_gateway,
+                &mut memory_ingest,
                 &mut legacy_catalog_shadow,
                 &mut native_storage,
                 None,
-                shutdown_timeout,
             );
             return Err(with_startup_rollback(error, rollback));
         }
@@ -1294,13 +1384,13 @@ impl LegacyServerRuntime {
             Err(error) => {
                 let mut no_gateway = None;
                 let rollback = rollback_startup(
-                    &master,
+                    rollback_context,
                     &mut master_listener,
                     &mut no_gateway,
+                    &mut memory_ingest,
                     &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
-                    shutdown_timeout,
                 );
                 return Err(with_startup_rollback(error, rollback));
             }
@@ -1313,23 +1403,24 @@ impl LegacyServerRuntime {
                     .query_engine(),
             )) as Arc<dyn zippy_gateway::GatewayNativeQueryFrontend>
         });
-        let mut gateway = match start_legacy_gateway_with_query_frontend_if_enabled(
+        let mut gateway = match start_legacy_gateway_with_frontends_if_enabled(
             &runtime_config,
             &control_endpoint,
             persisted_read_snapshot_source,
             native_query_frontend,
+            memory_ingest.as_ref().map(MemoryIngestRuntime::handle),
         ) {
             Ok(gateway) => gateway,
             Err(error) => {
                 let mut no_gateway = None;
                 let rollback = rollback_startup(
-                    &master,
+                    rollback_context,
                     &mut master_listener,
                     &mut no_gateway,
+                    &mut memory_ingest,
                     &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
-                    shutdown_timeout,
                 );
                 return Err(with_startup_rollback(
                     map_core_error("bind gateway listener", error),
@@ -1346,13 +1437,13 @@ impl LegacyServerRuntime {
             Ok(timeout) => timeout,
             Err(error) => {
                 let rollback = rollback_startup(
-                    &master,
+                    rollback_context,
                     &mut master_listener,
                     &mut gateway,
+                    &mut memory_ingest,
                     &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
-                    shutdown_timeout,
                 );
                 return Err(with_startup_rollback(error, rollback));
             }
@@ -1363,13 +1454,13 @@ impl LegacyServerRuntime {
         };
         if let Err(error) = dependency_probe {
             let rollback = rollback_startup(
-                &master,
+                rollback_context,
                 &mut master_listener,
                 &mut gateway,
+                &mut memory_ingest,
                 &mut legacy_catalog_shadow,
                 &mut native_storage,
                 None,
-                shutdown_timeout,
             );
             return Err(with_startup_rollback(
                 map_core_error("probe master dependency", error),
@@ -1381,13 +1472,13 @@ impl LegacyServerRuntime {
             .is_some_and(MasterListenerRuntime::is_finished)
         {
             let rollback = rollback_startup(
-                &master,
+                rollback_context,
                 &mut master_listener,
                 &mut gateway,
+                &mut memory_ingest,
                 &mut legacy_catalog_shadow,
                 &mut native_storage,
                 None,
-                shutdown_timeout,
             );
             return Err(with_startup_rollback(
                 ServerError::new(
@@ -1407,13 +1498,13 @@ impl LegacyServerRuntime {
                 Ok(services) => LegacyServiceSet::CatalogAndQuery { services },
                 Err(error) => {
                     let rollback = rollback_startup(
-                        &master,
+                        rollback_context,
                         &mut master_listener,
                         &mut gateway,
+                        &mut memory_ingest,
                         &mut legacy_catalog_shadow,
                         &mut native_storage,
                         None,
-                        shutdown_timeout,
                     );
                     return Err(with_startup_rollback(
                         with_stage("compose legacy services", error),
@@ -1429,13 +1520,13 @@ impl LegacyServerRuntime {
 
         if let Err(error) = services.activate() {
             let rollback = rollback_startup(
-                &master,
+                rollback_context,
                 &mut master_listener,
                 &mut gateway,
+                &mut memory_ingest,
                 &mut legacy_catalog_shadow,
                 &mut native_storage,
                 Some(&services),
-                shutdown_timeout,
             );
             return Err(with_startup_rollback(
                 with_stage("activate legacy services", error),
@@ -1445,19 +1536,19 @@ impl LegacyServerRuntime {
         let mut flight = match start_flight_if_enabled(
             &runtime_config,
             native_storage.as_ref(),
-            gateway.as_ref(),
+            memory_ingest.as_ref().map(MemoryIngestRuntime::handle),
             startup_deadline,
         ) {
             Ok(flight) => flight,
             Err(error) => {
                 let rollback = rollback_startup(
-                    &master,
+                    rollback_context,
                     &mut master_listener,
                     &mut gateway,
+                    &mut memory_ingest,
                     &mut legacy_catalog_shadow,
                     &mut native_storage,
                     Some(&services),
-                    shutdown_timeout,
                 );
                 return Err(with_startup_rollback(
                     with_stage("start Flight listener", error),
@@ -1470,13 +1561,13 @@ impl LegacyServerRuntime {
         if let Err(error) = remaining_before(startup_deadline, "publish server readiness") {
             let flight_error = stop_flight_until(&mut flight, startup_deadline).err();
             let rollback = rollback_startup(
-                &master,
+                rollback_context,
                 &mut master_listener,
                 &mut gateway,
+                &mut memory_ingest,
                 &mut legacy_catalog_shadow,
                 &mut native_storage,
                 Some(&services),
-                shutdown_timeout,
             );
             return Err(with_startup_rollback(
                 combine_optional_errors(Some(error), flight_error)
@@ -1485,9 +1576,15 @@ impl LegacyServerRuntime {
             ));
         }
 
+        let memory_ingest_configured = memory_ingest.is_some();
+        let memory_ingest_ready = memory_ingest
+            .as_ref()
+            .is_some_and(|ingest| ingest.status().accepting);
         let readiness = LegacyServerReadiness {
             admission_open: true,
             master_listener_ready: true,
+            memory_ingest_configured,
+            memory_ingest_ready,
             gateway_configured,
             gateway_listener_ready: gateway_configured,
             gateway_master_reachable: gateway_configured,
@@ -1507,6 +1604,7 @@ impl LegacyServerRuntime {
             control_endpoint = control_endpoint.display_string(),
             gateway_endpoint = gateway_endpoint.as_deref().unwrap_or("disabled"),
             flight_endpoint = flight_endpoint.as_deref().unwrap_or("disabled"),
+            memory_ingest = memory_ingest_configured,
             mode = if gateway_configured || flight_configured {
                 "catalog_and_query"
             } else {
@@ -1530,6 +1628,7 @@ impl LegacyServerRuntime {
             gateway_endpoint,
             flight,
             flight_endpoint,
+            memory_ingest,
             services,
             readiness,
             shutdown_outcome: None,
@@ -1562,6 +1661,12 @@ impl LegacyServerRuntime {
     #[must_use]
     pub fn flight_status(&self) -> Option<FlightServiceStatus> {
         self.flight.as_ref().map(FlightServerRuntime::status)
+    }
+
+    /// Returns server-owned compatibility memory ingest lifecycle and counters.
+    #[must_use]
+    pub fn memory_ingest_status(&self) -> Option<MemoryIngestStatus> {
+        self.memory_ingest.as_ref().map(MemoryIngestRuntime::status)
     }
 
     /// Returns non-secret TLS diagnostics for the Flight listener when configured.
@@ -1685,6 +1790,12 @@ impl LegacyServerRuntime {
             readiness.flight_listener_ready &= running;
             readiness.flight_protocol_ready &= running;
         }
+        if readiness.memory_ingest_configured {
+            readiness.memory_ingest_ready &= self
+                .memory_ingest
+                .as_ref()
+                .is_some_and(|ingest| ingest.status().accepting);
+        }
         apply_native_storage_runtime_health(
             &mut readiness,
             self.native_storage
@@ -1725,6 +1836,7 @@ impl LegacyServerRuntime {
                 .native_storage
                 .as_ref()
                 .and_then(|storage| storage.runtime_snapshot_pin_status().ok()),
+            memory_ingest: self.memory_ingest_status(),
             native_query_canary: self
                 .native_storage
                 .as_ref()
@@ -1734,6 +1846,17 @@ impl LegacyServerRuntime {
     }
 
     fn terminal_failure(&self) -> Option<ServerError> {
+        if self.readiness.memory_ingest_configured
+            && !self
+                .memory_ingest
+                .as_ref()
+                .is_some_and(|ingest| ingest.status().accepting)
+        {
+            return Some(ServerError::new(
+                ErrorCode::Unavailable,
+                "memory ingest authority closed while server admission remained open",
+            ));
+        }
         if self.readiness.flight_configured
             && !self
                 .flight
@@ -1759,6 +1882,9 @@ impl LegacyServerRuntime {
         self.services.begin_shutdown();
         if let Some(flight) = &self.flight {
             flight.close_admission();
+        }
+        if let Some(memory_ingest) = &self.memory_ingest {
+            memory_ingest.close_admission();
         }
         if let Some(native_storage) = &self.native_storage {
             native_storage.close_query_canary_admission();
@@ -1807,33 +1933,66 @@ impl LegacyServerRuntime {
         self.readiness.gateway_listener_ready = false;
         self.readiness.gateway_master_reachable = false;
 
-        let graceful = self.master.drain_registered_processes_for_shutdown(
-            deadline.saturating_duration_since(Instant::now()),
-        );
-        let seal_error = self
-            .master
-            .seal_legacy_catalog_commit_events(deadline.saturating_duration_since(Instant::now()))
-            .err()
-            .map(|error| {
-                ServerError::new(
-                    ErrorCode::DeadlineExceeded,
-                    format!("seal legacy Catalog commit events error=[{error}]"),
-                )
-            });
-        let legacy_catalog_shadow_outcome = self
-            .legacy_catalog_shadow
+        let memory_ingest_outcome = self
+            .memory_ingest
             .as_mut()
-            .map(|shadow| shadow.shutdown_until(deadline));
+            .map(|ingest| ingest.shutdown_until(deadline));
+        let memory_ingest_error = memory_ingest_outcome
+            .as_ref()
+            .and_then(memory_ingest_shutdown_error);
+        if memory_ingest_outcome
+            .as_ref()
+            .is_some_and(MemoryIngestShutdownOutcome::is_clean)
+        {
+            self.memory_ingest.take();
+        }
+        self.readiness.memory_ingest_ready = false;
+
+        let memory_ingest_closed = memory_ingest_outcome
+            .as_ref()
+            .is_none_or(MemoryIngestShutdownOutcome::is_clean);
+        let timed_out_processes = if memory_ingest_closed {
+            self.master
+                .drain_registered_processes_for_shutdown(
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .timed_out_processes
+        } else {
+            Vec::new()
+        };
+        let seal_error = if memory_ingest_closed {
+            self.master
+                .seal_legacy_catalog_commit_events(
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .err()
+                .map(|error| {
+                    ServerError::new(
+                        ErrorCode::DeadlineExceeded,
+                        format!("seal legacy Catalog commit events error=[{error}]"),
+                    )
+                })
+        } else {
+            None
+        };
+        let legacy_catalog_shadow_outcome = if memory_ingest_closed {
+            self.legacy_catalog_shadow
+                .as_mut()
+                .map(|shadow| shadow.shutdown_until(deadline))
+        } else {
+            None
+        };
         if legacy_catalog_shadow_outcome
             .as_ref()
             .is_some_and(LegacyCatalogShadowShutdownOutcome::is_complete)
         {
             self.legacy_catalog_shadow.take();
         }
-        let shadow_joined = !matches!(
-            legacy_catalog_shadow_outcome.as_ref(),
-            Some(&LegacyCatalogShadowShutdownOutcome::TimedOut)
-        );
+        let shadow_joined = memory_ingest_closed
+            && !matches!(
+                legacy_catalog_shadow_outcome.as_ref(),
+                Some(&LegacyCatalogShadowShutdownOutcome::TimedOut)
+            );
         let listener_error = if shadow_joined && seal_error.is_none() {
             self.master.shutdown();
             self.readiness.master_listener_ready = false;
@@ -1862,11 +2021,13 @@ impl LegacyServerRuntime {
             combine_optional_errors(seal_error, listener_error),
         );
         let outcome = LegacyServerShutdownOutcome {
-            timed_out_processes: graceful.timed_out_processes,
+            timed_out_processes,
             gateway_error,
             gateway_outcome,
             flight_error,
             flight_outcome,
+            memory_ingest_error,
+            memory_ingest_outcome,
             master_error,
             legacy_catalog_shadow_outcome,
             native_storage_outcome,
@@ -1884,6 +2045,8 @@ impl LegacyServerRuntime {
             gateway_outcome = ?outcome.gateway_outcome,
             flight_error = ?outcome.flight_error,
             flight_outcome = ?outcome.flight_outcome,
+            memory_ingest_error = ?outcome.memory_ingest_error,
+            memory_ingest_outcome = ?outcome.memory_ingest_outcome,
             legacy_catalog_shadow_outcome = ?outcome.legacy_catalog_shadow_outcome,
             native_storage_outcome = ?outcome.native_storage_outcome,
             master_error = ?outcome.master_error,
@@ -1901,6 +2064,11 @@ impl LegacyServerRuntime {
                 outcome.native_storage_outcome.as_ref(),
                 Some(NativeStorageShutdownOutcome::TimedOut)
             )
+            || (self.memory_ingest.is_some()
+                && outcome
+                    .memory_ingest_outcome
+                    .as_ref()
+                    .is_none_or(|ingest| !ingest.is_clean()))
             || (self.native_storage.is_some() && outcome.native_storage_outcome.is_none());
         if !retryable_ordered_cleanup {
             self.shutdown_outcome = Some(outcome.clone());
@@ -1932,6 +2100,8 @@ impl Drop for LegacyServerRuntime {
                 gateway_outcome = ?outcome.gateway_outcome,
                 flight_error = ?outcome.flight_error,
                 flight_outcome = ?outcome.flight_outcome,
+                memory_ingest_error = ?outcome.memory_ingest_error,
+                memory_ingest_outcome = ?outcome.memory_ingest_outcome,
                 native_storage_outcome = ?outcome.native_storage_outcome,
                 master_error = ?outcome.master_error,
                 "zippy server runtime drop completed with cleanup errors"
@@ -2289,10 +2459,93 @@ fn gateway_persisted_read_snapshot_source(
     }
 }
 
+fn start_memory_ingest_if_required(
+    runtime_config: &ZippyConfig,
+    control_endpoint: &ControlEndpoint,
+    startup_deadline: Instant,
+) -> Result<Option<MemoryIngestRuntime>, ServerError> {
+    if !runtime_config.gateway.enabled && !runtime_config.flight.ingest.enabled {
+        return Ok(None);
+    }
+    let config =
+        MemoryIngestConfig::new().with_operation_timeout(DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT);
+    config.validate()?;
+    let startup_timeout = remaining_before(startup_deadline, "start memory ingest authority")?;
+    let catalog = LegacyMasterMemoryIngestCatalog::start(
+        control_endpoint.clone(),
+        startup_timeout,
+        DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT,
+    )?;
+    MemoryIngestRuntime::start(config, catalog).map(Some)
+}
+
+fn start_legacy_gateway_with_frontends_if_enabled(
+    runtime_config: &ZippyConfig,
+    control_endpoint: &ControlEndpoint,
+    persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
+    native_query_frontend: Option<Arc<dyn zippy_gateway::GatewayNativeQueryFrontend>>,
+    memory_ingest: Option<MemoryIngestHandle>,
+) -> CoreResult<Option<GatewayServer>> {
+    if !runtime_config.gateway.enabled {
+        return Ok(None);
+    }
+    if runtime_config.query.native_enabled && native_query_frontend.is_none() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "native query is enabled but no server-owned frontend was installed"
+                .to_string(),
+        });
+    }
+    let endpoint =
+        runtime_config
+            .gateway
+            .endpoint
+            .clone()
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "gateway endpoint is required when gateway is enabled".to_string(),
+            })?;
+    let mut gateway = GatewayServer::new_with_query_limits_and_persisted_read_snapshot_source(
+        GatewayServerConfig {
+            endpoint,
+            master_endpoint: control_endpoint.clone(),
+            token: runtime_config.gateway.token.clone(),
+            max_write_rows: None,
+            max_connections: None,
+            max_subscribers: None,
+            max_blocking_requests: None,
+            write_timeout_ms: None,
+        },
+        runtime_config.runtime.max_cpu_cores,
+        runtime_config.query_parallelism(),
+        runtime_config.runtime.max_query_buffer_bytes,
+        runtime_config.query_max_buffered_bytes(),
+        persisted_read_snapshot_source,
+    )?;
+    if let Some(frontend) = native_query_frontend {
+        gateway = gateway.with_native_query_frontend(frontend)?;
+    }
+    if let Some(memory_ingest) = memory_ingest {
+        gateway = gateway.with_memory_ingest(memory_ingest)?;
+    }
+    let gateway = gateway.start()?;
+    tracing::info!(
+        component = "gateway",
+        event = "gateway_start",
+        status = "ready",
+        endpoint = gateway.endpoint(),
+        max_cpu_cores = runtime_config.runtime.max_cpu_cores,
+        query_parallelism = runtime_config.query_parallelism(),
+        max_query_buffer_bytes = runtime_config.runtime.max_query_buffer_bytes,
+        query_max_buffered_bytes = runtime_config.query_max_buffered_bytes(),
+        memory_ingest_authority = gateway.has_memory_ingest(),
+        "started zippy gateway compatibility adapter"
+    );
+    Ok(Some(gateway))
+}
+
 fn start_flight_if_enabled(
     runtime_config: &ZippyConfig,
     native_storage: Option<&NativeStorageRuntime>,
-    gateway: Option<&GatewayServer>,
+    memory_ingest: Option<MemoryIngestHandle>,
     startup_deadline: Instant,
 ) -> Result<Option<FlightServerRuntime>, ServerError> {
     if !runtime_config.flight.enabled {
@@ -2349,10 +2602,10 @@ fn start_flight_if_enabled(
         native_storage.catalog_read_handle(),
     );
     if runtime_config.flight.ingest.enabled {
-        let gateway = gateway.ok_or_else(|| {
+        let memory_ingest = memory_ingest.ok_or_else(|| {
             ServerError::new(
                 ErrorCode::Internal,
-                "validated Flight ingest configuration did not start Gateway",
+                "validated Flight ingest configuration did not start memory ingest authority",
             )
             .with_retryable(false)
         })?;
@@ -2364,7 +2617,7 @@ fn start_flight_if_enabled(
             runtime_config.flight.ingest.max_batch_bytes,
             runtime_config.flight.ingest.max_bytes_per_put,
         )?);
-        frontend = frontend.with_legacy_ingest(gateway.legacy_write_facade());
+        frontend = frontend.with_memory_ingest(memory_ingest);
     }
     let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> = Arc::new(frontend);
     let service = ZippyFlightService::try_new(config, frontend)?;
@@ -2466,16 +2719,23 @@ fn probe_master_dependency(endpoint: &ControlEndpoint, timeout: Duration) -> Cor
     }
 }
 
+#[derive(Clone, Copy)]
+struct StartupRollbackContext<'a> {
+    master: &'a MasterServer,
+    shutdown_timeout: Duration,
+}
+
 fn rollback_startup(
-    master: &MasterServer,
+    context: StartupRollbackContext<'_>,
     master_listener: &mut Option<MasterListenerRuntime>,
     gateway: &mut Option<GatewayServer>,
+    memory_ingest: &mut Option<MemoryIngestRuntime>,
     legacy_catalog_shadow: &mut Option<LegacyCatalogShadowWorker>,
     native_storage: &mut Option<NativeStorageRuntime>,
     services: Option<&LegacyServiceSet>,
-    shutdown_timeout: Duration,
 ) -> LegacyServerShutdownOutcome {
-    let (deadline, budget_error) = match Instant::now().checked_add(shutdown_timeout) {
+    let master = context.master;
+    let (deadline, budget_error) = match Instant::now().checked_add(context.shutdown_timeout) {
         Some(deadline) => (deadline, None),
         None => (
             Instant::now(),
@@ -2514,6 +2774,18 @@ fn rollback_startup(
         },
         None => (None, None),
     };
+    let memory_ingest_outcome = memory_ingest
+        .as_mut()
+        .map(|ingest| ingest.shutdown_until(deadline));
+    let memory_ingest_error = memory_ingest_outcome
+        .as_ref()
+        .and_then(memory_ingest_shutdown_error);
+    if memory_ingest_outcome
+        .as_ref()
+        .is_some_and(MemoryIngestShutdownOutcome::is_clean)
+    {
+        memory_ingest.take();
+    }
     let graceful = master.drain_registered_processes_for_shutdown(
         deadline.saturating_duration_since(Instant::now()),
     );
@@ -2595,6 +2867,8 @@ fn rollback_startup(
         gateway_outcome,
         flight_error: None,
         flight_outcome: None,
+        memory_ingest_error,
+        memory_ingest_outcome,
         master_error: combine_optional_errors(
             budget_error,
             combine_optional_errors(seal_error, listener_error),
@@ -3065,6 +3339,8 @@ mod tests {
         let readiness = LegacyServerReadiness {
             admission_open: true,
             master_listener_ready: true,
+            memory_ingest_configured: false,
+            memory_ingest_ready: false,
             gateway_configured: false,
             gateway_listener_ready: false,
             gateway_master_reachable: false,
@@ -3223,6 +3499,8 @@ mod tests {
         let mut readiness = LegacyServerReadiness {
             admission_open: true,
             master_listener_ready: true,
+            memory_ingest_configured: false,
+            memory_ingest_ready: false,
             gateway_configured: true,
             gateway_listener_ready: true,
             gateway_master_reachable: false,
@@ -3244,10 +3522,40 @@ mod tests {
     }
 
     #[test]
+    fn readiness_requires_configured_memory_ingest_authority() {
+        let mut readiness = LegacyServerReadiness {
+            admission_open: true,
+            master_listener_ready: true,
+            memory_ingest_configured: true,
+            memory_ingest_ready: false,
+            gateway_configured: false,
+            gateway_listener_ready: false,
+            gateway_master_reachable: false,
+            flight_configured: false,
+            flight_listener_ready: false,
+            flight_protocol_ready: false,
+            native_storage_configured: false,
+            native_catalog_ready: false,
+            native_current_snapshot_files_ready: false,
+            storage_reconciliation_complete: false,
+            commit_recovery_complete: false,
+        };
+
+        assert!(!readiness.is_ready());
+        readiness.memory_ingest_ready = true;
+        assert!(readiness.is_ready());
+        readiness.memory_ingest_configured = false;
+        readiness.memory_ingest_ready = false;
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
     fn readiness_requires_every_configured_native_storage_gate() {
         let mut readiness = LegacyServerReadiness {
             admission_open: true,
             master_listener_ready: true,
+            memory_ingest_configured: false,
+            memory_ingest_ready: false,
             gateway_configured: false,
             gateway_listener_ready: false,
             gateway_master_reachable: false,
@@ -3276,6 +3584,8 @@ mod tests {
         let mut readiness = LegacyServerReadiness {
             admission_open: true,
             master_listener_ready: true,
+            memory_ingest_configured: false,
+            memory_ingest_ready: false,
             gateway_configured: false,
             gateway_listener_ready: false,
             gateway_master_reachable: false,
@@ -3301,6 +3611,8 @@ mod tests {
         let mut readiness = LegacyServerReadiness {
             admission_open: true,
             master_listener_ready: true,
+            memory_ingest_configured: false,
+            memory_ingest_ready: false,
             gateway_configured: false,
             gateway_listener_ready: false,
             gateway_master_reachable: false,
@@ -3570,6 +3882,8 @@ token = "must-not-appear-in-ready-record"
             gateway_outcome: None,
             flight_error: None,
             flight_outcome: None,
+            memory_ingest_error: None,
+            memory_ingest_outcome: None,
             master_error: None,
             legacy_catalog_shadow_outcome: None,
             native_storage_outcome: None,
@@ -3611,6 +3925,8 @@ token = "must-not-appear-in-ready-record"
             gateway_outcome: None,
             flight_error: None,
             flight_outcome: None,
+            memory_ingest_error: None,
+            memory_ingest_outcome: None,
             master_error: None,
             legacy_catalog_shadow_outcome: None,
             native_storage_outcome: None,

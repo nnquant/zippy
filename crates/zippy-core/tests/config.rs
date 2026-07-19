@@ -1816,10 +1816,6 @@ backend = "sqlite_shadow"
 [query]
 native_enabled = true
 
-[gateway]
-enabled = true
-endpoint = "127.0.0.1:17691"
-
 [flight]
 enabled = true
 endpoint = "127.0.0.1:17692"
@@ -1851,6 +1847,7 @@ enabled = true
     .unwrap();
 
     assert!(config.flight.ingest.enabled);
+    assert!(!config.gateway.enabled);
     assert_eq!(
         config.flight.auth.writer_bootstrap_token(),
         Some(writer_token)

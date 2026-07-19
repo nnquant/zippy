@@ -382,9 +382,43 @@ async fn flight_gateway_transport_performance_baseline() {
     let gateway_metrics = runtime
         .gateway_metrics()
         .expect("combined runtime exposes Gateway metrics");
+    let memory_ingest = runtime
+        .memory_ingest_status()
+        .expect("combined runtime exposes server-owned memory ingest metrics");
     let flight_status = runtime
         .flight_status()
         .expect("combined runtime exposes Flight metrics");
+    let samples_per_transport = config
+        .warmup_samples
+        .saturating_add(config.measured_samples);
+    let expected_batches_per_transport = config
+        .write_rows
+        .len()
+        .saturating_mul(samples_per_transport);
+    let expected_rows_per_transport = config
+        .write_rows
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_mul(samples_per_transport);
+    assert_eq!(
+        memory_ingest.write_batches_total,
+        u64::try_from(expected_batches_per_transport.saturating_mul(2))
+            .expect("combined batch count fits u64")
+    );
+    assert_eq!(
+        memory_ingest.written_rows_total,
+        u64::try_from(expected_rows_per_transport.saturating_mul(2))
+            .expect("combined row count fits u64")
+    );
+    assert_eq!(
+        gateway_metrics["memory_ingest"]["write_batches_total"],
+        memory_ingest.write_batches_total
+    );
+    assert_eq!(
+        gateway_metrics["memory_ingest"]["written_rows_total"],
+        memory_ingest.written_rows_total
+    );
     assert_eq!(flight_status.pending_tickets, 0);
     assert_eq!(flight_status.active_puts, 0);
     let rss_after = process_rss_kib().unwrap_or(0);

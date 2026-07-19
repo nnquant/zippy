@@ -13,7 +13,7 @@ use zippy_core::{
     canonical_schema_hash, schema_metadata, ControlEndpoint, ControlRequest, ControlResponse,
     HeartbeatRequest, MasterClient, RegisterEngineRequest, RegisterProcessRequest,
     RegisterSourceRequest, RegisterStreamRequest, SchemaRef, StreamInfo, UnregisterSourceRequest,
-    UpdateRecordStatusRequest, WatchResource, ZippyConfig,
+    UpdateRecordStatusRequest, WatchResource, ZippyConfig, ZippyError,
 };
 
 fn empty_schema() -> SchemaRef {
@@ -69,6 +69,26 @@ fn stream_info_persisted_files_revision_is_backward_compatible() {
     let decoded =
         serde_json::from_value::<StreamInfo>(serde_json::to_value(&current).unwrap()).unwrap();
     assert_eq!(decoded, current);
+}
+
+#[test]
+fn master_client_request_timeout_rejects_zero_and_can_be_restored() {
+    let mut client = MasterClient::connect_endpoint(ControlEndpoint::Unix(unique_socket_path()))
+        .expect("construct Master client without connecting");
+    assert_eq!(client.request_timeout(), None);
+
+    let error = client
+        .set_request_timeout(Some(Duration::ZERO))
+        .unwrap_err();
+    assert!(matches!(error, ZippyError::InvalidConfig { .. }));
+    assert_eq!(client.request_timeout(), None);
+
+    client
+        .set_request_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    assert_eq!(client.request_timeout(), Some(Duration::from_millis(250)));
+    client.set_request_timeout(None).unwrap();
+    assert_eq!(client.request_timeout(), None);
 }
 
 #[test]

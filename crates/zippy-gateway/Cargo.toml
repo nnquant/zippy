@@ -13,6 +13,7 @@ tokio.workspace = true
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-engines = { path = "../zippy-engines" }
+zippy-ingest = { path = "../zippy-ingest" }
 zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-types = { path = "../zippy-types" }
 

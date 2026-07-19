@@ -2533,8 +2533,9 @@ Server 可在 Gateway 关闭时独立启动 Flight，并直接复用 Phase 5 `Na
 和重启证书轮换已经完成；非 loopback endpoint 必须同时启用 TLS 与认证。owner-bound 标准取消、
 control-only admin session、query generation/server-instance ABA fence，以及四类标准 Flight SQL metadata
 已经接入相同 Catalog/Query authority。标准 `DoPut` 已实现独立 Writer session、append + memory command、
-逐 batch 回执和并发/行数/字节硬上限；当前通过 Gateway compatibility facade 接入 segment materializer，
-不承诺 WAL、producer fencing、去重或 persisted durability。独立 `zippy-client` 现在从 Master 自动发现
+逐 batch 回执和并发/行数/字节硬上限；Stage 7.1 已将 Gateway/Flight 接入同一个 server-owned memory
+ingest authority，Flight 不再依赖 Gateway listener，但仍不承诺 WAL、producer fencing、去重或 persisted
+durability。独立 `zippy-client` 现在从 Master 自动发现
 Flight，隔离 read/writer session，将 lazy Table 完整编译为 SQL + 显式 Catalog bindings，执行
 `GetFlightInfo -> DoGet`，并按服务端上限切分 DoPut、逐批校验 memory receipt。结构化错误公开稳定
 `code/retryable/ID/details`；查询和写入优先 Flight，SHM 仍服务同 namespace 热订阅，Gateway 只作为旧
@@ -2561,15 +2562,16 @@ Stage 6.1/6.2/6.3/6.4 自动化证据：
   客户端断连释放；
 - `zippy-server` runtime E2E 使用真实 SQLite Catalog、legacy import 和 Parquet scan 验证
   `GetFlightInfo -> DoGet`，并断言重复消费失败、operator memory 归零；
-- Flight listener 已纳入 schema version 6 ready record、动态健康检查和 Gateway 之前的有序 shutdown；
+- Flight listener 与 memory ingest 已纳入 schema version 7 ready record、动态健康检查和有序 shutdown；
 - TLS 测试验证明文/不受信 CA 失败、受信 CA 成功、mTLS client identity 和重启证书轮换；认证测试验证
   服务端签发 session、防伪造、容量上限、过期和 pending ticket 回收。
 - 标准 Flight 客户端测试覆盖 owner/admin cancel、control-only admin、跨 session 拒绝和 ABA fence；
 - 标准 Flight SQL client 覆盖四类 metadata，真实 Server E2E 验证 `GetTables(include_schema=true)` 的
   revision 固定与轻量 schema 读取；共享字节预算测试验证 ticket 生命周期归还 permit。
 - 标准 Flight client 覆盖 Writer/read 权限隔离、逐 batch memory receipt 和超限 batch 在 backend 前拒绝；
-  真实 Server E2E 启动 master + Gateway + Flight，并从 Gateway metrics 和 Master active segment descriptor
-  双向证明 `DoPut` 已进入兼容 materializer。
+  真实 Server E2E 证明 Gateway 关闭时 `DoPut` 仍可写入并发布 Master active segment descriptor，Gateway
+  E2E 另行证明其写入计数汇聚到同一个 server-owned authority。Gateway/Flight 性能基准校验合并后的
+  batch/row 总数，防止重新分裂 writer ownership。
 - Python connector 的真实 PyArrow loopback 覆盖 capability、command descriptor、单 ticket 和 Arrow batch
   stream；mock protocol suite 覆盖 read/writer Handshake、session 隔离、显式 binding、DoPut 分组回执和
   结构化错误与 ambiguous write fail-closed。Flight transport + SQL compiler 聚焦覆盖率为 83%，
@@ -2587,6 +2589,11 @@ Stage 6.1/6.2/6.3/6.4 自动化证据：
 ### Phase 7：Durable ingest 和 subscription
 
 目标：解决写入歧义和断线数据缺口。
+
+当前进度（2026-07-19）：Stage 7.0 已建立真实 Gateway/Flight query 与 memory-ACK write 性能门禁；
+Stage 7.1 已把进程内 compatibility materializer 从 Gateway 移到 `zippy-ingest::MemoryIngestRuntime`，
+由 Server 统一启动、监控和有界关闭。Flight ingest 已可在 Gateway 关闭时工作。该阶段只完成 ownership
+cutover，不改变 memory durability 语义；以下 producer fencing、WAL 和 stable offset 仍未完成。
 
 任务：
 

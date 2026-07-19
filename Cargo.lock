@@ -4119,6 +4119,7 @@ dependencies = [
  "tracing",
  "zippy-core",
  "zippy-engines",
+ "zippy-ingest",
  "zippy-master",
  "zippy-segment-store",
  "zippy-types",
@@ -4129,7 +4130,10 @@ name = "zippy-ingest"
 version = "0.5.0"
 dependencies = [
  "arrow",
+ "serde",
  "tokio",
+ "zippy-core",
+ "zippy-engines",
  "zippy-segment-store",
  "zippy-storage",
  "zippy-types",

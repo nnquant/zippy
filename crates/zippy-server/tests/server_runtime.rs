@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{BinaryArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -538,6 +539,42 @@ fn write_gateway_request(stream: &mut TcpStream, header: &serde_json::Value) {
     stream.write_all(&header).unwrap();
 }
 
+fn gateway_write_batch(
+    endpoint: &str,
+    token: &str,
+    stream_name: &str,
+    batch: &RecordBatch,
+) -> serde_json::Value {
+    let mut payload = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut payload, &batch.schema()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+    }
+    let header = serde_json::to_vec(&serde_json::json!({
+        "kind": "write_batch",
+        "stream_name": stream_name,
+        "token": token,
+        "rows": batch.num_rows(),
+    }))
+    .unwrap();
+    let mut stream = TcpStream::connect(endpoint).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .write_all(&(header.len() as u32).to_be_bytes())
+        .unwrap();
+    stream
+        .write_all(&(payload.len() as u64).to_be_bytes())
+        .unwrap();
+    stream.write_all(&header).unwrap();
+    stream.write_all(&payload).unwrap();
+    let (response, response_payload) = read_gateway_frame(&mut stream);
+    assert!(response_payload.is_empty());
+    response
+}
+
 fn read_gateway_frame(stream: &mut TcpStream) -> (serde_json::Value, Vec<u8>) {
     let mut prefix = [0_u8; 12];
     stream.read_exact(&mut prefix).unwrap();
@@ -675,6 +712,54 @@ async fn catalog_only_runtime_is_ready_without_fabricating_query_service() {
         .acquire_process_ownership()
         .expect("clean server shutdown releases data ownership");
     assert!(!temp.path().join("zippy-server.sock").exists());
+}
+
+#[test]
+fn gateway_write_uses_server_owned_memory_ingest_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let gateway_addr = reserve_tcp_addr();
+    let mut runtime =
+        LegacyServerRuntime::start(runtime_config(&temp, Some(gateway_addr))).unwrap();
+    let health = runtime.health();
+    assert!(health.readiness.gateway_listener_ready);
+    assert!(health.readiness.memory_ingest_configured);
+    assert!(health.readiness.memory_ingest_ready);
+
+    let batch = RecordBatch::try_new(
+        append_table_schema(),
+        vec![Arc::new(Int64Array::from(vec![11_i64, 12, 13]))],
+    )
+    .unwrap();
+    let response = gateway_write_batch(
+        runtime.gateway_endpoint().unwrap(),
+        "phase1-test-token",
+        "gateway_ingest_ticks",
+        &batch,
+    );
+    assert_eq!(response["status"], "ok", "response: {response}");
+
+    let memory_ingest = runtime.memory_ingest_status().unwrap();
+    assert_eq!(memory_ingest.active_tables, 1);
+    assert_eq!(memory_ingest.write_batches_total, 1);
+    assert_eq!(memory_ingest.written_rows_total, 3);
+    let gateway = runtime.gateway_metrics().unwrap();
+    assert_eq!(gateway["write_batches_total"], 1);
+    assert_eq!(gateway["written_rows_total"], 3);
+    assert_eq!(gateway["memory_ingest"]["write_batches_total"], 1);
+    assert_eq!(gateway["memory_ingest"]["written_rows_total"], 3);
+
+    let mut master = MasterClient::connect_endpoint(runtime.control_endpoint().clone()).unwrap();
+    master
+        .register_process("gateway-memory-ingest-runtime-test")
+        .unwrap();
+    let stream = master.get_stream("gateway_ingest_ticks").unwrap();
+    assert!(stream.active_segment_descriptor.is_some());
+    master.unregister_process().unwrap();
+    drop(master);
+
+    let outcome = runtime.shutdown();
+    assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+    wait_until_bindable(gateway_addr);
 }
 
 #[test]
@@ -1097,7 +1182,7 @@ async fn flight_only_runtime_streams_real_native_snapshot_and_releases_ticket() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() {
+async fn flight_writer_put_succeeds_without_gateway_and_publishes_master_descriptor() {
     use std::os::unix::fs::PermissionsExt;
 
     const READ_TOKEN: &str = "test-only-flight-read-token-0000000001";
@@ -1105,9 +1190,15 @@ async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() 
 
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("database");
-    let gateway_addr = reserve_tcp_addr();
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
     let flight_addr = reserve_tcp_addr();
-    let config = runtime_config_with_native_query_frontend(&temp, &data_dir, gateway_addr);
+    let config = runtime_config_with_native_flight_frontend_and_persist_root(
+        &temp,
+        &data_dir,
+        flight_addr,
+        &persist_root,
+    );
     let config_path = config
         .master()
         .config_path
@@ -1123,12 +1214,7 @@ async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() 
     let mut source = fs::read_to_string(config_path).unwrap();
     source.push_str(&format!(
         concat!(
-            "\n[flight]\n",
-            "enabled = true\n",
-            "endpoint = {:?}\n",
-            "max_message_bytes = 2097152\n",
-            "max_pending_tickets = 16\n\n",
-            "[flight.auth]\n",
+            "\n[flight.auth]\n",
             "enabled = true\n",
             "token_file = {:?}\n",
             "writer_token_file = {:?}\n",
@@ -1143,7 +1229,6 @@ async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() 
             "max_batch_bytes = 1048576\n",
             "max_bytes_per_put = 2097152\n"
         ),
-        flight_addr.to_string(),
         read_token_path.display().to_string(),
         writer_token_path.display().to_string(),
     ));
@@ -1151,8 +1236,12 @@ async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() 
 
     let mut runtime = LegacyServerRuntime::start(config).expect("start Flight ingest runtime");
     let health = runtime.health();
-    assert!(health.readiness.gateway_listener_ready);
+    assert!(!health.readiness.gateway_configured);
+    assert!(!health.readiness.gateway_listener_ready);
     assert!(health.readiness.flight_protocol_ready);
+    assert!(health.readiness.memory_ingest_configured);
+    assert!(health.readiness.memory_ingest_ready);
+    assert!(runtime.gateway_endpoint().is_none());
 
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{flight_addr}"))
         .unwrap()
@@ -1226,9 +1315,13 @@ async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() 
     assert_eq!(flight.active_writer_sessions, 1);
     assert_eq!(flight.puts_completed, 1);
     assert_eq!(flight.put_rows, 3);
-    let gateway = runtime.gateway_metrics().unwrap();
-    assert_eq!(gateway["write_batches_total"], 1);
-    assert_eq!(gateway["written_rows_total"], 3);
+    assert!(runtime.gateway_metrics().is_none());
+    let memory_ingest = runtime.memory_ingest_status().unwrap();
+    assert!(memory_ingest.accepting);
+    assert_eq!(memory_ingest.active_tables, 1);
+    assert_eq!(memory_ingest.write_batches_total, 1);
+    assert_eq!(memory_ingest.written_rows_total, 3);
+    assert_eq!(memory_ingest.table_creations_total, 1);
     let mut master = MasterClient::connect_endpoint(runtime.control_endpoint().clone()).unwrap();
     master
         .register_process("flight-ingest-runtime-test")
@@ -1246,7 +1339,6 @@ async fn flight_writer_put_reaches_gateway_materializer_and_master_descriptor() 
     let outcome = runtime.shutdown();
     assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
     wait_until_bindable(flight_addr);
-    wait_until_bindable(gateway_addr);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

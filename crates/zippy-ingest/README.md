@@ -1,7 +1,9 @@
 # zippy-ingest
 
 `zippy-ingest` owns native per-table runtime identity and serialized mutation admission. It has no
-dependency on the legacy master, Gateway writer map, or `StreamTableMaterializer`.
+dependency on the legacy Master or Gateway writer map. The native actor path is independent from
+`StreamTableMaterializer`; the temporary `memory` module deliberately wraps that materializer as
+the Stage 7.1 compatibility authority shared by protocol adapters.
 
 At startup, `TableRuntimeRegistry` atomically validates the Catalog-derived active table, schema,
 snapshot, writer epoch, and committed logical watermark. `TableActorRegistry` then starts one
@@ -39,6 +41,18 @@ complete Catalog envelope first: exact, conflicting, and missing historical repl
 temporary files without publishing; only a missing advance may cross the final publication
 boundary.
 
-RecordBatch append, segment rollover, query snapshot leases, producer-session fencing, and ingest
-WAL remain subsequent implementation stages. Until the later authority cutover is complete, the
-legacy Gateway remains write authority.
+`MemoryIngestRuntime` now owns each process-local compatibility materializer exactly once. Gateway
+and Flight receive cloneable handles, so either listener can be disabled without moving writer
+ownership to the other protocol. The runtime bounds retained tables, rejects schema drift, exposes
+lock/append/flush counters, closes admission before drain, and publishes active descriptors through
+a composition-root Catalog adapter. The unified Server uses this authority; standalone Gateway
+retains its internal writer only as a legacy rollback path.
+
+The current legacy Master adapter registers one dedicated `zippy-server-ingest` process and owns a
+one-second heartbeat worker. The worker shares the same process credentials as descriptor/source
+operations, has a one-second control-request timeout, and is joined before process unregister.
+Heartbeat and writer cleanup therefore remain inside the Server's absolute shutdown deadline.
+
+This cutover still acknowledges process-local memory visibility only. RecordBatch append into the
+native table actor, producer-session fencing, sequence idempotency, ingest WAL, stable logical
+offsets, restart recovery, and durable subscription remain subsequent Phase 7 stages.

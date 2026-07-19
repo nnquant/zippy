@@ -31,8 +31,8 @@ if os.name == "posix":
 
 
 _STATE_SCHEMA_VERSION = 1
-_READY_SCHEMA_VERSION = 6
-_SUPPORTED_READY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5, _READY_SCHEMA_VERSION})
+_READY_SCHEMA_VERSION = 7
+_SUPPORTED_READY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5, 6, _READY_SCHEMA_VERSION})
 _SERVER_ERROR_CODES = frozenset(
     {
         "INVALID_ARGUMENT",
@@ -451,6 +451,13 @@ def _validate_ready_record(record: dict[str, object]) -> None:
             "native server ready record has invalid gateway configuration fact"
         )
     schema_version = record.get("schema_version")
+    memory_ingest_configured = facts.get("memory_ingest_configured")
+    if schema_version in {2, 3, 4, 5, 6} and memory_ingest_configured is None:
+        memory_ingest_configured = False
+    if not isinstance(memory_ingest_configured, bool):
+        raise _ServerProcessError(
+            "native server ready record has invalid memory ingest configuration fact"
+        )
     flight_configured = facts.get("flight_configured")
     if schema_version == 2 and flight_configured is None:
         flight_configured = False
@@ -472,6 +479,7 @@ def _validate_ready_record(record: dict[str, object]) -> None:
     runtime_ready = (
         facts.get("admission_open") is True
         and facts.get("master_listener_ready") is True
+        and (not memory_ingest_configured or facts.get("memory_ingest_ready") is True)
         and native_storage_ready
         and (
             not gateway_configured
@@ -518,6 +526,8 @@ def _ready_record_for_status_validation(record: dict[str, object]) -> dict[str, 
             "native_current_snapshot_files_ready": False,
             "storage_reconciliation_complete": False,
             "commit_recovery_complete": False,
+            "memory_ingest_configured": False,
+            "memory_ingest_ready": False,
             "flight_configured": False,
             "flight_listener_ready": False,
             "flight_protocol_ready": False,

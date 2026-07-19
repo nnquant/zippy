@@ -54,13 +54,14 @@ use zippy_core::{control_response_result, MAX_CONTROL_RESPONSE_LINE_BYTES};
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
+use zippy_ingest::MemoryIngestHandle;
 use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
     ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanBatchReader, RowSpanView,
 };
 use zippy_types::query::{QueryPriority, QueryTableVersion, SendableRecordBatchStream};
 use zippy_types::table::TableRef;
-use zippy_types::{BoxFuture, QueryId, ResourceLimit, ServerError, SessionId};
+use zippy_types::{BoxFuture, ErrorCode, QueryId, ResourceLimit, ServerError, SessionId};
 
 pub mod legacy_ingest;
 pub mod legacy_query;
@@ -332,6 +333,7 @@ struct GatewayState {
     native_query_frontend: Option<Arc<dyn GatewayNativeQueryFrontend>>,
     token: Option<String>,
     max_write_rows: Option<usize>,
+    memory_ingest: Option<MemoryIngestHandle>,
     writers: Mutex<BTreeMap<String, GatewayTableWriterHandle>>,
     subscribe_catalog_notifier: GatewaySubscribeCatalogNotifier,
     snapshots: Mutex<HashMap<String, GatewaySnapshot>>,
@@ -1957,6 +1959,7 @@ impl GatewayServer {
                 native_query_frontend: None,
                 token: config.token,
                 max_write_rows: config.max_write_rows,
+                memory_ingest: None,
                 writers: Mutex::new(BTreeMap::new()),
                 subscribe_catalog_notifier: GatewaySubscribeCatalogNotifier::default(),
                 snapshots: Mutex::new(HashMap::new()),
@@ -2000,10 +2003,32 @@ impl GatewayServer {
         Ok(self)
     }
 
+    /// Installs the server-owned memory ingest authority before the listener starts.
+    pub fn with_memory_ingest(mut self, memory_ingest: MemoryIngestHandle) -> Result<Self> {
+        if self.runtime.is_some() {
+            return Err(ZippyError::InvalidConfig {
+                reason: "memory ingest authority must be installed before gateway start"
+                    .to_string(),
+            });
+        }
+        let state = Arc::get_mut(&mut self.state).ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "memory ingest authority must be installed before gateway state is shared"
+                .to_string(),
+        })?;
+        state.memory_ingest = Some(memory_ingest);
+        Ok(self)
+    }
+
     /// Returns whether this Gateway owns an installed native query frontend.
     #[must_use]
     pub fn has_native_query_frontend(&self) -> bool {
         self.state.native_query_frontend.is_some()
+    }
+
+    /// Returns whether writes are delegated to a server-owned ingest authority.
+    #[must_use]
+    pub fn has_memory_ingest(&self) -> bool {
+        self.state.memory_ingest.is_some()
     }
 
     /// Start serving TCP requests in a background thread.
@@ -2148,6 +2173,9 @@ impl GatewayServer {
             "native_query_enabled",
             self.has_native_query_frontend(),
         );
+        if let Some(memory_ingest) = &self.state.memory_ingest {
+            insert_json_metric(fields, "memory_ingest", memory_ingest.status());
+        }
         if let Some(status) = self.state.persisted_read_snapshot_source.shadow_status() {
             insert_json_metric(fields, "persisted_read_shadow", status);
         }
@@ -3082,17 +3110,7 @@ impl GatewayState {
         stream_plan: GatewayCollectStreamPlan,
     ) -> Result<GatewayCollectStreamProducer> {
         if stream_plan.snapshot_id.is_none() {
-            let active_writer = self
-                .writers
-                .lock()
-                .unwrap()
-                .get(&stream_plan.source)
-                .cloned();
-            if let Some(writer) = active_writer {
-                let span = {
-                    let writer = writer.lock().unwrap();
-                    writer.materializer.active_row_span()?
-                };
+            if let Some(span) = self.active_row_span(&stream_plan.source)? {
                 return GatewayCollectStreamProducer::segment(
                     span.schema_ref(),
                     vec![span],
@@ -3181,17 +3199,7 @@ impl GatewayState {
             });
         }
 
-        let active_writer = self
-            .writers
-            .lock()
-            .unwrap()
-            .get(&stream_plan.source)
-            .cloned();
-        if let Some(writer) = active_writer {
-            let span = {
-                let writer = writer.lock().unwrap();
-                writer.materializer.active_row_span()?
-            };
+        if let Some(span) = self.active_row_span(&stream_plan.source)? {
             return GatewayCollectStreamProducer::segment(
                 span.schema_ref(),
                 vec![span],
@@ -3345,20 +3353,11 @@ impl GatewayState {
             )?,
         };
         let snapshot_id = header.get("snapshot_id").and_then(Value::as_str);
-        let batch = {
-            let writers = self.writers.lock().unwrap();
-            if snapshot_id.is_some() {
-                None
-            } else {
-                writers.get(source).cloned()
-            }
+        let batch = if snapshot_id.is_some() {
+            None
+        } else {
+            self.active_record_batch(source)?
         };
-        let batch = batch
-            .map(|writer| {
-                let writer = writer.lock().unwrap();
-                writer.materializer.active_record_batch()
-            })
-            .transpose()?;
         let mut row_range_pushed = false;
         let mut scan_pushdown_applied = false;
         let scanned = if let Some(snapshot_id) = snapshot_id {
@@ -3725,6 +3724,13 @@ impl GatewayState {
     }
 
     fn write_batch(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
+        if let Some(memory_ingest) = &self.memory_ingest {
+            memory_ingest
+                .write_batch(stream_name, batch)
+                .map_err(map_memory_ingest_error)?;
+            self.subscribe_catalog_notifier.mark_activity();
+            return Ok(());
+        }
         let writer = self.writer_handle(stream_name, batch.schema())?;
         {
             let writer_lock_started = Instant::now();
@@ -3748,12 +3754,41 @@ impl GatewayState {
     }
 
     fn close_writer(&self, stream_name: &str) -> Result<()> {
+        if let Some(memory_ingest) = &self.memory_ingest {
+            return memory_ingest
+                .close_writer(stream_name)
+                .map_err(map_memory_ingest_error);
+        }
         let writer = self.writers.lock().unwrap().remove(stream_name);
         if let Some(writer) = writer {
             let mut writer = writer.lock().unwrap();
             self.close_table_writer(&mut writer)?;
         }
         Ok(())
+    }
+
+    fn active_row_span(&self, stream_name: &str) -> Result<Option<RowSpanView>> {
+        if let Some(memory_ingest) = &self.memory_ingest {
+            return memory_ingest
+                .active_row_span(stream_name)
+                .map_err(map_memory_ingest_error);
+        }
+        let writer = self.writers.lock().unwrap().get(stream_name).cloned();
+        writer
+            .map(|writer| writer.lock().unwrap().materializer.active_row_span())
+            .transpose()
+    }
+
+    fn active_record_batch(&self, stream_name: &str) -> Result<Option<RecordBatch>> {
+        if let Some(memory_ingest) = &self.memory_ingest {
+            return memory_ingest
+                .active_record_batch(stream_name)
+                .map_err(map_memory_ingest_error);
+        }
+        let writer = self.writers.lock().unwrap().get(stream_name).cloned();
+        writer
+            .map(|writer| writer.lock().unwrap().materializer.active_record_batch())
+            .transpose()
     }
 
     fn close_all_writers_until(&self, deadline: Instant) -> GatewayWriterShutdownReport {
@@ -3998,6 +4033,9 @@ impl GatewayState {
             "snapshots_active",
             self.snapshots.lock().unwrap().len(),
         );
+        if let Some(memory_ingest) = &self.memory_ingest {
+            insert_json_metric(fields, "memory_ingest", memory_ingest.status());
+        }
         if let Some(status) = self.persisted_read_snapshot_source.shadow_status() {
             insert_json_metric(fields, "persisted_read_shadow", status);
         }
@@ -5293,6 +5331,30 @@ async fn wait_for_gateway_peer_disconnect(stream: &tokio::net::TcpStream) -> Res
 fn gateway_peer_disconnected() -> ZippyError {
     ZippyError::Io {
         reason: "native query client disconnected".to_string(),
+    }
+}
+
+fn map_memory_ingest_error(error: ServerError) -> ZippyError {
+    let reason = error.to_string();
+    match error.code() {
+        ErrorCode::InvalidArgument | ErrorCode::UnsupportedPlan => {
+            ZippyError::InvalidConfig { reason }
+        }
+        ErrorCode::ResourceExhausted => ZippyError::ResourceExhausted { reason },
+        ErrorCode::NotFound => ZippyError::NotFound { reason },
+        ErrorCode::AlreadyExists
+        | ErrorCode::Conflict
+        | ErrorCode::StaleProducerEpoch
+        | ErrorCode::SequenceGap
+        | ErrorCode::OffsetExpired => ZippyError::Conflict { reason },
+        ErrorCode::SchemaMismatch => ZippyError::SchemaMismatch { reason },
+        ErrorCode::DeadlineExceeded => ZippyError::DeadlineExceeded { reason },
+        ErrorCode::Cancelled => ZippyError::Cancelled { reason },
+        ErrorCode::DataCorruption => ZippyError::DataCorruption { reason },
+        ErrorCode::Unauthenticated
+        | ErrorCode::PermissionDenied
+        | ErrorCode::Unavailable
+        | ErrorCode::Internal => ZippyError::Io { reason },
     }
 }
 

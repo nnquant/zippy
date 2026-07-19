@@ -180,12 +180,12 @@ fencing**。若连接在部分 batch 成功后断开，客户端可能已经收�
 生效。此时不能盲目重试并期待 exactly-once。需要网络重试去重、重启恢复或 WAL/persisted ACK 的生产
 写入，应继续使用既有受控链路，或等待 Phase 7 durable ingest。
 
-Stage 6.4 backend 通过 process-local `LegacyWriteFacade` 复用 Gateway 的 segment materializer，并在
-每批后完成现有 flush；它不会写 ingest WAL、登记 producer epoch、推进 durable sequence，也不会把
-memory ACK 冒充磁盘提交。启用 `[flight.ingest]` 因而要求 `[gateway]` 同时启用。后续 Phase 7 只替换
-该 backend 为原生 `IngestService`，不会再改 Flight command、Writer role 和资源边界。
-若不再服务旧 remote client，应像示例一样把 Gateway listener 只绑定到 loopback；Flight frontend 与
-facade 的进程内调用不经过该 TCP listener。
+Stage 7.1 backend 使用 server-owned `MemoryIngestRuntime`。Gateway 和 Flight 只持有同一个 cloneable
+handle，每个 stream 的 segment materializer 仅由该 runtime 创建一次，并在每批后完成现有 flush。
+因此 `[flight.ingest]` 不再要求 `[gateway]` 启用；Gateway 关闭时 Flight writer 仍可独立运行。
+该 backend 不会写 ingest WAL、登记 producer epoch、推进 durable sequence，也不会把 memory ACK 冒充
+磁盘提交。后续 Phase 7 会把协议适配器切到原生 durable ingest actor，不再修改 Flight command、Writer
+role 和资源边界。若仍需旧 remote client，可继续启用 Gateway compatibility listener；否则可直接关闭。
 
 ## 查询取消与管理员权限
 
@@ -243,7 +243,8 @@ ticket 会被撤销并释放 prepared query。已经通过 `DoGet` 完成认证�
 ingest 另有 `max_concurrent_puts` semaphore，以及每个 put 的 batch、row、byte 累计上限和单 batch
 row/byte 上限。并发槽耗尽时在读取请求体前快速返回可重试的 `RESOURCE_EXHAUSTED`；解码后超限的 batch
 不会调用 backend。`max_batch_bytes` 不得超过共享 query transport budget，避免写入绕过进程级内存账本。
-每个 put 内顺序提交，默认最多只有 4 条活跃写入流，因此 `spawn_blocking` 的 Gateway 兼容调用也是有界的。
+每个 put 内顺序提交，默认最多只有 4 条活跃写入流，因此 `spawn_blocking` 的进程内 memory authority
+调用也是有界的。
 capability response 和 ready record 同时公开六项有效上限，客户端应在发送前按较小值切 batch。
 
 ## 凭据与 TLS 约束
@@ -265,7 +266,7 @@ capability response 和 ready record 同时公开六项有效上限，客户端�
 1. 将新证书和新私钥写入新的 regular file，并把私钥权限设为 `0600`；
 2. 原子替换配置或更新配置路径；
 3. 执行有界 `zippy server restart`；
-4. 等待 schema version 6 ready record，再核对 `flight.certificate_sha256`；
+4. 等待 schema version 7 ready record，再核对 `flight.certificate_sha256`；
 5. 客户端信任库切换到新 CA 后建立新 session。旧 session 随旧 listener 退出，不跨进程复用。
 
 自动化测试覆盖旧 CA 在重启轮换后失败、新 CA 成功，以及 mTLS 无 client identity 失败。进程内无损
@@ -282,16 +283,15 @@ message 文本。两份 envelope 不一致时客户端必须 fail closed。
 
 ## Readiness 与关停
 
-Server ready record schema version 6 包含 Flight enabled/endpoint/protocol、TLS/auth 状态、管理员和
-Writer 认证开关、query control/metadata/ingest capability、metadata/ingest limits、客户端证书要求和
-非敏感证书指纹。`zippy server run/status` 摘要会显示 Flight endpoint、TLS、memory ingest 和 Writer
-鉴权状态。进程
-readiness 需要
+Server ready record schema version 7 在既有 Flight enabled/endpoint/protocol、TLS/auth、capability、
+limit 和非敏感证书指纹之外，新增 `memory_ingest_configured/ready` 以及 bounded ingest 状态。`zippy
+server run/status` 摘要会显示 Flight endpoint、TLS、memory ingest 和 Writer 鉴权状态。进程 readiness 需要
 `flight_configured`、`flight_listener_ready` 和 `flight_protocol_ready` 同时满足。listener 异常退出会撤销
-动态 readiness。
+动态 readiness；配置 Gateway 或 Flight ingest 时，共享 memory ingest authority 也必须仍在接受请求。
 
-关停顺序为：关闭 Flight admission、释放 pending ticket、停止 Flight listener，再关闭 Gateway、drain
-legacy process 与 Catalog shadow、停止 master listener，最后关闭 native storage/Catalog。所有阶段共享
+关停顺序为：统一关闭 Flight 与 memory ingest admission、释放 pending ticket、停止 Flight listener，
+再关闭 Gateway、drain memory writers/publisher process、legacy process 与 Catalog shadow、停止 master
+listener，最后关闭 native storage/Catalog。所有阶段共享
 Server 的绝对 shutdown deadline；若 Flight listener 超时，Server 返回不完整结果并让已发出 shutdown 的
 listener 在后台继续清理，不会用无界 `join` 突破调用方 deadline。
 
@@ -315,5 +315,5 @@ p99 发布依据。
 
 1. Stage 6.5 Python connector 已完成：`zippy-client` 默认使用 Flight query/DoPut，解析稳定错误，
    并保留 legacy Gateway compatibility adapter。Rust connector 后续单独发布。
-2. Phase 7：把 `DoPut` backend 切到 producer epoch/sequence + WAL，并实现 `DoExchange` durable
-   subscription、offset/ack 和 replay。
+2. Phase 7.1 已完成 Gateway/Flight server-owned memory authority cutover；下一步把该 backend 切到
+   producer epoch/sequence + WAL，并实现 `DoExchange` durable subscription、offset/ack 和 replay。

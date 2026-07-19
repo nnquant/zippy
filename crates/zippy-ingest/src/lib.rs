@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod memory;
 mod registry;
 
 pub use actor::{
@@ -17,5 +18,11 @@ pub use actor::{
     TableActorPersistRequest, TableActorRegistry, TableActorRegistryConfig,
     TableActorRegistryHandle, TableActorSnapshot, TableActorSnapshotRequest,
     TablePersistenceStatus,
+};
+pub use memory::{
+    MemoryIngestCatalog, MemoryIngestConfig, MemoryIngestHandle, MemoryIngestRegistration,
+    MemoryIngestRuntime, MemoryIngestShutdownOutcome, MemoryIngestStatus,
+    DEFAULT_MEMORY_INGEST_MAX_ACTIVE_TABLES, DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT,
+    MAX_MEMORY_INGEST_ACTIVE_TABLES,
 };
 pub use registry::{TableRuntime, TableRuntimeBootstrap, TableRuntimeRegistry};

@@ -2603,12 +2603,6 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
                 reason: "flight ingest requires the Flight listener to be enabled".to_string(),
             });
         }
-        if !config.gateway.enabled {
-            return Err(ZippyError::InvalidConfig {
-                reason: "Stage 6.4 Flight ingest requires the Gateway compatibility backend"
-                    .to_string(),
-            });
-        }
         if !config.flight.auth.enabled {
             return Err(ZippyError::InvalidConfig {
                 reason: "flight ingest requires bearer authentication".to_string(),

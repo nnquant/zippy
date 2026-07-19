@@ -13,7 +13,8 @@ use crate::bus_protocol::{
 };
 use crate::{
     canonical_schema_hash, resolve_control_endpoint, schema_metadata, send_control_line_request,
-    ControlEndpoint, Result, SchemaRef, ZippyConfig, ZippyError,
+    send_control_line_request_with_timeout, ControlEndpoint, Result, SchemaRef, ZippyConfig,
+    ZippyError,
 };
 
 static CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -31,6 +32,7 @@ pub struct MasterClient {
     process_token: Option<String>,
     process_app: Option<String>,
     token: Option<String>,
+    request_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +57,7 @@ impl MasterClient {
             process_token: None,
             process_app: None,
             token: None,
+            request_timeout: None,
         })
     }
 
@@ -76,6 +79,23 @@ impl MasterClient {
 
     pub fn set_token(&mut self, token: impl Into<String>) {
         self.token = Some(token.into());
+    }
+
+    /// Applies one positive timeout to all subsequent control requests.
+    pub fn set_request_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
+        if timeout.is_some_and(|value| value.is_zero()) {
+            return Err(ZippyError::InvalidConfig {
+                reason: "master client request timeout must be positive".to_string(),
+            });
+        }
+        self.request_timeout = timeout;
+        Ok(())
+    }
+
+    /// Returns the configured per-request timeout, or `None` for legacy unbounded behavior.
+    #[must_use]
+    pub const fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     pub fn register_process(&mut self, app: &str) -> Result<String> {
@@ -643,7 +663,12 @@ impl MasterClient {
     }
 
     fn send_request(&self, request: ControlRequest) -> Result<ControlResponse> {
-        send_control_line_request(&self.endpoint, request)
+        match self.request_timeout {
+            Some(timeout) => {
+                send_control_line_request_with_timeout(&self.endpoint, request, timeout)
+            }
+            None => send_control_line_request(&self.endpoint, request),
+        }
     }
 }
 

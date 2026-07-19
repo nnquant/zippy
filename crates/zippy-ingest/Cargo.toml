@@ -5,7 +5,10 @@ edition.workspace = true
 
 [dependencies]
 arrow.workspace = true
+serde.workspace = true
 tokio.workspace = true
+zippy-core = { path = "../zippy-core" }
+zippy-engines = { path = "../zippy-engines" }
 zippy-storage = { path = "../zippy-storage" }
 zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-types = { path = "../zippy-types" }

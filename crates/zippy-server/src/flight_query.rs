@@ -8,7 +8,7 @@ use zippy_catalog::{
     decode_persisted_schema, SqliteCatalogReadHandle, SqliteCatalogSchemaReadLimits,
     SqliteCatalogSchemaSelector,
 };
-use zippy_gateway::LegacyWriteFacade;
+use zippy_ingest::MemoryIngestHandle;
 use zippy_protocol::ingest::FlightPutBatch;
 use zippy_protocol::query::FlightQueryRequest;
 use zippy_protocol::server::{FlightQueryFrontend, OpaquePreparedFlightQuery, PreparedFlightQuery};
@@ -30,7 +30,7 @@ const FLIGHT_SQL_TABLE_TYPE: &str = "TABLE";
 pub struct NativeFlightQueryFrontend {
     engine: NativeQueryEngine,
     catalog: SqliteCatalogReadHandle,
-    legacy_ingest: Option<LegacyWriteFacade>,
+    memory_ingest: Option<MemoryIngestHandle>,
 }
 
 impl NativeFlightQueryFrontend {
@@ -40,14 +40,14 @@ impl NativeFlightQueryFrontend {
         Self {
             engine,
             catalog,
-            legacy_ingest: None,
+            memory_ingest: None,
         }
     }
 
-    /// Installs the Stage 6.4 compatibility append backend.
+    /// Installs the server-owned process-local memory append authority.
     #[must_use]
-    pub fn with_legacy_ingest(mut self, legacy_ingest: LegacyWriteFacade) -> Self {
-        self.legacy_ingest = Some(legacy_ingest);
+    pub fn with_memory_ingest(mut self, memory_ingest: MemoryIngestHandle) -> Self {
+        self.memory_ingest = Some(memory_ingest);
         self
     }
 
@@ -259,11 +259,11 @@ impl FlightQueryFrontend for NativeFlightQueryFrontend {
     }
 
     fn write_batch(&self, request: FlightPutBatch) -> BoxFuture<'_, Result<()>> {
-        let Some(facade) = self.legacy_ingest.clone() else {
+        let Some(memory_ingest) = self.memory_ingest.clone() else {
             return Box::pin(async move {
                 Err(ServerError::new(
                     ErrorCode::UnsupportedPlan,
-                    "Flight ingest compatibility backend is not configured",
+                    "Flight memory ingest authority is not configured",
                 )
                 .with_request_id(request.command.put_id)
                 .with_retryable(false))
@@ -272,17 +272,19 @@ impl FlightQueryFrontend for NativeFlightQueryFrontend {
         Box::pin(async move {
             let put_id = request.command.put_id;
             let stream_name = request.command.stream_name.clone();
-            tokio::task::spawn_blocking(move || facade.write_batch(&stream_name, request.batch))
-                .await
-                .map_err(|error| {
-                    ServerError::new(
-                        ErrorCode::Internal,
-                        format!("join Flight ingest compatibility writer failed error=[{error}]"),
-                    )
-                    .with_request_id(put_id)
-                    .with_retryable(false)
-                })?
-                .map_err(|error| map_legacy_ingest_error(put_id, error))
+            tokio::task::spawn_blocking(move || {
+                memory_ingest.write_batch(&stream_name, request.batch)
+            })
+            .await
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    format!("join Flight memory ingest writer failed error=[{error}]"),
+                )
+                .with_request_id(put_id)
+                .with_retryable(false)
+            })?
+            .map_err(|error| error.with_request_id(put_id))
         })
     }
 }
@@ -352,38 +354,6 @@ fn catalog_changed(expected: u64, actual: u64) -> ServerError {
 fn metadata_build_error(error: impl std::fmt::Display) -> ServerError {
     internal(format!(
         "build Flight SQL metadata batch failed error=[{error}]"
-    ))
-}
-
-fn map_legacy_ingest_error(
-    put_id: zippy_types::RequestId,
-    error: zippy_core::ZippyError,
-) -> ServerError {
-    let code = match &error {
-        zippy_core::ZippyError::InvalidConfig { .. } => ErrorCode::InvalidArgument,
-        zippy_core::ZippyError::ResourceExhausted { .. } => ErrorCode::ResourceExhausted,
-        zippy_core::ZippyError::NotFound { .. } => ErrorCode::NotFound,
-        zippy_core::ZippyError::Conflict { .. } => ErrorCode::Conflict,
-        zippy_core::ZippyError::DataCorruption { .. } => ErrorCode::DataCorruption,
-        zippy_core::ZippyError::SchemaMismatch { .. } => ErrorCode::SchemaMismatch,
-        zippy_core::ZippyError::Cancelled { .. } => ErrorCode::Cancelled,
-        zippy_core::ZippyError::DeadlineExceeded { .. } => ErrorCode::DeadlineExceeded,
-        zippy_core::ZippyError::MasterShutdownRequested { .. }
-        | zippy_core::ZippyError::InvalidState { .. }
-        | zippy_core::ZippyError::Io { .. }
-        | zippy_core::ZippyError::ChannelSend
-        | zippy_core::ZippyError::ChannelReceive
-        | zippy_core::ZippyError::QueueClosed => ErrorCode::Unavailable,
-        zippy_core::ZippyError::LateData { .. } => ErrorCode::Internal,
-    };
-    ServerError::new(
-        code,
-        format!("Flight ingest compatibility write failed error=[{error}]"),
-    )
-    .with_request_id(put_id)
-    .with_retryable(matches!(
-        code,
-        ErrorCode::ResourceExhausted | ErrorCode::Unavailable | ErrorCode::DeadlineExceeded
     ))
 }
 

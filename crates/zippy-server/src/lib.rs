@@ -17,6 +17,7 @@ mod gateway_query;
 mod health;
 mod legacy_catalog_migration;
 mod legacy_query;
+mod memory_ingest;
 mod native_query;
 mod native_query_canary;
 mod native_storage;

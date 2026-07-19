@@ -41,12 +41,14 @@ def _unused_gateway_endpoint() -> str:
 
 def _valid_ready_record() -> dict[str, object]:
     return {
-        "schema_version": 6,
+        "schema_version": 7,
         "status": "ready",
         "health": {
             "readiness": {
                 "admission_open": True,
                 "master_listener_ready": True,
+                "memory_ingest_configured": True,
+                "memory_ingest_ready": True,
                 "gateway_configured": True,
                 "gateway_listener_ready": True,
                 "gateway_master_reachable": True,
@@ -419,6 +421,7 @@ def test_server_lock_without_state_is_starting_and_not_stoppable(
     ("section", "field"),
     [
         ("readiness", "master_listener_ready"),
+        ("readiness", "memory_ingest_ready"),
         ("readiness", "gateway_listener_ready"),
         ("readiness", "gateway_master_reachable"),
         ("readiness", "native_catalog_ready"),
@@ -482,6 +485,19 @@ def test_server_ready_record_requires_boolean_gateway_configuration(value: objec
 
 
 @pytest.mark.parametrize("value", [None, "true"])
+def test_server_ready_record_requires_boolean_memory_ingest_configuration(value: object) -> None:
+    record = _valid_ready_record()
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    readiness["memory_ingest_configured"] = value
+
+    with pytest.raises(_ServerProcessError, match="invalid memory ingest configuration"):
+        _validate_ready_record(record)
+
+
+@pytest.mark.parametrize("value", [None, "true"])
 def test_server_ready_record_requires_boolean_flight_configuration(value: object) -> None:
     record = _valid_ready_record()
     health = record["health"]
@@ -521,6 +537,12 @@ def test_server_ready_record_rejects_previous_schema_version() -> None:
 def test_server_ready_record_accepts_previous_rolling_upgrade_schema() -> None:
     record = _valid_ready_record()
     record["schema_version"] = 4
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    readiness.pop("memory_ingest_configured")
+    readiness.pop("memory_ingest_ready")
 
     _validate_ready_record(record)
 
@@ -565,6 +587,7 @@ def test_server_status_normalizes_ready_v1_without_mutating_authoritative_state(
     compatibility_readiness = compatibility_health["readiness"]
     assert isinstance(compatibility_readiness, dict)
     assert compatibility_readiness["native_storage_configured"] is False
+    assert compatibility_readiness["memory_ingest_configured"] is False
 
 
 def test_master_health_probe_uses_one_absolute_deadline() -> None:

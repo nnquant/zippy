@@ -31,8 +31,9 @@ stop: zippy server stop tcp://127.0.0.1:17690
 ```
 
 The launcher does not report success when only the Master port is open. Rust publishes its
-nonce-bound ready record only after the Master listener, optional Gateway bind, Gateway-to-Master
-request, compatibility adapter activation, and admission opening have all completed. Failure or
+nonce-bound ready record only after the Master listener, optional shared memory ingest authority,
+optional Gateway/Flight binds, Gateway-to-Master request, compatibility adapter activation, and
+admission opening have all completed. Failure or
 timeout terminates the child and removes partial active state. The child keeps a separate
 owner-only, code-only failure outcome for startup diagnostics; native runtime failures retain their
 stable server `ErrorCode` instead of collapsing every failure to `runtime_error`. A minimal child
@@ -42,15 +43,15 @@ file to `ready`. The short-lived launcher never rewrites authoritative child sta
 launcher does not orphan an unmanageable daemon.
 
 The bootstrap `starting`, runtime `stopping`/`failed`, and failure-outcome records remain schema v1.
-The promoted `ready` record uses schema v2 and requires typed `gateway_configured` and
-`native_storage_configured` facts; when
+The promoted `ready` record uses schema v7 and requires typed `gateway_configured`,
+`memory_ingest_configured`, and `native_storage_configured` facts; when
 either dependency is configured, all of its readiness gates must be explicitly true. The CLI
-rejects older or partially populated ready records instead of interpreting missing facts as a
-disabled dependency. `native_catalog_ready` covers Catalog migration/integrity/recovery;
+accepts ready schemas v2-v6 during rolling upgrades, treating capabilities introduced later as
+disabled, but rejects a partially populated v7 record. `native_catalog_ready` covers Catalog migration/integrity/recovery;
 `native_current_snapshot_files_ready` separately proves that every managed file in each active
 table's current snapshot passed physical verification. It does not claim historical snapshot
 availability, and native historical-query admission remains closed in this migration phase.
-Fresh startup accepts only ready v2. During a rolling CLI upgrade, `status` and `stop` still accept
+Fresh startup accepts only ready v7. During a rolling CLI upgrade, `status` and `stop` still accept
 an already-running ready-v1 generation after validating its unchanged PID/boot/start-tick/nonce
 identity; status uses a non-persisted compatibility copy that explicitly treats native storage as
 disabled.
@@ -111,11 +112,15 @@ or abnormal actor exit closes native admission, revokes dynamic server readiness
 ordered actor/controller/Catalog cleanup. Definitive Catalog rejections remain request-local, and
 an exact retained request ID can replay its original receipt after restart without rolling a newer
 actor snapshot backward. It then binds the master listener, waits for its
-readiness barrier, starts Gateway when `[gateway].enabled = true`, performs a real Gateway-to-master
-control probe, starts Arrow Flight when `[flight].enabled = true`, and only then opens service
+readiness barrier, starts the shared memory ingest authority when Gateway or Flight DoPut needs it,
+starts Gateway when `[gateway].enabled = true`, performs a real Gateway-to-master control probe,
+starts Arrow Flight when `[flight].enabled = true`, and only then opens service
 admission. With both Gateway and Flight disabled it intentionally runs in catalog-only mode; with a
 ready Flight listener it can publish native query service without installing the legacy Gateway
-adapter.
+adapter. While legacy Master still publishes active descriptors, the shared ingest authority owns a
+dedicated process lease and one-second heartbeat worker. Ordered shutdown joins that worker and
+unregisters its process before Master drain; an incomplete ingest close keeps Master alive so a
+later bounded shutdown attempt can finish cleanup.
 
 The CPU value is a canonical process configuration ceiling consumed by each component, not yet one
 hard semaphore shared by every independent thread pool. The legacy `runtime.max_parallelism` and
@@ -320,8 +325,8 @@ Gateway transport are implemented. Physical GC, durable Flight write/subscriptio
 removal of legacy metadata authority remain later phases. Flight query TLS, bearer authentication,
 server-issued read/admin/writer sessions, Catalog metadata, and bounded append + memory `DoPut` are
 implemented behind explicit configuration. Standard Flight `GetFlightInfo`/`DoGet` query transport
-is implemented behind the opt-in `[flight]` gate; Stage 6.4 `DoPut` additionally requires Gateway
-because its process-local compatibility backend reuses the existing materializer.
+is implemented behind the opt-in `[flight]` gate. Stage 7.1 `DoPut` uses the server-owned process-local
+memory authority and no longer requires Gateway; it still does not provide WAL or persisted ACK.
 Legacy live descriptors without exact logical-offset provenance are intentionally not promoted into
 native active snapshots.
 
