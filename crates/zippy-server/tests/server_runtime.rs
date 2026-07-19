@@ -3,6 +3,9 @@
 #[allow(dead_code)]
 mod support;
 
+#[path = "server_runtime/transport_performance.rs"]
+mod transport_performance;
+
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
