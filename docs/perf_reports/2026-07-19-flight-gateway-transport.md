@@ -98,6 +98,9 @@ soak 覆盖。
 高并发混合读写、慢消费者和 durable ingest 不在本报告覆盖范围。进入 Phase 7.1 后，应继续使用同一门禁
 防止 native ingest backend 替换造成 transport 回归，并新增 backend queue、WAL 与 durable ACK 指标。
 
+Stage 7.1 已完成 server-owned ingest authority 替换并复跑相同门禁，六个场景全部通过；详见
+[`2026-07-19-native-ingest-authority.md`](2026-07-19-native-ingest-authority.md)。
+
 ## 验证
 
 - `cargo test -p zippy-protocol`：15 项 unit、19 项 Flight integration 通过；

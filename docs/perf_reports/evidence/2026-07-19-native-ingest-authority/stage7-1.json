@@ -1,0 +1,452 @@
+{
+  "format_version": 2,
+  "git_sha": "ac5999dfafea8be62e1148694c7a815846132d7d",
+  "target": "linux-x86_64",
+  "started_at_unix_ms": 1784431975315,
+  "source_rows": 262144,
+  "warmup_samples": 10,
+  "measured_samples": 100,
+  "flight_session_open_micros": {
+    "read": 1230.042,
+    "writer": 894.798
+  },
+  "scenarios": [
+    {
+      "operation": "query",
+      "rows_per_operation": 1,
+      "logical_bytes_per_operation": 8,
+      "gateway": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 800,
+        "elapsed_seconds": 0.3859801839999999,
+        "rows_per_second": 259.08065788164924,
+        "mebibytes_per_second": 0.001976628554394907,
+        "latency_micros": {
+          "p50": 3825.891,
+          "p95": 4420.467,
+          "p99": 4771.468,
+          "max": 4988.82
+        },
+        "prepare_latency_micros": {
+          "p50": 2210.591,
+          "p95": 2561.272,
+          "p99": 2650.645,
+          "max": 2721.6929999999998
+        },
+        "time_to_first_batch_micros": {
+          "p50": 3813.9480000000003,
+          "p95": 4407.201,
+          "p99": 4757.591,
+          "max": 4760.557000000001
+        }
+      },
+      "flight": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 800,
+        "elapsed_seconds": 0.4161328049999998,
+        "rows_per_second": 240.3078988209066,
+        "mebibytes_per_second": 0.001833403769080403,
+        "latency_micros": {
+          "p50": 4098.932,
+          "p95": 4820.485000000001,
+          "p99": 5373.689,
+          "max": 6871.593
+        },
+        "prepare_latency_micros": {
+          "p50": 1663.189,
+          "p95": 2154.871,
+          "p99": 2585.026,
+          "max": 2662.8360000000002
+        },
+        "time_to_first_batch_micros": {
+          "p50": 4082.379,
+          "p95": 4772.141,
+          "p99": 5260.469,
+          "max": 6865.571
+        }
+      },
+      "flight_to_gateway_rows_per_sec": 0.9275408700354688,
+      "flight_to_gateway_p99_latency": 1.126212939078707
+    },
+    {
+      "operation": "query",
+      "rows_per_operation": 1024,
+      "logical_bytes_per_operation": 8192,
+      "gateway": {
+        "samples": 100,
+        "total_rows": 102400,
+        "total_logical_bytes": 819200,
+        "elapsed_seconds": 0.389258947,
+        "rows_per_second": 263063.9598375114,
+        "mebibytes_per_second": 2.0070187365532792,
+        "latency_micros": {
+          "p50": 3832.898,
+          "p95": 4350.5109999999995,
+          "p99": 5067.695,
+          "max": 5528.0199999999995
+        },
+        "prepare_latency_micros": {
+          "p50": 2169.891,
+          "p95": 2552.1530000000002,
+          "p99": 2905.471,
+          "max": 3743.619
+        },
+        "time_to_first_batch_micros": {
+          "p50": 3819.753,
+          "p95": 4338.197,
+          "p99": 5049.589999999999,
+          "max": 5516.107
+        }
+      },
+      "flight": {
+        "samples": 100,
+        "total_rows": 102400,
+        "total_logical_bytes": 819200,
+        "elapsed_seconds": 0.4194358060000001,
+        "rows_per_second": 244137.47833440805,
+        "mebibytes_per_second": 1.8626211420776981,
+        "latency_micros": {
+          "p50": 4133.9890000000005,
+          "p95": 4762.029,
+          "p99": 4910.570000000001,
+          "max": 5268.33
+        },
+        "prepare_latency_micros": {
+          "p50": 1664.24,
+          "p95": 2064.935,
+          "p99": 2207.6589999999997,
+          "max": 2216.855
+        },
+        "time_to_first_batch_micros": {
+          "p50": 4033.9649999999997,
+          "p95": 4665.6939999999995,
+          "p99": 4821.457,
+          "max": 5179.394
+        }
+      },
+      "flight_to_gateway_rows_per_sec": 0.9280536888641309,
+      "flight_to_gateway_p99_latency": 0.9689947796779406
+    },
+    {
+      "operation": "query",
+      "rows_per_operation": 65536,
+      "logical_bytes_per_operation": 524288,
+      "gateway": {
+        "samples": 100,
+        "total_rows": 6553600,
+        "total_logical_bytes": 52428800,
+        "elapsed_seconds": 0.8143383940000001,
+        "rows_per_second": 8047760.056859114,
+        "mebibytes_per_second": 61.399536566613115,
+        "latency_micros": {
+          "p50": 8066.678000000001,
+          "p95": 9388.218,
+          "p99": 10100.960000000001,
+          "max": 10318.026
+        },
+        "prepare_latency_micros": {
+          "p50": 2448.58,
+          "p95": 2962.276,
+          "p99": 3332.962,
+          "max": 3441.6440000000002
+        },
+        "time_to_first_batch_micros": {
+          "p50": 4918.666,
+          "p95": 5860.575,
+          "p99": 6180.943,
+          "max": 6227.762000000001
+        }
+      },
+      "flight": {
+        "samples": 100,
+        "total_rows": 6553600,
+        "total_logical_bytes": 52428800,
+        "elapsed_seconds": 0.8269651330000003,
+        "rows_per_second": 7924880.673294357,
+        "mebibytes_per_second": 60.462041269640785,
+        "latency_micros": {
+          "p50": 8097.074,
+          "p95": 9505.082999999999,
+          "p99": 11214.638,
+          "max": 11313.132
+        },
+        "prepare_latency_micros": {
+          "p50": 2018.5680000000002,
+          "p95": 2503.44,
+          "p99": 2900.602,
+          "max": 3121.57
+        },
+        "time_to_first_batch_micros": {
+          "p50": 5626.974,
+          "p95": 7288.983,
+          "p99": 8189.325000000001,
+          "max": 8498.306
+        }
+      },
+      "flight_to_gateway_rows_per_sec": 0.98473123170962,
+      "flight_to_gateway_p99_latency": 1.1102546688631576
+    },
+    {
+      "operation": "write_memory_ack",
+      "rows_per_operation": 1,
+      "logical_bytes_per_operation": 104,
+      "gateway": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 10400,
+        "elapsed_seconds": 0.07804771199999996,
+        "rows_per_second": 1281.2675405526309,
+        "mebibytes_per_second": 0.12707884237048492,
+        "latency_micros": {
+          "p50": 769.136,
+          "p95": 964.472,
+          "p99": 1042.9599999999998,
+          "max": 1049.978
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      },
+      "flight": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 10400,
+        "elapsed_seconds": 0.05748983699999999,
+        "rows_per_second": 1739.4378766459195,
+        "mebibytes_per_second": 0.17252115170590937,
+        "latency_micros": {
+          "p50": 558.605,
+          "p95": 715.662,
+          "p99": 815.903,
+          "max": 880.192
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      },
+      "flight_to_gateway_rows_per_sec": 1.3575914643835219,
+      "flight_to_gateway_p99_latency": 0.7822955818056303
+    },
+    {
+      "operation": "write_memory_ack",
+      "rows_per_operation": 1024,
+      "logical_bytes_per_operation": 8288,
+      "gateway": {
+        "samples": 100,
+        "total_rows": 102400,
+        "total_logical_bytes": 828800,
+        "elapsed_seconds": 0.08298123800000001,
+        "rows_per_second": 1234013.8863679038,
+        "mebibytes_per_second": 9.525108235159133,
+        "latency_micros": {
+          "p50": 832.31,
+          "p95": 1006.5659999999999,
+          "p99": 1184.271,
+          "max": 1360.788
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      },
+      "flight": {
+        "samples": 100,
+        "total_rows": 102400,
+        "total_logical_bytes": 828800,
+        "elapsed_seconds": 0.06375185099999998,
+        "rows_per_second": 1606227.8725052238,
+        "mebibytes_per_second": 12.398154109086185,
+        "latency_micros": {
+          "p50": 629.9050000000001,
+          "p95": 748.873,
+          "p99": 837.893,
+          "max": 1099.327
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      },
+      "flight_to_gateway_rows_per_sec": 1.3016286852596646,
+      "flight_to_gateway_p99_latency": 0.7075179583051515
+    },
+    {
+      "operation": "write_memory_ack",
+      "rows_per_operation": 65536,
+      "logical_bytes_per_operation": 524384,
+      "gateway": {
+        "samples": 100,
+        "total_rows": 6553600,
+        "total_logical_bytes": 52438400,
+        "elapsed_seconds": 0.7077772160000001,
+        "rows_per_second": 9259410.803073943,
+        "mebibytes_per_second": 70.65663339103232,
+        "latency_micros": {
+          "p50": 6383.283,
+          "p95": 7683.126,
+          "p99": 8962.2,
+          "max": 90235.935
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      },
+      "flight": {
+        "samples": 100,
+        "total_rows": 6553600,
+        "total_logical_bytes": 52438400,
+        "elapsed_seconds": 0.5969977260000001,
+        "rows_per_second": 10977596.253021572,
+        "mebibytes_per_second": 83.76774834388145,
+        "latency_micros": {
+          "p50": 5628.697,
+          "p95": 7204.409000000001,
+          "p99": 8390.076,
+          "max": 8687.386
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      },
+      "flight_to_gateway_rows_per_sec": 1.185560991567328,
+      "flight_to_gateway_p99_latency": 0.9361625493740374
+    }
+  ],
+  "gates": {
+    "min_flight_throughput_ratio": 0.9,
+    "max_flight_p99_ratio": 1.2,
+    "pass": true,
+    "failures": []
+  },
+  "gateway_metrics": {
+    "auth_failures_total": 0,
+    "blocking_requests_active": 0,
+    "blocking_requests_rejected_total": 0,
+    "collect_requests_total": 0,
+    "connections_active": 0,
+    "connections_rejected_total": 0,
+    "endpoint": "127.0.0.1:45540",
+    "errors_total": 0,
+    "master_async_requests_total": 7,
+    "master_process_reregistrations_total": 1,
+    "max_blocking_requests": 64,
+    "max_connections": 1024,
+    "max_parallelism": 4,
+    "max_query_buffer_bytes": 536870912,
+    "max_subscribers": 256,
+    "memory_ingest": {
+      "accepting": true,
+      "active_operations": 0,
+      "active_tables": 6,
+      "append_micros_total": 470178,
+      "descriptor_publications_total": 226,
+      "flush_micros_total": 22,
+      "max_active_tables": 4096,
+      "rejected_operations_total": 0,
+      "table_creations_total": 6,
+      "write_batches_total": 660,
+      "writer_lock_wait_micros_total": 0,
+      "written_rows_total": 14643420
+    },
+    "native_query_batches_delivered_total": 1100,
+    "native_query_enabled": true,
+    "native_query_explain_failures_total": 0,
+    "native_query_explain_requests_total": 0,
+    "native_query_failures_total": 0,
+    "native_query_requests_active": 0,
+    "native_query_requests_total": 330,
+    "native_query_rows_delivered_total": 7321710,
+    "native_query_transport_failures_total": 0,
+    "payload_timeouts_total": 0,
+    "persisted_read_shadow": {
+      "comparisons_active": 0,
+      "completed_dedup_entries": 0,
+      "config": {
+        "comparison_timeout_ms": 250,
+        "dedup_capacity": 5,
+        "max_files_per_comparison": 8,
+        "max_metadata_bytes_per_comparison": 65536,
+        "metadata_budget_bytes": 131072,
+        "queue_capacity": 3
+      },
+      "in_flight_dedup_entries": 0,
+      "last_error": null,
+      "last_mismatch": null,
+      "metrics": {
+        "comparison_file_limit_exhausted_total": 0,
+        "comparison_metadata_limit_exhausted_total": 0,
+        "comparisons_deduplicated_total": 0,
+        "comparisons_enqueued_total": 0,
+        "comparisons_started_total": 0,
+        "matches_total": 0,
+        "max_outstanding_metadata_bytes": 0,
+        "max_queue_depth": 0,
+        "metadata_budget_exhausted_total": 0,
+        "metadata_encode_errors_total": 0,
+        "metadata_normalization_errors_total": 0,
+        "mismatches_total": 0,
+        "primary_errors_total": 0,
+        "primary_snapshots_total": 0,
+        "queue_full_total": 0,
+        "shadow_cancellations_total": 0,
+        "shadow_errors_total": 0,
+        "shadow_panics_total": 0,
+        "shadow_timeouts_total": 0,
+        "worker_unavailable_total": 0
+      },
+      "outstanding_metadata_bytes": 0,
+      "queue_depth": 0,
+      "worker_running": true
+    },
+    "query_buffer_reserved_bytes": 0,
+    "query_max_buffered_bytes": 134217728,
+    "query_parallelism": 4,
+    "request_timeouts_total": 0,
+    "requests_total": 660,
+    "running": true,
+    "snapshots_active": 0,
+    "snapshots_evicted_total": 0,
+    "snapshots_expired_total": 0,
+    "subscribe_clients_active": 0,
+    "subscribe_clients_rejected_total": 0,
+    "subscribe_clients_total": 0,
+    "subscribe_last_close_reason": null,
+    "subscribe_last_write_elapsed_ms": 0.0,
+    "subscribe_rows_delivered_total": 0,
+    "subscribe_slow_clients_total": 0,
+    "subscribe_table_rows_delivered_total": 0,
+    "subscribe_tables_delivered_total": 0,
+    "subscribe_write_elapsed_ms_total": 0.0,
+    "subscribe_write_timeouts_total": 0,
+    "write_batches_total": 330,
+    "write_rejections_total": 0,
+    "write_timeout_ms": 30000,
+    "writer_create_count": 0,
+    "writer_create_last_ms": 0.0,
+    "writer_create_total_ms": 0.0,
+    "writer_descriptor_publish_count": 0,
+    "writer_descriptor_publish_last_ms": 0.0,
+    "writer_descriptor_publish_total_ms": 0.0,
+    "writer_flush_count": 0,
+    "writer_flush_last_ms": 0.0,
+    "writer_flush_total_ms": 0.0,
+    "writer_lock_wait_count": 0,
+    "writer_lock_wait_last_ms": 0.0,
+    "writer_lock_wait_total_ms": 0.0,
+    "writer_map_lock_wait_count": 0,
+    "writer_map_lock_wait_last_ms": 0.0,
+    "writer_map_lock_wait_total_ms": 0.0,
+    "writer_on_data_count": 0,
+    "writer_on_data_last_ms": 0.0,
+    "writer_on_data_total_ms": 0.0,
+    "written_rows_total": 7321710
+  },
+  "flight_metrics": {
+    "issued_tickets": 330,
+    "consumed_tickets": 330,
+    "put_batches": 330,
+    "put_rows": 7321710,
+    "put_bytes": 59533760,
+    "active_puts": 0,
+    "transport_buffer_bytes_in_use": 0
+  },
+  "process_rss_kib": {
+    "before_kib": 29988,
+    "after_kib": 301764,
+    "peak_kib": 301764
+  }
+}
