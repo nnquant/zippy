@@ -1,0 +1,74 @@
+{
+  "format_version": 1,
+  "zippy_version": "0.5.0",
+  "warmup_samples": 20,
+  "measured_samples": 200,
+  "scenarios": [
+    {
+      "durability": "memory",
+      "rows": 1,
+      "logical_bytes": 8,
+      "p50_us": 4.84,
+      "p99_us": 12.795,
+      "p999_us": 13.507,
+      "max_us": 81.561,
+      "p50_rows_per_second": 206611.57024793388,
+      "wal_commits_total": 1
+    },
+    {
+      "durability": "wal",
+      "rows": 1,
+      "logical_bytes": 8,
+      "p50_us": 1217.425,
+      "p99_us": 1952.431,
+      "p999_us": 1967.912,
+      "max_us": 2227.662,
+      "p50_rows_per_second": 821.4058360884654,
+      "wal_commits_total": 220
+    },
+    {
+      "durability": "memory",
+      "rows": 1024,
+      "logical_bytes": 8192,
+      "p50_us": 22.765,
+      "p99_us": 43.816,
+      "p999_us": 54.257,
+      "max_us": 70.96,
+      "p50_rows_per_second": 44981330.990555674,
+      "wal_commits_total": 1
+    },
+    {
+      "durability": "wal",
+      "rows": 1024,
+      "logical_bytes": 8192,
+      "p50_us": 1277.152,
+      "p99_us": 1478.057,
+      "p999_us": 1485.412,
+      "max_us": 1512.816,
+      "p50_rows_per_second": 801783.9693317631,
+      "wal_commits_total": 220
+    },
+    {
+      "durability": "memory",
+      "rows": 65536,
+      "logical_bytes": 524288,
+      "p50_us": 1244.367,
+      "p99_us": 1513.486,
+      "p999_us": 1518.417,
+      "max_us": 1790.502,
+      "p50_rows_per_second": 52666134.669273615,
+      "wal_commits_total": 1
+    },
+    {
+      "durability": "wal",
+      "rows": 65536,
+      "logical_bytes": 524288,
+      "p50_us": 2698.919,
+      "p99_us": 3672.404,
+      "p999_us": 6166.73,
+      "max_us": 7343.636,
+      "p50_rows_per_second": 24282314.511847153,
+      "wal_commits_total": 220
+    }
+  ]
+}
