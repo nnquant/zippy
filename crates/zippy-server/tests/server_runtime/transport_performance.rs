@@ -44,11 +44,13 @@ const FLIGHT_READ_TOKEN: &str = "transport-perf-flight-read-token-00000001";
 const FLIGHT_WRITER_TOKEN: &str = "transport-perf-flight-writer-token-000001";
 const DEFAULT_SOURCE_ROWS: usize = 262_144;
 const DEFAULT_WARMUP_SAMPLES: usize = 3;
-const DEFAULT_MEASURED_SAMPLES: usize = 20;
+const DEFAULT_MEASURED_SAMPLES: usize = 100;
 const DEFAULT_QUERY_ROWS: &[usize] = &[1, 1_024, 65_536];
 const DEFAULT_WRITE_ROWS: &[usize] = &[1, 1_024, 65_536];
 const DEFAULT_RESULT_BATCH_ROWS: usize = 8_192;
-const REPORT_VERSION: u32 = 1;
+const DEFAULT_MIN_FLIGHT_THROUGHPUT_RATIO: f64 = 0.90;
+const DEFAULT_MAX_FLIGHT_P99_RATIO: f64 = 1.20;
+const REPORT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 struct BenchmarkConfig {
@@ -57,6 +59,8 @@ struct BenchmarkConfig {
     measured_samples: usize,
     query_rows: Vec<usize>,
     write_rows: Vec<usize>,
+    min_flight_throughput_ratio: f64,
+    max_flight_p99_ratio: f64,
     output_path: Option<std::path::PathBuf>,
 }
 
@@ -67,7 +71,11 @@ impl BenchmarkConfig {
             "ZIPPY_TRANSPORT_PERF_WARMUP_SAMPLES",
             DEFAULT_WARMUP_SAMPLES,
         );
-        let measured_samples = env_usize("ZIPPY_TRANSPORT_PERF_SAMPLES", DEFAULT_MEASURED_SAMPLES);
+        let measured_samples = env_usize_with_legacy_alias(
+            "ZIPPY_TRANSPORT_PERF_MEASURED_SAMPLES",
+            "ZIPPY_TRANSPORT_PERF_SAMPLES",
+            DEFAULT_MEASURED_SAMPLES,
+        );
         assert!(source_rows > 0, "source row count must be positive");
         assert!(
             measured_samples > 0,
@@ -75,9 +83,25 @@ impl BenchmarkConfig {
         );
         let query_rows = env_row_counts("ZIPPY_TRANSPORT_PERF_QUERY_ROWS", DEFAULT_QUERY_ROWS);
         let write_rows = env_row_counts("ZIPPY_TRANSPORT_PERF_WRITE_ROWS", DEFAULT_WRITE_ROWS);
+        let min_flight_throughput_ratio = env_f64(
+            "ZIPPY_TRANSPORT_PERF_MIN_FLIGHT_THROUGHPUT_RATIO",
+            DEFAULT_MIN_FLIGHT_THROUGHPUT_RATIO,
+        );
+        let max_flight_p99_ratio = env_f64(
+            "ZIPPY_TRANSPORT_PERF_MAX_FLIGHT_P99_RATIO",
+            DEFAULT_MAX_FLIGHT_P99_RATIO,
+        );
         assert!(
             query_rows.iter().all(|rows| *rows <= source_rows),
             "query row counts must not exceed source rows"
+        );
+        assert!(
+            min_flight_throughput_ratio.is_finite() && min_flight_throughput_ratio > 0.0,
+            "minimum Flight throughput ratio must be positive and finite"
+        );
+        assert!(
+            max_flight_p99_ratio.is_finite() && max_flight_p99_ratio > 0.0,
+            "maximum Flight p99 ratio must be positive and finite"
         );
         Self {
             source_rows,
@@ -85,6 +109,8 @@ impl BenchmarkConfig {
             measured_samples,
             query_rows,
             write_rows,
+            min_flight_throughput_ratio,
+            max_flight_p99_ratio,
             output_path: std::env::var_os("ZIPPY_TRANSPORT_PERF_REPORT_JSON").map(Into::into),
         }
     }
@@ -101,6 +127,7 @@ struct BenchmarkReport {
     measured_samples: usize,
     flight_session_open_micros: FlightSessionOpenLatency,
     scenarios: Vec<ScenarioReport>,
+    gates: GateReport,
     gateway_metrics: serde_json::Value,
     flight_metrics: FlightMetrics,
     process_rss_kib: ProcessRss,
@@ -160,6 +187,14 @@ struct ProcessRss {
 struct FlightSessionOpenLatency {
     read: f64,
     writer: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct GateReport {
+    min_flight_throughput_ratio: f64,
+    max_flight_p99_ratio: f64,
+    pass: bool,
+    failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -353,7 +388,13 @@ async fn flight_gateway_transport_performance_baseline() {
     assert_eq!(flight_status.pending_tickets, 0);
     assert_eq!(flight_status.active_puts, 0);
     let rss_after = process_rss_kib().unwrap_or(0);
-    let rss_peak = rss_sampler.stop();
+    let rss_peak = rss_sampler.stop().max(rss_before).max(rss_after);
+    let gates = evaluate_gates(
+        &scenarios,
+        config.min_flight_throughput_ratio,
+        config.max_flight_p99_ratio,
+    );
+    let gates_pass = gates.pass;
     let report = BenchmarkReport {
         format_version: REPORT_VERSION,
         git_sha: current_git_sha(),
@@ -367,6 +408,7 @@ async fn flight_gateway_transport_performance_baseline() {
             writer: duration_micros(writer_session_open),
         },
         scenarios,
+        gates,
         gateway_metrics,
         flight_metrics: FlightMetrics {
             issued_tickets: flight_status.issued_tickets,
@@ -395,6 +437,10 @@ async fn flight_gateway_transport_performance_baseline() {
     assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
     wait_until_bindable(flight_addr);
     wait_until_bindable(gateway_addr);
+    assert!(
+        gates_pass,
+        "Flight/Gateway transport performance gate failed"
+    );
 }
 
 fn transport_runtime_config(
@@ -829,8 +875,25 @@ fn summarize_latencies(samples: &[Duration]) -> LatencySummary {
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> f64 {
-    let rank = ((sorted.len() - 1) as f64 * quantile).ceil() as usize;
+    assert!(!sorted.is_empty(), "percentile input must not be empty");
+    assert!(
+        (0.0..=1.0).contains(&quantile),
+        "percentile quantile must be within [0, 1]"
+    );
+    let rank = ((sorted.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
     sorted[rank]
+}
+
+#[test]
+fn percentile_uses_nearest_rank() {
+    let samples = (1..=100).map(f64::from).collect::<Vec<_>>();
+
+    assert_eq!(percentile(&samples, 0.50), 50.0);
+    assert_eq!(percentile(&samples, 0.95), 95.0);
+    assert_eq!(percentile(&samples, 0.99), 99.0);
+    assert_eq!(percentile(&samples, 1.00), 100.0);
 }
 
 fn ratio(numerator: f64, denominator: f64) -> f64 {
@@ -838,6 +901,40 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
         0.0
     } else {
         numerator / denominator
+    }
+}
+
+fn evaluate_gates(
+    scenarios: &[ScenarioReport],
+    min_flight_throughput_ratio: f64,
+    max_flight_p99_ratio: f64,
+) -> GateReport {
+    let mut failures = Vec::new();
+    for scenario in scenarios {
+        if scenario.flight_to_gateway_rows_per_sec < min_flight_throughput_ratio {
+            failures.push(format!(
+                "Flight throughput ratio below gate operation=[{}] rows=[{}] ratio=[{:.6}] minimum=[{:.6}]",
+                scenario.operation,
+                scenario.rows_per_operation,
+                scenario.flight_to_gateway_rows_per_sec,
+                min_flight_throughput_ratio,
+            ));
+        }
+        if scenario.flight_to_gateway_p99_latency > max_flight_p99_ratio {
+            failures.push(format!(
+                "Flight p99 latency ratio above gate operation=[{}] rows=[{}] ratio=[{:.6}] maximum=[{:.6}]",
+                scenario.operation,
+                scenario.rows_per_operation,
+                scenario.flight_to_gateway_p99_latency,
+                max_flight_p99_ratio,
+            ));
+        }
+    }
+    GateReport {
+        min_flight_throughput_ratio,
+        max_flight_p99_ratio,
+        pass: failures.is_empty(),
+        failures,
     }
 }
 
@@ -849,6 +946,22 @@ fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).map_or(default, |value| {
         value
             .parse::<usize>()
+            .unwrap_or_else(|error| panic!("invalid {name} value=[{value}] error=[{error}]"))
+    })
+}
+
+fn env_usize_with_legacy_alias(name: &str, legacy_name: &str, default: usize) -> usize {
+    if std::env::var_os(name).is_some() {
+        env_usize(name, default)
+    } else {
+        env_usize(legacy_name, default)
+    }
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name).map_or(default, |value| {
+        value
+            .parse::<f64>()
             .unwrap_or_else(|error| panic!("invalid {name} value=[{value}] error=[{error}]"))
     })
 }
