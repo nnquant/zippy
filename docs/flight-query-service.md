@@ -295,6 +295,22 @@ legacy process 与 Catalog shadow、停止 master listener，最后关闭 native
 Server 的绝对 shutdown deadline；若 Flight listener 超时，Server 返回不完整结果并让已发出 shutdown 的
 listener 在后台继续清理，不会用无界 `join` 突破调用方 deadline。
 
+## 性能基线与门禁
+
+真实 Gateway/Flight release 基准会启动两种 listener，并让它们共享同一 Catalog、Parquet 数据、
+native query engine 和写入 materializer。默认对 1、1,024、65,536 行的查询与 memory-ACK 写入分别
+采集 100 个样本；每个场景要求 Flight 吞吐不低于 Gateway 的 90%，且 p99 不超过 Gateway 的 1.20 倍。
+
+2026-07-19 的 WSL2 loopback 基线中，Flight 小查询吞吐约为 Gateway 的 93%，65,536 行查询基本持平；
+三档写入吞吐均高于 Gateway。accepted Flight socket 必须保持 `TCP_NODELAY`，对应回归测试会直接验证
+server 侧 socket 选项。完整方法、结果和适用边界见
+[`perf_reports/2026-07-19-flight-gateway-transport.md`](perf_reports/2026-07-19-flight-gateway-transport.md)。
+
+手动生成 JSON 报告时设置 `ZIPPY_TRANSPORT_PERF_REPORT_JSON`，并运行 ignored test
+`flight_gateway_transport_performance_baseline`。可用
+`ZIPPY_TRANSPORT_PERF_MEASURED_SAMPLES` 调整计量次数；低于 100 的样本只适合快速 smoke，不应作为
+p99 发布依据。
+
 ## 后续阶段
 
 1. Stage 6.5 Python connector 已完成：`zippy-client` 默认使用 Flight query/DoPut，解析稳定错误，
