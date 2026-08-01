@@ -337,6 +337,7 @@ class Client:
         schema: object | None = None,
         batch_size: int = 1024,
         flush_interval_ms: int | None = 5,
+        durability: str | None = None,
         transport: str | Transport | None = None,
     ) -> GatewayWriter | FlightWriter:
         """Return a buffered Flight writer or Gateway compatibility writer."""
@@ -359,7 +360,10 @@ class Client:
                 schema=schema,
                 batch_size=batch_size,
                 flush_interval_ms=flush_interval_ms,
+                durability="wal" if durability is None else durability,
             )
+        if durability is not None and str(durability).strip().lower() != "memory":
+            raise CapabilityError("Gateway writers only support memory durability")
         if schema is None:
             try:
                 _, schema = self.gateway.get_stream(stream_name)
@@ -751,6 +755,7 @@ def get_writer(
     schema: object | None = None,
     batch_size: int = 1024,
     flush_interval_ms: int | None = 5,
+    durability: str | None = None,
     transport: str | Transport | None = None,
 ) -> GatewayWriter | FlightWriter:
     """Return a buffered writer using the process-wide client.
@@ -763,6 +768,7 @@ def get_writer(
         schema=schema,
         batch_size=batch_size,
         flush_interval_ms=flush_interval_ms,
+        durability=durability,
         transport=transport,
     )
 

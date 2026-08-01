@@ -29,6 +29,9 @@ message PutCommand {
   uint64 first_batch_sequence = 5;
   PutMutation mutation = 6;
   PutDurability durability = 7;
+  bytes producer_id = 8;
+  bytes connection_id = 9;
+  optional uint64 expected_writer_epoch = 10;
 }
 
 enum PutMutation {
@@ -39,6 +42,8 @@ enum PutMutation {
 enum PutDurability {
   PUT_DURABILITY_UNSPECIFIED = 0;
   PUT_DURABILITY_MEMORY = 1;
+  PUT_DURABILITY_WAL = 2;
+  PUT_DURABILITY_PERSISTED = 3;
 }
 
 message PutBatchResult {
@@ -47,6 +52,13 @@ message PutBatchResult {
   uint64 batch_sequence = 3;
   uint64 row_count = 4;
   PutDurability durability_reached = 5;
+  bytes request_id = 6;
+  uint64 producer_epoch = 7;
+  optional uint64 first_log_offset = 8;
+  optional uint64 last_log_offset = 9;
+  OffsetWatermark previous_log_offset = 10;
+  OffsetWatermark committed_log_offset = 11;
+  optional uint64 persisted_snapshot_version = 12;
 }
 
 message QueryCommand {

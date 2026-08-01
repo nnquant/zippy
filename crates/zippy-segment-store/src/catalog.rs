@@ -419,10 +419,15 @@ impl PartitionHandle {
             .map_err(ZippySegmentStoreError::Writer)
     }
 
-    /// 返回当前 active segment 描述符，仅用于测试。
-    pub fn active_descriptor_for_test(&self) -> crate::ActiveSegmentDescriptor {
+    /// Returns the current active segment descriptor for server-local publication.
+    pub fn active_descriptor(&self) -> crate::ActiveSegmentDescriptor {
         let state = self.inner.state.lock().unwrap();
         state.writer.active_descriptor()
+    }
+
+    /// 返回当前 active segment 描述符，仅用于测试。
+    pub fn active_descriptor_for_test(&self) -> crate::ActiveSegmentDescriptor {
+        self.active_descriptor()
     }
 
     pub(crate) fn subscribe(&self) -> Result<SegmentNotifier, ZippySegmentStoreError> {

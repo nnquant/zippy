@@ -120,12 +120,12 @@ def test_connect_replaces_and_closes_process_wide_client(gateway_stack) -> None:
         zp.client()
 
 
-def test_connect_local_false_forces_discovered_gateway_scope(gateway_stack) -> None:
+def test_connect_local_false_disables_shm_without_overriding_auto(gateway_stack) -> None:
     master_uri, _ = gateway_stack
 
     client = zp.connect(master_uri, local=False)
     try:
-        assert client.default_transport == zp.Transport.GATEWAY_LOCAL
+        assert client.default_transport == zp.Transport.AUTO
         assert client.transport_for("subscribe").selected == zp.Transport.GATEWAY_LOCAL
     finally:
         client.close()

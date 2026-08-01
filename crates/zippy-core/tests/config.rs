@@ -655,18 +655,33 @@ backend = "sqlite_shadow"
 }
 
 #[test]
-fn zippy_config_rejects_sqlite_authority_before_cutover() {
-    let error = with_env(
+fn zippy_config_accepts_explicit_sqlite_authority_without_gateway() {
+    let config = with_env(
         &[
             ("ZIPPY_SERVER_NATIVE_STORAGE", "true"),
             ("ZIPPY_CATALOG_BACKEND", "sqlite"),
         ],
         || ZippyConfig::load_from_path(None::<&std::path::Path>),
     )
-    .expect_err("sqlite authority must remain closed until cutover");
+    .expect("sqlite is the explicit native Catalog cutover");
+    assert_eq!(config.catalog.backend, ZippyCatalogBackend::Sqlite);
+}
+
+#[test]
+fn zippy_config_rejects_sqlite_authority_with_legacy_gateway() {
+    let error = with_env(
+        &[
+            ("ZIPPY_SERVER_NATIVE_STORAGE", "true"),
+            ("ZIPPY_CATALOG_BACKEND", "sqlite"),
+            ("ZIPPY_GATEWAY", "true"),
+            ("ZIPPY_GATEWAY_ENDPOINT", "127.0.0.1:17810"),
+        ],
+        || ZippyConfig::load_from_path(None::<&std::path::Path>),
+    )
+    .expect_err("sqlite authority must not coexist with the legacy Gateway");
     assert!(error
         .to_string()
-        .contains("sqlite authority is not available before explicit cutover"));
+        .contains("sqlite authority does not support the legacy Gateway"));
 }
 
 #[test]
@@ -1223,7 +1238,7 @@ endpoint = "127.0.0.1:17666"
 [query]
 native_enabled = true
 "#,
-            "native query frontend requires catalog sqlite_shadow backend",
+            "native query frontend requires catalog sqlite_shadow or sqlite backend",
         ),
     ];
 
@@ -1811,7 +1826,7 @@ fn zippy_config_loads_explicit_flight_ingest_and_redacts_writer_token() {
 native_storage_enabled = true
 
 [catalog]
-backend = "sqlite_shadow"
+backend = "sqlite"
 
 [query]
 native_enabled = true
@@ -1860,6 +1875,55 @@ enabled = true
     assert_eq!(config.flight.ingest.max_bytes_per_put, 4_194_304);
     assert!(!format!("{config:?}").contains(writer_token));
     assert!(!config.to_json_value().to_string().contains(writer_token));
+}
+
+#[test]
+fn zippy_config_rejects_flight_ingest_with_sqlite_shadow_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[query]
+native_enabled = true
+
+[flight]
+enabled = true
+endpoint = "127.0.0.1:17692"
+
+[flight.auth]
+enabled = true
+
+[flight.ingest]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(
+        &[
+            (
+                "ZIPPY_FLIGHT_AUTH_TOKEN",
+                "test-only-flight-bootstrap-token-0001",
+            ),
+            (
+                "ZIPPY_FLIGHT_AUTH_WRITER_TOKEN",
+                "test-only-flight-writer-token-000000001",
+            ),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .expect_err("Flight ingest must own the authoritative SQLite Catalog");
+
+    assert!(error
+        .to_string()
+        .contains("native Flight ingest requires catalog sqlite authority"));
 }
 
 #[test]

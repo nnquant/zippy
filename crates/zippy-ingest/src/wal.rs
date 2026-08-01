@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -218,35 +219,66 @@ impl MutationFingerprintComputer for ArrowIpcMutationFingerprintComputer {
         schema_version: u64,
         mutation: &TableMutation,
     ) -> Result<MutationFingerprintDigest> {
-        if format_version.get() != CURRENT_INGEST_WAL_FORMAT_VERSION {
-            return Err(ServerError::new(
-                ErrorCode::UnsupportedPlan,
-                format!(
-                    "ingest mutation fingerprint format is unsupported version=[{}]",
-                    format_version.get()
-                ),
-            )
-            .with_retryable(false));
-        }
-        let (mutation_kind, batch) = mutation_parts(mutation);
+        require_supported_fingerprint_format(format_version)?;
+        let (_, batch) = mutation_parts(mutation);
         let payload = encode_batch(batch)?;
-        let record_payload = canonical_record_payload(&payload)?;
-        let mut digest = Sha256::new();
-        digest.update(FINGERPRINT_DOMAIN);
-        digest.update(format_version.get().to_be_bytes());
-        digest.update(schema_version.to_be_bytes());
-        digest.update([mutation_kind]);
-        digest.update(canonical_catalog_schema_digest_v1(batch.schema().as_ref()));
-        digest.update(
-            u64::try_from(record_payload.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        digest.update(record_payload);
-        Ok(MutationFingerprintDigest::from_bytes(
-            digest.finalize().into(),
-        ))
+        fingerprint_payload(format_version, schema_version, mutation, &payload)
     }
+
+    fn compute_prepared(
+        &self,
+        format_version: MutationFingerprintFormatVersion,
+        schema_version: u64,
+        mutation: &TableMutation,
+    ) -> Result<(MutationFingerprintDigest, Option<Arc<[u8]>>)> {
+        require_supported_fingerprint_format(format_version)?;
+        let (_, batch) = mutation_parts(mutation);
+        let payload = Arc::<[u8]>::from(encode_batch(batch)?);
+        let digest = fingerprint_payload(format_version, schema_version, mutation, &payload)?;
+        Ok((digest, Some(payload)))
+    }
+}
+
+fn fingerprint_payload(
+    format_version: MutationFingerprintFormatVersion,
+    schema_version: u64,
+    mutation: &TableMutation,
+    payload: &[u8],
+) -> Result<MutationFingerprintDigest> {
+    require_supported_fingerprint_format(format_version)?;
+    let (mutation_kind, batch) = mutation_parts(mutation);
+    let record_payload = canonical_record_payload(payload)?;
+    let mut digest = Sha256::new();
+    digest.update(FINGERPRINT_DOMAIN);
+    digest.update(format_version.get().to_be_bytes());
+    digest.update(schema_version.to_be_bytes());
+    digest.update([mutation_kind]);
+    digest.update(canonical_catalog_schema_digest_v1(batch.schema().as_ref()));
+    digest.update(
+        u64::try_from(record_payload.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(record_payload);
+    Ok(MutationFingerprintDigest::from_bytes(
+        digest.finalize().into(),
+    ))
+}
+
+fn require_supported_fingerprint_format(
+    format_version: MutationFingerprintFormatVersion,
+) -> Result<()> {
+    if format_version.get() != CURRENT_INGEST_WAL_FORMAT_VERSION {
+        return Err(ServerError::new(
+            ErrorCode::UnsupportedPlan,
+            format!(
+                "ingest mutation fingerprint format is unsupported version=[{}]",
+                format_version.get()
+            ),
+        )
+        .with_retryable(false));
+    }
+    Ok(())
 }
 
 /// Exclusive append and fsync owner for one producer-epoch WAL segment.
@@ -656,7 +688,7 @@ pub fn recover_table_wal(
 
 struct EncodedWalRecord {
     header: [u8; WAL_HEADER_LEN],
-    payload: Vec<u8>,
+    payload: Arc<[u8]>,
 }
 
 #[derive(Debug)]
@@ -709,7 +741,10 @@ fn encode_data_record(
         .with_retryable(false));
     }
     let (mutation_kind, batch) = mutation_parts(request.mutation());
-    let payload = encode_batch(batch)?;
+    let payload = request
+        .prepared_payload()
+        .cloned()
+        .map_or_else(|| encode_batch(batch).map(Arc::from), Ok)?;
     if payload.len() > config.max_record_bytes {
         return Err(ServerError::new(
             ErrorCode::ResourceExhausted,
@@ -1595,8 +1630,9 @@ mod tests {
     };
 
     use super::{
-        crc32c, decode_batch, encode_batch, recover_table_wal, ArrowIpcMutationFingerprintComputer,
-        IngestWalConfig, IngestWalIdentity, IngestWalWriter, WAL_HEADER_LEN,
+        crc32c, decode_batch, encode_batch, encode_data_record, recover_table_wal,
+        ArrowIpcMutationFingerprintComputer, IngestWalConfig, IngestWalIdentity, IngestWalWriter,
+        WAL_HEADER_LEN,
     };
 
     fn table_id(value: u128) -> TableId {
@@ -1678,6 +1714,31 @@ mod tests {
     #[test]
     fn crc32c_matches_the_castagnoli_check_vector() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+    }
+
+    #[test]
+    fn prepared_fingerprint_payload_is_reused_by_wal_encoding() {
+        let request = request(0, &[1, 2, 3]);
+        let prepared = request
+            .prepared_payload()
+            .cloned()
+            .expect("Arrow ingress prepares one canonical payload");
+        let encoded = encode_data_record(
+            identity(1),
+            &request,
+            &receipt(&request, OffsetWatermark::Empty),
+            IngestWalConfig::new(),
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&prepared, &encoded.payload));
+        let decoded =
+            decode_batch(Path::new("prepared-payload"), table_id(1), &encoded.payload).unwrap();
+        assert_eq!(decoded.num_rows(), 3);
+        let TableMutation::Append(expected) = request.mutation() else {
+            panic!("test request must contain an append mutation");
+        };
+        assert_eq!(&decoded, expected);
     }
 
     #[test]

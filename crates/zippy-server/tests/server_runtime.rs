@@ -6,7 +6,7 @@ mod support;
 #[path = "server_runtime/transport_performance.rs"]
 mod transport_performance;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -41,7 +41,7 @@ use zippy_master::snapshot::{
     SnapshotStreamRecord,
 };
 use zippy_protocol::error::status_to_server_error;
-use zippy_protocol::ingest::encode_put_descriptor;
+use zippy_protocol::ingest::{encode_put_descriptor, put_batch_request_id};
 use zippy_protocol::query::{
     encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
 };
@@ -57,7 +57,7 @@ use zippy_server::{
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
-    CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand,
+    CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, CreateTableCommand,
     LegacyCatalogAdvanceCheckpointCommandV4, LegacyCatalogCheckpointModeV4,
     LegacyCatalogProjectionCommandV4, LegacyCatalogProjectionEnvelopeV4,
     LegacyCatalogProjectionOutcomeV4, LegacyCatalogProjectionPhaseV4,
@@ -65,8 +65,14 @@ use zippy_types::catalog::{
 };
 use zippy_types::query::{QueryInput, QueryPriority, QueryRequest};
 use zippy_types::runtime::RuntimeRegistry;
-use zippy_types::table::{CatalogName, DataFileLocation, TableRef};
-use zippy_types::{ErrorCode, NamespaceId, QueryId, RequestId, ResourceLimit, SessionId};
+use zippy_types::table::{
+    AppendTableDefinition, CatalogName, DataFileLocation, SchemaIpcPayload, TableDefinition,
+    TableRef,
+};
+use zippy_types::{
+    ConnectionId, ErrorCode, NamespaceId, ProducerId, QueryId, RequestId, ResourceLimit, SessionId,
+    TableId,
+};
 
 use support::{reserve_tcp_addr, wait_until_bindable};
 
@@ -528,6 +534,143 @@ fn seed_legacy_append_table(
     .unwrap();
     drop(ownership);
     snapshot_path
+}
+
+async fn seed_native_append_table(data_dir: &Path, stream_name: &str) {
+    let schema = append_table_schema();
+    let mut schema_ipc = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut schema_ipc, schema.as_ref()).unwrap();
+    writer.finish().unwrap();
+    drop(writer);
+
+    let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(data_dir).unwrap());
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+    let actor = CatalogActor {
+        kind: CatalogActorKind::Server,
+        principal: "server-native-flight-ingest-test".to_owned(),
+    };
+    catalog
+        .command(
+            CatalogCommandEnvelopeV1::new(
+                RequestId::from_u128(2_080).unwrap(),
+                Some(0),
+                actor.clone(),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(2_081).unwrap(),
+                    name: CatalogName::default_namespace(),
+                }),
+            )
+            .unwrap()
+            .into(),
+        )
+        .await
+        .unwrap();
+    catalog
+        .command(
+            CatalogCommandEnvelopeV1::new(
+                RequestId::from_u128(2_082).unwrap(),
+                Some(1),
+                actor,
+                CatalogCommandV1::CreateTable(CreateTableCommand {
+                    table_id: TableId::from_u128(2_083).unwrap(),
+                    namespace_id: NamespaceId::from_u128(2_081).unwrap(),
+                    name: CatalogName::new(stream_name).unwrap(),
+                    definition: TableDefinition::Append(AppendTableDefinition::default()),
+                    schema_ipc: SchemaIpcPayload::new(schema_ipc).unwrap(),
+                    config: BTreeMap::new(),
+                }),
+            )
+            .unwrap()
+            .into(),
+        )
+        .await
+        .unwrap();
+    catalog.close().unwrap();
+}
+
+async fn read_flight_i64_with_token(
+    endpoint: std::net::SocketAddr,
+    bootstrap_token: &str,
+    stream_name: &str,
+    query_id: QueryId,
+) -> Vec<i64> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{endpoint}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut reader = FlightClient::new(channel);
+    reader
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {bootstrap_token}"),
+        )
+        .unwrap();
+    let opened = SessionOpenResponse::decode(
+        reader
+            .handshake(
+                SessionOpenRequest {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let read_session =
+        SessionId::from_bytes(opened.session_id.as_ref().try_into().unwrap()).unwrap();
+    reader
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {}", opened.bearer_token),
+        )
+        .unwrap();
+    let table_ref = TableRef::Name {
+        namespace: CatalogName::default_namespace(),
+        table: CatalogName::new(stream_name).unwrap(),
+    };
+    let query = FlightQueryRequest {
+        request: QueryRequest {
+            query_id,
+            session_id: read_session,
+            input: QueryInput::Sql("SELECT value FROM ticks ORDER BY value".to_owned()),
+            tables: vec![table_ref.clone()],
+            priority: QueryPriority::Interactive,
+            deadline_ns: None,
+            memory_limit_bytes: ResourceLimit::ServerDefault,
+            spill_limit_bytes: ResourceLimit::Disabled,
+            result_batch_rows: NonZeroU32::new(16),
+        },
+        bindings: vec![FlightTableBinding {
+            sql_name: "ticks".to_owned(),
+            table: table_ref,
+        }],
+    };
+    let info = reader
+        .get_flight_info(encode_query_descriptor(
+            &encode_query_request(&query).unwrap(),
+        ))
+        .await
+        .unwrap();
+    reader
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
 }
 
 fn write_gateway_request(stream: &mut TcpStream, header: &serde_json::Value) {
@@ -1182,7 +1325,7 @@ async fn flight_only_runtime_streams_real_native_snapshot_and_releases_ticket() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn flight_writer_put_succeeds_without_gateway_and_publishes_master_descriptor() {
+async fn flight_writer_wal_put_uses_native_ingest_without_gateway() {
     use std::os::unix::fs::PermissionsExt;
 
     const READ_TOKEN: &str = "test-only-flight-read-token-0000000001";
@@ -1192,6 +1335,7 @@ async fn flight_writer_put_succeeds_without_gateway_and_publishes_master_descrip
     let data_dir = temp.path().join("database");
     let persist_root = temp.path().join("persisted");
     fs::create_dir_all(&persist_root).unwrap();
+    seed_native_append_table(&data_dir, "flight_ingest_ticks").await;
     let flight_addr = reserve_tcp_addr();
     let config = runtime_config_with_native_flight_frontend_and_persist_root(
         &temp,
@@ -1211,7 +1355,9 @@ async fn flight_writer_put_succeeds_without_gateway_and_publishes_master_descrip
     fs::set_permissions(&read_token_path, fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&writer_token_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut source = fs::read_to_string(config_path).unwrap();
+    let mut source = fs::read_to_string(config_path)
+        .unwrap()
+        .replace("backend = \"sqlite_shadow\"", "backend = \"sqlite\"");
     source.push_str(&format!(
         concat!(
             "\n[flight.auth]\n",
@@ -1234,13 +1380,14 @@ async fn flight_writer_put_succeeds_without_gateway_and_publishes_master_descrip
     ));
     fs::write(config_path, source).unwrap();
 
+    let restart_config = config.clone();
     let mut runtime = LegacyServerRuntime::start(config).expect("start Flight ingest runtime");
     let health = runtime.health();
     assert!(!health.readiness.gateway_configured);
     assert!(!health.readiness.gateway_listener_ready);
     assert!(health.readiness.flight_protocol_ready);
-    assert!(health.readiness.memory_ingest_configured);
-    assert!(health.readiness.memory_ingest_ready);
+    assert!(!health.readiness.memory_ingest_configured);
+    assert!(!health.readiness.memory_ingest_ready);
     assert!(runtime.gateway_endpoint().is_none());
 
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{flight_addr}"))
@@ -1283,21 +1430,23 @@ async fn flight_writer_put_succeeds_without_gateway_and_publishes_master_descrip
         vec![Arc::new(Int64Array::from(vec![101_i64, 102, 103]))],
     )
     .unwrap();
+    let put_id = RequestId::from_u128(2_101).unwrap();
+    let producer_id = ProducerId::from_u128(2_102).unwrap();
+    let connection_id = ConnectionId::from_u128(2_103).unwrap();
     let descriptor = encode_put_descriptor(&PutCommand {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         session_id: session_id.into_bytes().to_vec().into(),
-        put_id: RequestId::from_u128(2_101)
-            .unwrap()
-            .into_bytes()
-            .to_vec()
-            .into(),
+        put_id: put_id.into_bytes().to_vec().into(),
         stream_name: "flight_ingest_ticks".to_owned(),
-        first_batch_sequence: 41,
+        first_batch_sequence: 0,
         mutation: PutMutation::Append as i32,
-        durability: PutDurability::Memory as i32,
+        durability: PutDurability::Wal as i32,
+        producer_id: producer_id.into_bytes().to_vec().into(),
+        connection_id: connection_id.into_bytes().to_vec().into(),
+        expected_writer_epoch: None,
     });
     let input = FlightDataEncoderBuilder::new()
-        .with_schema(schema)
+        .with_schema(Arc::clone(&schema))
         .with_flight_descriptor(Some(descriptor))
         .build(futures::stream::iter([Ok(batch)]));
     let results = writer
@@ -1309,35 +1458,113 @@ async fn flight_writer_put_succeeds_without_gateway_and_publishes_master_descrip
         .unwrap();
     assert_eq!(results.len(), 1);
     let result = PutBatchResult::decode(results[0].app_metadata.clone()).unwrap();
-    assert_eq!((result.batch_sequence, result.row_count), (41, 3));
+    assert_eq!((result.batch_sequence, result.row_count), (0, 3));
+    assert_eq!(result.durability_reached, PutDurability::Wal as i32);
+    assert_eq!(result.producer_epoch, 1);
+    assert_eq!(
+        result.request_id.as_ref(),
+        put_batch_request_id(put_id, 0).into_bytes()
+    );
+    assert_eq!(
+        (result.first_log_offset, result.last_log_offset),
+        (Some(0), Some(2))
+    );
+    assert_eq!(
+        result.previous_log_offset.unwrap().state,
+        zippy_protocol::wire::offset_watermark::State::Empty as i32
+    );
+    let committed = result.committed_log_offset.unwrap();
+    assert_eq!(
+        committed.state,
+        zippy_protocol::wire::offset_watermark::State::Known as i32
+    );
+    assert_eq!(committed.offset, 2);
+
+    let resumed_put_id = RequestId::from_u128(2_104).unwrap();
+    let resumed_descriptor = encode_put_descriptor(&PutCommand {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        session_id: session_id.into_bytes().to_vec().into(),
+        put_id: resumed_put_id.into_bytes().to_vec().into(),
+        stream_name: "flight_ingest_ticks".to_owned(),
+        first_batch_sequence: 1,
+        mutation: PutMutation::Append as i32,
+        durability: PutDurability::Wal as i32,
+        producer_id: producer_id.into_bytes().to_vec().into(),
+        connection_id: connection_id.into_bytes().to_vec().into(),
+        expected_writer_epoch: Some(1),
+    });
+    let resumed_batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![104_i64]))],
+    )
+    .unwrap();
+    let resumed_input = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_flight_descriptor(Some(resumed_descriptor))
+        .build(futures::stream::iter([Ok(resumed_batch)]));
+    let resumed_results = writer
+        .do_put(resumed_input)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(resumed_results.len(), 1);
+    let resumed = PutBatchResult::decode(resumed_results[0].app_metadata.clone()).unwrap();
+    assert_eq!((resumed.batch_sequence, resumed.row_count), (1, 1));
+    assert_eq!(resumed.producer_epoch, 1);
+    assert_eq!(
+        resumed.request_id.as_ref(),
+        put_batch_request_id(resumed_put_id, 0).into_bytes()
+    );
+    assert_eq!(
+        (resumed.first_log_offset, resumed.last_log_offset),
+        (Some(3), Some(3))
+    );
+
+    let values = read_flight_i64_with_token(
+        flight_addr,
+        READ_TOKEN,
+        "flight_ingest_ticks",
+        QueryId::from_u128(2_105).unwrap(),
+    )
+    .await;
+    assert_eq!(values, [101, 102, 103, 104]);
 
     let flight = runtime.flight_status().unwrap();
     assert_eq!(flight.active_writer_sessions, 1);
-    assert_eq!(flight.puts_completed, 1);
-    assert_eq!(flight.put_rows, 3);
+    assert_eq!(flight.puts_completed, 2);
+    assert_eq!(flight.put_rows, 4);
     assert!(runtime.gateway_metrics().is_none());
-    let memory_ingest = runtime.memory_ingest_status().unwrap();
-    assert!(memory_ingest.accepting);
-    assert_eq!(memory_ingest.active_tables, 1);
-    assert_eq!(memory_ingest.write_batches_total, 1);
-    assert_eq!(memory_ingest.written_rows_total, 3);
-    assert_eq!(memory_ingest.table_creations_total, 1);
-    let mut master = MasterClient::connect_endpoint(runtime.control_endpoint().clone()).unwrap();
-    master
-        .register_process("flight-ingest-runtime-test")
-        .unwrap();
-    let stream = master.get_stream("flight_ingest_ticks").unwrap();
-    assert!(stream.active_segment_descriptor.is_some());
-    assert_eq!(
-        stream.active_segment_preflight.as_ref().unwrap()["status"],
-        "ok"
-    );
-    master.unregister_process().unwrap();
-    drop(master);
+    assert!(runtime.memory_ingest_status().is_none());
+    let native_ingest = runtime.native_ingest_status().unwrap();
+    assert!(native_ingest.accepting);
+    assert_eq!(native_ingest.write_batches_total, 2);
+    assert_eq!(native_ingest.written_rows_total, 4);
+    assert_eq!(native_ingest.wal_commits_total, 2);
+    assert_eq!(native_ingest.writer_acquisitions_total, 1);
+    assert_eq!(native_ingest.writer_resumes_total, 1);
     drop(writer);
 
     let outcome = runtime.shutdown();
     assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+    wait_until_bindable(flight_addr);
+
+    let mut recovered = LegacyServerRuntime::start(restart_config)
+        .expect("restart Flight ingest runtime and recover committed WAL");
+    let recovered_values = read_flight_i64_with_token(
+        flight_addr,
+        READ_TOKEN,
+        "flight_ingest_ticks",
+        QueryId::from_u128(2_106).unwrap(),
+    )
+    .await;
+    assert_eq!(recovered_values, [101, 102, 103, 104]);
+    let outcome = recovered.shutdown();
+    assert!(
+        outcome.is_clean(),
+        "recovered shutdown outcome: {outcome:?}"
+    );
     wait_until_bindable(flight_addr);
 }
 

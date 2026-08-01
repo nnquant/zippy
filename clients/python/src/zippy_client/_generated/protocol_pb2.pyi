@@ -23,6 +23,8 @@ class PutDurability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     PUT_DURABILITY_UNSPECIFIED: _ClassVar[PutDurability]
     PUT_DURABILITY_MEMORY: _ClassVar[PutDurability]
+    PUT_DURABILITY_WAL: _ClassVar[PutDurability]
+    PUT_DURABILITY_PERSISTED: _ClassVar[PutDurability]
 
 class QueryPriority(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -38,6 +40,8 @@ PUT_MUTATION_UNSPECIFIED: PutMutation
 PUT_MUTATION_APPEND: PutMutation
 PUT_DURABILITY_UNSPECIFIED: PutDurability
 PUT_DURABILITY_MEMORY: PutDurability
+PUT_DURABILITY_WAL: PutDurability
+PUT_DURABILITY_PERSISTED: PutDurability
 QUERY_PRIORITY_UNSPECIFIED: QueryPriority
 QUERY_PRIORITY_INTERACTIVE: QueryPriority
 QUERY_PRIORITY_NORMAL: QueryPriority
@@ -64,7 +68,7 @@ class SessionOpenResponse(_message.Message):
     def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[bytes] = ..., bearer_token: _Optional[str] = ..., expires_at_ns: _Optional[int] = ..., role: _Optional[_Union[SessionRole, str]] = ...) -> None: ...
 
 class PutCommand(_message.Message):
-    __slots__ = ("protocol_version", "session_id", "put_id", "stream_name", "first_batch_sequence", "mutation", "durability")
+    __slots__ = ("protocol_version", "session_id", "put_id", "stream_name", "first_batch_sequence", "mutation", "durability", "producer_id", "connection_id", "expected_writer_epoch")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     PUT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -72,6 +76,9 @@ class PutCommand(_message.Message):
     FIRST_BATCH_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     MUTATION_FIELD_NUMBER: _ClassVar[int]
     DURABILITY_FIELD_NUMBER: _ClassVar[int]
+    PRODUCER_ID_FIELD_NUMBER: _ClassVar[int]
+    CONNECTION_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_WRITER_EPOCH_FIELD_NUMBER: _ClassVar[int]
     protocol_version: int
     session_id: bytes
     put_id: bytes
@@ -79,21 +86,38 @@ class PutCommand(_message.Message):
     first_batch_sequence: int
     mutation: PutMutation
     durability: PutDurability
-    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[bytes] = ..., put_id: _Optional[bytes] = ..., stream_name: _Optional[str] = ..., first_batch_sequence: _Optional[int] = ..., mutation: _Optional[_Union[PutMutation, str]] = ..., durability: _Optional[_Union[PutDurability, str]] = ...) -> None: ...
+    producer_id: bytes
+    connection_id: bytes
+    expected_writer_epoch: int
+    def __init__(self, protocol_version: _Optional[int] = ..., session_id: _Optional[bytes] = ..., put_id: _Optional[bytes] = ..., stream_name: _Optional[str] = ..., first_batch_sequence: _Optional[int] = ..., mutation: _Optional[_Union[PutMutation, str]] = ..., durability: _Optional[_Union[PutDurability, str]] = ..., producer_id: _Optional[bytes] = ..., connection_id: _Optional[bytes] = ..., expected_writer_epoch: _Optional[int] = ...) -> None: ...
 
 class PutBatchResult(_message.Message):
-    __slots__ = ("protocol_version", "put_id", "batch_sequence", "row_count", "durability_reached")
+    __slots__ = ("protocol_version", "put_id", "batch_sequence", "row_count", "durability_reached", "request_id", "producer_epoch", "first_log_offset", "last_log_offset", "previous_log_offset", "committed_log_offset", "persisted_snapshot_version")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     PUT_ID_FIELD_NUMBER: _ClassVar[int]
     BATCH_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     ROW_COUNT_FIELD_NUMBER: _ClassVar[int]
     DURABILITY_REACHED_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    PRODUCER_EPOCH_FIELD_NUMBER: _ClassVar[int]
+    FIRST_LOG_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    LAST_LOG_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_LOG_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_LOG_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    PERSISTED_SNAPSHOT_VERSION_FIELD_NUMBER: _ClassVar[int]
     protocol_version: int
     put_id: bytes
     batch_sequence: int
     row_count: int
     durability_reached: PutDurability
-    def __init__(self, protocol_version: _Optional[int] = ..., put_id: _Optional[bytes] = ..., batch_sequence: _Optional[int] = ..., row_count: _Optional[int] = ..., durability_reached: _Optional[_Union[PutDurability, str]] = ...) -> None: ...
+    request_id: bytes
+    producer_epoch: int
+    first_log_offset: int
+    last_log_offset: int
+    previous_log_offset: OffsetWatermark
+    committed_log_offset: OffsetWatermark
+    persisted_snapshot_version: int
+    def __init__(self, protocol_version: _Optional[int] = ..., put_id: _Optional[bytes] = ..., batch_sequence: _Optional[int] = ..., row_count: _Optional[int] = ..., durability_reached: _Optional[_Union[PutDurability, str]] = ..., request_id: _Optional[bytes] = ..., producer_epoch: _Optional[int] = ..., first_log_offset: _Optional[int] = ..., last_log_offset: _Optional[int] = ..., previous_log_offset: _Optional[_Union[OffsetWatermark, _Mapping]] = ..., committed_log_offset: _Optional[_Union[OffsetWatermark, _Mapping]] = ..., persisted_snapshot_version: _Optional[int] = ...) -> None: ...
 
 class QueryCommand(_message.Message):
     __slots__ = ("protocol_version", "query_id", "session_id", "sql", "bindings", "priority", "deadline_ns", "memory_limit", "spill_limit", "result_batch_rows")

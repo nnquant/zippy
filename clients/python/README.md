@@ -113,11 +113,28 @@ ZIPPY_FLIGHT_TLS_CLIENT_KEY_FILE
 ZIPPY_FLIGHT_TLS_SERVER_NAME
 ```
 
-`get_writer()` 自动按服务端上限切分 Arrow batch，并在 `flush()` 返回前逐批校验 memory durability
-receipt。Stage 6.5 的 `Append + Memory` 没有 WAL、producer fencing 或服务端去重；连接中断时最后一批
-是否生效可能不确定，不能把整批盲目重试当作 exactly-once。需要可恢复持久写入时继续使用既有受控链路，
-或等待 Phase 7 durable ingest。发生这类错误时 writer 永久 fail-closed，`AmbiguousWriteError.receipts`
-只列出已明确收到的回执；调用方核对业务状态后必须创建新 writer。
+`get_writer()` 默认请求 `wal` durability，自动按服务端上限切分 Arrow batch。同一个 writer 会跨
+`flush()` 复用 producer、connection、epoch 和开放的 DoPut stream，在 batch/row/byte 配额或 RPC
+deadline 前有界轮换，并在每次 `flush()` 返回前逐批校验 request ID、连续 log offset、水位和 WAL
+ACK。需要最低延迟且明确接受进程
+崩溃丢失未提交尾部时，才显式选择 `memory`：
+
+```python
+with zp.get_writer(
+    "ldc_tgw_ticks",
+    batch_size=4096,
+    flush_interval_ms=10,
+    durability="wal",
+) as writer:
+    writer.write({"instrument_id": "110059.SH", "dt": ts, "last_price": 121.35})
+    writer.flush()
+    print(writer.last_receipts[-1]["committed_log_offset"])
+```
+
+同一个 `FlightWriter` 保留稳定 producer/connection ID，并把前一次服务端 epoch 作为下一次 resume 的
+期望值；其他连接抢先接管表时会明确失败。若网络在提交与回执之间中断，最后一批仍可能状态不确定，高层 writer 不会
+用新身份盲目重试，而是永久 fail-closed。`AmbiguousWriteError.receipts` 只列出已明确收到的回执；调用方
+按稳定 offset 或业务主键核对后创建新 writer。`Persisted` durability 尚未开放。
 
 Flight 每次 terminal query 都固定一个服务端 snapshot；同一次 `collect()` 内结果一致。旧 Gateway
 `snapshot=True` 的跨多次 terminal 调用 lease 复用不属于 Flight version 1。`tail()` 必须先显式

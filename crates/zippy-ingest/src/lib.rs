@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod materializer;
 mod memory;
 mod native;
 mod registry;
@@ -19,7 +20,12 @@ pub use actor::{
     TableActorLiveSegmentsPublication, TableActorLiveSegmentsPublishRequest,
     TableActorPersistRequest, TableActorRegistry, TableActorRegistryConfig,
     TableActorRegistryHandle, TableActorSnapshot, TableActorSnapshotRequest,
-    TablePersistenceStatus,
+    TableActorWriterEpochUpdateRequest, TablePersistenceStatus,
+};
+pub use materializer::{
+    NativeAppendMaterializerConfig, NativeAppendMaterializerSink,
+    DEFAULT_NATIVE_APPEND_MAX_LIVE_SEGMENTS, DEFAULT_NATIVE_APPEND_ROW_CAPACITY,
+    MAX_NATIVE_APPEND_LIVE_SEGMENTS,
 };
 pub use memory::{
     MemoryIngestCatalog, MemoryIngestConfig, MemoryIngestHandle, MemoryIngestRegistration,
@@ -29,10 +35,11 @@ pub use memory::{
 };
 pub use native::{
     NativeIngestApplyContext, NativeIngestConfig, NativeIngestHandle, NativeIngestRuntime,
-    NativeIngestShutdownOutcome, NativeIngestSink, NativeIngestStatus, NativeIngestTableBootstrap,
-    DEFAULT_NATIVE_INGEST_MAX_ACTIVE_OPERATIONS, DEFAULT_NATIVE_INGEST_MAX_PENDING_DURABLE_ACKS,
-    DEFAULT_NATIVE_INGEST_MAX_RECEIPTS_PER_EPOCH, MAX_NATIVE_INGEST_ACTIVE_OPERATIONS,
-    MAX_NATIVE_INGEST_PENDING_DURABLE_ACKS, MAX_NATIVE_INGEST_RECEIPTS_PER_EPOCH,
+    NativeIngestShutdownOutcome, NativeIngestSink, NativeIngestSinkError, NativeIngestStatus,
+    NativeIngestTableBootstrap, DEFAULT_NATIVE_INGEST_MAX_ACTIVE_OPERATIONS,
+    DEFAULT_NATIVE_INGEST_MAX_PENDING_DURABLE_ACKS, DEFAULT_NATIVE_INGEST_MAX_RECEIPTS_PER_EPOCH,
+    MAX_NATIVE_INGEST_ACTIVE_OPERATIONS, MAX_NATIVE_INGEST_PENDING_DURABLE_ACKS,
+    MAX_NATIVE_INGEST_RECEIPTS_PER_EPOCH,
 };
 pub use registry::{TableRuntime, TableRuntimeBootstrap, TableRuntimeRegistry};
 pub use wal::{

@@ -40,7 +40,10 @@ use crate::auth::{
     AuthenticatedFlightSession, FlightBearerAuthConfig, FlightSessionRole, SessionAuthority,
 };
 use crate::error::server_error_to_status;
-use crate::ingest::{decode_put_descriptor, put_batch_result, FlightPutBatch, FlightPutLimits};
+use crate::ingest::{
+    decode_put_descriptor, validate_put_batch_result, FlightPutBatch, FlightPutCommand,
+    FlightPutLimits,
+};
 use crate::query::{
     decode_query_descriptor, decode_query_ticket, encode_query_ticket, query_info,
     FlightQueryRequest, OPAQUE_TICKET_ID_BYTES,
@@ -67,6 +70,7 @@ const SESSION_ROLE_CAPABILITY: &str = "auth.session_roles.v1";
 const QUERY_CANCEL_CAPABILITY: &str = "query.cancel_flight_info.v1";
 const FLIGHT_SQL_METADATA_CAPABILITY: &str = "flight_sql.metadata.v1";
 const FLIGHT_MEMORY_INGEST_CAPABILITY: &str = "ingest.append.memory.v1";
+const FLIGHT_WAL_INGEST_CAPABILITY: &str = "ingest.append.wal.v1";
 const CANCEL_FLIGHT_INFO_ACTION: &str = "CancelFlightInfo";
 const MAX_HANDSHAKE_PAYLOAD_BYTES: usize = 4 * 1024;
 
@@ -90,6 +94,18 @@ pub trait PreparedFlightQuery: Send {
 
 /// Type-erased non-cloneable prepared query owned by the Flight ticket registry.
 pub type OpaquePreparedFlightQuery = Box<dyn PreparedFlightQuery>;
+
+/// One producer-fenced writer owned by exactly one Flight `DoPut` stream.
+pub trait FlightIngestWriter: Send {
+    /// Applies one bounded batch and returns its authoritative wire receipt.
+    fn write_batch(
+        &mut self,
+        batch: FlightPutBatch,
+    ) -> BoxFuture<'_, Result<crate::wire::PutBatchResult>>;
+}
+
+/// Type-erased stream-scoped Flight ingest writer.
+pub type OpaqueFlightIngestWriter = Box<dyn FlightIngestWriter>;
 
 /// Query planner boundary consumed by the protocol service.
 pub trait FlightQueryFrontend: Send + Sync + 'static {
@@ -143,14 +159,17 @@ pub trait FlightQueryFrontend: Send + Sync + 'static {
         })
     }
 
-    /// Applies one bounded append batch to the configured memory-durability backend.
-    fn write_batch(&self, batch: FlightPutBatch) -> BoxFuture<'_, Result<()>> {
+    /// Opens one stream-scoped producer-fenced append writer.
+    fn open_ingest_writer(
+        &self,
+        command: Arc<FlightPutCommand>,
+    ) -> BoxFuture<'_, Result<OpaqueFlightIngestWriter>> {
         Box::pin(async move {
             Err(ServerError::new(
                 ErrorCode::UnsupportedPlan,
                 "Flight ingest is not configured",
             )
-            .with_request_id(batch.command.put_id)
+            .with_request_id(command.put_id)
             .with_retryable(false))
         })
     }
@@ -538,6 +557,7 @@ impl ZippyFlightService {
         }
         if self.inner.config.ingest.is_some() {
             capabilities.push(FLIGHT_MEMORY_INGEST_CAPABILITY.to_owned());
+            capabilities.push(FLIGHT_WAL_INGEST_CAPABILITY.to_owned());
         }
         let metadata = self.inner.config.metadata;
         let ingest = self.inner.config.ingest;
@@ -861,6 +881,7 @@ impl ZippyFlightService {
         let mut batch_count = 0_usize;
         let mut total_rows = 0_u64;
         let mut total_bytes = 0_usize;
+        let mut writer: Option<OpaqueFlightIngestWriter> = None;
         while let Some(decoded) = decoder.next().await {
             let decoded = decoded.map_err(flight_decode_error)?;
             if decoded.inner.flight_descriptor.is_some() {
@@ -963,14 +984,24 @@ impl ZippyFlightService {
                     .with_request_id(command.put_id)
                     .with_retryable(true)
                 })?;
-            self.inner
-                .frontend
+            if writer.is_none() {
+                writer = Some(
+                    self.inner
+                        .frontend
+                        .open_ingest_writer(Arc::clone(&command))
+                        .await?,
+                );
+            }
+            let result = writer
+                .as_mut()
+                .expect("writer is installed before the first batch")
                 .write_batch(FlightPutBatch {
                     command: Arc::clone(&command),
                     batch_sequence,
                     batch,
                 })
                 .await?;
+            validate_put_batch_result(&command, batch_sequence, row_count, &result)?;
             drop(batch_permit);
 
             self.inner
@@ -986,9 +1017,7 @@ impl ZippyFlightService {
                 Ordering::Relaxed,
             );
             let result = PutResult {
-                app_metadata: Bytes::from(
-                    put_batch_result(&command, batch_sequence, row_count).encode_to_vec(),
-                ),
+                app_metadata: Bytes::from(result.encode_to_vec()),
             };
             if responses.send(Ok(result)).await.is_err() {
                 return Err(unavailable("Flight DoPut response consumer disconnected")

@@ -1,12 +1,17 @@
-//! Bounded Arrow Flight `DoPut` descriptors and memory-durability receipts.
+//! Bounded Arrow Flight `DoPut` descriptors and native ingest receipts.
 
 use arrow::record_batch::RecordBatch;
 use arrow_flight::flight_descriptor::DescriptorType;
 use arrow_flight::FlightDescriptor;
 use bytes::Bytes;
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use zippy_types::{ErrorCode, RequestId, Result, ServerError, SessionId};
+use zippy_types::ingest::{Durability, WriteReceipt};
+use zippy_types::{
+    ConnectionId, ErrorCode, LogOffset, OffsetRange, OffsetWatermark, ProducerId, RequestId,
+    Result, ServerError, SessionId,
+};
 
 use crate::query::STABLE_ID_BYTES;
 use crate::wire::{PutBatchResult, PutCommand, PutDurability, PutMutation};
@@ -25,7 +30,7 @@ pub const MAX_ROWS_PER_PUT: u64 = 1_000_000_000;
 /// Maximum configurable decoded bytes in one batch or complete `DoPut` stream.
 pub const MAX_BYTES_PER_PUT: usize = 4 * 1024 * 1024 * 1024;
 
-/// Validated append-only, memory-durability command for one `DoPut` stream.
+/// Validated append-only command for one `DoPut` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightPutCommand {
     /// Server-issued writer session bound to the request metadata.
@@ -36,6 +41,14 @@ pub struct FlightPutCommand {
     pub stream_name: String,
     /// Sequence assigned to the first decoded record batch.
     pub first_batch_sequence: u64,
+    /// Durable producer identity shared by reconnecting writer attempts.
+    pub producer_id: ProducerId,
+    /// Boot-scoped connection identity for this `DoPut` writer lease.
+    pub connection_id: ConnectionId,
+    /// Previously observed fencing epoch, when supplied by the client.
+    pub expected_writer_epoch: Option<u64>,
+    /// Durability boundary requested for every batch in this stream.
+    pub durability: Durability,
 }
 
 /// One decoded batch admitted to the configured Flight ingest frontend.
@@ -191,33 +204,260 @@ pub fn decode_put_command(command: PutCommand) -> Result<FlightPutCommand> {
                 .with_request_id(put_id),
         );
     }
-    if PutDurability::try_from(command.durability).ok() != Some(PutDurability::Memory) {
-        return Err(unsupported(
-            "Flight Stage 6.4 only acknowledges process-local memory durability",
-        )
-        .with_request_id(put_id));
-    }
+    let durability = match PutDurability::try_from(command.durability).ok() {
+        Some(PutDurability::Memory) => Durability::Memory,
+        Some(PutDurability::Wal) => Durability::Wal,
+        Some(PutDurability::Persisted) => {
+            return Err(unsupported(
+                "Flight persisted acknowledgement requires the future checkpoint pipeline",
+            )
+            .with_request_id(put_id));
+        }
+        Some(PutDurability::Unspecified) | None => {
+            return Err(
+                unsupported("Flight ingest requires explicit memory or WAL durability")
+                    .with_request_id(put_id),
+            );
+        }
+    };
+    let fallback_id = put_id.into_bytes();
+    let producer_id = if command.producer_id.is_empty() {
+        ProducerId::from_bytes(fallback_id)
+            .expect("a nonzero request identity is also a valid producer identity")
+    } else {
+        decode_id(&command.producer_id, ProducerId::from_bytes, "producer_id")?
+    };
+    let connection_id = if command.connection_id.is_empty() {
+        ConnectionId::from_bytes(fallback_id)
+            .expect("a nonzero request identity is also a valid connection identity")
+    } else {
+        decode_id(
+            &command.connection_id,
+            ConnectionId::from_bytes,
+            "connection_id",
+        )?
+    };
     Ok(FlightPutCommand {
         session_id,
         put_id,
         stream_name: command.stream_name,
         first_batch_sequence: command.first_batch_sequence,
+        producer_id,
+        connection_id,
+        expected_writer_epoch: command.expected_writer_epoch,
+        durability,
     })
 }
 
-/// Builds one stable memory-durability result for a successfully applied batch.
+/// Derives the native idempotency key for one zero-based batch position in a `DoPut` stream.
+#[must_use]
+pub fn put_batch_request_id(put_id: RequestId, batch_index: u64) -> RequestId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zippy-flight-put-batch-v1\0");
+    hasher.update(put_id.into_bytes());
+    hasher.update(batch_index.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; STABLE_ID_BYTES];
+    bytes.copy_from_slice(&digest[..STABLE_ID_BYTES]);
+    if bytes.iter().all(|value| *value == 0) {
+        bytes[STABLE_ID_BYTES - 1] = 1;
+    }
+    RequestId::from_bytes(bytes).expect("SHA-256-derived request identity is nonzero")
+}
+
+/// Builds one stable memory-durability compatibility result.
 #[must_use]
 pub fn put_batch_result(
     command: &FlightPutCommand,
     batch_sequence: u64,
     row_count: u64,
 ) -> PutBatchResult {
+    let batch_index = batch_sequence.saturating_sub(command.first_batch_sequence);
+    let (first_log_offset, last_log_offset, committed_log_offset) = if row_count == 0 {
+        (None, None, OffsetWatermark::Empty)
+    } else {
+        (
+            Some(0),
+            Some(row_count - 1),
+            OffsetWatermark::Known(zippy_types::LogOffset::new(row_count - 1)),
+        )
+    };
     PutBatchResult {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         put_id: Bytes::copy_from_slice(&command.put_id.into_bytes()),
         batch_sequence,
         row_count,
         durability_reached: PutDurability::Memory as i32,
+        request_id: Bytes::copy_from_slice(
+            &put_batch_request_id(command.put_id, batch_index).into_bytes(),
+        ),
+        producer_epoch: 1,
+        first_log_offset,
+        last_log_offset,
+        previous_log_offset: Some(watermark_to_wire(OffsetWatermark::Empty)),
+        committed_log_offset: Some(watermark_to_wire(committed_log_offset)),
+        persisted_snapshot_version: None,
+    }
+}
+
+/// Verifies that a frontend receipt exactly binds the submitted Flight batch and durability.
+pub fn validate_put_batch_result(
+    command: &FlightPutCommand,
+    batch_sequence: u64,
+    row_count: u64,
+    result: &PutBatchResult,
+) -> Result<()> {
+    let batch_index = batch_sequence
+        .checked_sub(command.first_batch_sequence)
+        .ok_or_else(|| internal_receipt(command, "batch sequence precedes command prefix"))?;
+    let expected_request_id = put_batch_request_id(command.put_id, batch_index);
+    if result.protocol_version != CURRENT_PROTOCOL_VERSION
+        || result.put_id.as_ref() != command.put_id.into_bytes()
+        || result.batch_sequence != batch_sequence
+        || result.row_count != row_count
+        || result.request_id.as_ref() != expected_request_id.into_bytes()
+        || result.producer_epoch == 0
+    {
+        return Err(internal_receipt(
+            command,
+            "frontend receipt identity or batch metadata mismatch",
+        ));
+    }
+    let reached = match PutDurability::try_from(result.durability_reached).ok() {
+        Some(PutDurability::Memory) => Durability::Memory,
+        Some(PutDurability::Wal) => Durability::Wal,
+        Some(PutDurability::Persisted) => Durability::Persisted,
+        Some(PutDurability::Unspecified) | None => {
+            return Err(internal_receipt(
+                command,
+                "frontend receipt has unknown durability",
+            ));
+        }
+    };
+    if !reached.satisfies(command.durability) {
+        return Err(internal_receipt(
+            command,
+            "frontend receipt did not reach requested durability",
+        ));
+    }
+    let offsets = match (result.first_log_offset, result.last_log_offset) {
+        (None, None) => None,
+        (Some(first), Some(last)) => Some(
+            OffsetRange::new(LogOffset::new(first), LogOffset::new(last)).map_err(|_| {
+                internal_receipt(command, "frontend receipt offset range is invalid")
+            })?,
+        ),
+        _ => {
+            return Err(internal_receipt(
+                command,
+                "frontend receipt contains a partial logical offset range",
+            ));
+        }
+    };
+    let previous = result
+        .previous_log_offset
+        .as_ref()
+        .ok_or_else(|| internal_receipt(command, "frontend receipt omitted previous watermark"))
+        .and_then(|value| decode_watermark(command, value))?;
+    let committed = result
+        .committed_log_offset
+        .as_ref()
+        .ok_or_else(|| internal_receipt(command, "frontend receipt omitted committed watermark"))
+        .and_then(|value| decode_watermark(command, value))?;
+    WriteReceipt::new(
+        expected_request_id,
+        batch_sequence,
+        row_count,
+        offsets,
+        previous,
+        committed,
+        reached,
+        result.persisted_snapshot_version,
+    )
+    .map_err(|error| {
+        internal_receipt(
+            command,
+            &format!("frontend receipt invariants failed error=[{error}]"),
+        )
+    })?;
+    Ok(())
+}
+
+fn decode_watermark(
+    command: &FlightPutCommand,
+    value: &crate::wire::OffsetWatermark,
+) -> Result<OffsetWatermark> {
+    use crate::wire::offset_watermark::State;
+
+    match State::try_from(value.state).ok() {
+        Some(State::Empty) if value.offset == 0 => Ok(OffsetWatermark::Empty),
+        Some(State::Known) => Ok(OffsetWatermark::Known(LogOffset::new(value.offset))),
+        Some(State::LegacyUnknown) => Err(internal_receipt(
+            command,
+            "frontend receipt contains a legacy-unknown watermark",
+        )),
+        Some(State::Empty | State::Unspecified) | None => Err(internal_receipt(
+            command,
+            "frontend receipt watermark state is invalid",
+        )),
+    }
+}
+
+fn internal_receipt(command: &FlightPutCommand, message: &str) -> ServerError {
+    ServerError::new(
+        ErrorCode::Internal,
+        format!("invalid Flight ingest frontend receipt reason=[{message}]"),
+    )
+    .with_request_id(command.put_id)
+    .with_retryable(false)
+}
+
+/// Converts an authoritative native receipt into the versioned Flight batch result.
+#[must_use]
+pub fn put_batch_result_from_receipt(
+    command: &FlightPutCommand,
+    batch_sequence: u64,
+    producer_epoch: u64,
+    receipt: &WriteReceipt,
+) -> PutBatchResult {
+    let (first_log_offset, last_log_offset) = receipt.offsets().map_or((None, None), |offsets| {
+        (Some(offsets.first().get()), Some(offsets.last().get()))
+    });
+    PutBatchResult {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        put_id: Bytes::copy_from_slice(&command.put_id.into_bytes()),
+        batch_sequence,
+        row_count: receipt.row_count(),
+        durability_reached: durability_to_wire(receipt.durability_reached()) as i32,
+        request_id: Bytes::copy_from_slice(&receipt.request_id().into_bytes()),
+        producer_epoch,
+        first_log_offset,
+        last_log_offset,
+        previous_log_offset: Some(watermark_to_wire(receipt.previous_log_offset())),
+        committed_log_offset: Some(watermark_to_wire(receipt.committed_log_offset())),
+        persisted_snapshot_version: receipt.persisted_snapshot_version(),
+    }
+}
+
+fn durability_to_wire(durability: Durability) -> PutDurability {
+    match durability {
+        Durability::Memory => PutDurability::Memory,
+        Durability::Wal => PutDurability::Wal,
+        Durability::Persisted => PutDurability::Persisted,
+    }
+}
+
+fn watermark_to_wire(value: OffsetWatermark) -> crate::wire::OffsetWatermark {
+    use crate::wire::offset_watermark::State;
+
+    let (state, offset) = match value {
+        OffsetWatermark::Empty => (State::Empty, 0),
+        OffsetWatermark::Known(offset) => (State::Known, offset.get()),
+        OffsetWatermark::LegacyUnknown => (State::LegacyUnknown, 0),
+    };
+    crate::wire::OffsetWatermark {
+        state: state as i32,
+        offset,
     }
 }
 
@@ -246,9 +486,16 @@ fn unsupported(message: impl Into<String>) -> ServerError {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use zippy_types::{ErrorCode, RequestId, SessionId};
+    use zippy_types::ingest::{Durability, WriteReceipt};
+    use zippy_types::{
+        ConnectionId, ErrorCode, LogOffset, OffsetRange, OffsetWatermark, ProducerId, RequestId,
+        SessionId,
+    };
 
-    use super::{decode_put_command, FlightPutLimits};
+    use super::{
+        decode_put_command, put_batch_request_id, put_batch_result_from_receipt,
+        validate_put_batch_result, FlightPutLimits,
+    };
     use crate::wire::{PutCommand, PutDurability, PutMutation};
     use crate::CURRENT_PROTOCOL_VERSION;
 
@@ -261,11 +508,14 @@ mod tests {
             first_batch_sequence: 7,
             mutation: PutMutation::Append as i32,
             durability: PutDurability::Memory as i32,
+            producer_id: Bytes::new(),
+            connection_id: Bytes::new(),
+            expected_writer_epoch: None,
         }
     }
 
     #[test]
-    fn command_requires_explicit_append_memory_semantics_and_nonzero_ids() {
+    fn command_requires_explicit_append_supported_durability_and_nonzero_ids() {
         let decoded = decode_put_command(command()).unwrap();
         assert_eq!(decoded.stream_name, "ticks");
         assert_eq!(decoded.first_batch_sequence, 7);
@@ -282,6 +532,63 @@ mod tests {
         assert_eq!(
             decode_put_command(nil).unwrap_err().code(),
             ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn command_accepts_wal_with_explicit_fencing_ids_and_rejects_persisted() {
+        let producer_id = ProducerId::from_u128(3).unwrap();
+        let connection_id = ConnectionId::from_u128(4).unwrap();
+        let mut wal = command();
+        wal.durability = PutDurability::Wal as i32;
+        wal.producer_id = Bytes::copy_from_slice(&producer_id.into_bytes());
+        wal.connection_id = Bytes::copy_from_slice(&connection_id.into_bytes());
+        wal.expected_writer_epoch = Some(9);
+
+        let decoded = decode_put_command(wal).unwrap();
+        assert_eq!(decoded.durability, Durability::Wal);
+        assert_eq!(decoded.producer_id, producer_id);
+        assert_eq!(decoded.connection_id, connection_id);
+        assert_eq!(decoded.expected_writer_epoch, Some(9));
+
+        let mut persisted = command();
+        persisted.durability = PutDurability::Persisted as i32;
+        assert_eq!(
+            decode_put_command(persisted).unwrap_err().code(),
+            ErrorCode::UnsupportedPlan
+        );
+    }
+
+    #[test]
+    fn native_receipt_round_trip_uses_stable_batch_ids_and_validates_watermarks() {
+        let mut wire = command();
+        wire.durability = PutDurability::Wal as i32;
+        let decoded = decode_put_command(wire).unwrap();
+        let request_id = put_batch_request_id(decoded.put_id, 0);
+        assert_eq!(request_id, put_batch_request_id(decoded.put_id, 0));
+        assert_ne!(request_id, put_batch_request_id(decoded.put_id, 1));
+
+        let receipt = WriteReceipt::new(
+            request_id,
+            0,
+            2,
+            Some(OffsetRange::new(LogOffset::new(0), LogOffset::new(1)).unwrap()),
+            OffsetWatermark::Empty,
+            OffsetWatermark::Known(LogOffset::new(1)),
+            Durability::Wal,
+            None,
+        )
+        .unwrap();
+        let result = put_batch_result_from_receipt(&decoded, 7, 3, &receipt);
+        validate_put_batch_result(&decoded, 7, 2, &result).unwrap();
+
+        let mut malformed = result;
+        malformed.committed_log_offset.as_mut().unwrap().offset = 0;
+        assert_eq!(
+            validate_put_batch_result(&decoded, 7, 2, &malformed)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Internal
         );
     }
 

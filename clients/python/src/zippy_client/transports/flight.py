@@ -1,7 +1,8 @@
-"""Arrow Flight query and bounded in-memory ingest transport."""
+"""Arrow Flight query and bounded producer-fenced ingest transport."""
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 import threading
@@ -31,6 +32,7 @@ CAPABILITIES_ACTION = "zippy.capabilities.v1"
 QUERY_CAPABILITY = "query.get_flight_info_do_get.v1"
 STRUCTURED_ERROR_CAPABILITY = "error.details.v1"
 MEMORY_INGEST_CAPABILITY = "ingest.append.memory.v1"
+WAL_INGEST_CAPABILITY = "ingest.append.wal.v1"
 
 _SESSION_METADATA_KEY = b"x-zippy-session-id"
 _AUTHORIZATION_METADATA_KEY = b"authorization"
@@ -78,6 +80,15 @@ class FlightCapabilities:
             and MEMORY_INGEST_CAPABILITY in self.names
         )
 
+    @property
+    def wal_ingest(self) -> bool:
+        """Return whether authenticated append + WAL ingest is usable."""
+        return (
+            self.ingest_enabled
+            and self.writer_authentication_enabled
+            and WAL_INGEST_CAPABILITY in self.names
+        )
+
 
 @dataclass(frozen=True)
 class _Session:
@@ -92,6 +103,26 @@ class _RoleConnection:
     client: flight.FlightClient
     session: _Session
     auth_handler: _SessionAuthHandler | None
+
+
+@dataclass
+class _ActivePut:
+    stream_name: str
+    schema: pa.Schema
+    durability: str
+    producer_id: bytes
+    connection_id: bytes
+    put_id: bytes
+    writer: Any
+    metadata_reader: Any
+    first_batch_sequence: int
+    next_batch_sequence: int
+    retire_at_ns: int
+    deadline_at_ns: int
+    batch_count: int = 0
+    row_count: int = 0
+    byte_count: int = 0
+    producer_epoch: int | None = None
 
 
 class _SessionAuthHandler(flight.ClientAuthHandler):
@@ -126,7 +157,7 @@ class _SessionAuthHandler(flight.ClientAuthHandler):
 
 class FlightTransport:
     """
-    Execute server-owned queries and memory-durable writes through Arrow Flight.
+    Execute server-owned queries and producer-fenced writes through Arrow Flight.
 
     :param endpoint: Connectable ``host:port`` Flight endpoint.
     :type endpoint: str
@@ -181,8 +212,10 @@ class FlightTransport:
         self._private_key = private_key
         self._override_hostname = override_hostname
         self._connection_lock = threading.RLock()
+        self._put_lock = threading.RLock()
         self._read_connection: _RoleConnection | None = None
         self._writer_connection: _RoleConnection | None = None
+        self._active_puts: dict[bytes, _ActivePut] = {}
         self._closed = False
         discovery = self._new_client()
         try:
@@ -273,9 +306,18 @@ class FlightTransport:
         table: pa.Table,
         *,
         first_batch_sequence: int = 0,
+        durability: str = "wal",
+        producer_id: bytes | str | uuid.UUID | None = None,
+        connection_id: bytes | str | uuid.UUID | None = None,
+        expected_writer_epoch: int | None = None,
     ) -> list[dict[str, object]]:
-        """Append one Arrow table using one or more bounded Flight DoPut streams."""
-        if not self.capabilities.memory_ingest:
+        """Append one Arrow table using bounded producer-fenced Flight DoPut streams."""
+        durability = str(durability).strip().lower()
+        if durability not in {"memory", "wal"}:
+            raise ValueError("durability must be 'memory' or 'wal'")
+        if durability == "wal" and not self.capabilities.wal_ingest:
+            raise CapabilityError("Flight listener does not advertise append + WAL ingest")
+        if durability == "memory" and not self.capabilities.memory_ingest:
             raise CapabilityError("Flight listener does not advertise append + memory ingest")
         if not isinstance(table, pa.Table):
             raise TypeError("Flight write_table requires a pyarrow.Table")
@@ -283,29 +325,69 @@ class FlightTransport:
             return []
         if first_batch_sequence < 0:
             raise ValueError("first_batch_sequence must be non-negative")
+        if expected_writer_epoch is not None and expected_writer_epoch < 0:
+            raise ValueError("expected_writer_epoch must be non-negative or None")
+        producer_id_bytes = (
+            uuid.uuid4().bytes
+            if producer_id is None
+            else _stable_id_bytes(producer_id, "producer_id")
+        )
+        if connection_id is None:
+            keep_open = False
+            connection_id_bytes = uuid.uuid4().bytes
+        else:
+            keep_open = True
+            connection_id_bytes = _stable_id_bytes(connection_id, "connection_id")
         batches = list(self._bounded_batches(table))
         receipts: list[dict[str, object]] = []
         sequence = int(first_batch_sequence)
-        for group in self._put_groups(batches):
-            try:
-                group_receipts = self._write_put(
+        writer_epoch = expected_writer_epoch
+        try:
+            for batch in batches:
+                receipt = self._write_put_batch(
                     str(stream_name),
                     table.schema,
-                    group,
-                    first_batch_sequence=sequence,
+                    batch,
+                    batch_sequence=sequence,
+                    durability=durability,
+                    producer_id=producer_id_bytes,
+                    connection_id=connection_id_bytes,
+                    expected_writer_epoch=writer_epoch,
                 )
-            except AmbiguousWriteError as error:
-                raise AmbiguousWriteError(
-                    "Flight write stopped after an ambiguous partial commit; "
-                    "do not retry the original table blindly",
-                    receipts=[*receipts, *error.receipts],
-                ) from error
-            receipts.extend(group_receipts)
-            sequence += len(group)
+                receipts.append(receipt)
+                producer_epoch = receipt.get("producer_epoch")
+                if not isinstance(producer_epoch, int) or producer_epoch <= 0:
+                    raise ProtocolError("Flight DoPut receipt has an invalid producer epoch")
+                writer_epoch = producer_epoch
+                sequence += 1
+            if not keep_open:
+                with self._put_lock:
+                    self._close_write_locked(connection_id_bytes)
+        except AmbiguousWriteError as error:
+            raise AmbiguousWriteError(
+                "Flight write stopped after an ambiguous partial commit; "
+                "do not retry the original table blindly",
+                receipts=[*receipts, *error.receipts],
+            ) from error
         return receipts
 
+    def close_write(self, connection_id: bytes | str | uuid.UUID) -> None:
+        """Finish one reusable logical DoPut connection after all receipts were consumed."""
+        connection_id_bytes = _stable_id_bytes(connection_id, "connection_id")
+        with self._put_lock:
+            self._retire_write_locked(connection_id_bytes)
+
     def close(self) -> None:
-        """Close all role-specific Flight channels."""
+        """Close reusable puts and all role-specific Flight channels."""
+        close_error: BaseException | None = None
+        with self._put_lock:
+            active_connections = list(self._active_puts)
+            for connection_id in active_connections:
+                try:
+                    self._retire_write_locked(connection_id)
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
         with self._connection_lock:
             if self._closed:
                 return
@@ -323,6 +405,213 @@ class FlightTransport:
                 continue
             seen.add(id(client))
             client.close()
+        if close_error is not None:
+            raise close_error
+
+    def _write_put_batch(
+        self,
+        stream_name: str,
+        schema: pa.Schema,
+        batch: pa.RecordBatch,
+        *,
+        batch_sequence: int,
+        durability: str,
+        producer_id: bytes,
+        connection_id: bytes,
+        expected_writer_epoch: int | None,
+    ) -> dict[str, object]:
+        with self._put_lock:
+            if (
+                self.capabilities.ingest_max_batches_per_put <= 0
+                or self.capabilities.ingest_max_rows_per_put <= 0
+                or self.capabilities.ingest_max_bytes_per_put <= 0
+            ):
+                raise ProtocolError("Flight ingest capabilities contain invalid per-put limits")
+            if (
+                batch.num_rows > self.capabilities.ingest_max_rows_per_put
+                or batch.nbytes > self.capabilities.ingest_max_bytes_per_put
+            ):
+                raise CapabilityError(
+                    "one Flight batch exceeds the server per-put limit "
+                    f"rows=[{batch.num_rows}] bytes=[{batch.nbytes}]"
+                )
+            active = self._active_puts.get(connection_id)
+            if active is not None and not self._put_matches(
+                active,
+                stream_name=stream_name,
+                schema=schema,
+                batch_sequence=batch_sequence,
+                durability=durability,
+                producer_id=producer_id,
+                expected_writer_epoch=expected_writer_epoch,
+            ):
+                self._retire_write_locked(connection_id)
+                active = None
+            if active is not None and not self._put_has_capacity(active, batch):
+                self._retire_write_locked(connection_id)
+                active = None
+            if active is None:
+                active = self._open_put(
+                    stream_name,
+                    schema,
+                    first_batch_sequence=batch_sequence,
+                    durability=durability,
+                    producer_id=producer_id,
+                    connection_id=connection_id,
+                    expected_writer_epoch=expected_writer_epoch,
+                )
+                self._active_puts[connection_id] = active
+            try:
+                self._invoke(
+                    "DoPut.write_batch",
+                    lambda: _write_batch(active.writer, batch),
+                )
+                metadata = self._invoke("DoPut.read_receipt", active.metadata_reader.read)
+                if metadata is None:
+                    raise ProtocolError("Flight DoPut ended before returning every batch receipt")
+                receipt = _decode_put_receipt(
+                    metadata,
+                    put_id=active.put_id,
+                    expected_sequence=batch_sequence,
+                    expected_rows=batch.num_rows,
+                    expected_batch_index=active.batch_count,
+                    requested_durability=durability,
+                )
+            except BaseException as error:
+                self._active_puts.pop(connection_id, None)
+                try:
+                    active.writer.close()
+                except BaseException:
+                    pass
+                raise AmbiguousWriteError(
+                    "Flight DoPut stopped before the current batch outcome was certain",
+                    receipts=[],
+                ) from error
+            active.batch_count += 1
+            active.row_count += batch.num_rows
+            active.byte_count += batch.nbytes
+            active.next_batch_sequence += 1
+            producer_epoch = receipt.get("producer_epoch")
+            if not isinstance(producer_epoch, int) or producer_epoch <= 0:
+                raise ProtocolError("Flight DoPut receipt has an invalid producer epoch")
+            active.producer_epoch = producer_epoch
+            return receipt
+
+    def _open_put(
+        self,
+        stream_name: str,
+        schema: pa.Schema,
+        *,
+        first_batch_sequence: int,
+        durability: str,
+        producer_id: bytes,
+        connection_id: bytes,
+        expected_writer_epoch: int | None,
+    ) -> _ActivePut:
+        connection = self._connection("writer")
+        put_id = uuid.uuid4().bytes
+        command = wire.PutCommand(
+            protocol_version=FLIGHT_PROTOCOL_VERSION,
+            session_id=connection.session.session_id,
+            put_id=put_id,
+            stream_name=stream_name,
+            first_batch_sequence=first_batch_sequence,
+            mutation=wire.PUT_MUTATION_APPEND,
+            durability=(
+                wire.PUT_DURABILITY_WAL if durability == "wal" else wire.PUT_DURABILITY_MEMORY
+            ),
+            producer_id=producer_id,
+            connection_id=connection_id,
+        )
+        if expected_writer_epoch is not None:
+            command.expected_writer_epoch = expected_writer_epoch
+        descriptor = flight.FlightDescriptor.for_command(command.SerializeToString())
+        options = self._call_options(connection)
+        writer, metadata_reader = self._invoke(
+            "DoPut",
+            lambda: connection.client.do_put(descriptor, schema, options),
+        )
+        opened_ns = time.perf_counter_ns()
+        timeout_ns = max(1, int(self.timeout_sec * 1_000_000_000))
+        return _ActivePut(
+            stream_name=stream_name,
+            schema=schema,
+            durability=durability,
+            producer_id=producer_id,
+            connection_id=connection_id,
+            put_id=put_id,
+            writer=writer,
+            metadata_reader=metadata_reader,
+            first_batch_sequence=first_batch_sequence,
+            next_batch_sequence=first_batch_sequence,
+            retire_at_ns=opened_ns + max(1, timeout_ns * 4 // 5),
+            deadline_at_ns=opened_ns + timeout_ns,
+        )
+
+    def _put_matches(
+        self,
+        active: _ActivePut,
+        *,
+        stream_name: str,
+        schema: pa.Schema,
+        batch_sequence: int,
+        durability: str,
+        producer_id: bytes,
+        expected_writer_epoch: int | None,
+    ) -> bool:
+        return (
+            active.stream_name == stream_name
+            and active.schema.equals(schema, check_metadata=True)
+            and active.next_batch_sequence == batch_sequence
+            and active.durability == durability
+            and active.producer_id == producer_id
+            and (
+                expected_writer_epoch is None
+                or active.producer_epoch is None
+                or active.producer_epoch == expected_writer_epoch
+            )
+        )
+
+    def _put_has_capacity(self, active: _ActivePut, batch: pa.RecordBatch) -> bool:
+        return (
+            time.perf_counter_ns() < active.retire_at_ns
+            and active.batch_count < self.capabilities.ingest_max_batches_per_put
+            and active.row_count + batch.num_rows <= self.capabilities.ingest_max_rows_per_put
+            and active.byte_count + batch.nbytes <= self.capabilities.ingest_max_bytes_per_put
+        )
+
+    def _retire_write_locked(self, connection_id: bytes) -> None:
+        active = self._active_puts.get(connection_id)
+        if active is None:
+            return
+        if time.perf_counter_ns() < active.deadline_at_ns:
+            self._close_write_locked(connection_id)
+            return
+        self._active_puts.pop(connection_id, None)
+        try:
+            active.writer.close()
+        except BaseException:
+            pass
+
+    def _close_write_locked(self, connection_id: bytes) -> None:
+        active = self._active_puts.pop(connection_id, None)
+        if active is None:
+            return
+        try:
+            self._invoke("DoPut.done_writing", active.writer.done_writing)
+            terminal = self._invoke("DoPut.read_terminal", active.metadata_reader.read)
+            if terminal is not None:
+                raise ProtocolError("Flight DoPut returned unexpected trailing metadata")
+        except BaseException as error:
+            try:
+                active.writer.close()
+            except BaseException:
+                pass
+            raise AmbiguousWriteError(
+                "Flight DoPut could not confirm a clean terminal boundary",
+                receipts=[],
+            ) from error
+        self._invoke("DoPut.close", active.writer.close)
 
     def _discover_capabilities(self, client: flight.FlightClient) -> FlightCapabilities:
         request = wire.CapabilitiesRequest(protocol_version=FLIGHT_PROTOCOL_VERSION)
@@ -471,95 +760,6 @@ class FlightTransport:
             raise ProtocolError("Flight ingest capabilities contain invalid batch limits")
         for batch in table.to_batches(max_chunksize=row_limit):
             yield from _split_batch_by_bytes(batch, byte_limit)
-
-    def _put_groups(self, batches: list[pa.RecordBatch]) -> Iterable[list[pa.RecordBatch]]:
-        max_batches = self.capabilities.ingest_max_batches_per_put
-        max_rows = self.capabilities.ingest_max_rows_per_put
-        max_bytes = self.capabilities.ingest_max_bytes_per_put
-        if min(max_batches, max_rows, max_bytes) <= 0:
-            raise ProtocolError("Flight ingest capabilities contain invalid per-put limits")
-        group: list[pa.RecordBatch] = []
-        rows = 0
-        size = 0
-        for batch in batches:
-            would_overflow = group and (
-                len(group) >= max_batches
-                or rows + batch.num_rows > max_rows
-                or size + batch.nbytes > max_bytes
-            )
-            if would_overflow:
-                yield group
-                group, rows, size = [], 0, 0
-            if batch.num_rows > max_rows or batch.nbytes > max_bytes:
-                raise CapabilityError(
-                    "one Flight batch exceeds the server per-put limit "
-                    f"rows=[{batch.num_rows}] bytes=[{batch.nbytes}]"
-                )
-            group.append(batch)
-            rows += batch.num_rows
-            size += batch.nbytes
-        if group:
-            yield group
-
-    def _write_put(
-        self,
-        stream_name: str,
-        schema: pa.Schema,
-        batches: list[pa.RecordBatch],
-        *,
-        first_batch_sequence: int,
-    ) -> list[dict[str, object]]:
-        connection = self._connection("writer")
-        put_id = uuid.uuid4().bytes
-        command = wire.PutCommand(
-            protocol_version=FLIGHT_PROTOCOL_VERSION,
-            session_id=connection.session.session_id,
-            put_id=put_id,
-            stream_name=stream_name,
-            first_batch_sequence=first_batch_sequence,
-            mutation=wire.PUT_MUTATION_APPEND,
-            durability=wire.PUT_DURABILITY_MEMORY,
-        )
-        descriptor = flight.FlightDescriptor.for_command(command.SerializeToString())
-        options = self._call_options(connection)
-        writer, metadata_reader = self._invoke(
-            "DoPut",
-            lambda: connection.client.do_put(descriptor, schema, options),
-        )
-        receipts: list[dict[str, object]] = []
-        try:
-            for index, batch in enumerate(batches):
-                self._invoke(
-                    "DoPut.write_batch",
-                    lambda: _write_batch(writer, batch),
-                )
-                metadata = self._invoke("DoPut.read_receipt", metadata_reader.read)
-                if metadata is None:
-                    raise ProtocolError("Flight DoPut ended before returning every batch receipt")
-                receipt = _decode_put_receipt(
-                    metadata,
-                    put_id=put_id,
-                    expected_sequence=first_batch_sequence + index,
-                    expected_rows=batch.num_rows,
-                )
-                receipts.append(receipt)
-            self._invoke("DoPut.done_writing", writer.done_writing)
-            terminal = self._invoke("DoPut.read_terminal", metadata_reader.read)
-            if terminal is not None:
-                raise ProtocolError("Flight DoPut returned unexpected trailing metadata")
-        except BaseException as error:
-            try:
-                writer.close()
-            except BaseException:
-                pass
-            raise AmbiguousWriteError(
-                "Flight DoPut stopped after an ambiguous partial commit; "
-                "only returned receipts are known to be acknowledged",
-                receipts=receipts,
-            ) from error
-        else:
-            self._invoke("DoPut.close", writer.close)
-        return receipts
 
     @staticmethod
     def _invoke(operation: str, function: Callable[[], _T]) -> _T:
@@ -735,6 +935,8 @@ def _decode_put_receipt(
     put_id: bytes,
     expected_sequence: int,
     expected_rows: int,
+    expected_batch_index: int,
+    requested_durability: str,
 ) -> dict[str, object]:
     receipt = wire.PutBatchResult()
     try:
@@ -755,14 +957,96 @@ def _decode_put_receipt(
             "Flight DoPut receipt row count differs from the submitted batch "
             f"expected=[{expected_rows}] actual=[{receipt.row_count}]"
         )
-    if receipt.durability_reached != wire.PUT_DURABILITY_MEMORY:
-        raise ProtocolError("Flight DoPut did not acknowledge memory durability")
+    expected_request_id = _put_batch_request_id(put_id, expected_batch_index)
+    if bytes(receipt.request_id) != expected_request_id:
+        raise ProtocolError("Flight DoPut receipt request_id differs from the batch identity")
+    if receipt.producer_epoch <= 0:
+        raise ProtocolError("Flight DoPut receipt has no producer epoch")
+    requested = (
+        wire.PUT_DURABILITY_WAL if requested_durability == "wal" else wire.PUT_DURABILITY_MEMORY
+    )
+    if receipt.durability_reached < requested:
+        raise ProtocolError(
+            "Flight DoPut did not reach requested durability "
+            f"requested=[{requested_durability}] actual=[{receipt.durability_reached}]"
+        )
+    durability_names = {
+        wire.PUT_DURABILITY_MEMORY: "memory",
+        wire.PUT_DURABILITY_WAL: "wal",
+        wire.PUT_DURABILITY_PERSISTED: "persisted",
+    }
+    durability = durability_names.get(receipt.durability_reached)
+    if durability is None:
+        raise ProtocolError("Flight DoPut receipt contains an unknown durability")
+    has_first_offset = receipt.HasField("first_log_offset")
+    has_last_offset = receipt.HasField("last_log_offset")
+    if has_first_offset != has_last_offset:
+        raise ProtocolError("Flight DoPut receipt contains a partial logical offset range")
+    has_offsets = has_first_offset and has_last_offset
+    if expected_rows > 0 and not has_offsets:
+        raise ProtocolError("Flight DoPut receipt omitted the logical offset range")
+    if expected_rows == 0 and has_offsets:
+        raise ProtocolError("Flight DoPut zero-row receipt unexpectedly assigned offsets")
+    first_offset = int(receipt.first_log_offset) if has_offsets else None
+    last_offset = int(receipt.last_log_offset) if has_offsets else None
+    if has_offsets:
+        if first_offset is None or last_offset is None:
+            raise ProtocolError("Flight DoPut receipt offset presence is inconsistent")
+        if last_offset - first_offset + 1 != expected_rows:
+            raise ProtocolError("Flight DoPut receipt offset width differs from the row count")
+    if not receipt.HasField("previous_log_offset") or not receipt.HasField("committed_log_offset"):
+        raise ProtocolError("Flight DoPut receipt omitted its logical watermarks")
+    previous_offset = _decode_put_watermark(receipt.previous_log_offset)
+    committed_offset = _decode_put_watermark(receipt.committed_log_offset)
+    if expected_rows > 0:
+        if first_offset is None or last_offset is None:
+            raise ProtocolError("Flight DoPut receipt omitted the logical offset range")
+        expected_first_offset = 0 if previous_offset is None else previous_offset + 1
+        if first_offset != expected_first_offset:
+            raise ProtocolError(
+                "Flight DoPut offset range does not continue its previous watermark"
+            )
+        if committed_offset != last_offset:
+            raise ProtocolError("Flight DoPut committed watermark differs from the offset range")
+    elif previous_offset != committed_offset:
+        raise ProtocolError("Flight DoPut zero-row receipt changed its logical watermark")
+    has_snapshot = receipt.HasField("persisted_snapshot_version")
+    if (durability == "persisted") != has_snapshot:
+        raise ProtocolError("Flight DoPut receipt durability and persisted snapshot disagree")
     return {
         "put_id": str(uuid.UUID(bytes=put_id)),
+        "request_id": str(uuid.UUID(bytes=expected_request_id)),
         "batch_sequence": int(receipt.batch_sequence),
         "row_count": int(receipt.row_count),
-        "durability": "memory",
+        "durability": durability,
+        "producer_epoch": int(receipt.producer_epoch),
+        "first_log_offset": first_offset,
+        "last_log_offset": last_offset,
+        "previous_log_offset": previous_offset,
+        "committed_log_offset": committed_offset,
+        "persisted_snapshot_version": (
+            int(receipt.persisted_snapshot_version) if has_snapshot else None
+        ),
     }
+
+
+def _put_batch_request_id(put_id: bytes, batch_index: int) -> bytes:
+    hasher = hashlib.sha256()
+    hasher.update(b"zippy-flight-put-batch-v1\0")
+    hasher.update(put_id)
+    hasher.update(int(batch_index).to_bytes(8, "little", signed=False))
+    result = bytearray(hasher.digest()[:16])
+    if result == bytearray(16):
+        result[-1] = 1
+    return bytes(result)
+
+
+def _decode_put_watermark(value: wire.OffsetWatermark) -> int | None:
+    if value.state == wire.OffsetWatermark.STATE_EMPTY and value.offset == 0:
+        return None
+    if value.state == wire.OffsetWatermark.STATE_KNOWN:
+        return int(value.offset)
+    raise ProtocolError("Flight DoPut receipt contains an unsupported logical watermark")
 
 
 def _split_batch_by_bytes(batch: pa.RecordBatch, limit: int) -> Iterable[pa.RecordBatch]:

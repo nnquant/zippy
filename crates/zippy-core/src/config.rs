@@ -1856,12 +1856,19 @@ impl ZippyConfig {
                 });
             }
             ZippyCatalogBackend::SqliteShadow => {}
-            ZippyCatalogBackend::Sqlite => {
+            ZippyCatalogBackend::Sqlite if !self.server.native_storage_enabled => {
                 return Err(ZippyError::InvalidConfig {
-                    reason: "catalog sqlite authority is not available before explicit cutover"
+                    reason: "catalog sqlite authority requires server native_storage_enabled"
                         .to_string(),
                 });
             }
+            ZippyCatalogBackend::Sqlite if self.gateway.enabled => {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "catalog sqlite authority does not support the legacy Gateway"
+                        .to_string(),
+                });
+            }
+            ZippyCatalogBackend::Sqlite => {}
         }
         if self.runtime.max_cpu_cores == 0 || self.runtime.max_cpu_cores > MAX_CPU_CORES {
             return Err(ZippyError::InvalidConfig {
@@ -1983,9 +1990,14 @@ impl ZippyConfig {
                 reason: "flight query frontend requires query native_enabled".to_string(),
             });
         }
-        if self.query.native_enabled && self.catalog.backend != ZippyCatalogBackend::SqliteShadow {
+        if self.query.native_enabled
+            && !matches!(
+                self.catalog.backend,
+                ZippyCatalogBackend::SqliteShadow | ZippyCatalogBackend::Sqlite
+            )
+        {
             return Err(ZippyError::InvalidConfig {
-                reason: "native query frontend requires catalog sqlite_shadow backend until explicit cutover"
+                reason: "native query frontend requires catalog sqlite_shadow or sqlite backend"
                     .to_string(),
             });
         }
@@ -2614,6 +2626,11 @@ fn validate_flight(config: &ZippyConfig) -> Result<()> {
             return Err(ZippyError::InvalidConfig {
                 reason: "flight ingest requires exactly one writer bootstrap token source"
                     .to_string(),
+            });
+        }
+        if config.catalog.backend != ZippyCatalogBackend::Sqlite {
+            return Err(ZippyError::InvalidConfig {
+                reason: "native Flight ingest requires catalog sqlite authority".to_string(),
             });
         }
     }

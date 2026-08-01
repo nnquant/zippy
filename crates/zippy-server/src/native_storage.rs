@@ -1,6 +1,7 @@
 //! Server-owned lifecycle for the SQLite Catalog and native manifest storage.
 
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -11,12 +12,15 @@ use zippy_catalog::{
     decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig,
     SqliteCatalogLegacyReconcileHandle, SqliteCatalogReadHandle,
     SqliteCatalogRuntimeSnapshotPinAdmissionControl, SqliteCatalogRuntimeSnapshotPinRecord,
-    SqliteCatalogRuntimeSnapshotPinStatus,
+    SqliteCatalogRuntimeSnapshotPinStatus, SqliteCatalogWriteHandle,
 };
 use zippy_core::OwnedDataDirectory;
 use zippy_ingest::{
-    TableActorAdmissionControl, TableActorHandle, TableActorRegistry, TableActorRegistryConfig,
-    TableActorRegistryHandle, TableRuntimeBootstrap, TableRuntimeRegistry,
+    NativeAppendMaterializerConfig, NativeAppendMaterializerSink, NativeIngestConfig,
+    NativeIngestHandle, NativeIngestRuntime, NativeIngestShutdownOutcome, NativeIngestStatus,
+    NativeIngestTableBootstrap, TableActorAdmissionControl, TableActorHandle, TableActorRegistry,
+    TableActorRegistryConfig, TableActorRegistryHandle, TableRuntimeBootstrap,
+    TableRuntimeRegistry,
 };
 use zippy_storage::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, ParquetCandidateWriter,
@@ -25,7 +29,9 @@ use zippy_storage::{
     StartupCatalogFileVerifierConfig, StartupOrphanReconciler, StartupOrphanReconcilerConfig,
     StartupOrphanReconciliationReport,
 };
-use zippy_types::catalog::{CatalogActor, CatalogActorKind, CatalogPersistence, CatalogRead};
+use zippy_types::catalog::{
+    CatalogActor, CatalogActorKind, CatalogPersistence, CatalogRead, CatalogWrite,
+};
 use zippy_types::table::TableDescriptor;
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
 
@@ -37,6 +43,7 @@ use crate::legacy_catalog_migration::{
 
 const SUPERVISOR_THREAD_NAME: &str = "zippy-native-storage";
 const REAPER_THREAD_NAME: &str = "zippy-native-storage-reaper";
+const NATIVE_INGEST_START_THREAD_NAME: &str = "zippy-native-ingest-start";
 const DEFAULT_SERVER_ACTOR_PRINCIPAL: &str = "zippy-server";
 const STARTUP_CANCELLED_MESSAGE: &str = "native storage startup was cancelled before readiness";
 const CATALOG_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -398,15 +405,18 @@ impl NativeStorageStartup {
             catalog_file_verification: ready.catalog_file_verification,
             legacy_catalog_migration: ready.legacy_catalog_migration,
             catalog_read_handle: ready.catalog_read_handle,
+            catalog_write_handle: ready.catalog_write_handle,
             catalog_legacy_reconcile_handle: ready.catalog_legacy_reconcile_handle,
             runtime_snapshot_pin_admission: ready.runtime_snapshot_pin_admission,
             table_actors: ready.table_actors,
+            native_ingest_bootstraps: ready.native_ingest_bootstraps,
             table_actor_admission: ready.table_actor_admission,
             query_snapshot_coordinator,
             query_resources: ready.query_resources,
             query_process_memory: ready.query_process_memory,
             query_engine,
             query_canary,
+            native_ingest: None,
             healthy: ready.healthy,
             terminal_failure: Arc::clone(&self.terminal_failure),
             shutdown: self.shutdown.take(),
@@ -459,15 +469,18 @@ pub struct NativeStorageRuntime {
     catalog_file_verification: StartupCatalogFileVerificationReport,
     legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
+    catalog_write_handle: SqliteCatalogWriteHandle,
     catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
     runtime_snapshot_pin_admission: SqliteCatalogRuntimeSnapshotPinAdmissionControl,
     table_actors: TableActorRegistryHandle,
+    native_ingest_bootstraps: Arc<[NativeIngestTableBootstrap]>,
     table_actor_admission: TableActorAdmissionControl,
     query_snapshot_coordinator: crate::query_snapshot::NativeQuerySnapshotCoordinator,
     query_resources: crate::query_service::QueryResourceCoordinator,
     query_process_memory: zippy_query::QueryProcessMemoryPool,
     query_engine: crate::native_query::NativeQueryEngine,
     query_canary: Option<crate::native_query_canary::NativeQueryCanaryService>,
+    native_ingest: Option<NativeIngestRuntime>,
     healthy: Arc<AtomicBool>,
     terminal_failure: Arc<Mutex<Option<ServerError>>>,
     shutdown: Option<watch::Sender<bool>>,
@@ -537,6 +550,12 @@ impl NativeStorageRuntime {
     #[must_use]
     pub fn catalog_read_handle(&self) -> SqliteCatalogReadHandle {
         self.catalog_read_handle.clone()
+    }
+
+    /// Returns a lifecycle-bound Catalog command endpoint for native ingest fencing.
+    #[must_use]
+    pub fn catalog_write_handle(&self) -> SqliteCatalogWriteHandle {
+        self.catalog_write_handle.clone()
     }
 
     /// Returns a lifecycle-bound submitter for trusted legacy file-view reconciliation.
@@ -612,6 +631,84 @@ impl NativeStorageRuntime {
         self.table_actors.table(table_id)
     }
 
+    /// Returns the cloneable actor registry used by native ingest publication.
+    #[must_use]
+    pub fn table_actor_registry_handle(&self) -> TableActorRegistryHandle {
+        self.table_actors.clone()
+    }
+
+    /// Returns the revision-consistent startup inputs required by WAL recovery.
+    #[must_use]
+    pub fn native_ingest_bootstraps(&self) -> Arc<[NativeIngestTableBootstrap]> {
+        Arc::clone(&self.native_ingest_bootstraps)
+    }
+
+    /// Starts WAL recovery and native append publication after table actors are ready.
+    pub fn start_native_ingest(
+        &mut self,
+        wal_root: impl Into<PathBuf>,
+    ) -> Result<NativeIngestHandle> {
+        if let Some(runtime) = &self.native_ingest {
+            return Ok(runtime.handle());
+        }
+        if self.shutdown_requested || self.final_shutdown.is_some() || !self.is_healthy() {
+            return Err(ServerError::new(
+                ErrorCode::Unavailable,
+                "native storage is not available for ingest startup",
+            )
+            .with_retryable(false));
+        }
+        let wal_root = wal_root.into();
+        let bootstraps = self.native_ingest_bootstraps.to_vec();
+        let sink = Arc::new(NativeAppendMaterializerSink::start(
+            NativeAppendMaterializerConfig::new(),
+            &bootstraps,
+            &self.table_actors,
+        )?);
+        let catalog: Arc<dyn CatalogWrite> = Arc::new(self.catalog_write_handle.clone());
+        let runtime = thread::Builder::new()
+            .name(NATIVE_INGEST_START_THREAD_NAME.to_owned())
+            .spawn(move || {
+                NativeIngestRuntime::start(
+                    NativeIngestConfig::new(),
+                    wal_root,
+                    catalog,
+                    bootstraps,
+                    sink,
+                )
+            })
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    format!("failed to start native ingest recovery thread error=[{error}]"),
+                )
+                .with_retryable(false)
+            })?
+            .join()
+            .map_err(|_| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "native ingest recovery thread panicked before startup completed",
+                )
+                .with_retryable(false)
+            })??;
+        let handle = runtime.handle();
+        self.native_ingest = Some(runtime);
+        Ok(handle)
+    }
+
+    /// Returns the producer-fenced ingest endpoint when configured.
+    #[must_use]
+    pub fn native_ingest_handle(&self) -> Option<NativeIngestHandle> {
+        self.native_ingest.as_ref().map(NativeIngestRuntime::handle)
+    }
+
+    /// Returns native ingest lifecycle and hot-path counters when configured.
+    #[must_use]
+    pub fn native_ingest_status(&self) -> Option<NativeIngestStatus> {
+        self.native_ingest.as_ref().map(NativeIngestRuntime::status)
+    }
+
     /// Returns whether the supervisor still owns a ready native storage stack.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
@@ -624,6 +721,10 @@ impl NativeStorageRuntime {
                 .supervisor
                 .as_ref()
                 .is_some_and(|supervisor| !supervisor.is_finished())
+            && self
+                .native_ingest
+                .as_ref()
+                .is_none_or(|ingest| ingest.status().accepting)
     }
 
     /// Returns the first terminal supervisor error observed after readiness.
@@ -636,6 +737,9 @@ impl NativeStorageRuntime {
     pub fn begin_shutdown(&mut self) {
         self.healthy.store(false, Ordering::Release);
         self.close_query_canary_admission();
+        if let Some(ingest) = &self.native_ingest {
+            ingest.close_admission();
+        }
         if !self.shutdown_requested {
             self.shutdown_requested = true;
             self.query_snapshot_coordinator.close_admission();
@@ -652,6 +756,19 @@ impl NativeStorageRuntime {
             return outcome.clone();
         }
         self.begin_shutdown();
+        if let Some(ingest) = self.native_ingest.as_mut() {
+            match ingest.shutdown_until(deadline) {
+                NativeIngestShutdownOutcome::Complete => {
+                    self.native_ingest.take();
+                }
+                NativeIngestShutdownOutcome::TimedOut => {
+                    return NativeStorageShutdownOutcome::TimedOut;
+                }
+                NativeIngestShutdownOutcome::Failed(error) => {
+                    return NativeStorageShutdownOutcome::Failed(error);
+                }
+            }
+        }
         while !self.try_signal_storage_shutdown() {
             let now = Instant::now();
             if now >= deadline {
@@ -757,9 +874,11 @@ struct SupervisorReady {
     catalog_file_verification: StartupCatalogFileVerificationReport,
     legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
+    catalog_write_handle: SqliteCatalogWriteHandle,
     catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
     runtime_snapshot_pin_admission: SqliteCatalogRuntimeSnapshotPinAdmissionControl,
     table_actors: TableActorRegistryHandle,
+    native_ingest_bootstraps: Arc<[NativeIngestTableBootstrap]>,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
     query_resources: crate::query_service::QueryResourceCoordinator,
@@ -997,6 +1116,28 @@ async fn supervise_storage(
             );
         }
     };
+    let native_ingest_bootstraps = match table_runtimes
+        .iter()
+        .map(|runtime| {
+            NativeIngestTableBootstrap::new(
+                runtime.table_id(),
+                runtime.table().definition.clone(),
+                runtime.schema_descriptor().schema_version,
+                Arc::clone(runtime.schema()),
+                runtime.writer_epoch(),
+                runtime.committed_log_offset(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(bootstraps) => Arc::<[NativeIngestTableBootstrap]>::from(bootstraps),
+        Err(error) => {
+            return (
+                false,
+                fail_storage(error, None, Some(persist_controller), catalog).await,
+            );
+        }
+    };
     let mut table_actors = match TableActorRegistry::start_with_persistence(
         config.table_actors.clone(),
         table_runtimes,
@@ -1100,6 +1241,15 @@ async fn supervise_storage(
             );
         }
     };
+    let catalog_write_handle = match catalog.write_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            return (
+                false,
+                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
+            );
+        }
+    };
     let catalog_legacy_reconcile_handle = match catalog.legacy_reconcile_handle() {
         Ok(handle) => handle,
         Err(error) => {
@@ -1117,9 +1267,11 @@ async fn supervise_storage(
             catalog_file_verification,
             legacy_catalog_migration,
             catalog_read_handle,
+            catalog_write_handle,
             catalog_legacy_reconcile_handle,
             runtime_snapshot_pin_admission,
             table_actors: table_actor_handle,
+            native_ingest_bootstraps,
             table_actor_admission,
             healthy: Arc::clone(&healthy),
             query_resources,

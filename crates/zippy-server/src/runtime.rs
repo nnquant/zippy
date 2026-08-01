@@ -28,7 +28,7 @@ use zippy_gateway::{
 };
 use zippy_ingest::{
     MemoryIngestConfig, MemoryIngestHandle, MemoryIngestRuntime, MemoryIngestShutdownOutcome,
-    MemoryIngestStatus, DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT,
+    MemoryIngestStatus, NativeIngestStatus, DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT,
 };
 use zippy_master::daemon::{prepare_master_runtime, MasterDaemonConfig};
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
@@ -1016,7 +1016,7 @@ pub struct LegacyServerReadiness {
     pub admission_open: bool,
     /// Whether the master listener crossed its explicit bind barrier.
     pub master_listener_ready: bool,
-    /// Whether Gateway writes or Flight DoPut require the shared memory ingest authority.
+    /// Whether Gateway writes require the legacy shared-memory ingest authority.
     pub memory_ingest_configured: bool,
     /// Whether the shared memory ingest authority still admits operations.
     pub memory_ingest_ready: bool,
@@ -1259,6 +1259,38 @@ impl LegacyServerRuntime {
             startup_deadline,
             legacy_catalog_migration,
         )?;
+        if runtime_config.flight.ingest.enabled {
+            let wal_root = data_directory.directory().root().join("wal").join("ingest");
+            let start_result = native_storage
+                .as_mut()
+                .ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::Internal,
+                        "Flight ingest requires the native storage runtime",
+                    )
+                    .with_retryable(false)
+                })
+                .and_then(|storage| storage.start_native_ingest(wal_root));
+            if let Err(error) = start_result {
+                let cleanup = native_storage
+                    .as_mut()
+                    .map(|storage| storage.shutdown_until(startup_deadline));
+                let error = match cleanup {
+                    Some(NativeStorageShutdownOutcome::Failed(cleanup_error)) => {
+                        append_secondary_error(error, &cleanup_error)
+                    }
+                    Some(NativeStorageShutdownOutcome::TimedOut) => append_secondary_error(
+                        error,
+                        &ServerError::new(
+                            ErrorCode::DeadlineExceeded,
+                            "native storage cleanup timed out after ingest startup failure",
+                        ),
+                    ),
+                    Some(NativeStorageShutdownOutcome::Complete) | None => error,
+                };
+                return Err(error);
+            }
+        }
         let mut memory_ingest = None;
         let rollback_context = StartupRollbackContext {
             master: &master,
@@ -1536,7 +1568,6 @@ impl LegacyServerRuntime {
         let mut flight = match start_flight_if_enabled(
             &runtime_config,
             native_storage.as_ref(),
-            memory_ingest.as_ref().map(MemoryIngestRuntime::handle),
             startup_deadline,
         ) {
             Ok(flight) => flight,
@@ -1667,6 +1698,14 @@ impl LegacyServerRuntime {
     #[must_use]
     pub fn memory_ingest_status(&self) -> Option<MemoryIngestStatus> {
         self.memory_ingest.as_ref().map(MemoryIngestRuntime::status)
+    }
+
+    /// Returns producer-fenced native ingest lifecycle and WAL counters when configured.
+    #[must_use]
+    pub fn native_ingest_status(&self) -> Option<NativeIngestStatus> {
+        self.native_storage
+            .as_ref()
+            .and_then(NativeStorageRuntime::native_ingest_status)
     }
 
     /// Returns non-secret TLS diagnostics for the Flight listener when configured.
@@ -2464,7 +2503,7 @@ fn start_memory_ingest_if_required(
     control_endpoint: &ControlEndpoint,
     startup_deadline: Instant,
 ) -> Result<Option<MemoryIngestRuntime>, ServerError> {
-    if !runtime_config.gateway.enabled && !runtime_config.flight.ingest.enabled {
+    if !runtime_config.gateway.enabled {
         return Ok(None);
     }
     let config =
@@ -2545,7 +2584,6 @@ fn start_legacy_gateway_with_frontends_if_enabled(
 fn start_flight_if_enabled(
     runtime_config: &ZippyConfig,
     native_storage: Option<&NativeStorageRuntime>,
-    memory_ingest: Option<MemoryIngestHandle>,
     startup_deadline: Instant,
 ) -> Result<Option<FlightServerRuntime>, ServerError> {
     if !runtime_config.flight.enabled {
@@ -2602,10 +2640,10 @@ fn start_flight_if_enabled(
         native_storage.catalog_read_handle(),
     );
     if runtime_config.flight.ingest.enabled {
-        let memory_ingest = memory_ingest.ok_or_else(|| {
+        let native_ingest = native_storage.native_ingest_handle().ok_or_else(|| {
             ServerError::new(
                 ErrorCode::Internal,
-                "validated Flight ingest configuration did not start memory ingest authority",
+                "validated Flight ingest configuration did not start native ingest authority",
             )
             .with_retryable(false)
         })?;
@@ -2617,7 +2655,7 @@ fn start_flight_if_enabled(
             runtime_config.flight.ingest.max_batch_bytes,
             runtime_config.flight.ingest.max_bytes_per_put,
         )?);
-        frontend = frontend.with_memory_ingest(memory_ingest);
+        frontend = frontend.with_native_ingest(native_ingest);
     }
     let frontend: Arc<dyn zippy_protocol::server::FlightQueryFrontend> = Arc::new(frontend);
     let service = ZippyFlightService::try_new(config, frontend)?;

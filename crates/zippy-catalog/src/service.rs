@@ -117,6 +117,19 @@ pub struct SqliteCatalogReadHandle {
     ownership: Weak<zippy_core::OwnedDataDirectory>,
 }
 
+/// Cloneable lifecycle-bound command submitter for server-owned native services.
+///
+/// The handle retains bounded admission budgets but only a weak writer endpoint. Keeping a clone
+/// therefore cannot extend the Catalog owner lifetime or prevent deterministic shutdown.
+#[derive(Clone)]
+pub struct SqliteCatalogWriteHandle {
+    endpoint: Weak<CatalogWriterEndpoint>,
+    command_budget: Arc<CommandBudget>,
+    manifest_queue_budget: Arc<ManifestQueueBudget>,
+    publication_gate: Arc<Semaphore>,
+    publication_owner_id: usize,
+}
+
 /// Owner-issued control capability that irreversibly closes runtime snapshot-pin admission.
 ///
 /// The capability holds only a weak reference, so retaining it cannot extend Catalog or data-root
@@ -324,6 +337,19 @@ impl SqliteCatalog {
             runtime_snapshot_pins: Arc::downgrade(&self.runtime_snapshot_pins),
             snapshot_memory_lease_verifier: self.snapshot_memory_lease_verifier.clone(),
             ownership: Arc::downgrade(&self.ownership),
+        })
+    }
+
+    /// Creates a lifecycle-bound submitter for ordinary server-owned Catalog commands.
+    pub fn write_handle(&self) -> Result<SqliteCatalogWriteHandle> {
+        self.check_runtime_health()?;
+        self.seal_legacy_imports_for_ordinary_mutation()?;
+        Ok(SqliteCatalogWriteHandle {
+            endpoint: Arc::downgrade(&self.writer_endpoint),
+            command_budget: Arc::clone(&self.command_budget),
+            manifest_queue_budget: Arc::clone(&self.manifest_queue_budget),
+            publication_gate: Arc::clone(&self.publication_gate),
+            publication_owner_id: self.publication_owner_id(),
         })
     }
 
@@ -1308,6 +1334,50 @@ impl CatalogWrite for SqliteCatalog {
                 .map_err(|error| error.with_request_id(request_id))?;
             self.submit_command_with_publication_permit(command, permit)
                 .await
+        })
+    }
+}
+
+impl CatalogWrite for SqliteCatalogWriteHandle {
+    fn command(
+        &self,
+        command: VersionedCatalogCommand,
+    ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
+        Box::pin(async move {
+            let VersionedCatalogCommand::V1(envelope) = &command;
+            let request_id = envelope.request_id;
+            let endpoint = self.endpoint.upgrade().ok_or_else(actor_stopped)?;
+            endpoint.check_admission()?;
+            let command_permit = self
+                .command_budget
+                .reserve()
+                .map_err(|error| error.with_request_id(request_id))?;
+            let publication_permit = Arc::clone(&self.publication_gate)
+                .acquire_owned()
+                .await
+                .map_err(|_| publication_gate_stopped().with_request_id(request_id))?;
+            let queued_bytes = manifest_domain::manifest_command_preflight_bytes(&command).await?;
+            let manifest_permit = self
+                .manifest_queue_budget
+                .reserve(queued_bytes)
+                .map_err(|error| error.with_request_id(request_id))?;
+            let publication_permit = SqlitePublicationPermit {
+                owner_id: self.publication_owner_id,
+                _command_permit: command_permit,
+                _publication_permit: publication_permit,
+            };
+            await_response(endpoint.writer_request(|response| {
+                ServiceMessage::Command(CommandRequest {
+                    command,
+                    state: CommandRequestState {
+                        request_id,
+                        response,
+                        _manifest_permit: manifest_permit,
+                        _publication_permit: publication_permit,
+                    },
+                })
+            }))
+            .await
         })
     }
 }

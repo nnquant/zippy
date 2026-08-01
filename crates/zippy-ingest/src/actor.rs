@@ -269,6 +269,51 @@ impl TableActorLiveSegmentsPublishRequest {
             .with_retryable(false))
         })
     }
+
+    /// Blocks a non-async ingest worker until the actor publishes the accepted replacement.
+    pub fn wait_blocking(self) -> Result<()> {
+        self.response.blocking_recv().unwrap_or_else(|_| {
+            Err(ServerError::new(
+                ErrorCode::Internal,
+                "table actor stopped before publishing accepted live segments",
+            )
+            .with_table_id(self.table_id)
+            .with_retryable(false))
+        })
+    }
+}
+
+/// One accepted writer-epoch transition awaiting its serialized actor turn.
+#[derive(Debug)]
+pub struct TableActorWriterEpochUpdateRequest {
+    table_id: TableId,
+    response: oneshot::Receiver<Result<()>>,
+}
+
+impl TableActorWriterEpochUpdateRequest {
+    /// Waits until the actor has installed or rejected the fencing epoch.
+    pub async fn wait(self) -> Result<()> {
+        self.response.await.unwrap_or_else(|_| {
+            Err(ServerError::new(
+                ErrorCode::Internal,
+                "table actor stopped before returning an accepted writer epoch update",
+            )
+            .with_table_id(self.table_id)
+            .with_retryable(false))
+        })
+    }
+
+    /// Blocks a non-async ingest worker until the actor installs the fencing epoch.
+    pub fn wait_blocking(self) -> Result<()> {
+        self.response.blocking_recv().unwrap_or_else(|_| {
+            Err(ServerError::new(
+                ErrorCode::Internal,
+                "table actor stopped before installing an accepted writer epoch update",
+            )
+            .with_table_id(self.table_id)
+            .with_retryable(false))
+        })
+    }
 }
 
 /// One admitted persist request whose completion remains owned by its table actor.
@@ -394,6 +439,38 @@ impl TableActorHandle {
         publication: TableActorLiveSegmentsPublication,
     ) -> Result<()> {
         self.try_publish_live_segments(publication)?.wait().await
+    }
+
+    /// Attempts immediate bounded admission of one table-wide writer fencing transition.
+    pub fn try_update_writer_epoch(
+        &self,
+        writer_epoch: u64,
+    ) -> Result<TableActorWriterEpochUpdateRequest> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(actor_closed(self.table_id));
+        }
+        let permit = Arc::clone(&self.global_budget)
+            .try_acquire_owned()
+            .map_err(|_| actor_global_budget_exhausted(self.table_id))?;
+        let (response_sender, response) = oneshot::channel();
+        let command = TableActorCommand::UpdateWriterEpoch {
+            writer_epoch,
+            response: response_sender,
+            _permit: permit,
+        };
+        match self.sender.try_send(command) {
+            Ok(()) => Ok(TableActorWriterEpochUpdateRequest {
+                table_id: self.table_id,
+                response,
+            }),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(actor_mailbox_full(self.table_id)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(actor_closed(self.table_id)),
+        }
+    }
+
+    /// Installs one monotonic writer epoch in the actor's serialized order.
+    pub async fn update_writer_epoch(&self, writer_epoch: u64) -> Result<()> {
+        self.try_update_writer_epoch(writer_epoch)?.wait().await
     }
 
     /// Attempts immediate admission of one atomic native persist operation.
@@ -721,6 +798,11 @@ enum TableActorCommand {
         response: oneshot::Sender<Result<()>>,
         _permit: OwnedSemaphorePermit,
     },
+    UpdateWriterEpoch {
+        writer_epoch: u64,
+        response: oneshot::Sender<Result<()>>,
+        _permit: OwnedSemaphorePermit,
+    },
     #[cfg(test)]
     Panic,
 }
@@ -967,6 +1049,7 @@ impl TableActorState {
         let segment_count = segments.len();
         let mut identities = BTreeSet::new();
         let mut installed = Vec::with_capacity(segment_count);
+        let mut previous_writer_epoch = None;
 
         for (index, segment) in segments.into_iter().enumerate() {
             if segment.role == TableActorLiveSegmentRole::Active && index + 1 != segment_count {
@@ -993,14 +1076,14 @@ impl TableActorState {
                     ),
                 ));
             }
-            if segment.identity.writer_epoch != self.writer_epoch
-                || segment.descriptor.writer_epoch() != self.writer_epoch
+            if segment.identity.writer_epoch > self.writer_epoch
+                || segment.descriptor.writer_epoch() > self.writer_epoch
             {
                 return Err(live_publication_error(
                     self.table_id,
                     ErrorCode::StaleProducerEpoch,
                     format!(
-                        "live segment writer epoch mismatch expected=[{}] identity=[{}] descriptor=[{}]",
+                        "live segment writer epoch is ahead of actor expected_max=[{}] identity=[{}] descriptor=[{}]",
                         self.writer_epoch,
                         segment.identity.writer_epoch,
                         segment.descriptor.writer_epoch()
@@ -1009,6 +1092,7 @@ impl TableActorState {
             }
             if segment.identity.segment_id != segment.descriptor.segment_id()
                 || segment.identity.generation != segment.descriptor.generation()
+                || segment.identity.writer_epoch != segment.descriptor.writer_epoch()
             {
                 return Err(live_publication_error(
                     self.table_id,
@@ -1016,6 +1100,16 @@ impl TableActorState {
                     "live segment source identity differs from its shared-memory descriptor",
                 ));
             }
+            if previous_writer_epoch
+                .is_some_and(|previous| segment.identity.writer_epoch < previous)
+            {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    "live segment writer epochs are not monotonic in logical offset order",
+                ));
+            }
+            previous_writer_epoch = Some(segment.identity.writer_epoch);
             if segment.start_row >= segment.end_row {
                 return Err(live_publication_error(
                     self.table_id,
@@ -1097,6 +1191,27 @@ impl TableActorState {
         }
 
         self.live_segments = installed.into();
+        Ok(())
+    }
+
+    fn update_writer_epoch(&mut self, writer_epoch: u64) -> Result<()> {
+        if writer_epoch < self.writer_epoch {
+            return Err(ServerError::new(
+                ErrorCode::StaleProducerEpoch,
+                format!(
+                    "table actor writer epoch regressed expected=[{}] actual=[{writer_epoch}]",
+                    self.writer_epoch
+                ),
+            )
+            .with_table_id(self.table_id)
+            .with_retryable(false)
+            .with_details(ServerErrorDetails::ProducerEpoch {
+                expected: self.writer_epoch,
+                actual: writer_epoch,
+            })
+            .expect("producer epoch details match stale producer error"));
+        }
+        self.writer_epoch = writer_epoch;
         Ok(())
     }
 
@@ -1397,6 +1512,18 @@ fn process_command(
             let result = state
                 .advance_command()
                 .and_then(|()| state.install_live_segments(publication));
+            drop(_permit);
+            let _ = response.send(result);
+            None
+        }
+        TableActorCommand::UpdateWriterEpoch {
+            writer_epoch,
+            response,
+            _permit,
+        } => {
+            let result = state
+                .advance_command()
+                .and_then(|()| state.update_writer_epoch(writer_epoch));
             drop(_permit);
             let _ = response.send(result);
             None
@@ -2288,6 +2415,88 @@ mod tests {
             OffsetWatermark::Known(LogOffset::new(1))
         );
 
+        registry.drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_keeps_monotonic_live_prefix_across_writer_epochs() {
+        let registry =
+            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
+                .unwrap();
+        let actor = registry.handle().table(table_id(10)).unwrap();
+        actor.update_writer_epoch(8).await.unwrap();
+        let segment_schema =
+            compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
+        let old_store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+        let old_handle = old_store
+            .open_partition_with_schema_and_writer_epoch(
+                "prices-old",
+                "all",
+                segment_schema.clone(),
+                7,
+            )
+            .unwrap();
+        old_handle
+            .writer()
+            .write_row(|row| row.write_i64("price", 101))
+            .unwrap();
+        let old_descriptor = old_handle.active_descriptor_for_test();
+        old_handle.writer().rollover_without_persistence().unwrap();
+
+        let current_store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+        let current_handle = current_store
+            .open_partition_with_schema_and_writer_epoch("prices-current", "all", segment_schema, 8)
+            .unwrap();
+        current_handle
+            .writer()
+            .write_row(|row| row.write_i64("price", 102))
+            .unwrap();
+        let current_descriptor = current_handle.active_descriptor_for_test();
+
+        actor
+            .publish_live_segments(TableActorLiveSegmentsPublication::new(
+                table_id(10),
+                vec![
+                    TableActorLiveSegmentPublication::new(
+                        TableActorLiveSegmentRole::RetainedSealed,
+                        SourceSegmentIdentity {
+                            segment_id: old_descriptor.segment_id(),
+                            generation: old_descriptor.generation(),
+                            writer_epoch: old_descriptor.writer_epoch(),
+                        },
+                        1,
+                        OffsetRange::new(LogOffset::new(0), LogOffset::new(0)).unwrap(),
+                        old_descriptor,
+                        0,
+                        1,
+                    ),
+                    TableActorLiveSegmentPublication::new(
+                        TableActorLiveSegmentRole::Active,
+                        SourceSegmentIdentity {
+                            segment_id: current_descriptor.segment_id(),
+                            generation: current_descriptor.generation(),
+                            writer_epoch: current_descriptor.writer_epoch(),
+                        },
+                        1,
+                        OffsetRange::new(LogOffset::new(1), LogOffset::new(1)).unwrap(),
+                        current_descriptor,
+                        0,
+                        1,
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let snapshot = actor.snapshot().await.unwrap();
+        assert_eq!(snapshot.writer_epoch, 8);
+        assert_eq!(snapshot.live_segments.len(), 2);
+        assert_eq!(snapshot.live_segments[0].identity().writer_epoch, 7);
+        assert_eq!(snapshot.live_segments[1].identity().writer_epoch, 8);
+        assert_eq!(
+            actor.update_writer_epoch(7).await.unwrap_err().code(),
+            ErrorCode::StaleProducerEpoch
+        );
         registry.drain().await.unwrap();
     }
 

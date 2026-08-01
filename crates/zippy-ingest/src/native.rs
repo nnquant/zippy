@@ -208,6 +208,36 @@ impl NativeIngestTableBootstrap {
     pub const fn table_id(&self) -> TableId {
         self.table_id
     }
+
+    /// Borrows the table-kind-specific durable definition.
+    #[must_use]
+    pub const fn table_definition(&self) -> &TableDefinition {
+        &self.table_definition
+    }
+
+    /// Returns the schema version accepted by this startup generation.
+    #[must_use]
+    pub const fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
+    /// Borrows the decoded Arrow schema used by native writers.
+    #[must_use]
+    pub const fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Returns the latest Catalog writer epoch recovered at startup.
+    #[must_use]
+    pub const fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+
+    /// Returns the manifest-covered logical offset recovered at startup.
+    #[must_use]
+    pub const fn persisted_log_offset(&self) -> OffsetWatermark {
+        self.persisted_log_offset
+    }
 }
 
 /// Context supplied exactly once when a newly accepted or recovered mutation becomes visible.
@@ -223,15 +253,50 @@ pub struct NativeIngestApplyContext {
     pub replay: bool,
 }
 
+/// Classification of a native materializer failure relative to visible table state.
+#[derive(Debug, Clone)]
+pub enum NativeIngestSinkError {
+    /// Validation failed before any mutation became visible and the WAL append may be rolled back.
+    Rejected(ServerError),
+    /// The materializer may have changed visibility and the table authority must stop.
+    Indeterminate(ServerError),
+}
+
+impl NativeIngestSinkError {
+    fn into_error(self) -> ServerError {
+        match self {
+            Self::Rejected(error) | Self::Indeterminate(error) => error,
+        }
+    }
+}
+
+impl From<ServerError> for NativeIngestSinkError {
+    fn from(error: ServerError) -> Self {
+        Self::Rejected(error)
+    }
+}
+
 /// Server-owned mutation materializer behind the producer and WAL authority.
 pub trait NativeIngestSink: Send + Sync {
+    /// Installs one Catalog-committed writer epoch before the first mutation uses it.
+    ///
+    /// Implementations must be idempotent because retrying the same producer acquisition replays
+    /// the Catalog response and invokes this hook again.
+    fn fence_writer(&self, _table_id: TableId, _writer_epoch: u64) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Applies one non-duplicate mutation to process-local table state.
     ///
     /// The implementation must make each call atomic at its visible table boundary. A normal error
     /// means no part of the mutation became visible and allows the authority to roll back its
     /// uncommitted WAL append. A panic is treated as an unknown outcome and terminally closes the
     /// table authority.
-    fn apply(&self, context: NativeIngestApplyContext, mutation: &TableMutation) -> Result<()>;
+    fn apply(
+        &self,
+        context: NativeIngestApplyContext,
+        mutation: &TableMutation,
+    ) -> std::result::Result<(), NativeIngestSinkError>;
 }
 
 /// Point-in-time lifecycle and hot-path counters for native ingest.
@@ -251,6 +316,10 @@ pub struct NativeIngestStatus {
     pub duplicate_writes_total: u64,
     /// Successful WAL fsync group boundaries.
     pub wal_commits_total: u64,
+    /// Catalog-backed producer acquisitions that installed a writer epoch.
+    pub writer_acquisitions_total: u64,
+    /// Writer opens that reused the active producer, connection, and epoch.
+    pub writer_resumes_total: u64,
     /// Rejected opens or writes.
     pub rejected_operations_total: u64,
     /// Bytes removed from incomplete WAL tails during startup.
@@ -282,6 +351,8 @@ struct NativeIngestMetrics {
     written_rows_total: u64,
     duplicate_writes_total: u64,
     wal_commits_total: u64,
+    writer_acquisitions_total: u64,
+    writer_resumes_total: u64,
     rejected_operations_total: u64,
     recovered_truncated_tail_bytes: u64,
 }
@@ -594,6 +665,8 @@ impl NativeIngestInner {
             written_rows_total: metrics.written_rows_total,
             duplicate_writes_total: metrics.duplicate_writes_total,
             wal_commits_total: metrics.wal_commits_total,
+            writer_acquisitions_total: metrics.writer_acquisitions_total,
+            writer_resumes_total: metrics.writer_resumes_total,
             rejected_operations_total: metrics.rejected_operations_total,
             recovered_truncated_tail_bytes: metrics.recovered_truncated_tail_bytes,
         }
@@ -680,6 +753,55 @@ async fn open_writer(
     let table = inner.table(request.table_id)?;
     let _open = table.open_gate.lock().await;
 
+    let resumed_info = {
+        let state = lock_table_state(&table);
+        require_table_healthy(&table, &state)?;
+        if state.transitioning {
+            return Err(table_unavailable(
+                table.table_id,
+                "native ingest producer transition is already active",
+            ));
+        }
+        if state.current_producer == Some(request.producer_id)
+            && state.active_connection == Some(request.connection_id)
+        {
+            if let Some(expected) = request.expected_writer_epoch {
+                if expected != state.current_epoch {
+                    return Err(stale_epoch(
+                        table.table_id,
+                        state.current_epoch,
+                        expected,
+                        request.request_id,
+                    ));
+                }
+            }
+            Some(WriterInfo {
+                table_id: table.table_id,
+                producer_id: request.producer_id,
+                connection_id: request.connection_id,
+                producer_epoch: state.current_epoch,
+                schema_version: table.schema_version,
+                last_durable_batch_sequence: state.last_durable_sequence,
+                last_durable_log_offset: state.committed_log_offset,
+            })
+        } else {
+            None
+        }
+    };
+    if let Some(info) = resumed_info {
+        let mut metrics = inner
+            .metrics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics.writer_resumes_total = metrics.writer_resumes_total.saturating_add(1);
+        drop(metrics);
+        return Ok(Box::new(NativeIngestWriter {
+            info,
+            inner: Arc::downgrade(&inner),
+            table: Arc::downgrade(&table),
+        }));
+    }
+
     let prior_connection = {
         let mut state = lock_table_state(&table);
         require_table_healthy(&table, &state)?;
@@ -756,6 +878,30 @@ async fn open_writer(
             table.table_id,
             "Catalog producer descriptor identity mismatch",
         ));
+    }
+
+    let sink = Arc::clone(&inner.sink);
+    let table_id = table.table_id;
+    let producer_epoch = producer.producer_epoch;
+    let fence_result =
+        tokio::spawn(async move { sink.fence_writer(table_id, producer_epoch).await })
+            .await
+            .unwrap_or_else(|_| {
+                Err(internal_table_error(
+                    table_id,
+                    "panic while installing native ingest writer epoch in the materializer",
+                ))
+            });
+    if let Err(error) = fence_result {
+        let mut state = lock_table_state(&table);
+        if producer.producer_epoch > state.current_epoch {
+            install_new_epoch(&mut state, producer.producer_epoch, producer.producer_id);
+        }
+        state.transitioning = false;
+        state.active_connection = None;
+        return Err(error
+            .with_request_id(request.request_id)
+            .with_table_id(table.table_id));
     }
 
     let needs_wal = {
@@ -849,6 +995,13 @@ async fn open_writer(
             last_durable_log_offset: state.committed_log_offset,
         }
     };
+
+    let mut metrics = inner
+        .metrics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    metrics.writer_acquisitions_total = metrics.writer_acquisitions_total.saturating_add(1);
+    drop(metrics);
 
     Ok(Box::new(NativeIngestWriter {
         info,
@@ -1163,7 +1316,7 @@ fn admit_write(
         inner.sink.apply(context, request.mutation())
     })) {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+        Ok(Err(NativeIngestSinkError::Rejected(error))) => {
             if let Err(rollback_error) = wal_writer.rollback_uncommitted_append(
                 position,
                 previous_batch_sequence,
@@ -1184,6 +1337,14 @@ fn admit_write(
             return Err(error
                 .with_request_id(request.request_id())
                 .with_table_id(table.table_id));
+        }
+        Ok(Err(NativeIngestSinkError::Indeterminate(error))) => {
+            let error = error
+                .with_request_id(request.request_id())
+                .with_table_id(table.table_id)
+                .with_retryable(false);
+            state.terminal_error = Some(error.clone());
+            return Err(error);
         }
         Err(_) => {
             let _ = wal_writer.rollback_uncommitted_append(
@@ -1394,7 +1555,8 @@ fn recover_table_authority(
                     replay: true,
                 },
                 record.request.mutation(),
-            )?;
+            )
+            .map_err(NativeIngestSinkError::into_error)?;
             visible_watermark = record.receipt.committed_log_offset();
         }
         if record.identity.producer_epoch == bootstrap.writer_epoch {
@@ -1888,7 +2050,7 @@ mod tests {
 
     use super::{
         ArrowIpcMutationFingerprintComputer, NativeIngestApplyContext, NativeIngestConfig,
-        NativeIngestRuntime, NativeIngestShutdownOutcome, NativeIngestSink,
+        NativeIngestRuntime, NativeIngestShutdownOutcome, NativeIngestSink, NativeIngestSinkError,
         NativeIngestTableBootstrap,
     };
 
@@ -2030,9 +2192,13 @@ mod tests {
     }
 
     impl NativeIngestSink for RecordingSink {
-        fn apply(&self, context: NativeIngestApplyContext, mutation: &TableMutation) -> Result<()> {
+        fn apply(
+            &self,
+            context: NativeIngestApplyContext,
+            mutation: &TableMutation,
+        ) -> std::result::Result<(), NativeIngestSinkError> {
             if let Some(error) = self.next_error.lock().unwrap().take() {
-                return Err(error);
+                return Err(error.into());
             }
             self.applied.lock().unwrap().push(AppliedMutation {
                 request_id: context.receipt.request_id(),
@@ -2695,6 +2861,55 @@ mod tests {
         assert_eq!(retry, second_receipt);
         assert_eq!(sink.applied().len(), 2);
         assert_eq!(catalog.epoch(), 2);
+        assert_eq!(
+            runtime.shutdown_until(Instant::now() + Duration::from_secs(2)),
+            NativeIngestShutdownOutcome::Complete
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_logical_connection_resumes_without_reacquiring_producer_epoch() {
+        let directory = TempDir::new().unwrap();
+        let catalog = Arc::new(FakeCatalog::default());
+        let sink = Arc::new(RecordingSink::default());
+        let mut runtime = start_runtime(&directory, Arc::clone(&catalog), Arc::clone(&sink), 0);
+        let handle = runtime.handle();
+        let mut first = handle
+            .open_writer(open_request(10, 20, Some(0)))
+            .await
+            .unwrap();
+        first
+            .submit_durable(write_request(100, 0, &[1]), DurableWriteTarget::Wal)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+
+        let mut resumed = handle
+            .open_writer(open_request(11, 20, Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(resumed.info().producer_epoch, 1);
+        assert_eq!(
+            resumed.info().last_durable_batch_sequence,
+            SequenceWatermark::Known(0)
+        );
+        resumed.write_memory(write_request(101, 1, &[2])).unwrap();
+
+        assert_eq!(catalog.epoch(), 1);
+        assert_eq!(sink.applied().len(), 2);
+        let status = runtime.status();
+        assert_eq!(status.writer_acquisitions_total, 1);
+        assert_eq!(status.writer_resumes_total, 1);
+
+        let stale = handle
+            .open_writer(open_request(12, 20, Some(0)))
+            .await
+            .err()
+            .expect("stale resume must fail");
+        assert_eq!(stale.code(), ErrorCode::StaleProducerEpoch);
+        assert_eq!(catalog.epoch(), 1);
+        assert_eq!(runtime.status().writer_resumes_total, 1);
         assert_eq!(
             runtime.shutdown_until(Instant::now() + Duration::from_secs(2)),
             NativeIngestShutdownOutcome::Complete

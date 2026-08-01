@@ -1,4 +1,4 @@
-//! Manual release benchmark for the legacy Gateway and Arrow Flight transports.
+//! Manual release benchmarks for legacy query transport and native Flight ingest.
 
 use std::fs;
 use std::io::{Cursor, Write};
@@ -13,11 +13,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::Int64Array;
 use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::FlightClient;
-use futures::TryStreamExt;
+use futures::{SinkExt, TryStreamExt};
 use prost::Message;
 use serde::Serialize;
 use zippy_protocol::ingest::encode_put_descriptor;
@@ -31,12 +31,13 @@ use zippy_protocol::wire::{
 use zippy_protocol::{AUTHORIZATION_METADATA_KEY, CURRENT_PROTOCOL_VERSION};
 use zippy_types::query::{QueryInput, QueryPriority, QueryRequest};
 use zippy_types::table::{CatalogName, TableRef};
-use zippy_types::{QueryId, RequestId, ResourceLimit, SessionId};
+use zippy_types::{ConnectionId, ProducerId, QueryId, RequestId, ResourceLimit, SessionId};
 
 use super::{
     append_table_schema, read_gateway_frame, reserve_tcp_addr,
+    runtime_config_with_native_flight_frontend_and_persist_root,
     runtime_config_with_native_query_frontend_and_persist_root, seed_legacy_append_table,
-    wait_until_bindable, write_test_parquet, LegacyServerRuntime,
+    seed_native_append_table, wait_until_bindable, write_test_parquet, LegacyServerRuntime,
 };
 
 const GATEWAY_TOKEN: &str = "shadow-catalog-test";
@@ -50,7 +51,9 @@ const DEFAULT_WRITE_ROWS: &[usize] = &[1, 1_024, 65_536];
 const DEFAULT_RESULT_BATCH_ROWS: usize = 8_192;
 const DEFAULT_MIN_FLIGHT_THROUGHPUT_RATIO: f64 = 0.90;
 const DEFAULT_MAX_FLIGHT_P99_RATIO: f64 = 1.20;
-const REPORT_VERSION: u32 = 2;
+const REPORT_VERSION: u32 = 3;
+const NATIVE_INGEST_REPORT_VERSION: u32 = 2;
+const PERSISTENT_INGEST_REPORT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 struct BenchmarkConfig {
@@ -58,10 +61,44 @@ struct BenchmarkConfig {
     warmup_samples: usize,
     measured_samples: usize,
     query_rows: Vec<usize>,
-    write_rows: Vec<usize>,
     min_flight_throughput_ratio: f64,
     max_flight_p99_ratio: f64,
     output_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeIngestBenchmarkConfig {
+    warmup_samples: usize,
+    measured_samples: usize,
+    write_rows: Vec<usize>,
+    output_path: Option<std::path::PathBuf>,
+}
+
+impl NativeIngestBenchmarkConfig {
+    fn from_environment() -> Self {
+        let warmup_samples = env_usize(
+            "ZIPPY_FLIGHT_NATIVE_INGEST_PERF_WARMUP_SAMPLES",
+            DEFAULT_WARMUP_SAMPLES,
+        );
+        let measured_samples = env_usize(
+            "ZIPPY_FLIGHT_NATIVE_INGEST_PERF_MEASURED_SAMPLES",
+            DEFAULT_MEASURED_SAMPLES,
+        );
+        assert!(
+            measured_samples > 0,
+            "native Flight ingest measured samples must be positive"
+        );
+        Self {
+            warmup_samples,
+            measured_samples,
+            write_rows: env_row_counts(
+                "ZIPPY_FLIGHT_NATIVE_INGEST_PERF_WRITE_ROWS",
+                DEFAULT_WRITE_ROWS,
+            ),
+            output_path: std::env::var_os("ZIPPY_FLIGHT_NATIVE_INGEST_PERF_REPORT_JSON")
+                .map(Into::into),
+        }
+    }
 }
 
 impl BenchmarkConfig {
@@ -82,7 +119,6 @@ impl BenchmarkConfig {
             "measured sample count must be positive"
         );
         let query_rows = env_row_counts("ZIPPY_TRANSPORT_PERF_QUERY_ROWS", DEFAULT_QUERY_ROWS);
-        let write_rows = env_row_counts("ZIPPY_TRANSPORT_PERF_WRITE_ROWS", DEFAULT_WRITE_ROWS);
         let min_flight_throughput_ratio = env_f64(
             "ZIPPY_TRANSPORT_PERF_MIN_FLIGHT_THROUGHPUT_RATIO",
             DEFAULT_MIN_FLIGHT_THROUGHPUT_RATIO,
@@ -108,7 +144,6 @@ impl BenchmarkConfig {
             warmup_samples,
             measured_samples,
             query_rows,
-            write_rows,
             min_flight_throughput_ratio,
             max_flight_p99_ratio,
             output_path: std::env::var_os("ZIPPY_TRANSPORT_PERF_REPORT_JSON").map(Into::into),
@@ -131,6 +166,55 @@ struct BenchmarkReport {
     gateway_metrics: serde_json::Value,
     flight_metrics: FlightMetrics,
     process_rss_kib: ProcessRss,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeIngestBenchmarkReport {
+    format_version: u32,
+    git_sha: String,
+    target: String,
+    started_at_unix_ms: u128,
+    warmup_samples: usize,
+    measured_samples: usize,
+    writer_session_open_micros: f64,
+    scenarios: Vec<NativeIngestScenarioReport>,
+    native_ingest_metrics: NativeIngestMetrics,
+    flight_metrics: FlightMetrics,
+    process_rss_kib: ProcessRss,
+}
+
+#[derive(Debug, Serialize)]
+struct PersistentIngestBenchmarkReport {
+    format_version: u32,
+    git_sha: String,
+    target: String,
+    started_at_unix_ms: u128,
+    warmup_samples: usize,
+    measured_samples: usize,
+    writer_session_open_micros: f64,
+    scenarios: Vec<NativeIngestScenarioReport>,
+    native_ingest_metrics: NativeIngestMetrics,
+    flight_metrics: FlightMetrics,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeIngestScenarioReport {
+    durability: &'static str,
+    rows_per_operation: usize,
+    logical_bytes_per_operation: usize,
+    flight: SampleSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeIngestMetrics {
+    write_batches_total: u64,
+    written_rows_total: u64,
+    duplicate_writes_total: u64,
+    wal_commits_total: u64,
+    writer_acquisitions_total: u64,
+    writer_resumes_total: u64,
+    rejected_operations_total: u64,
+    recovered_truncated_tail_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,7 +270,7 @@ struct ProcessRss {
 #[derive(Debug, Serialize)]
 struct FlightSessionOpenLatency {
     read: f64,
-    writer: f64,
+    writer: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,8 +367,6 @@ async fn flight_gateway_transport_performance_baseline() {
 
     let (mut flight_reader, read_session, read_session_open) =
         authenticated_flight_client(flight_addr, FLIGHT_READ_TOKEN, SessionRole::Read).await;
-    let (mut flight_writer, write_session, writer_session_open) =
-        authenticated_flight_client(flight_addr, FLIGHT_WRITER_TOKEN, SessionRole::Writer).await;
     let gateway_endpoint = gateway_addr.to_string();
     let rss_before = process_rss_kib().unwrap_or(0);
     let rss_sampler = RssSampler::start(rss_before);
@@ -327,98 +409,12 @@ async fn flight_gateway_transport_performance_baseline() {
         ));
     }
 
-    for rows in config.write_rows.iter().copied() {
-        let batch = benchmark_batch(rows);
-        let logical_bytes = batch.get_array_memory_size();
-        let gateway_stream = format!("transport_perf_gateway_{rows}");
-        let flight_stream = format!("transport_perf_flight_{rows}");
-        let mut gateway_samples = Vec::with_capacity(config.measured_samples);
-        let mut flight_samples = Vec::with_capacity(config.measured_samples);
-        for sample in 0..config
-            .warmup_samples
-            .saturating_add(config.measured_samples)
-        {
-            let sequence = u64::try_from(sample).expect("sample index fits u64");
-            let gateway_first = sample % 2 == 0;
-            if gateway_first {
-                let elapsed = timed_gateway_write(&gateway_endpoint, &gateway_stream, &batch);
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut gateway_samples);
-                let elapsed = timed_flight_write(
-                    &mut flight_writer,
-                    write_session,
-                    identity,
-                    &flight_stream,
-                    sequence,
-                    batch.clone(),
-                )
-                .await;
-                identity += 1;
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut flight_samples);
-            } else {
-                let elapsed = timed_flight_write(
-                    &mut flight_writer,
-                    write_session,
-                    identity,
-                    &flight_stream,
-                    sequence,
-                    batch.clone(),
-                )
-                .await;
-                identity += 1;
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut flight_samples);
-                let elapsed = timed_gateway_write(&gateway_endpoint, &gateway_stream, &batch);
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut gateway_samples);
-            }
-        }
-        scenarios.push(scenario_report(
-            "write_memory_ack",
-            rows,
-            logical_bytes,
-            gateway_samples,
-            flight_samples,
-        ));
-    }
-
     let gateway_metrics = runtime
         .gateway_metrics()
         .expect("combined runtime exposes Gateway metrics");
-    let memory_ingest = runtime
-        .memory_ingest_status()
-        .expect("combined runtime exposes server-owned memory ingest metrics");
     let flight_status = runtime
         .flight_status()
         .expect("combined runtime exposes Flight metrics");
-    let samples_per_transport = config
-        .warmup_samples
-        .saturating_add(config.measured_samples);
-    let expected_batches_per_transport = config
-        .write_rows
-        .len()
-        .saturating_mul(samples_per_transport);
-    let expected_rows_per_transport = config
-        .write_rows
-        .iter()
-        .copied()
-        .sum::<usize>()
-        .saturating_mul(samples_per_transport);
-    assert_eq!(
-        memory_ingest.write_batches_total,
-        u64::try_from(expected_batches_per_transport.saturating_mul(2))
-            .expect("combined batch count fits u64")
-    );
-    assert_eq!(
-        memory_ingest.written_rows_total,
-        u64::try_from(expected_rows_per_transport.saturating_mul(2))
-            .expect("combined row count fits u64")
-    );
-    assert_eq!(
-        gateway_metrics["memory_ingest"]["write_batches_total"],
-        memory_ingest.write_batches_total
-    );
-    assert_eq!(
-        gateway_metrics["memory_ingest"]["written_rows_total"],
-        memory_ingest.written_rows_total
-    );
     assert_eq!(flight_status.pending_tickets, 0);
     assert_eq!(flight_status.active_puts, 0);
     let rss_after = process_rss_kib().unwrap_or(0);
@@ -439,7 +435,7 @@ async fn flight_gateway_transport_performance_baseline() {
         measured_samples: config.measured_samples,
         flight_session_open_micros: FlightSessionOpenLatency {
             read: duration_micros(read_session_open),
-            writer: duration_micros(writer_session_open),
+            writer: None,
         },
         scenarios,
         gates,
@@ -466,7 +462,6 @@ async fn flight_gateway_transport_performance_baseline() {
     }
 
     drop(flight_reader);
-    drop(flight_writer);
     let outcome = runtime.shutdown();
     assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
     wait_until_bindable(flight_addr);
@@ -475,6 +470,343 @@ async fn flight_gateway_transport_performance_baseline() {
         gates_pass,
         "Flight/Gateway transport performance gate failed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual release benchmark; run with --ignored --test-threads=1"]
+async fn native_flight_ingest_performance_baseline() {
+    const STREAM_NAME: &str = "native_flight_ingest_perf";
+
+    let config = NativeIngestBenchmarkConfig::from_environment();
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must follow the Unix epoch")
+        .as_millis();
+    let temp = tempfile::tempdir().expect("create native Flight ingest benchmark directory");
+    let data_dir = temp.path().join("database");
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).expect("create native persisted benchmark directory");
+    seed_native_append_table(&data_dir, STREAM_NAME).await;
+    let flight_addr = reserve_tcp_addr();
+    let runtime_config = native_ingest_runtime_config(&temp, &data_dir, &persist_root, flight_addr);
+    let mut runtime = LegacyServerRuntime::start(runtime_config)
+        .expect("start native Flight ingest benchmark runtime");
+    let health = runtime.health();
+    assert!(!health.readiness.gateway_configured);
+    assert!(health.readiness.flight_protocol_ready);
+    assert!(!health.readiness.memory_ingest_configured);
+    assert!(runtime.native_ingest_status().unwrap().accepting);
+
+    let (mut flight_writer, write_session, writer_session_open) =
+        authenticated_flight_client(flight_addr, FLIGHT_WRITER_TOKEN, SessionRole::Writer).await;
+    let rss_before = process_rss_kib().unwrap_or(0);
+    let rss_sampler = RssSampler::start(rss_before);
+    let producer_id = ProducerId::from_u128(9_001).expect("producer ID is nonzero");
+    let connection_id = ConnectionId::from_u128(9_002).expect("connection ID is nonzero");
+    let mut expected_writer_epoch = None;
+    let mut identity = 10_000_u128;
+    let mut batch_sequence = 0_u64;
+    let mut scenarios = Vec::new();
+
+    for (durability, durability_name) in [
+        (PutDurability::Memory, "memory"),
+        (PutDurability::Wal, "wal"),
+    ] {
+        for rows in config.write_rows.iter().copied() {
+            let batch = benchmark_batch(rows);
+            let logical_bytes = batch.get_array_memory_size();
+            let mut samples = Vec::with_capacity(config.measured_samples);
+            for sample in 0..config
+                .warmup_samples
+                .saturating_add(config.measured_samples)
+            {
+                let (elapsed, producer_epoch) = timed_native_flight_write(
+                    &mut flight_writer,
+                    write_session,
+                    identity,
+                    STREAM_NAME,
+                    producer_id,
+                    connection_id,
+                    batch_sequence,
+                    expected_writer_epoch,
+                    durability,
+                    batch.clone(),
+                )
+                .await;
+                identity = identity.saturating_add(2);
+                batch_sequence = batch_sequence.saturating_add(1);
+                expected_writer_epoch = Some(producer_epoch);
+                record_after_warmup(sample, config.warmup_samples, elapsed, &mut samples);
+            }
+            scenarios.push(NativeIngestScenarioReport {
+                durability: durability_name,
+                rows_per_operation: rows,
+                logical_bytes_per_operation: logical_bytes,
+                flight: sample_summary(&samples, rows, logical_bytes),
+            });
+        }
+    }
+
+    let native_ingest = runtime
+        .native_ingest_status()
+        .expect("native benchmark exposes ingest metrics");
+    let flight_status = runtime
+        .flight_status()
+        .expect("native benchmark exposes Flight metrics");
+    let operations_per_scenario = config
+        .warmup_samples
+        .saturating_add(config.measured_samples);
+    let expected_batches = config
+        .write_rows
+        .len()
+        .saturating_mul(2)
+        .saturating_mul(operations_per_scenario);
+    let expected_rows = config
+        .write_rows
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_mul(2)
+        .saturating_mul(operations_per_scenario);
+    assert_eq!(
+        native_ingest.write_batches_total,
+        u64::try_from(expected_batches).expect("native batch count fits u64")
+    );
+    assert_eq!(
+        native_ingest.written_rows_total,
+        u64::try_from(expected_rows).expect("native row count fits u64")
+    );
+    assert_eq!(native_ingest.duplicate_writes_total, 0);
+    assert_eq!(native_ingest.rejected_operations_total, 0);
+    assert_eq!(native_ingest.writer_acquisitions_total, 1);
+    assert_eq!(
+        native_ingest.writer_resumes_total,
+        u64::try_from(expected_batches.saturating_sub(1)).expect("resume count fits u64")
+    );
+    assert_eq!(flight_status.put_batches, native_ingest.write_batches_total);
+    assert_eq!(flight_status.put_rows, native_ingest.written_rows_total);
+    assert_eq!(flight_status.active_puts, 0);
+
+    let rss_after = process_rss_kib().unwrap_or(0);
+    let rss_peak = rss_sampler.stop().max(rss_before).max(rss_after);
+    let report = NativeIngestBenchmarkReport {
+        format_version: NATIVE_INGEST_REPORT_VERSION,
+        git_sha: current_git_sha(),
+        target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        started_at_unix_ms,
+        warmup_samples: config.warmup_samples,
+        measured_samples: config.measured_samples,
+        writer_session_open_micros: duration_micros(writer_session_open),
+        scenarios,
+        native_ingest_metrics: NativeIngestMetrics {
+            write_batches_total: native_ingest.write_batches_total,
+            written_rows_total: native_ingest.written_rows_total,
+            duplicate_writes_total: native_ingest.duplicate_writes_total,
+            wal_commits_total: native_ingest.wal_commits_total,
+            writer_acquisitions_total: native_ingest.writer_acquisitions_total,
+            writer_resumes_total: native_ingest.writer_resumes_total,
+            rejected_operations_total: native_ingest.rejected_operations_total,
+            recovered_truncated_tail_bytes: native_ingest.recovered_truncated_tail_bytes,
+        },
+        flight_metrics: FlightMetrics {
+            issued_tickets: flight_status.issued_tickets,
+            consumed_tickets: flight_status.consumed_tickets,
+            put_batches: flight_status.put_batches,
+            put_rows: flight_status.put_rows,
+            put_bytes: flight_status.put_bytes,
+            active_puts: flight_status.active_puts,
+            transport_buffer_bytes_in_use: flight_status.transport_buffer_bytes_in_use,
+        },
+        process_rss_kib: ProcessRss {
+            before_kib: rss_before,
+            after_kib: rss_after,
+            peak_kib: rss_peak,
+        },
+    };
+    let encoded = serde_json::to_string_pretty(&report).expect("encode native ingest report");
+    println!("{encoded}");
+    if let Some(path) = config.output_path.as_ref() {
+        write_report(path, encoded.as_bytes());
+    }
+
+    drop(flight_writer);
+    let outcome = runtime.shutdown();
+    assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+    wait_until_bindable(flight_addr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual release benchmark; run with --ignored --test-threads=1"]
+async fn native_flight_persistent_ingest_performance_baseline() {
+    const STREAM_NAME: &str = "native_flight_persistent_ingest_perf";
+
+    let config = NativeIngestBenchmarkConfig::from_environment();
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must follow the Unix epoch")
+        .as_millis();
+    let temp = tempfile::tempdir().expect("create persistent ingest benchmark directory");
+    let data_dir = temp.path().join("database");
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).expect("create persistent ingest benchmark persist root");
+    seed_native_append_table(&data_dir, STREAM_NAME).await;
+    let flight_addr = reserve_tcp_addr();
+    let runtime_config = native_ingest_runtime_config(&temp, &data_dir, &persist_root, flight_addr);
+    let mut runtime = LegacyServerRuntime::start(runtime_config)
+        .expect("start persistent Flight ingest benchmark runtime");
+    let (mut flight_writer, write_session, writer_session_open) =
+        authenticated_flight_client(flight_addr, FLIGHT_WRITER_TOKEN, SessionRole::Writer).await;
+    let producer_id = ProducerId::from_u128(19_001).expect("producer ID is nonzero");
+    let batch = benchmark_batch(1);
+    let logical_bytes = batch.get_array_memory_size();
+    let mut expected_writer_epoch = None;
+    let mut scenarios = Vec::new();
+
+    for (index, (durability, durability_name)) in [
+        (PutDurability::Memory, "memory"),
+        (PutDurability::Wal, "wal"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let identity = 20_000_u128 + u128::try_from(index).expect("scenario index fits u128") * 2;
+        let (samples, producer_epoch) = timed_native_flight_persistent_writes(
+            &mut flight_writer,
+            write_session,
+            identity,
+            STREAM_NAME,
+            producer_id,
+            ConnectionId::from_u128(identity + 1).expect("connection ID is nonzero"),
+            expected_writer_epoch,
+            durability,
+            batch.clone(),
+            config.warmup_samples,
+            config.measured_samples,
+        )
+        .await;
+        expected_writer_epoch = Some(producer_epoch);
+        scenarios.push(NativeIngestScenarioReport {
+            durability: durability_name,
+            rows_per_operation: 1,
+            logical_bytes_per_operation: logical_bytes,
+            flight: sample_summary(&samples, 1, logical_bytes),
+        });
+    }
+
+    let native_ingest = runtime
+        .native_ingest_status()
+        .expect("persistent benchmark exposes ingest metrics");
+    let flight_status = runtime
+        .flight_status()
+        .expect("persistent benchmark exposes Flight metrics");
+    let operations = config
+        .warmup_samples
+        .saturating_add(config.measured_samples)
+        .saturating_mul(2);
+    assert_eq!(
+        native_ingest.write_batches_total,
+        u64::try_from(operations).expect("operation count fits u64")
+    );
+    assert_eq!(native_ingest.writer_acquisitions_total, 2);
+    assert_eq!(native_ingest.writer_resumes_total, 0);
+    assert_eq!(flight_status.puts_completed, 2);
+    assert_eq!(flight_status.active_puts, 0);
+
+    let report = PersistentIngestBenchmarkReport {
+        format_version: PERSISTENT_INGEST_REPORT_VERSION,
+        git_sha: current_git_sha(),
+        target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        started_at_unix_ms,
+        warmup_samples: config.warmup_samples,
+        measured_samples: config.measured_samples,
+        writer_session_open_micros: duration_micros(writer_session_open),
+        scenarios,
+        native_ingest_metrics: NativeIngestMetrics {
+            write_batches_total: native_ingest.write_batches_total,
+            written_rows_total: native_ingest.written_rows_total,
+            duplicate_writes_total: native_ingest.duplicate_writes_total,
+            wal_commits_total: native_ingest.wal_commits_total,
+            writer_acquisitions_total: native_ingest.writer_acquisitions_total,
+            writer_resumes_total: native_ingest.writer_resumes_total,
+            rejected_operations_total: native_ingest.rejected_operations_total,
+            recovered_truncated_tail_bytes: native_ingest.recovered_truncated_tail_bytes,
+        },
+        flight_metrics: FlightMetrics {
+            issued_tickets: flight_status.issued_tickets,
+            consumed_tickets: flight_status.consumed_tickets,
+            put_batches: flight_status.put_batches,
+            put_rows: flight_status.put_rows,
+            put_bytes: flight_status.put_bytes,
+            active_puts: flight_status.active_puts,
+            transport_buffer_bytes_in_use: flight_status.transport_buffer_bytes_in_use,
+        },
+    };
+    let encoded = serde_json::to_string_pretty(&report).expect("encode persistent ingest report");
+    println!("{encoded}");
+    if let Some(path) = std::env::var_os("ZIPPY_FLIGHT_PERSISTENT_INGEST_PERF_REPORT_JSON") {
+        write_report(Path::new(&path), encoded.as_bytes());
+    }
+
+    drop(flight_writer);
+    let outcome = runtime.shutdown();
+    assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+    wait_until_bindable(flight_addr);
+}
+
+fn native_ingest_runtime_config(
+    temp: &tempfile::TempDir,
+    data_dir: &Path,
+    persist_root: &Path,
+    flight_addr: std::net::SocketAddr,
+) -> super::LegacyServerRuntimeConfig {
+    let config = runtime_config_with_native_flight_frontend_and_persist_root(
+        temp,
+        data_dir,
+        flight_addr,
+        persist_root,
+    );
+    let config_path = config
+        .master()
+        .config_path
+        .as_ref()
+        .expect("native ingest benchmark config has an explicit path");
+    let read_token_path = temp.path().join("native-flight-read.token");
+    let writer_token_path = temp.path().join("native-flight-writer.token");
+    fs::write(&read_token_path, format!("{FLIGHT_READ_TOKEN}\n"))
+        .expect("write native Flight read token");
+    fs::write(&writer_token_path, format!("{FLIGHT_WRITER_TOKEN}\n"))
+        .expect("write native Flight writer token");
+    fs::set_permissions(&read_token_path, fs::Permissions::from_mode(0o600))
+        .expect("protect native Flight read token");
+    fs::set_permissions(&writer_token_path, fs::Permissions::from_mode(0o600))
+        .expect("protect native Flight writer token");
+    let source = fs::read_to_string(config_path)
+        .expect("read native Flight benchmark config")
+        .replace("backend = \"sqlite_shadow\"", "backend = \"sqlite\"");
+    let source = format!(
+        concat!(
+            "{}\n\n",
+            "[flight.auth]\n",
+            "enabled = true\n",
+            "token_file = {:?}\n",
+            "writer_token_file = {:?}\n",
+            "session_ttl_ms = 600000\n",
+            "max_sessions = 8\n\n",
+            "[flight.ingest]\n",
+            "enabled = true\n",
+            "max_concurrent_puts = 4\n",
+            "max_batches_per_put = 1024\n",
+            "max_rows_per_batch = 65536\n",
+            "max_rows_per_put = 1048576\n",
+            "max_batch_bytes = 2097152\n",
+            "max_bytes_per_put = 268435456\n"
+        ),
+        source,
+        read_token_path.display().to_string(),
+        writer_token_path.display().to_string(),
+    );
+    fs::write(config_path, source).expect("write native Flight benchmark config");
+    config
 }
 
 fn transport_runtime_config(
@@ -496,14 +828,9 @@ fn transport_runtime_config(
         .as_ref()
         .expect("benchmark runtime config has an explicit path");
     let read_token_path = temp.path().join("flight-read.token");
-    let writer_token_path = temp.path().join("flight-writer.token");
     fs::write(&read_token_path, format!("{FLIGHT_READ_TOKEN}\n")).expect("write Flight read token");
-    fs::write(&writer_token_path, format!("{FLIGHT_WRITER_TOKEN}\n"))
-        .expect("write Flight writer token");
     fs::set_permissions(&read_token_path, fs::Permissions::from_mode(0o600))
         .expect("protect Flight read token");
-    fs::set_permissions(&writer_token_path, fs::Permissions::from_mode(0o600))
-        .expect("protect Flight writer token");
     let mut source = fs::read_to_string(config_path).expect("read benchmark runtime config");
     source.push_str(&format!(
         concat!(
@@ -515,21 +842,11 @@ fn transport_runtime_config(
             "[flight.auth]\n",
             "enabled = true\n",
             "token_file = {:?}\n",
-            "writer_token_file = {:?}\n",
             "session_ttl_ms = 600000\n",
-            "max_sessions = 8\n\n",
-            "[flight.ingest]\n",
-            "enabled = true\n",
-            "max_concurrent_puts = 4\n",
-            "max_batches_per_put = 1024\n",
-            "max_rows_per_batch = 65536\n",
-            "max_rows_per_put = 1048576\n",
-            "max_batch_bytes = 2097152\n",
-            "max_bytes_per_put = 268435456\n"
+            "max_sessions = 8\n"
         ),
         flight_addr.to_string(),
         read_token_path.display().to_string(),
-        writer_token_path.display().to_string(),
     ));
     fs::write(config_path, source).expect("write combined benchmark runtime config");
     config
@@ -704,58 +1021,32 @@ async fn timed_flight_query(
     }
 }
 
-fn timed_gateway_write(endpoint: &str, stream_name: &str, batch: &RecordBatch) -> OperationSample {
-    let payload = encode_gateway_batch(batch);
-    let header = serde_json::json!({
-        "kind": "write_batch",
-        "stream_name": stream_name,
-        "token": GATEWAY_TOKEN,
-        "rows": batch.num_rows(),
-    });
-    let encoded_header = serde_json::to_vec(&header).expect("encode Gateway write header");
-    let started = Instant::now();
-    let mut stream = TcpStream::connect(endpoint).expect("connect Gateway write endpoint");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("set Gateway write timeout");
-    stream
-        .write_all(&(encoded_header.len() as u32).to_be_bytes())
-        .expect("write Gateway header length");
-    stream
-        .write_all(&(payload.len() as u64).to_be_bytes())
-        .expect("write Gateway payload length");
-    stream
-        .write_all(&encoded_header)
-        .expect("write Gateway header");
-    stream.write_all(&payload).expect("write Gateway payload");
-    let (response, response_payload) = read_gateway_frame(&mut stream);
-    let elapsed = started.elapsed();
-    assert_eq!(response["status"], "ok", "Gateway write failed: {response}");
-    assert!(response_payload.is_empty());
-    OperationSample::total(elapsed)
-}
-
-async fn timed_flight_write(
+#[allow(clippy::too_many_arguments)]
+async fn timed_native_flight_write(
     client: &mut FlightClient,
     session_id: SessionId,
     identity: u128,
     stream_name: &str,
+    producer_id: ProducerId,
+    connection_id: ConnectionId,
     batch_sequence: u64,
+    expected_writer_epoch: Option<u64>,
+    durability: PutDurability,
     batch: RecordBatch,
-) -> OperationSample {
+) -> (OperationSample, u64) {
     let rows = batch.num_rows();
+    let put_id = RequestId::from_u128(identity).expect("put ID is nonzero");
     let descriptor = encode_put_descriptor(&PutCommand {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         session_id: session_id.into_bytes().to_vec().into(),
-        put_id: RequestId::from_u128(identity)
-            .expect("put ID is nonzero")
-            .into_bytes()
-            .to_vec()
-            .into(),
+        put_id: put_id.into_bytes().to_vec().into(),
         stream_name: stream_name.to_owned(),
         first_batch_sequence: batch_sequence,
         mutation: PutMutation::Append as i32,
-        durability: PutDurability::Memory as i32,
+        durability: durability as i32,
+        producer_id: producer_id.into_bytes().to_vec().into(),
+        connection_id: connection_id.into_bytes().to_vec().into(),
+        expected_writer_epoch,
     });
     let input = FlightDataEncoderBuilder::new()
         .with_schema(batch.schema())
@@ -765,20 +1056,133 @@ async fn timed_flight_write(
     let results = client
         .do_put(input)
         .await
-        .expect("start benchmark Flight put")
+        .expect("start native benchmark Flight put")
         .try_collect::<Vec<_>>()
         .await
-        .expect("collect benchmark Flight put receipts");
+        .expect("collect native benchmark Flight receipts");
     let elapsed = started.elapsed();
     assert_eq!(results.len(), 1);
     let receipt = PutBatchResult::decode(results[0].app_metadata.clone())
-        .expect("decode benchmark Flight receipt");
+        .expect("decode native benchmark Flight receipt");
     assert_eq!(receipt.batch_sequence, batch_sequence);
     assert_eq!(
         usize::try_from(receipt.row_count).expect("receipt row count fits usize"),
         rows
     );
-    OperationSample::total(elapsed)
+    assert_eq!(receipt.durability_reached, durability as i32);
+    if let Some(expected_writer_epoch) = expected_writer_epoch {
+        assert_eq!(receipt.producer_epoch, expected_writer_epoch);
+    } else {
+        assert!(receipt.producer_epoch > 0);
+    }
+    (OperationSample::total(elapsed), receipt.producer_epoch)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn timed_native_flight_persistent_writes(
+    client: &mut FlightClient,
+    session_id: SessionId,
+    identity: u128,
+    stream_name: &str,
+    producer_id: ProducerId,
+    connection_id: ConnectionId,
+    expected_writer_epoch: Option<u64>,
+    durability: PutDurability,
+    batch: RecordBatch,
+    warmup_samples: usize,
+    measured_samples: usize,
+) -> (Vec<OperationSample>, u64) {
+    let put_id = RequestId::from_u128(identity).expect("put ID is nonzero");
+    let descriptor = encode_put_descriptor(&PutCommand {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        session_id: session_id.into_bytes().to_vec().into(),
+        put_id: put_id.into_bytes().to_vec().into(),
+        stream_name: stream_name.to_owned(),
+        first_batch_sequence: 0,
+        mutation: PutMutation::Append as i32,
+        durability: durability as i32,
+        producer_id: producer_id.into_bytes().to_vec().into(),
+        connection_id: connection_id.into_bytes().to_vec().into(),
+        expected_writer_epoch,
+    });
+    let total_samples = warmup_samples.saturating_add(measured_samples);
+    assert!(total_samples > 0, "persistent benchmark needs samples");
+    let (mut sender, receiver) =
+        futures::channel::mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(1);
+    let mut input = Some(
+        FlightDataEncoderBuilder::new()
+            .with_schema(batch.schema())
+            .with_flight_descriptor(Some(descriptor))
+            .build(receiver),
+    );
+    let mut samples = Vec::with_capacity(measured_samples);
+    let mut producer_epoch = None;
+    let mut responses = None;
+
+    for sample in 0..total_samples {
+        let started = Instant::now();
+        sender
+            .send(Ok(batch.clone()))
+            .await
+            .expect("send persistent Flight benchmark batch");
+        if responses.is_none() {
+            responses = Some(
+                client
+                    .do_put(input.take().expect("persistent input is opened once"))
+                    .await
+                    .expect("start persistent Flight benchmark put"),
+            );
+        }
+        let result = responses
+            .as_mut()
+            .expect("persistent response stream is open")
+            .try_next()
+            .await
+            .expect("read persistent Flight benchmark receipt")
+            .expect("persistent Flight benchmark ended before every receipt");
+        let elapsed = started.elapsed();
+        let receipt = PutBatchResult::decode(result.app_metadata)
+            .expect("decode persistent Flight benchmark receipt");
+        assert_eq!(
+            receipt.batch_sequence,
+            u64::try_from(sample).expect("sample index fits u64")
+        );
+        assert_eq!(receipt.row_count, 1);
+        assert_eq!(receipt.durability_reached, durability as i32);
+        if let Some(epoch) = producer_epoch {
+            assert_eq!(receipt.producer_epoch, epoch);
+        } else if let Some(expected) = expected_writer_epoch {
+            assert!(receipt.producer_epoch > expected);
+        } else {
+            assert!(receipt.producer_epoch > 0);
+        }
+        producer_epoch = Some(receipt.producer_epoch);
+        record_after_warmup(
+            sample,
+            warmup_samples,
+            OperationSample::total(elapsed),
+            &mut samples,
+        );
+    }
+
+    sender
+        .close()
+        .await
+        .expect("close persistent Flight benchmark input");
+    assert!(
+        responses
+            .as_mut()
+            .expect("persistent response stream is open")
+            .try_next()
+            .await
+            .expect("finish persistent Flight benchmark put")
+            .is_none(),
+        "persistent Flight benchmark returned trailing metadata"
+    );
+    (
+        samples,
+        producer_epoch.expect("persistent benchmark receives one producer epoch"),
+    )
 }
 
 fn benchmark_batch(rows: usize) -> RecordBatch {
@@ -790,21 +1194,6 @@ fn benchmark_batch(rows: usize) -> RecordBatch {
         vec![Arc::new(Int64Array::from(values))],
     )
     .expect("construct benchmark write batch")
-}
-
-fn encode_gateway_batch(batch: &RecordBatch) -> Vec<u8> {
-    let mut payload = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut payload, &batch.schema())
-            .expect("create Gateway benchmark Arrow writer");
-        writer
-            .write(batch)
-            .expect("write Gateway benchmark Arrow batch");
-        writer
-            .finish()
-            .expect("finish Gateway benchmark Arrow stream");
-    }
-    payload
 }
 
 fn record_after_warmup(

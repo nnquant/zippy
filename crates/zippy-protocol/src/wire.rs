@@ -45,6 +45,12 @@ pub struct PutCommand {
     pub mutation: i32,
     #[prost(enumeration = "PutDurability", tag = "7")]
     pub durability: i32,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub producer_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "9")]
+    pub connection_id: ::prost::bytes::Bytes,
+    #[prost(uint64, optional, tag = "10")]
+    pub expected_writer_epoch: ::core::option::Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -59,6 +65,8 @@ pub enum PutMutation {
 pub enum PutDurability {
     Unspecified = 0,
     Memory = 1,
+    Wal = 2,
+    Persisted = 3,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -73,6 +81,20 @@ pub struct PutBatchResult {
     pub row_count: u64,
     #[prost(enumeration = "PutDurability", tag = "5")]
     pub durability_reached: i32,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub request_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "7")]
+    pub producer_epoch: u64,
+    #[prost(uint64, optional, tag = "8")]
+    pub first_log_offset: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "9")]
+    pub last_log_offset: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "10")]
+    pub previous_log_offset: ::core::option::Option<OffsetWatermark>,
+    #[prost(message, optional, tag = "11")]
+    pub committed_log_offset: ::core::option::Option<OffsetWatermark>,
+    #[prost(uint64, optional, tag = "12")]
+    pub persisted_snapshot_version: ::core::option::Option<u64>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

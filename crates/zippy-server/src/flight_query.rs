@@ -2,21 +2,33 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use zippy_catalog::{
     decode_persisted_schema, SqliteCatalogReadHandle, SqliteCatalogSchemaReadLimits,
     SqliteCatalogSchemaSelector,
 };
-use zippy_ingest::MemoryIngestHandle;
-use zippy_protocol::ingest::FlightPutBatch;
+use zippy_ingest::{ArrowIpcMutationFingerprintComputer, NativeIngestHandle};
+use zippy_protocol::ingest::{
+    put_batch_request_id, put_batch_result_from_receipt, FlightPutBatch, FlightPutCommand,
+};
 use zippy_protocol::query::FlightQueryRequest;
-use zippy_protocol::server::{FlightQueryFrontend, OpaquePreparedFlightQuery, PreparedFlightQuery};
+use zippy_protocol::server::{
+    FlightIngestWriter, FlightQueryFrontend, OpaqueFlightIngestWriter, OpaquePreparedFlightQuery,
+    PreparedFlightQuery,
+};
 use zippy_protocol::sql::{
     FlightSqlMetadataLimits, FlightSqlMetadataRequest, PreparedFlightSqlMetadata,
 };
 use zippy_types::catalog::{CatalogRead, ListNamespacesRequest, ListTablesRequest};
+use zippy_types::ingest::{
+    Durability, DurableWriteTarget, IncomingWriteRequest, IngestService,
+    MutationFingerprintComputer, OpaqueDurableWriteAck, OpaqueIngestWriter, OpenWriterRequest,
+    TableMutation, WriteReceipt,
+};
 use zippy_types::query::{QueryEngine, QueryInstanceId, QueryPlanInfo, SendableRecordBatchStream};
+use zippy_types::table::{CatalogName, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, Result, ServerError, SessionId};
 
 use crate::{NativePreparedQuery, NativeQueryBinding, NativeQueryEngine};
@@ -30,7 +42,7 @@ const FLIGHT_SQL_TABLE_TYPE: &str = "TABLE";
 pub struct NativeFlightQueryFrontend {
     engine: NativeQueryEngine,
     catalog: SqliteCatalogReadHandle,
-    memory_ingest: Option<MemoryIngestHandle>,
+    native_ingest: Option<NativeIngestHandle>,
 }
 
 impl NativeFlightQueryFrontend {
@@ -40,14 +52,14 @@ impl NativeFlightQueryFrontend {
         Self {
             engine,
             catalog,
-            memory_ingest: None,
+            native_ingest: None,
         }
     }
 
-    /// Installs the server-owned process-local memory append authority.
+    /// Installs the server-owned producer-fenced native append authority.
     #[must_use]
-    pub fn with_memory_ingest(mut self, memory_ingest: MemoryIngestHandle) -> Self {
-        self.memory_ingest = Some(memory_ingest);
+    pub fn with_native_ingest(mut self, native_ingest: NativeIngestHandle) -> Self {
+        self.native_ingest = Some(native_ingest);
         self
     }
 
@@ -258,33 +270,145 @@ impl FlightQueryFrontend for NativeFlightQueryFrontend {
         Box::pin(async move { self.prepare_metadata_inner(request, limits).await })
     }
 
-    fn write_batch(&self, request: FlightPutBatch) -> BoxFuture<'_, Result<()>> {
-        let Some(memory_ingest) = self.memory_ingest.clone() else {
+    fn open_ingest_writer(
+        &self,
+        command: Arc<FlightPutCommand>,
+    ) -> BoxFuture<'_, Result<OpaqueFlightIngestWriter>> {
+        let Some(native_ingest) = self.native_ingest.clone() else {
             return Box::pin(async move {
                 Err(ServerError::new(
                     ErrorCode::UnsupportedPlan,
-                    "Flight memory ingest authority is not configured",
+                    "Flight native ingest authority is not configured",
                 )
-                .with_request_id(request.command.put_id)
+                .with_request_id(command.put_id)
                 .with_retryable(false))
             });
         };
         Box::pin(async move {
-            let put_id = request.command.put_id;
-            let stream_name = request.command.stream_name.clone();
-            tokio::task::spawn_blocking(move || {
-                memory_ingest.write_batch(&stream_name, request.batch)
+            let table = self
+                .catalog
+                .get_table(TableRef::Name {
+                    namespace: CatalogName::default_namespace(),
+                    table: CatalogName::new(command.stream_name.clone()).map_err(|error| {
+                        ServerError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("invalid Flight ingest table name error=[{error}]"),
+                        )
+                        .with_request_id(command.put_id)
+                        .with_retryable(false)
+                    })?,
+                })
+                .await
+                .map_err(|error| error.with_request_id(command.put_id))?;
+            let writer = native_ingest
+                .open_writer(OpenWriterRequest {
+                    request_id: command.put_id,
+                    table_id: table.table_id,
+                    producer_id: command.producer_id,
+                    connection_id: command.connection_id,
+                    expected_writer_epoch: command.expected_writer_epoch,
+                })
+                .await?;
+            Ok(Box::new(NativeFlightIngestWriter {
+                command,
+                writer: Some(writer),
+                next_batch_index: 0,
+            }) as OpaqueFlightIngestWriter)
+        })
+    }
+}
+
+enum NativeFlightWriteSubmission {
+    Ready(WriteReceipt),
+    Durable(OpaqueDurableWriteAck),
+}
+
+struct NativeFlightIngestWriter {
+    command: Arc<FlightPutCommand>,
+    writer: Option<OpaqueIngestWriter>,
+    next_batch_index: u64,
+}
+
+impl FlightIngestWriter for NativeFlightIngestWriter {
+    fn write_batch(
+        &mut self,
+        batch: FlightPutBatch,
+    ) -> BoxFuture<'_, Result<zippy_protocol::wire::PutBatchResult>> {
+        Box::pin(async move {
+            if batch.command.put_id != self.command.put_id {
+                return Err(ServerError::new(
+                    ErrorCode::Internal,
+                    "Flight ingest writer received a batch from another put",
+                )
+                .with_request_id(batch.command.put_id)
+                .with_retryable(false));
+            }
+            let batch_index = self.next_batch_index;
+            let request_id = put_batch_request_id(self.command.put_id, batch_index);
+            let mut writer = self.writer.take().ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::Unavailable,
+                    "Flight native ingest writer is no longer available",
+                )
+                .with_request_id(request_id)
+                .with_retryable(false)
+            })?;
+            let producer_epoch = writer.info().producer_epoch;
+            let schema_version = writer.info().schema_version;
+            let durability = self.command.durability;
+            let joined = tokio::task::spawn_blocking(move || {
+                let result = ArrowIpcMutationFingerprintComputer.prepare(IncomingWriteRequest {
+                    request_id,
+                    schema_version,
+                    batch_sequence: batch.batch_sequence,
+                    mutation: TableMutation::Append(batch.batch),
+                });
+                let submission = result.and_then(|request| match durability {
+                    Durability::Memory => writer
+                        .write_memory(request)
+                        .map(NativeFlightWriteSubmission::Ready),
+                    Durability::Wal => writer
+                        .submit_durable(request, DurableWriteTarget::Wal)
+                        .map(NativeFlightWriteSubmission::Durable),
+                    Durability::Persisted => Err(ServerError::new(
+                        ErrorCode::UnsupportedPlan,
+                        "Flight persisted acknowledgement is not implemented",
+                    )
+                    .with_request_id(request_id)
+                    .with_retryable(false)),
+                });
+                (writer, submission)
             })
             .await
             .map_err(|error| {
                 ServerError::new(
                     ErrorCode::Internal,
-                    format!("join Flight memory ingest writer failed error=[{error}]"),
+                    format!("join Flight native ingest writer failed error=[{error}]"),
                 )
-                .with_request_id(put_id)
+                .with_request_id(request_id)
                 .with_retryable(false)
-            })?
-            .map_err(|error| error.with_request_id(put_id))
+            })?;
+            self.writer = Some(joined.0);
+            let receipt = match joined.1? {
+                NativeFlightWriteSubmission::Ready(receipt) => receipt,
+                NativeFlightWriteSubmission::Durable(acknowledgement) => {
+                    acknowledgement.wait().await?
+                }
+            };
+            self.next_batch_index = self.next_batch_index.checked_add(1).ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "Flight native ingest batch index exhausted u64",
+                )
+                .with_request_id(request_id)
+                .with_retryable(false)
+            })?;
+            Ok(put_batch_result_from_receipt(
+                &self.command,
+                batch.batch_sequence,
+                producer_epoch,
+                &receipt,
+            ))
         })
     }
 }

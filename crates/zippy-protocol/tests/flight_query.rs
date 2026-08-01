@@ -26,15 +26,17 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate as TonicCertificate, ClientTlsConfig, Identity};
 use zippy_protocol::auth::FlightBearerAuthConfig;
 use zippy_protocol::error::status_to_server_error;
-use zippy_protocol::ingest::{encode_put_descriptor, FlightPutBatch, FlightPutLimits};
+use zippy_protocol::ingest::{
+    encode_put_descriptor, put_batch_result, FlightPutBatch, FlightPutCommand, FlightPutLimits,
+};
 use zippy_protocol::query::{
     decode_query_ticket, encode_query_descriptor, encode_query_request, encode_query_ticket,
     FlightQueryRequest, FlightTableBinding,
 };
 use zippy_protocol::runtime::{FlightServerRuntime, FlightServerTlsConfig};
 use zippy_protocol::server::{
-    FlightQueryFrontend, FlightServiceConfig, OpaquePreparedFlightQuery, PreparedFlightQuery,
-    ZippyFlightService,
+    FlightIngestWriter, FlightQueryFrontend, FlightServiceConfig, OpaqueFlightIngestWriter,
+    OpaquePreparedFlightQuery, PreparedFlightQuery, ZippyFlightService,
 };
 use zippy_protocol::sql::{
     FlightSqlMetadataLimits, FlightSqlMetadataRequest, PreparedFlightSqlMetadata,
@@ -72,7 +74,33 @@ struct FakeFrontend {
 
 #[derive(Default)]
 struct RecordingPutFrontend {
-    writes: Mutex<Vec<(String, u64, usize)>>,
+    writes: Arc<Mutex<Vec<(String, u64, usize)>>>,
+}
+
+struct RecordingPutWriter {
+    command: Arc<FlightPutCommand>,
+    writes: Arc<Mutex<Vec<(String, u64, usize)>>>,
+}
+
+impl FlightIngestWriter for RecordingPutWriter {
+    fn write_batch(&mut self, request: FlightPutBatch) -> BoxFuture<'_, Result<PutBatchResult>> {
+        Box::pin(async move {
+            let row_count = request.batch.num_rows();
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((
+                    request.command.stream_name.clone(),
+                    request.batch_sequence,
+                    row_count,
+                ));
+            Ok(put_batch_result(
+                &self.command,
+                request.batch_sequence,
+                u64::try_from(row_count).unwrap(),
+            ))
+        })
+    }
 }
 
 impl FlightQueryFrontend for RecordingPutFrontend {
@@ -90,17 +118,13 @@ impl FlightQueryFrontend for RecordingPutFrontend {
         })
     }
 
-    fn write_batch(&self, request: FlightPutBatch) -> BoxFuture<'_, Result<()>> {
+    fn open_ingest_writer(
+        &self,
+        command: Arc<FlightPutCommand>,
+    ) -> BoxFuture<'_, Result<OpaqueFlightIngestWriter>> {
+        let writes = Arc::clone(&self.writes);
         Box::pin(async move {
-            self.writes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((
-                    request.command.stream_name.clone(),
-                    request.batch_sequence,
-                    request.batch.num_rows(),
-                ));
-            Ok(())
+            Ok(Box::new(RecordingPutWriter { command, writes }) as OpaqueFlightIngestWriter)
         })
     }
 }
@@ -607,6 +631,9 @@ async fn writer_session_streams_bounded_memory_puts_and_read_session_is_rejected
         first_batch_sequence: 11,
         mutation: PutMutation::Append as i32,
         durability: PutDurability::Memory as i32,
+        producer_id: bytes::Bytes::new(),
+        connection_id: bytes::Bytes::new(),
+        expected_writer_epoch: None,
     });
     let input = FlightDataEncoderBuilder::new()
         .with_schema(Arc::clone(&schema))
@@ -662,6 +689,9 @@ async fn writer_session_streams_bounded_memory_puts_and_read_session_is_rejected
         first_batch_sequence: 0,
         mutation: PutMutation::Append as i32,
         durability: PutDurability::Memory as i32,
+        producer_id: bytes::Bytes::new(),
+        connection_id: bytes::Bytes::new(),
+        expected_writer_epoch: None,
     });
     let denied_batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -722,6 +752,9 @@ async fn put_row_limit_rejects_batch_before_frontend_write() {
         first_batch_sequence: 0,
         mutation: PutMutation::Append as i32,
         durability: PutDurability::Memory as i32,
+        producer_id: bytes::Bytes::new(),
+        connection_id: bytes::Bytes::new(),
+        expected_writer_epoch: None,
     });
     let input = FlightDataEncoderBuilder::new()
         .with_schema(schema)

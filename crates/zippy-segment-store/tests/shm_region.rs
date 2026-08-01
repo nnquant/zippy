@@ -3,6 +3,11 @@ use std::os::unix::fs::MetadataExt;
 
 use zippy_segment_store::ShmRegion;
 
+#[cfg(target_os = "linux")]
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
 #[cfg(unix)]
 #[test]
 fn shm_region_backing_file_is_preallocated_to_avoid_sparse_mmap_sigbus() {
@@ -37,6 +42,27 @@ fn shm_region_reopens_by_os_id_and_reads_existing_bytes() {
 
     assert_eq!(actual, expected);
     assert_eq!(reader.len(), 4096);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shm_region_mappings_do_not_retain_backing_file_descriptors() {
+    let before = open_fd_count();
+    let owners = (0..64)
+        .map(|_| ShmRegion::create(4096).unwrap())
+        .collect::<Vec<_>>();
+    let readers = owners
+        .iter()
+        .map(|owner| ShmRegion::open(owner.os_id()).unwrap())
+        .collect::<Vec<_>>();
+    let after = open_fd_count();
+
+    assert_eq!(owners.len(), 64);
+    assert_eq!(readers.len(), 64);
+    assert!(
+        after <= before + 2,
+        "mapped regions retained backing descriptors before=[{before}] after=[{after}]"
+    );
 }
 
 #[test]

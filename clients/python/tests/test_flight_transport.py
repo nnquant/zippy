@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from zippy_client.sql import compile_flight_table_sql, expression_to_sql
 from zippy_client.transports.flight import (
     CAPABILITIES_ACTION,
     FlightTransport,
+    _put_batch_request_id,
     _translate_flight_error,
 )
 from zippy_client.writer import FlightWriter
@@ -78,12 +80,14 @@ class _FakePutWriter:
         command: wire.PutCommand,
         metadata: _FakeMetadataReader,
         batches: list[pa.RecordBatch],
+        state: _FakeFlightState,
         *,
         fail_before_first_batch: bool = False,
     ) -> None:
         self.command = command
         self.metadata = metadata
         self.batches = batches
+        self.state = state
         self.fail_before_first_batch = fail_before_first_batch
         self.closed = False
 
@@ -92,13 +96,31 @@ class _FakePutWriter:
             raise flight.FlightUnavailableError("injected disconnect")
         index = len(self.batches)
         self.batches.append(batch)
+        first_offset = self.state.next_log_offset
+        last_offset = first_offset + batch.num_rows - 1
+        previous = wire.OffsetWatermark(state=wire.OffsetWatermark.STATE_EMPTY)
+        if first_offset > 0:
+            previous = wire.OffsetWatermark(
+                state=wire.OffsetWatermark.STATE_KNOWN,
+                offset=first_offset - 1,
+            )
         receipt = wire.PutBatchResult(
             protocol_version=1,
             put_id=self.command.put_id,
             batch_sequence=self.command.first_batch_sequence + index,
             row_count=batch.num_rows,
-            durability_reached=wire.PUT_DURABILITY_MEMORY,
+            durability_reached=self.command.durability,
+            request_id=_put_batch_request_id(self.command.put_id, index),
+            producer_epoch=len(self.state.put_batches),
+            first_log_offset=first_offset,
+            last_log_offset=last_offset,
+            previous_log_offset=previous,
+            committed_log_offset=wire.OffsetWatermark(
+                state=wire.OffsetWatermark.STATE_KNOWN,
+                offset=last_offset,
+            ),
         )
+        self.state.next_log_offset = last_offset + 1
         self.metadata.pending.append(pa.py_buffer(receipt.SerializeToString()))
 
     def done_writing(self) -> None:
@@ -122,6 +144,7 @@ class _FakeFlightState:
                     "auth.bearer_handshake.v1",
                     "auth.session_roles.v1",
                     "ingest.append.memory.v1",
+                    "ingest.append.wal.v1",
                 ]
             )
         self.capabilities = wire.CapabilitiesResponse(
@@ -149,6 +172,7 @@ class _FakeFlightState:
         self.clients: list[_FakeFlightClient] = []
         self.message_limits: list[int] = []
         self.fail_put_number: int | None = None
+        self.next_log_offset = 0
         self.result = pa.table({"value": [10, 20]})
 
     def connect(self, location: str, **kwargs: object) -> _FakeFlightClient:
@@ -259,6 +283,7 @@ class _FakeFlightClient:
                 command,
                 metadata,
                 batches,
+                self.state,
                 fail_before_first_batch=(self.state.fail_put_number == len(self.state.put_batches)),
             ),
             metadata,
@@ -364,9 +389,199 @@ def test_authenticated_flight_query_and_bounded_do_put(
     assert query.spill_limit.kind == wire.ResourceLimit.KIND_DISABLED
     assert state.handshake_roles == [wire.SESSION_ROLE_READ, wire.SESSION_ROLE_WRITER]
     assert [command.first_batch_sequence for command in state.put_commands] == [7, 8]
+    assert all(command.durability == wire.PUT_DURABILITY_WAL for command in state.put_commands)
+    assert len({bytes(command.producer_id) for command in state.put_commands}) == 1
+    assert len({bytes(command.connection_id) for command in state.put_commands}) == 1
+    assert not state.put_commands[0].HasField("expected_writer_epoch")
+    assert state.put_commands[1].expected_writer_epoch == 1
     assert [len(batches) for batches in state.put_batches] == [1, 2]
     assert [receipt["batch_sequence"] for receipt in receipts] == [7, 8, 9]
+    assert [receipt["producer_epoch"] for receipt in receipts] == [1, 2, 2]
+    assert [receipt["committed_log_offset"] for receipt in receipts] == [1, 3, 4]
     assert all(client.closed for client in state.clients)
+
+
+def test_write_table_reuses_one_open_doput_across_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _FakeFlightState(authenticated=True)
+    monkeypatch.setattr(flight, "connect", state.connect)
+    transport = FlightTransport(
+        "127.0.0.1:17667",
+        tls_enabled=False,
+        read_token="read-token",
+        writer_token="writer-token",
+    )
+    producer_id = uuid.UUID("00000000-0000-0000-0000-000000000701")
+    connection_id = uuid.UUID("00000000-0000-0000-0000-000000000702")
+
+    first = transport.write_table(
+        "ticks",
+        pa.table({"value": [1]}),
+        durability="memory",
+        producer_id=producer_id,
+        connection_id=connection_id,
+    )
+    second = transport.write_table(
+        "ticks",
+        pa.table({"value": [2]}),
+        first_batch_sequence=1,
+        durability="memory",
+        producer_id=producer_id,
+        connection_id=connection_id,
+        expected_writer_epoch=1,
+    )
+    transport.close_write(connection_id)
+    transport._read_connection = transport._writer_connection
+    transport.close()
+
+    assert len(state.put_commands) == 1
+    assert [batch.num_rows for batch in state.put_batches[0]] == [1, 1]
+    assert [first[0]["batch_sequence"], second[0]["batch_sequence"]] == [0, 1]
+    assert [first[0]["producer_epoch"], second[0]["producer_epoch"]] == [1, 1]
+
+
+def test_reusable_doput_rotates_when_durability_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _FakeFlightState(authenticated=True)
+    monkeypatch.setattr(flight, "connect", state.connect)
+    transport = FlightTransport(
+        "127.0.0.1:17667",
+        tls_enabled=False,
+        read_token="read-token",
+        writer_token="writer-token",
+    )
+    producer_id = uuid.UUID("00000000-0000-0000-0000-000000000711")
+    connection_id = uuid.UUID("00000000-0000-0000-0000-000000000712")
+
+    transport.write_table(
+        "ticks",
+        pa.table({"value": [1]}),
+        durability="memory",
+        producer_id=producer_id,
+        connection_id=connection_id,
+    )
+    transport.write_table(
+        "ticks",
+        pa.table({"value": [2]}),
+        first_batch_sequence=1,
+        durability="wal",
+        producer_id=producer_id,
+        connection_id=connection_id,
+        expected_writer_epoch=1,
+    )
+    transport.close_write(connection_id)
+    transport.close()
+
+    assert len(state.put_commands) == 2
+    assert [command.durability for command in state.put_commands] == [
+        wire.PUT_DURABILITY_MEMORY,
+        wire.PUT_DURABILITY_WAL,
+    ]
+
+
+def test_expired_reusable_doput_is_aborted_before_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _FakeFlightState(authenticated=True)
+    monkeypatch.setattr(flight, "connect", state.connect)
+    transport = FlightTransport(
+        "127.0.0.1:17667",
+        tls_enabled=False,
+        read_token="read-token",
+        writer_token="writer-token",
+    )
+    producer_id = uuid.UUID("00000000-0000-0000-0000-000000000721")
+    connection_id = uuid.UUID("00000000-0000-0000-0000-000000000722")
+    transport.write_table(
+        "ticks",
+        pa.table({"value": [1]}),
+        durability="memory",
+        producer_id=producer_id,
+        connection_id=connection_id,
+    )
+    expired = transport._active_puts[connection_id.bytes]
+    expired.retire_at_ns = 0
+    expired.deadline_at_ns = 0
+
+    def fail_expired_close() -> None:
+        raise RuntimeError("expired stream already closed by Flight")
+
+    expired.writer.close = fail_expired_close
+
+    transport.write_table(
+        "ticks",
+        pa.table({"value": [2]}),
+        first_batch_sequence=1,
+        durability="memory",
+        producer_id=producer_id,
+        connection_id=connection_id,
+        expected_writer_epoch=1,
+    )
+    transport.close_write(connection_id)
+    transport.close()
+
+    assert not expired.metadata_reader.done
+    assert len(state.put_commands) == 2
+
+
+def test_transport_close_releases_clients_after_put_terminal_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _FakeFlightState(authenticated=True)
+    monkeypatch.setattr(flight, "connect", state.connect)
+    transport = FlightTransport(
+        "127.0.0.1:17667",
+        tls_enabled=False,
+        read_token="read-token",
+        writer_token="writer-token",
+    )
+    producer_id = uuid.UUID("00000000-0000-0000-0000-000000000731")
+    connection_id = uuid.UUID("00000000-0000-0000-0000-000000000732")
+    transport.write_table(
+        "ticks",
+        pa.table({"value": [1]}),
+        durability="memory",
+        producer_id=producer_id,
+        connection_id=connection_id,
+    )
+    active = transport._active_puts[connection_id.bytes]
+    active.metadata_reader.pending.append(pa.py_buffer(b"unexpected-terminal"))
+
+    with pytest.raises(AmbiguousWriteError, match="clean terminal boundary"):
+        transport.close()
+
+    assert active.writer.closed
+    assert all(client.closed for client in state.clients)
+
+
+def test_write_table_rejects_invalid_and_oversized_per_put_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _FakeFlightState(authenticated=True)
+    monkeypatch.setattr(flight, "connect", state.connect)
+    transport = FlightTransport(
+        "127.0.0.1:17667",
+        tls_enabled=False,
+        read_token="read-token",
+        writer_token="writer-token",
+    )
+    original = transport.capabilities
+    transport.capabilities = replace(original, ingest_max_batches_per_put=0)
+    with pytest.raises(ProtocolError, match="invalid per-put limits"):
+        transport.write_table("ticks", pa.table({"value": [1]}), durability="memory")
+
+    transport.capabilities = replace(original, ingest_max_rows_per_put=1)
+    with pytest.raises(CapabilityError, match="exceeds the server per-put limit"):
+        transport.write_table("ticks", pa.table({"value": [1, 2]}), durability="memory")
+
+    unknown_connection = uuid.UUID("00000000-0000-0000-0000-000000000799")
+    transport.close_write(unknown_connection)
+    with transport._put_lock:
+        transport._close_write_locked(unknown_connection.bytes)
+    transport.close()
+    transport.close()
 
 
 def test_pyarrow_loopback_executes_real_flight_rpc_stream() -> None:
@@ -696,6 +911,8 @@ def test_flight_sql_compiler_preserves_replaced_columns_and_outer_join_keys() ->
 class _WriterTransport:
     def __init__(self) -> None:
         self.calls: list[tuple[str, pa.Table, int]] = []
+        self.connection_ids: list[bytes] = []
+        self.closed_connections: list[bytes] = []
 
     def write_table(
         self,
@@ -703,16 +920,28 @@ class _WriterTransport:
         table: pa.Table,
         *,
         first_batch_sequence: int = 0,
+        durability: str = "wal",
+        producer_id: bytes | str | uuid.UUID | None = None,
+        connection_id: bytes | str | uuid.UUID | None = None,
+        expected_writer_epoch: int | None = None,
     ) -> list[dict[str, object]]:
+        del producer_id, expected_writer_epoch
+        assert isinstance(connection_id, bytes)
+        self.connection_ids.append(connection_id)
         self.calls.append((stream_name, table, first_batch_sequence))
         return [
             {
                 "put_id": str(uuid.uuid4()),
                 "batch_sequence": first_batch_sequence,
                 "row_count": table.num_rows,
-                "durability": "memory",
+                "durability": durability,
+                "producer_epoch": first_batch_sequence + 1,
             }
         ]
+
+    def close_write(self, connection_id: bytes | str | uuid.UUID) -> None:
+        assert isinstance(connection_id, bytes)
+        self.closed_connections.append(connection_id)
 
 
 def test_flight_writer_buffers_rows_and_router_prefers_flight() -> None:
@@ -725,7 +954,9 @@ def test_flight_writer_buffers_rows_and_router_prefers_flight() -> None:
 
     assert [call[1].num_rows for call in transport.calls] == [2, 2]
     assert [call[2] for call in transport.calls] == [0, 1]
-    assert writer.last_receipts[0]["durability"] == "memory"
+    assert len(set(transport.connection_ids)) == 1
+    assert transport.closed_connections == [transport.connection_ids[0]]
+    assert writer.last_receipts[0]["durability"] == "wal"
 
     router = TransportRouter(
         ControlEndpoint("tcp", "192.0.2.1:17690", "zippy://192.0.2.1:17690/default"),
@@ -761,8 +992,20 @@ def test_flight_writer_fails_closed_after_ambiguous_flush() -> None:
             table: pa.Table,
             *,
             first_batch_sequence: int = 0,
+            durability: str = "wal",
+            producer_id: bytes | str | uuid.UUID | None = None,
+            connection_id: bytes | str | uuid.UUID | None = None,
+            expected_writer_epoch: int | None = None,
         ) -> list[dict[str, object]]:
-            del stream_name, table, first_batch_sequence
+            del (
+                stream_name,
+                table,
+                first_batch_sequence,
+                durability,
+                producer_id,
+                connection_id,
+                expected_writer_epoch,
+            )
             self.calls += 1
             raise AmbiguousWriteError(
                 "connection lost after an unknown number of receipts",
@@ -775,6 +1018,9 @@ def test_flight_writer_fails_closed_after_ambiguous_flush() -> None:
                     }
                 ],
             )
+
+        def close_write(self, connection_id: bytes | str | uuid.UUID) -> None:
+            del connection_id
 
     transport = FailingTransport()
     writer = FlightWriter("ticks", transport, batch_size=2, flush_interval_ms=None)

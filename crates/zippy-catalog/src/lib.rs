@@ -41,6 +41,7 @@ pub use runtime_pins::{
 pub use service::{
     SqliteCatalog, SqliteCatalogLegacyImportSession, SqliteCatalogLegacyReconcileHandle,
     SqliteCatalogReadHandle, SqliteCatalogRuntimeSnapshotPinAdmissionControl,
+    SqliteCatalogWriteHandle,
 };
 pub use snapshot_domain::{
     SqliteCatalogSchemaReadLimits, SqliteCatalogSchemaSelector, SqliteCatalogSchemaSnapshot,

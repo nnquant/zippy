@@ -259,6 +259,24 @@ impl RowSpanView {
         }
     }
 
+    /// Returns the current committed-row watermark for an active shared-memory backing.
+    pub fn active_segment_committed_row_count(
+        &self,
+    ) -> Result<Option<usize>, ZippySegmentStoreError> {
+        match &self.backing {
+            RowSpanBacking::Sealed(_) => Ok(None),
+            RowSpanBacking::Active(attachment) => {
+                let committed = attachment
+                    .shm_region
+                    .load_u64_acquire(attachment.descriptor.committed_row_count_offset())
+                    .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
+                usize::try_from(committed).map(Some).map_err(|_| {
+                    ZippySegmentStoreError::Layout("committed row count overflows usize")
+                })
+            }
+        }
+    }
+
     /// 返回起始行。
     pub fn start_row(&self) -> usize {
         self.start_row

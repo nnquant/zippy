@@ -17,10 +17,10 @@ use arrow::{
 use parquet::arrow::ArrowWriter;
 use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, ZippyError};
 use zippy_segment_store::{
-    compile_schema, ColumnSpec, ColumnType, PartitionColumnWriter, PartitionHandle,
-    PartitionRowUpdater, PartitionRowWriter, PartitionWriterHandle, ReaderSession, RowSpanView,
-    SealedSegmentHandle, SegmentCellValue, SegmentLease, SegmentStore, SegmentStoreConfig,
-    ZippySegmentStoreError,
+    compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, PartitionColumnWriter,
+    PartitionHandle, PartitionRowUpdater, PartitionRowWriter, PartitionWriterHandle, ReaderSession,
+    RowSpanView, SealedSegmentHandle, SegmentCellValue, SegmentLease, SegmentStore,
+    SegmentStoreConfig, ZippySegmentStoreError,
 };
 
 use crate::stream_table_shard::{ShardConfig, ShardRouter};
@@ -119,6 +119,34 @@ pub struct StreamTableMaterializer {
     persist_publisher: Option<Arc<dyn StreamTablePersistPublisher>>,
     retention_guard: Option<Arc<dyn StreamTableRetentionGuard>>,
     persist_worker: Option<StreamTablePersistWorker>,
+}
+
+/// One server-local shared-memory segment retained by an append materializer.
+#[derive(Debug, Clone)]
+pub struct StreamTableLiveSegment {
+    descriptor: ActiveSegmentDescriptor,
+    row_count: usize,
+    sealed: bool,
+}
+
+impl StreamTableLiveSegment {
+    /// Returns the attachable shared-memory descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> &ActiveSegmentDescriptor {
+        &self.descriptor
+    }
+
+    /// Returns the committed prefix represented by this segment.
+    #[must_use]
+    pub const fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Returns whether rollover sealed the segment against further appends.
+    #[must_use]
+    pub const fn is_sealed(&self) -> bool {
+        self.sealed
+    }
 }
 
 /// A shard-level write or lifecycle failure captured by a sharded materializer.
@@ -956,6 +984,83 @@ impl StreamTableMaterializer {
         self.partition
             .debug_snapshot_record_batch()
             .map_err(segment_error)
+    }
+
+    /// Returns every retained append segment in logical row order.
+    ///
+    /// Sealed append segments are full by construction. Frame-per-batch materializers can seal
+    /// partial segments and therefore must use their frame-aware publication path instead.
+    pub fn append_live_segments(&self) -> Result<Vec<StreamTableLiveSegment>> {
+        if self.frame_per_batch {
+            return Err(ZippyError::InvalidState {
+                status: "append live segment publication does not support frame-per-batch mode",
+            });
+        }
+        let active = self.partition.active_descriptor();
+        let schema = active.schema().clone();
+        let layout = active.layout().clone();
+        let mut segments = Vec::with_capacity(
+            self.sealed_segment_descriptors.len()
+                + usize::from(self.active_committed_row_count() != 0),
+        );
+        for encoded in &self.sealed_segment_descriptors {
+            let bytes = serde_json::to_vec(encoded).map_err(|error| ZippyError::Io {
+                reason: format!("failed to encode retained append descriptor error=[{error}]"),
+            })?;
+            let descriptor = ActiveSegmentDescriptor::from_envelope_bytes(
+                &bytes,
+                schema.clone(),
+                layout.clone(),
+            )
+            .map_err(|error| ZippyError::Io {
+                reason: format!("failed to decode retained append descriptor error=[{error}]"),
+            })?;
+            let row_count = RowSpanView::from_active_descriptor(descriptor.clone(), 0, 0)
+                .map_err(|error| ZippyError::Io {
+                    reason: format!("failed to attach retained append descriptor error=[{error}]"),
+                })?
+                .active_segment_committed_row_count()
+                .map_err(segment_error)?
+                .ok_or(ZippyError::InvalidState {
+                    status: "retained append descriptor is not shared-memory backed",
+                })?;
+            segments.push(StreamTableLiveSegment {
+                row_count,
+                descriptor,
+                sealed: true,
+            });
+        }
+        let active_rows = self.active_committed_row_count();
+        if active_rows != 0 {
+            segments.push(StreamTableLiveSegment {
+                descriptor: active,
+                row_count: active_rows,
+                sealed: false,
+            });
+        }
+        Ok(segments)
+    }
+
+    /// Seals a non-empty append prefix before ownership moves to another writer epoch.
+    ///
+    /// The newly allocated empty active segment is intentionally not published. A later writer
+    /// epoch owns its own materializer, while this instance retains only the sealed history.
+    pub fn seal_active_for_writer_handoff(&mut self) -> Result<()> {
+        if self.frame_per_batch {
+            return Err(ZippyError::InvalidState {
+                status: "append writer handoff does not support frame-per-batch mode",
+            });
+        }
+        if self.active_committed_row_count() == 0 {
+            return Ok(());
+        }
+        let sealed_descriptor = self.active_descriptor_value()?;
+        self.partition
+            .writer()
+            .rollover_without_persistence()
+            .map_err(segment_error)?;
+        self.sealed_segment_descriptors.push(sealed_descriptor);
+        Ok(())
     }
 
     /// Keep the owned store observable for future lifecycle integration.

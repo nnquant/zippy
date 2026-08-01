@@ -443,11 +443,21 @@ impl MappedFile {
     ) -> Result<Self, ZippySegmentStoreError> {
         #[cfg(unix)]
         let ptr = map_file(&file, len)?;
+        #[cfg(unix)]
+        let file = {
+            // A successful mmap keeps its own reference to the backing object. Retaining the
+            // original file descriptor would consume one process FD for every live segment and
+            // every attached snapshot, eventually exhausting common 1,024-FD limits.
+            drop(file);
+            None
+        };
         #[cfg(windows)]
         let (ptr, mapping_handle) = map_file(&file, len)?;
+        #[cfg(windows)]
+        let file = Some(file);
 
         Ok(Self {
-            file: Some(file),
+            file,
             path,
             ptr,
             len,

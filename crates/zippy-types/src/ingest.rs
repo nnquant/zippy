@@ -3,6 +3,7 @@
 use arrow::record_batch::RecordBatch;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -277,6 +278,7 @@ pub struct WriteRequest {
     batch_sequence: u64,
     mutation: TableMutation,
     mutation_fingerprint: MutationFingerprint,
+    prepared_payload: Option<Arc<[u8]>>,
 }
 
 impl WriteRequest {
@@ -309,6 +311,12 @@ impl WriteRequest {
     pub const fn mutation_fingerprint(&self) -> MutationFingerprint {
         self.mutation_fingerprint
     }
+
+    /// Borrows an ingress-prepared canonical payload reusable by the persistence layer.
+    #[must_use]
+    pub const fn prepared_payload(&self) -> Option<&Arc<[u8]>> {
+        self.prepared_payload.as_ref()
+    }
 }
 
 /// Computes and verifies canonical mutation fingerprints at ingress and replay.
@@ -326,10 +334,26 @@ pub trait MutationFingerprintComputer: Send + Sync {
         mutation: &TableMutation,
     ) -> Result<MutationFingerprintDigest>;
 
+    /// Computes the fingerprint and optionally returns the same encoded canonical payload.
+    ///
+    /// Implementations that already encode a mutation while hashing should return that immutable
+    /// payload so the WAL path does not repeat the serialization. The default preserves existing
+    /// implementations and leaves persistence to encode the mutation itself.
+    fn compute_prepared(
+        &self,
+        format_version: MutationFingerprintFormatVersion,
+        schema_version: u64,
+        mutation: &TableMutation,
+    ) -> Result<(MutationFingerprintDigest, Option<Arc<[u8]>>)> {
+        self.compute(format_version, schema_version, mutation)
+            .map(|digest| (digest, None))
+    }
+
     /// Converts an unverified transport request into the only writer-accepted form.
     fn prepare(&self, request: IncomingWriteRequest) -> Result<WriteRequest> {
         let format_version = MutationFingerprintFormatVersion::current();
-        let digest = self.compute(format_version, request.schema_version, &request.mutation)?;
+        let (digest, prepared_payload) =
+            self.compute_prepared(format_version, request.schema_version, &request.mutation)?;
         Ok(WriteRequest {
             request_id: request.request_id,
             schema_version: request.schema_version,
@@ -339,6 +363,7 @@ pub trait MutationFingerprintComputer: Send + Sync {
                 format_version,
                 digest,
             },
+            prepared_payload,
         })
     }
 
@@ -357,6 +382,7 @@ pub trait MutationFingerprintComputer: Send + Sync {
             batch_sequence,
             mutation,
             mutation_fingerprint,
+            prepared_payload: None,
         };
         self.verify(&request)?;
         Ok(request)
