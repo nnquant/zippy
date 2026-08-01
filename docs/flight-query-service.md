@@ -1,41 +1,40 @@
-# Arrow Flight 查询与内存写入服务
+# Arrow Flight 查询与可恢复写入服务
 
 ## 定位
 
-Stage 6.4 在标准 Arrow Flight 查询入口上增加了有界、append-only 的 `DoPut`。Flight 仍只负责协议、
-listener、session、ticket 和 Arrow batch 传输，不复制 Catalog、DataFusion 或资源调度逻辑。一次查询仍由 Server 固定
-Catalog revision、table snapshot/schema version，并由原有 QueryService 负责内存、任务、取消和结果
-batch permit；一次 Stage 6.4 写入则复用现有 Gateway materializer，回执只表示进程内存已接收。
+Stage 7.3 已把标准 Arrow Flight `DoPut` 从兼容内存 backend 切换到原生 durable ingest authority。
+Flight 只负责协议、listener、session 和 Arrow batch 传输，不复制 Catalog、DataFusion、producer
+fencing、WAL 或资源调度逻辑。查询由 Server 固定 Catalog revision、table snapshot/schema version；
+写入由 SQLite Catalog 颁发 producer epoch，经 ingest WAL 和 native append materializer 原子发布到
+`TableActor`，回执携带权威 epoch、逻辑 offset、水位和实际 durability。
 
 当前适用场景：
 
 - 在单机、局域网或受控远程网络上运行加密的 Flight 查询链路；
 - 为 Rust/Python connector 的后续迁移提供稳定 wire contract；
-- 在不启动 legacy Gateway 时运行 persisted native SQL 查询。
+- 在不启动 legacy Gateway 时运行 native SQL 查询和 append 写入；
 - 使用标准 Flight SQL 客户端发现 catalog、namespace、table 和 Arrow schema；
 - 由查询 owner 取消自己的查询，或由控制面管理员精确取消跨 session 查询。
-- 从 Rust/Python 等 Arrow 客户端批量追加实时数据，并接受“进程退出可能丢失”的明确语义；
-- 在 Phase 7 durable ingest 上线前，先迁移远端批量写入的 transport、鉴权和资源治理。
+- 从 Rust/Python 等 Arrow 客户端批量追加实时数据，按请求选择 `Memory` 或可重启恢复的 `Wal` ACK；
+- 使用 producer fencing、严格 batch sequence、服务端幂等回执和跨重启稳定 log offset。
 
-当前不适用场景：公网裸露、要求 WAL/persisted durability 的写入、网络重试去重、实时订阅、完整
+当前不适用场景：公网裸露、要求 manifest `Persisted` ACK 的写入、自动恢复歧义写入、实时订阅、完整
 Flight SQL statement 执行、细粒度表级 RBAC 或未经兼容性验证的通用 BI 客户端直连。管理员凭据是
 control-only，不具备查询、metadata 读取或写入权限；Writer 凭据也不能读取或取消查询。
 
 ## 启用
 
-Flight 依赖 native storage、SQLite shadow Catalog 和 native query：
+Flight durable ingest 依赖 native storage 和 SQLite authoritative Catalog。该模式不启动 legacy Gateway：
 
 ```toml
 [server]
 native_storage_enabled = true
 
 [catalog]
-backend = "sqlite_shadow"
+backend = "sqlite"
 
-# Stage 6.4 DoPut 复用 Gateway materializer，因此启用写入时 Gateway 必须运行。
 [gateway]
-enabled = true
-endpoint = "127.0.0.1:17666"
+enabled = false
 
 [runtime]
 max_cpu_cores = 4
@@ -161,34 +160,40 @@ ingest 默认关闭；启用后的默认上限为 4 个并发 put、每个 put 1
 Version 1 只接受 SQL input；typed logical plan 会以 `UNSUPPORTED_PLAN` 明确失败，不会编码成空 SQL。
 binding 必须非空、有界且名称唯一。Server 不会根据 SQL 隐式猜测 Catalog table。
 
-## `DoPut` 内存写入协议
+## `DoPut` 可恢复写入协议
 
 1. 客户端先用独立 writer bootstrap token 调用 `Handshake`，得到 `Writer` role、随机
    `session_id` 和短期 session bearer。read/admin token 均不能建立 Writer session。
 2. 客户端创建标准 Flight `DoPut` stream。第一条消息必须是唯一的 Arrow schema，并携带 command
    descriptor；后续消息只能是相同 schema 的 record batch。
-3. version 1 `PutCommand` 必须提供非零 `put_id`、与 bearer 一致的 `session_id`、`stream_name`、
-   `first_batch_sequence`，并显式选择 `Append + Memory`。其他 mutation/durability 返回
-   `UNSUPPORTED_PLAN`。
+3. version 1 `PutCommand` 必须提供非零 `put_id`、`producer_id`、`connection_id`、与 bearer 一致的
+   `session_id`、`stream_name`、`first_batch_sequence`，并显式选择 `Append + Memory` 或
+   `Append + Wal`。已持有 writer 时还应发送 `expected_writer_epoch`，防止另一个连接已经接管表。
 4. Server 按顺序解码和提交 batch。每个成功 batch 返回一个标准 `PutResult`，其 `app_metadata` 是
-   `PutBatchResult`，包含 `put_id`、`batch_sequence`、`row_count` 和实际达到的 `Memory` durability。
+   `PutBatchResult`，包含确定性 batch `request_id`、`batch_sequence`、`row_count`、producer epoch、
+   连续 log-offset range、前后水位和实际达到的 durability。
 5. 回执 channel 容量为 1；客户端不读取回执时，Server 不会继续无限解码。单 batch 在 backend
    返回前占用共享 transport byte permit，返回后才释放。
 
-`put_id` 和 `batch_sequence` 在 Stage 6.4 只用于关联请求和回执，**不提供服务端去重或 producer
-fencing**。若连接在部分 batch 成功后断开，客户端可能已经收到部分回执，也可能无法确定最后一批是否
-生效。此时不能盲目重试并期待 exactly-once。需要网络重试去重、重启恢复或 WAL/persisted ACK 的生产
-写入，应继续使用既有受控链路。Stage 7.2 原生核心已经具备 fencing、幂等和 WAL ACK，但在 Flight
-durable command 完成切流前，不能把该能力推断到当前 v1 `DoPut`。
+每个不同的新 `connection_id` 都通过 Catalog acquire 获得更高的 table-wide producer epoch，旧
+connection 随后被明确 fence。同一 producer/connection 携带当前 `expected_writer_epoch` 再次打开
+DoPut 时直接恢复现有 epoch，不重复写 Catalog、切换 WAL segment 或 fence TableActor。相同
+epoch/sequence/request/payload 的底层重放返回原 receipt；身份或 payload
+冲突、sequence 缺口和 stale epoch 都明确失败。`Memory` 在 WAL data record 已追加并原子发布到
+TableActor 后返回，但未被 commit marker 覆盖的尾部在崩溃后允许丢失；`Wal` 只有在 commit marker
+完成 `sync_data` 后返回，可在重启时确定恢复。`Persisted` 仍返回 `UNSUPPORTED_PLAN`。
 
-Stage 7.1 backend 使用 server-owned `MemoryIngestRuntime`。Gateway 和 Flight 只持有同一个 cloneable
-handle，每个 stream 的 segment materializer 仅由该 runtime 创建一次，并在每批后完成现有 flush。
-因此 `[flight.ingest]` 不再要求 `[gateway]` 启用；Gateway 关闭时 Flight writer 仍可独立运行。
-该 backend 不会写 ingest WAL、登记 producer epoch、推进 durable sequence，也不会把 memory ACK 冒充
-磁盘提交。Stage 7.2 已在 `zippy-ingest::NativeIngestRuntime` 实现这些原生能力，但尚未接入当前 Flight
-command 和 table materializer。后续 Stage 7.3 会显式扩展 durable command 并切换 backend，同时保留
-Writer role 和已有资源边界。若仍需旧 remote client，可继续启用 Gateway compatibility listener；
-否则可直接关闭。
+Python 高层 `FlightWriter` 会稳定复用 producer/connection ID、串联服务端 epoch，并在服务端配额与
+RPC deadline 内跨多次 `flush()` 保持一个 DoPut stream；达到 batch/row/byte/time 上限后才关闭并以
+同一 epoch 恢复新 stream。它逐批校验 receipt 的 request ID、offset、水位和 durability。若网络在
+提交与回执之间中断，它会携带已确认 receipts 进入 fail-closed，
+不会用新身份盲目重放不确定 batch。需要业务级自动恢复时，调用方必须先按稳定 offset 或业务主键核对，
+再创建新 writer；当前高层 API 不宣称 exactly-once workflow。
+
+Stage 7.3 backend 是 server-owned `NativeIngestRuntime`，WAL 位于 Server 数据目录的
+`wal/ingest/<table-id>/`。Flight ingest 要求 `catalog.backend=sqlite`；该 authority 模式禁止同时启用
+legacy Gateway，避免两套 metadata/writer authority 并存。`sqlite_shadow` 仍只用于旧读路径迁移，不能
+接收 native Flight 写入。
 
 ## 查询取消与管理员权限
 
@@ -246,8 +251,8 @@ ticket 会被撤销并释放 prepared query。已经通过 `DoGet` 完成认证�
 ingest 另有 `max_concurrent_puts` semaphore，以及每个 put 的 batch、row、byte 累计上限和单 batch
 row/byte 上限。并发槽耗尽时在读取请求体前快速返回可重试的 `RESOURCE_EXHAUSTED`；解码后超限的 batch
 不会调用 backend。`max_batch_bytes` 不得超过共享 query transport budget，避免写入绕过进程级内存账本。
-每个 put 内顺序提交，默认最多只有 4 条活跃写入流，因此 `spawn_blocking` 的进程内 memory authority
-调用也是有界的。
+每个 put 内顺序提交，默认最多只有 4 条活跃写入流；native ingest 的全局 operation budget、per-table
+pending ACK budget 和 TableActor mailbox 继续提供第二层有界 admission。
 capability response 和 ready record 同时公开六项有效上限，客户端应在发送前按较小值切 batch。
 
 ## 凭据与 TLS 约束
@@ -287,36 +292,43 @@ message 文本。两份 envelope 不一致时客户端必须 fail closed。
 ## Readiness 与关停
 
 Server ready record schema version 7 在既有 Flight enabled/endpoint/protocol、TLS/auth、capability、
-limit 和非敏感证书指纹之外，新增 `memory_ingest_configured/ready` 以及 bounded ingest 状态。`zippy
-server run/status` 摘要会显示 Flight endpoint、TLS、memory ingest 和 Writer 鉴权状态。进程 readiness 需要
+limit 和非敏感证书指纹之外，公开 native ingest 状态。`zippy server run/status` 摘要会显示 Flight
+endpoint、TLS、native ingest 和 Writer 鉴权状态。进程 readiness 需要
 `flight_configured`、`flight_listener_ready` 和 `flight_protocol_ready` 同时满足。listener 异常退出会撤销
-动态 readiness；配置 Gateway 或 Flight ingest 时，共享 memory ingest authority 也必须仍在接受请求。
+动态 readiness；配置 Flight ingest 时，native ingest authority 也必须仍在接受请求。
 
-关停顺序为：统一关闭 Flight 与 memory ingest admission、释放 pending ticket、停止 Flight listener，
-再关闭 Gateway、drain memory writers/publisher process、legacy process 与 Catalog shadow、停止 master
-listener，最后关闭 native storage/Catalog。所有阶段共享
+关停顺序为：关闭 Flight admission、释放 pending ticket、停止 Flight listener，再 drain native ingest
+WAL/worker、TableActor 和 PersistController，最后关闭 native storage/Catalog 与 master listener。所有阶段共享
 Server 的绝对 shutdown deadline；若 Flight listener 超时，Server 返回不完整结果并让已发出 shutdown 的
 listener 在后台继续清理，不会用无界 `join` 突破调用方 deadline。
 
 ## 性能基线与门禁
 
-真实 Gateway/Flight release 基准会启动两种 listener，并让它们共享同一 Catalog、Parquet 数据、
-native query engine 和写入 materializer。默认对 1、1,024、65,536 行的查询与 memory-ACK 写入分别
-采集 100 个样本；每个场景要求 Flight 吞吐不低于 Gateway 的 90%，且 p99 不超过 Gateway 的 1.20 倍。
+Gateway/Flight query release 基准会启动两种 listener，并让它们共享同一 Catalog、Parquet 数据和
+native query engine。默认对 1、1,024、65,536 行的查询分别采集 100 个样本；每个场景要求 Flight
+吞吐不低于 Gateway 的 90%，且 p99 不超过 Gateway 的 1.20 倍。Stage 7.3 起不再在同一 runtime 比较
+Gateway/Flight 写入，因为 SQLite authoritative ingest 有意禁止 legacy Gateway 双 authority。
 
 2026-07-19 的 WSL2 loopback 基线中，Flight 小查询吞吐约为 Gateway 的 93%，65,536 行查询基本持平；
 三档写入吞吐均高于 Gateway。accepted Flight socket 必须保持 `TCP_NODELAY`，对应回归测试会直接验证
 server 侧 socket 选项。完整方法、结果和适用边界见
 [`perf_reports/2026-07-19-flight-gateway-transport.md`](perf_reports/2026-07-19-flight-gateway-transport.md)。
 
-手动生成 JSON 报告时设置 `ZIPPY_TRANSPORT_PERF_REPORT_JSON`，并运行 ignored test
+手动生成 query JSON 报告时设置 `ZIPPY_TRANSPORT_PERF_REPORT_JSON`，并运行 ignored test
 `flight_gateway_transport_performance_baseline`。可用
 `ZIPPY_TRANSPORT_PERF_MEASURED_SAMPLES` 调整计量次数；低于 100 的样本只适合快速 smoke，不应作为
 p99 发布依据。
+
+`native_flight_ingest_performance_baseline` 直接测量 WAL、native materializer、TableActor 和 Flight
+receipt 的完整公开路径。低延迟修订在 WSL2 loopback release 上把 1 行短 DoPut p50 降至 0.768 ms
+（Memory）和 4.507 ms（Wal）；Python 高层采用的持久 DoPut 目标形态进一步达到 0.557 ms 和
+1.884 ms。65,536 行短 DoPut 吞吐为 8.585 M rows/s 和 5.073 M rows/s。方法、原基线、完整百分位、
+RSS 和适用边界见
+[`perf_reports/2026-07-19-flight-native-ingest.md`](perf_reports/2026-07-19-flight-native-ingest.md)。
 
 ## 后续阶段
 
 1. Stage 6.5 Python connector 已完成：`zippy-client` 默认使用 Flight query/DoPut，解析稳定错误，
    并保留 legacy Gateway compatibility adapter。Rust connector 后续单独发布。
-2. Phase 7.1 已完成 Gateway/Flight server-owned memory authority cutover；下一步把该 backend 切到
-   producer epoch/sequence + WAL，并实现 `DoExchange` durable subscription、offset/ack 和 replay。
+2. Stage 7.3 已完成 Flight producer epoch/sequence + WAL cutover；下一步接入 manifest `Persisted`
+   ACK、WAL checkpoint/live-segment 回收，再实现 `DoExchange` durable subscription、offset/ack 和 replay。

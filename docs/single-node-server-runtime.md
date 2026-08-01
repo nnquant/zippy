@@ -122,6 +122,13 @@ dedicated process lease and one-second heartbeat worker. Ordered shutdown joins 
 unregisters its process before Master drain; an incomplete ingest close keeps Master alive so a
 later bounded shutdown attempt can finish cleanup.
 
+When Flight ingest is enabled under `catalog.backend=sqlite`, native storage starts
+`NativeIngestRuntime` before listener bind, replays checksum-valid WAL commit prefixes into the
+append materializer, and publishes exact live segments through each table's `TableActor`. Flight
+receives only a cloneable native ingest handle; it does not own WAL, materializer or producer
+fencing state. Ordered shutdown closes Flight admission, drains native ingest and its WAL workers,
+then closes TableActor, PersistController and Catalog in dependency order.
+
 The CPU value is a canonical process configuration ceiling consumed by each component, not yet one
 hard semaphore shared by every independent thread pool. The legacy `runtime.max_parallelism` and
 `ZIPPY_MAX_PARALLELISM` names remain aliases for one compatibility cycle. Native query admission is
@@ -321,15 +328,14 @@ persistence probes the complete command before final publication, moves an affin
 into the Catalog actor, and takes an exclusive publication exclusion before rejected-candidate
 cleanup. Exact, conflicting, and missing historical replays therefore never publish final
 candidates. Snapshot leases, runtime pins, QueryService integration, safe-GC claims, and bounded
-Gateway transport are implemented. Physical GC, durable Flight write/subscription and the final
-removal of legacy metadata authority remain later phases. Flight query TLS, bearer authentication,
-server-issued read/admin/writer sessions, Catalog metadata, and bounded append + memory `DoPut` are
-implemented behind explicit configuration. Standard Flight `GetFlightInfo`/`DoGet` query transport
-is implemented behind the opt-in `[flight]` gate. Stage 7.1 `DoPut` uses the server-owned process-local
-memory authority and no longer requires Gateway; it still does not provide WAL or persisted ACK.
-Stage 7.2 implements producer fencing, stable offsets, WAL acknowledgement, and bounded recovery in
-`NativeIngestRuntime`, but that authority is not yet wired to the Flight v1 command or native table
-materializer. Those public-path integrations remain Stage 7.3 work.
+Gateway transport are implemented. Flight query TLS, bearer authentication, server-issued
+read/admin/writer sessions and Catalog metadata are implemented behind explicit configuration.
+Stage 7.3 wires bounded append + memory/WAL `DoPut` to `NativeIngestRuntime`, native append
+materialization and TableActor live snapshots under SQLite Catalog authority. Producer fencing,
+stable offsets, WAL acknowledgement, bounded recovery, immediate query visibility and restart replay
+therefore share one public path; legacy Gateway is not supported in this authoritative mode.
+Physical GC, manifest `Persisted` ACK, WAL checkpoint/reclamation, durable Flight subscription and
+final removal of legacy metadata authority remain later phases.
 Legacy live descriptors without exact logical-offset provenance are intentionally not promoted into
 native active snapshots.
 

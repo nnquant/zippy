@@ -1,7 +1,7 @@
 # ADR-0005：Producer fencing 与 ingest WAL v1
 
 - 日期：2026-07-19
-- 状态：已接受，Stage 7.2 原生写入核心已实施
+- 状态：已接受，Stage 7.3 Flight/native materializer 接线已实施
 - 决策所有者：Zippy core maintainers
 
 ## 背景
@@ -47,7 +47,7 @@ payload 使用 Arrow IPC stream 编码；header 和 payload 分别由 CRC32C 校
 | --- | --- | --- |
 | `Memory` | WAL data record 已追加且 mutation 已原子应用到进程内 sink | 未被 commit marker 覆盖的尾部可丢失 |
 | `Wal` | 覆盖该 sequence 的 commit marker 已写入并 fsync | 可由 WAL 确定恢复 |
-| `Persisted` | manifest snapshot 覆盖该 offset range | Stage 7.2 尚未接入，明确返回 `UnsupportedPlan` |
+| `Persisted` | manifest snapshot 覆盖该 offset range | Stage 7.3 尚未接入，明确返回 `UnsupportedPlan` |
 
 非空 mutation 按行分配从 0 开始的连续 log offset；offset 在 producer epoch 和 server restart 之间不
 复用。零行 mutation 不分配 range，也不得改变 watermark。frame batch 作为一个原子 mutation，
@@ -68,6 +68,13 @@ sink panic、WAL rollback 失败或 commit-unknown 会把表置为 terminal，gr
 
 ## 结果
 
+Stage 7.3 已将该 authority 接入 SQLite authoritative Catalog、native append materializer、TableActor
+live snapshot、Flight v1 command 和 Python connector。`PutCommand` 现在携带 producer/connection
+identity、期望 epoch 和 durability；`PutBatchResult` 返回确定性 request ID、producer epoch、offset
+range、前后水位和实际 durability。Gateway 不再位于 durable write path，`sqlite_shadow` 也不能接受
+native Flight ingest。真实 Server E2E 已验证 WAL ACK 后立即查询，以及 shutdown/restart/replay 后再次
+查询相同数据。
+
 正向结果：
 
 - 响应丢失后可以按相同 epoch、sequence、request 和 payload 安全重试。
@@ -83,8 +90,13 @@ sink panic、WAL rollback 失败或 commit-unknown 会把表置为 terminal，gr
   coordinator 必须通过性能基准决定默认窗口，不能隐式扩大 ACK 延迟。
 - 已被 manifest 覆盖的 WAL checkpoint 与文件回收尚未接入，运维不能自行删除 WAL。
 - 当前恢复要求未 checkpoint 的 WAL 使用当前 table schema；schema evolution 必须先处理旧 WAL。
-- Gateway/Flight v1 尚未携带 table ID、producer ID、epoch 和 durable target，仍使用 Stage 7.1
-  memory compatibility backend。
+- Flight v1 已携带 producer ID、connection ID、期望 epoch 和 durable target；stream name 仍由服务端
+  authoritative Catalog 解析为 table ID，客户端不能自报 table authority。
+- 当前 append materializer 最多保留 1,024 个未持久化 live segment；达到上限会在 mutation 生效前返回
+  可重试 `ResourceExhausted`。Stage 7.4 必须用 manifest checkpoint 推进 persisted prefix 并回收 WAL/
+  live segment，运维仍不能自行删除文件。
+- Unix file-backed SHM 在 `mmap` 后立即关闭原始 FD；mapping、路径和 owner 删除语义保持不变，避免
+  多 epoch live snapshot 在线性增长时撞上常见的 1,024-FD 进程限制。
 
 ## 替代方案
 

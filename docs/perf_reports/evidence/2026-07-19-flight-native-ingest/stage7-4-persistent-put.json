@@ -1,0 +1,72 @@
+{
+  "format_version": 1,
+  "git_sha": "0d81c0a53a8e4d75df6f1d9d52ad03135559fc5b",
+  "target": "linux-x86_64",
+  "started_at_unix_ms": 1784469960615,
+  "warmup_samples": 10,
+  "measured_samples": 100,
+  "writer_session_open_micros": 1239.542,
+  "scenarios": [
+    {
+      "durability": "memory",
+      "rows_per_operation": 1,
+      "logical_bytes_per_operation": 104,
+      "flight": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 10400,
+        "elapsed_seconds": 0.05642728899999998,
+        "rows_per_second": 1772.1921746054475,
+        "mebibytes_per_second": 0.17576979270836499,
+        "latency_micros": {
+          "p50": 557.124,
+          "p95": 668.851,
+          "p99": 728.016,
+          "max": 802.0409999999999
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    },
+    {
+      "durability": "wal",
+      "rows_per_operation": 1,
+      "logical_bytes_per_operation": 104,
+      "flight": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 10400,
+        "elapsed_seconds": 0.191768958,
+        "rows_per_second": 521.4608299639402,
+        "mebibytes_per_second": 0.051719595257043637,
+        "latency_micros": {
+          "p50": 1883.624,
+          "p95": 2173.378,
+          "p99": 2861.3160000000003,
+          "max": 2983.5640000000003
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    }
+  ],
+  "native_ingest_metrics": {
+    "write_batches_total": 220,
+    "written_rows_total": 220,
+    "duplicate_writes_total": 0,
+    "wal_commits_total": 111,
+    "writer_acquisitions_total": 2,
+    "writer_resumes_total": 0,
+    "rejected_operations_total": 0,
+    "recovered_truncated_tail_bytes": 0
+  },
+  "flight_metrics": {
+    "issued_tickets": 0,
+    "consumed_tickets": 0,
+    "put_batches": 220,
+    "put_rows": 220,
+    "put_bytes": 49280,
+    "active_puts": 0,
+    "transport_buffer_bytes_in_use": 0
+  }
+}

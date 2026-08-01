@@ -1,0 +1,159 @@
+{
+  "format_version": 1,
+  "git_sha": "0d81c0a53a8e4d75df6f1d9d52ad03135559fc5b",
+  "target": "linux-x86_64",
+  "started_at_unix_ms": 1784455108345,
+  "warmup_samples": 10,
+  "measured_samples": 100,
+  "writer_session_open_micros": 1446.615,
+  "scenarios": [
+    {
+      "durability": "memory",
+      "rows_per_operation": 1,
+      "logical_bytes_per_operation": 104,
+      "flight": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 10400,
+        "elapsed_seconds": 0.8094283779999999,
+        "rows_per_second": 123.5439758698453,
+        "mebibytes_per_second": 0.012253354540313635,
+        "latency_micros": {
+          "p50": 8009.537,
+          "p95": 10240.637,
+          "p99": 11670.629,
+          "max": 13033.406
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    },
+    {
+      "durability": "memory",
+      "rows_per_operation": 1024,
+      "logical_bytes_per_operation": 8288,
+      "flight": {
+        "samples": 100,
+        "total_rows": 102400,
+        "total_logical_bytes": 828800,
+        "elapsed_seconds": 1.2805385420000004,
+        "rows_per_second": 79966.35528054256,
+        "mebibytes_per_second": 0.617244422962085,
+        "latency_micros": {
+          "p50": 12456.801,
+          "p95": 15394.818,
+          "p99": 19807.439,
+          "max": 25223.466
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    },
+    {
+      "durability": "memory",
+      "rows_per_operation": 65536,
+      "logical_bytes_per_operation": 524384,
+      "flight": {
+        "samples": 100,
+        "total_rows": 6553600,
+        "total_logical_bytes": 52438400,
+        "elapsed_seconds": 2.4933296110000005,
+        "rows_per_second": 2628453.1219165786,
+        "mebibytes_per_second": 20.057177780590475,
+        "latency_micros": {
+          "p50": 24553.161,
+          "p95": 28426.518,
+          "p99": 31483.899,
+          "max": 31589.394
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    },
+    {
+      "durability": "wal",
+      "rows_per_operation": 1,
+      "logical_bytes_per_operation": 104,
+      "flight": {
+        "samples": 100,
+        "total_rows": 100,
+        "total_logical_bytes": 10400,
+        "elapsed_seconds": 2.334119297,
+        "rows_per_second": 42.84271165082613,
+        "mebibytes_per_second": 0.0042492313496455365,
+        "latency_micros": {
+          "p50": 23150.154,
+          "p95": 26658.604,
+          "p99": 27454.561999999998,
+          "max": 29109.775
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    },
+    {
+      "durability": "wal",
+      "rows_per_operation": 1024,
+      "logical_bytes_per_operation": 8288,
+      "flight": {
+        "samples": 100,
+        "total_rows": 102400,
+        "total_logical_bytes": 828800,
+        "elapsed_seconds": 2.880226752,
+        "rows_per_second": 35552.75636853747,
+        "mebibytes_per_second": 0.27442466913018243,
+        "latency_micros": {
+          "p50": 28823.347999999998,
+          "p95": 32945.057,
+          "p99": 33899.334,
+          "max": 34282.118
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    },
+    {
+      "durability": "wal",
+      "rows_per_operation": 65536,
+      "logical_bytes_per_operation": 524384,
+      "flight": {
+        "samples": 100,
+        "total_rows": 6553600,
+        "total_logical_bytes": 52438400,
+        "elapsed_seconds": 4.275229253000001,
+        "rows_per_second": 1532923.6427265808,
+        "mebibytes_per_second": 11.697420726232453,
+        "latency_micros": {
+          "p50": 41912.496,
+          "p95": 49543.28999999999,
+          "p99": 56573.498999999996,
+          "max": 73210.094
+        },
+        "prepare_latency_micros": null,
+        "time_to_first_batch_micros": null
+      }
+    }
+  ],
+  "native_ingest_metrics": {
+    "write_batches_total": 660,
+    "written_rows_total": 14643420,
+    "duplicate_writes_total": 0,
+    "wal_commits_total": 660,
+    "rejected_operations_total": 0,
+    "recovered_truncated_tail_bytes": 0
+  },
+  "flight_metrics": {
+    "issued_tickets": 0,
+    "consumed_tickets": 0,
+    "put_batches": 660,
+    "put_rows": 14643420,
+    "put_bytes": 119067520,
+    "active_puts": 0,
+    "transport_buffer_bytes_in_use": 0
+  },
+  "process_rss_kib": {
+    "before_kib": 20672,
+    "after_kib": 487372,
+    "peak_kib": 522980
+  }
+}

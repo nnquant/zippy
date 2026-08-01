@@ -2,7 +2,7 @@
 
 日期：2026-07-13
 
-状态：实施中（Phase 0-6 已完成，Phase 7 Stage 7.2 原生 durable ingest 核心已完成，协议接入待实施）
+状态：实施中（Phase 0-6 已完成，Phase 7 Stage 7.3 durable Flight ingest 已完成）
 
 适用范围：Zippy 单机部署模式。本文不设计集群、Raft、多副本、跨节点查询和分布式事务。
 
@@ -2532,12 +2532,11 @@ Server 可在 Gateway 关闭时独立启动 Flight，并直接复用 Phase 5 `Na
 资源账本和取消生命周期。TLS、可选 mTLS、Bearer Handshake、服务端 session authority、凭据文件约束
 和重启证书轮换已经完成；非 loopback endpoint 必须同时启用 TLS 与认证。owner-bound 标准取消、
 control-only admin session、query generation/server-instance ABA fence，以及四类标准 Flight SQL metadata
-已经接入相同 Catalog/Query authority。标准 `DoPut` 已实现独立 Writer session、append + memory command、
-逐 batch 回执和并发/行数/字节硬上限；Stage 7.1 已将 Gateway/Flight 接入同一个 server-owned memory
-ingest authority，Flight 不再依赖 Gateway listener，但仍不承诺 WAL、producer fencing、去重或 persisted
-durability。独立 `zippy-client` 现在从 Master 自动发现
+已经接入相同 Catalog/Query authority。标准 `DoPut` 已实现独立 Writer session、append + memory/WAL
+command、逐 batch 权威回执和并发/行数/字节硬上限；Stage 7.3 已将 Flight 切到 server-owned native
+ingest authority，Gateway 不再位于 durable write path。独立 `zippy-client` 现在从 Master 自动发现
 Flight，隔离 read/writer session，将 lazy Table 完整编译为 SQL + 显式 Catalog bindings，执行
-`GetFlightInfo -> DoGet`，并按服务端上限切分 DoPut、逐批校验 memory receipt。结构化错误公开稳定
+`GetFlightInfo -> DoGet`，并按服务端上限切分 DoPut、逐批校验 epoch/offset/durability receipt。结构化错误公开稳定
 `code/retryable/ID/details`；查询和写入优先 Flight，SHM 仍服务同 namespace 热订阅，Gateway 只作为旧
 服务和 Phase 7 前远端订阅的 compatibility adapter。配置、协议边界和验收方法见
 [`flight-query-service.md`](flight-query-service.md)。
@@ -2546,7 +2545,7 @@ Flight，隔离 read/writer session，将 lazy Table 完整编译为 SQL + 显�
 
 1. 新建 `zippy-protocol` Protobuf 和 error mapping。（Stage 6.1 已完成）
 2. 实现 Flight query `GetFlightInfo/DoGet`。（Stage 6.1 已完成）
-3. 实现 Flight ingest `DoPut`。（Stage 6.4 memory compatibility backend 已完成；durable backend 属于 Phase 7）
+3. 实现 Flight ingest `DoPut`。（Stage 6.4 memory compatibility、Stage 7.3 durable backend 已完成）
 4. 实现 query cancel/admin actions。（Stage 6.3 已完成）
 5. 实现 Flight SQL catalog metadata。（Stage 6.3 已完成）
 6. 实现 TLS/auth middleware。（Stage 6.2 已完成）
@@ -2598,18 +2597,20 @@ IPC、commit marker + fsync、Memory/Wal ACK、有界恢复和未提交尾部截
 安全；全局 operation 与 per-table pending ACK 均有硬预算；atomic sink rejection 可回滚未提交 WAL，
 group commit completion 乱序不会误判 durable prefix；key-value delete 支持完整 row 和 key-only tombstone。
 
-Stage 7.2 当前是原生写入核心，不是公开协议切流：Gateway/Flight v1 仍使用 Stage 7.1 memory backend。
-native TableActor/materializer sink、manifest `Persisted` ACK、已持久 WAL checkpoint/回收、Flight durable
-command 和 subscription 属于后续 Stage 7.3+。磁盘格式和边界见
+Stage 7.3 已完成 append materializer sink、跨 epoch TableActor live snapshot、native ingest 的 Server
+启动/健康/关停、Flight producer-fenced memory/WAL command、权威 receipt 和 Python connector 默认 WAL
+写入。真实 E2E 覆盖 Gateway 关闭、写后立即查询、干净关停、WAL 重启恢复和再次查询。release 基准在
+660 次跨 epoch DoPut 下验证无拒绝/重复，并修复了 Unix SHM mapping 长期持有 backing FD 的资源泄漏。
+manifest `Persisted` ACK、已持久 WAL checkpoint/回收和 subscription 属于 Stage 7.4+。磁盘格式和边界见
 [`ADR-0005`](adr/0005-ingest-wal-v1.md)。
 
 任务：
 
 1. 实现 producer acquire/epoch/sequence。（Stage 7.2 已完成）
-2. 实现 per-table ingest actor。（Stage 7.2 authority 已完成；TableActor sink 接线待 Stage 7.3）
+2. 实现 per-table ingest actor。（Stage 7.3 TableActor sink 与查询快照接线已完成）
 3. 实现 WAL record、CRC、group commit。（Stage 7.2 record/CRC/commit group 已完成；定时批量 coordinator 待基准）
-4. 实现 memory/wal/persisted durability ACK。（Stage 7.2 Memory/Wal 已完成；Persisted 待 manifest 接线）
-5. 实现 WAL recovery/checkpoint/truncation。（Stage 7.2 recovery/tail truncation 已完成；checkpoint 回收待接线）
+4. 实现 memory/wal/persisted durability ACK。（Stage 7.3 Memory/Wal 已公开；Persisted 待 Stage 7.4）
+5. 实现 WAL recovery/checkpoint/truncation。（recovery/tail truncation 已完成；checkpoint 回收待 Stage 7.4）
 6. 为所有表分配稳定 log offset。（Stage 7.2 已完成）
 7. 实现 Flight DoExchange subscription。
 8. 实现 consumer offset commit 和 replay。
@@ -2622,6 +2623,7 @@ command 和 subscription 属于后续 Stage 7.3+。磁盘格式和边界见
 - stale producer epoch 永远不能写入。（Stage 7.2 core 已验证）
 - WAL 尾部 partial record 可检测并截断。（Stage 7.2 core 已验证）
 - 重启后 active state 与 WAL replay 一致。（Stage 7.2 core 已验证）
+- Flight WAL ACK 后立即查询和重启查询结果一致。（Stage 7.3 Server E2E 已验证）
 - Subscriber 可从 committed offset 继续，允许重复但不跳行。
 
 回滚：按表保留 `durability=memory` 和 best-effort subscription；已写 WAL 不删除。

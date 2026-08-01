@@ -101,6 +101,11 @@ soak 覆盖。
 Stage 7.1 已完成 server-owned ingest authority 替换并复跑相同门禁，六个场景全部通过；详见
 [`2026-07-19-native-ingest-authority.md`](2026-07-19-native-ingest-authority.md)。
 
+Stage 7.3 将 Flight 写入切到 SQLite authoritative native ingest 后，该组合 harness 已升级为 report
+format v3，并只保留 Gateway/Flight query 对比；authoritative 模式禁止 legacy Gateway 与 Flight ingest
+并存。后续写入门禁由
+[`2026-07-19-flight-native-ingest.md`](2026-07-19-flight-native-ingest.md) 的独立 harness 承担。
+
 ## 验证
 
 - `cargo test -p zippy-protocol`：15 项 unit、19 项 Flight integration 通过；
