@@ -1885,7 +1885,8 @@ impl LegacyServerRuntime {
     }
 
     fn terminal_failure(&self) -> Option<ServerError> {
-        if self.readiness.memory_ingest_configured
+        if self.readiness.admission_open
+            && self.readiness.memory_ingest_configured
             && !self
                 .memory_ingest
                 .as_ref()
@@ -1896,7 +1897,8 @@ impl LegacyServerRuntime {
                 "memory ingest authority closed while server admission remained open",
             ));
         }
-        if self.readiness.flight_configured
+        if self.readiness.admission_open
+            && self.readiness.flight_configured
             && !self
                 .flight
                 .as_ref()
@@ -3674,30 +3676,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_leaf_starts_waits_and_stops_the_owned_runtime() {
-        let temp = tempfile::tempdir().unwrap();
-        let socket_path = temp.path().join("daemon.sock");
-        let config_path = temp.path().join("zippy.toml");
-        fs::write(
-            &config_path,
-            r#"
-[master]
-shutdown_timeout_ms = 1000
-"#,
-        )
-        .unwrap();
-        let master = MasterDaemonConfig::new(ControlEndpoint::Unix(socket_path.clone()))
-            .with_config_path(config_path)
-            .with_logging(runtime_test_log_dir(), "info", false);
+        for gateway_enabled in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket_path = temp.path().join("daemon.sock");
+            let config_path = temp.path().join("zippy.toml");
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            let gateway_endpoint = probe.local_addr().unwrap();
+            drop(probe);
+            fs::write(
+                &config_path,
+                format!(
+                    "[master]\nshutdown_timeout_ms = 1000\n\n[gateway]\nenabled = {gateway_enabled}\nendpoint = \"{gateway_endpoint}\"\n"
+                ),
+            )
+            .unwrap();
+            let master = MasterDaemonConfig::new(ControlEndpoint::Unix(socket_path.clone()))
+                .with_config_path(config_path)
+                .with_logging(runtime_test_log_dir(), "info", false);
 
-        run_server_daemon_with_waiter(LegacyServerRuntimeConfig::new(master), |runtime| {
-            assert!(runtime.health().readiness.is_ready());
-            assert!(socket_path.exists());
-            Ok("TEST")
-        })
-        .unwrap();
+            run_server_daemon_with_waiter(LegacyServerRuntimeConfig::new(master), |runtime| {
+                assert!(runtime.health().readiness.is_ready());
+                assert!(runtime.terminal_failure().is_none());
+                assert!(socket_path.exists());
+                Ok("TEST")
+            })
+            .unwrap();
 
-        assert!(!socket_path.exists());
-        assert!(!socket_path.with_extension("sock.owner").exists());
+            assert!(!socket_path.exists());
+            assert!(!socket_path.with_extension("sock.owner").exists());
+        }
     }
 
     #[cfg(unix)]

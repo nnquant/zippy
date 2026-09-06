@@ -1,6 +1,7 @@
 pub mod bar_generator;
 pub mod cross_sectional;
 mod cross_sectional_bucket;
+mod key_value_state;
 mod latest_state;
 pub mod reactive;
 pub mod reactive_latest;
@@ -15,6 +16,7 @@ pub use bar_generator::{
     BootstrapPolicy, DtLabelPolicy, SessionWindow, VolumeOutputDtype, VolumeSpec,
 };
 pub use cross_sectional::CrossSectionalEngine;
+pub use key_value_state::{KeyValueSnapshotHandle, KeyValueState};
 pub use reactive::{ReactiveInvalidValuePolicy, ReactiveStateEngine, ReactiveStateFailurePolicy};
 pub use reactive_latest::ReactiveLatestEngine;
 pub use stream_table::{

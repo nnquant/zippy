@@ -36,7 +36,366 @@ use zippy_types::{
 const NAMESPACE_ID: u128 = 1;
 const TABLE_ID: u128 = 10;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_checkpoints_recycle_tiny_budgets_and_recover_exact_receipts() {
+    use zippy_ingest::{
+        ArrowIpcMutationFingerprintComputer, NativeAppendMaterializerConfig, NativeIngestConfig,
+    };
+    use zippy_types::ingest::{
+        IncomingWriteRequest, IngestService, MutationFingerprintComputer, OpenWriterRequest,
+        TableMutation,
+    };
+    use zippy_types::{ConnectionId, ProducerId};
+
+    let temp = tempfile::tempdir().unwrap();
+    let ownership =
+        Arc::new(OwnedDataDirectory::acquire_or_initialize(temp.path().join("db")).unwrap());
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+    create_test_table(&catalog).await;
+    catalog.close().unwrap();
+    let wal_root = temp.path().join("wal");
+    let ingest_config = NativeIngestConfig::new()
+        .with_max_receipts_per_epoch(1)
+        .with_checkpoint_interval(Duration::from_secs(60));
+    let materializer_config = NativeAppendMaterializerConfig::new()
+        .with_row_capacity(2)
+        .with_max_live_segments(3)
+        .with_max_buffered_bytes(4096);
+    let make_request = |sequence: u64, price: i64| {
+        ArrowIpcMutationFingerprintComputer
+            .prepare(IncomingWriteRequest {
+                request_id: request_id(1000 + u128::from(sequence)),
+                schema_version: 1,
+                batch_sequence: sequence,
+                mutation: TableMutation::Append(
+                    RecordBatch::try_new(
+                        test_schema(),
+                        vec![Arc::new(Int64Array::from(vec![price, price + 1]))],
+                    )
+                    .unwrap(),
+                ),
+            })
+            .unwrap()
+    };
+    let open = OpenWriterRequest {
+        request_id: request_id(100),
+        table_id: table_id(),
+        producer_id: ProducerId::from_u128(1).unwrap(),
+        connection_id: ConnectionId::from_u128(1).unwrap(),
+        expected_writer_epoch: Some(0),
+    };
+    let mut runtime =
+        NativeStorageRuntime::start(NativeStorageRuntimeConfig::new(&ownership)).unwrap();
+    let handle = runtime
+        .start_native_ingest_with_config(&wal_root, ingest_config.clone(), materializer_config)
+        .unwrap();
+    let mut writer = handle.open_writer(open.clone()).await.unwrap();
+    let write = |writer: &mut zippy_types::ingest::OpaqueIngestWriter, request| {
+        tokio::task::block_in_place(|| writer.write_memory(request))
+    };
+    let first = write(&mut writer, make_request(0, 10)).unwrap();
+    let pinned = runtime
+        .table_actor(table_id())
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap();
+    handle.checkpoint().await.unwrap();
+    let old = zippy_core::SegmentTableView::from_row_span(pinned.live_segments[0].span().clone())
+        .to_record_batch()
+        .unwrap();
+    assert_eq!(
+        old.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        10
+    );
+    drop(old);
+    drop(pinned);
+    for sequence in 0..20 {
+        if sequence > 0 {
+            write(&mut writer, make_request(sequence, 10)).unwrap();
+        }
+        handle.checkpoint().await.unwrap();
+    }
+    assert_eq!(
+        write(&mut writer, make_request(0, 10)).unwrap().offsets(),
+        first.offsets()
+    );
+    assert_eq!(
+        write(&mut writer, make_request(0, 999)).unwrap_err().code(),
+        ErrorCode::Conflict
+    );
+    handle.checkpoint().await.unwrap();
+    let snapshot = runtime
+        .table_actor(table_id())
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.committed_log_offset,
+        OffsetWatermark::Known(LogOffset::new(39))
+    );
+    assert!(snapshot.live_segments.is_empty());
+    let wal_directory = wal_root.join(table_id().to_string());
+    let wal_files = || {
+        fs::read_dir(&wal_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|value| value == "wal"))
+            .count()
+    };
+    assert_eq!(wal_files(), 1, "checkpoint retains only the new WAL tail");
+    assert_eq!(
+        runtime.native_ingest_status().unwrap().checkpoints_total,
+        20
+    );
+    let tail = write(&mut writer, make_request(20, 20)).unwrap();
+    drop(writer);
+    assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    drop(runtime);
+    let mut runtime =
+        NativeStorageRuntime::start(NativeStorageRuntimeConfig::new(&ownership)).unwrap();
+    let handle = runtime
+        .start_native_ingest_with_config(&wal_root, ingest_config, materializer_config)
+        .unwrap();
+    let mut resumed = open;
+    resumed.connection_id = ConnectionId::from_u128(2).unwrap();
+    // Replay the original acquisition identity to resume its epoch after restart.
+    let mut writer = handle.open_writer(resumed).await.unwrap();
+    assert_eq!(
+        write(&mut writer, make_request(0, 10)).unwrap().offsets(),
+        first.offsets()
+    );
+    assert_eq!(
+        write(&mut writer, make_request(20, 20)).unwrap().offsets(),
+        tail.offsets()
+    );
+    handle.checkpoint().await.unwrap();
+    let empty = ArrowIpcMutationFingerprintComputer
+        .prepare(IncomingWriteRequest {
+            request_id: request_id(1021),
+            schema_version: 1,
+            batch_sequence: 21,
+            mutation: TableMutation::Append(RecordBatch::new_empty(test_schema())),
+        })
+        .unwrap();
+    let receipt = write(&mut writer, empty.clone()).unwrap();
+    assert_eq!(receipt.offsets(), None);
+    handle.checkpoint().await.unwrap();
+    assert_eq!(
+        write(&mut writer, empty).unwrap().committed_log_offset(),
+        tail.committed_log_offset()
+    );
+    assert_eq!(
+        write(&mut writer, make_request(22, 22))
+            .unwrap()
+            .offsets()
+            .unwrap()
+            .first(),
+        LogOffset::new(42)
+    );
+    handle.checkpoint().await.unwrap();
+    drop(writer);
+    assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+}
+
 struct TerminalCatalog;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_checkpoint_worker_persists_without_an_explicit_flush() {
+    use zippy_ingest::{
+        ArrowIpcMutationFingerprintComputer, NativeAppendMaterializerConfig, NativeIngestConfig,
+    };
+    use zippy_types::ingest::{
+        IncomingWriteRequest, IngestService, MutationFingerprintComputer, OpenWriterRequest,
+        TableMutation,
+    };
+    use zippy_types::{ConnectionId, ProducerId};
+    let temp = tempfile::tempdir().unwrap();
+    let ownership =
+        Arc::new(OwnedDataDirectory::acquire_or_initialize(temp.path().join("db")).unwrap());
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+    create_test_table(&catalog).await;
+    catalog.close().unwrap();
+    let mut runtime =
+        NativeStorageRuntime::start(NativeStorageRuntimeConfig::new(&ownership)).unwrap();
+    let handle = runtime
+        .start_native_ingest_with_config(
+            temp.path().join("wal"),
+            NativeIngestConfig::new().with_checkpoint_interval(Duration::from_millis(1)),
+            NativeAppendMaterializerConfig::new().with_row_capacity(2),
+        )
+        .unwrap();
+    let mut writer = handle
+        .open_writer(OpenWriterRequest {
+            request_id: request_id(100),
+            table_id: table_id(),
+            producer_id: ProducerId::from_u128(1).unwrap(),
+            connection_id: ConnectionId::from_u128(1).unwrap(),
+            expected_writer_epoch: Some(0),
+        })
+        .await
+        .unwrap();
+    let request = ArrowIpcMutationFingerprintComputer
+        .prepare(IncomingWriteRequest {
+            request_id: request_id(1000),
+            schema_version: 1,
+            batch_sequence: 0,
+            mutation: TableMutation::Append(
+                RecordBatch::try_new(
+                    test_schema(),
+                    vec![Arc::new(Int64Array::from(vec![10, 11]))],
+                )
+                .unwrap(),
+            ),
+        })
+        .unwrap();
+    tokio::task::block_in_place(|| writer.write_memory(request)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.native_ingest_status().unwrap().checkpoints_total == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime
+            .table_actor(table_id())
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .committed_log_offset,
+        OffsetWatermark::Known(LogOffset::new(1))
+    );
+    drop(writer);
+    assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+}
+
+/// Opt-in real persistence benchmark; deliberately excluded from deterministic CI timing gates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "release-mode native ingest persistence benchmark"]
+async fn native_checkpoint_throughput_benchmark() {
+    use arrow::array::{ArrayRef, StringArray};
+    use zippy_ingest::{
+        ArrowIpcMutationFingerprintComputer, NativeAppendMaterializerConfig, NativeIngestConfig,
+    };
+    use zippy_types::ingest::{
+        IncomingWriteRequest, IngestService, MutationFingerprintComputer, OpenWriterRequest,
+        TableMutation,
+    };
+    use zippy_types::{ConnectionId, ProducerId};
+    let temp = tempfile::tempdir().unwrap();
+    let ownership =
+        Arc::new(OwnedDataDirectory::acquire_or_initialize(temp.path().join("db")).unwrap());
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+    let mut fields = vec![Field::new("instrument_id", DataType::Utf8, false)];
+    for side in ["bid", "ask"] {
+        for level in 1..=10 {
+            for metric in ["price_scaled", "volume_shares"] {
+                fields.push(Field::new(
+                    format!("{side}_{metric}_{level:02}"),
+                    DataType::Int64,
+                    false,
+                ));
+            }
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    create_test_table_with_schema(&catalog, &schema).await;
+    catalog.close().unwrap();
+    let mut runtime =
+        NativeStorageRuntime::start(NativeStorageRuntimeConfig::new(&ownership)).unwrap();
+    let handle = runtime
+        .start_native_ingest_with_config(
+            temp.path().join("wal"),
+            NativeIngestConfig::new().with_checkpoint_interval(Duration::from_secs(60)),
+            NativeAppendMaterializerConfig::new().with_row_capacity(8192),
+        )
+        .unwrap();
+    let mut writer = handle
+        .open_writer(OpenWriterRequest {
+            request_id: request_id(100),
+            table_id: table_id(),
+            producer_id: ProducerId::from_u128(1).unwrap(),
+            connection_id: ConnectionId::from_u128(1).unwrap(),
+            expected_writer_epoch: Some(0),
+        })
+        .await
+        .unwrap();
+    const ROWS: usize = 1024;
+    const BATCHES: u64 = 32;
+    let rounds: u64 = std::env::var("ZIPPY_CHECKPOINT_BENCH_ROUNDS")
+        .map(|value| value.parse().expect("positive benchmark round count"))
+        .unwrap_or(30);
+    assert!(rounds > 0);
+    let batches = (0..BATCHES)
+        .map(|index| {
+            let symbols = (0..ROWS)
+                .map(|row| format!("S{:05}", (index as usize * ROWS + row) % 10000))
+                .collect::<Vec<_>>();
+            let mut arrays = vec![Arc::new(StringArray::from(symbols)) as ArrayRef];
+            for column in 0..40 {
+                arrays
+                    .push(Arc::new(Int64Array::from_iter_values((0..ROWS).map(|row| {
+                        10000 + (row as i64 * 17 + column * 7 + index as i64) % 1024
+                    }))) as ArrayRef);
+            }
+            RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut latencies = Vec::new();
+    let start = Instant::now();
+    for round in 0..rounds {
+        tokio::task::block_in_place(|| {
+            for index in 0..BATCHES {
+                let sequence = round * BATCHES + index;
+                let started = Instant::now();
+                let request = ArrowIpcMutationFingerprintComputer
+                    .prepare(IncomingWriteRequest {
+                        request_id: request_id(1000 + u128::from(sequence)),
+                        schema_version: 1,
+                        batch_sequence: sequence,
+                        mutation: TableMutation::Append(batches[index as usize].clone()),
+                    })
+                    .unwrap();
+                writer.write_memory(request).unwrap();
+                latencies.push(started.elapsed().as_micros());
+            }
+        });
+        handle.checkpoint().await.unwrap();
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    latencies.sort_unstable();
+    let rows = rounds * BATCHES * ROWS as u64;
+    assert_eq!(
+        runtime
+            .table_actor(table_id())
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .committed_log_offset,
+        OffsetWatermark::Known(LogOffset::new(rows - 1))
+    );
+    println!(
+        "{}",
+        serde_json::json!({"case": "native_append_manifest_checkpoint",
+        "rows": rows, "schema": "instrument_id:utf8 + 40 int64 depth fields", "symbols": 10000,
+        "elapsed_seconds": elapsed,
+        "rows_per_second": rows as f64 / elapsed, "batch_rows": ROWS,
+        "admission_p99_us": latencies[latencies.len() * 99 / 100],
+        "peak_rss": fs::read_to_string("/proc/self/status").ok().and_then(|status|
+            status.lines().find(|line| line.starts_with("VmHWM:")).map(str::to_owned)),
+        "checkpoints": runtime.native_ingest_status().unwrap().checkpoints_total})
+    );
+    drop(writer);
+    assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+}
 
 impl CatalogWrite for TerminalCatalog {
     fn command(
@@ -103,6 +462,10 @@ fn catalog_command(
 }
 
 async fn create_test_table(catalog: &SqliteCatalog) {
+    create_test_table_with_schema(catalog, &test_schema()).await;
+}
+
+async fn create_test_table_with_schema(catalog: &SqliteCatalog, schema: &SchemaRef) {
     catalog
         .command(catalog_command(
             1,
@@ -123,7 +486,7 @@ async fn create_test_table(catalog: &SqliteCatalog) {
                 namespace_id: namespace_id(),
                 name: CatalogName::new("ticks").unwrap(),
                 definition: TableDefinition::Append(AppendTableDefinition::default()),
-                schema_ipc: schema_ipc(test_schema().as_ref()),
+                schema_ipc: schema_ipc(schema.as_ref()),
                 config: BTreeMap::new(),
             }),
         ))

@@ -788,6 +788,29 @@ impl PreparedSourceRuntime {
                         }
 
                         if let Some(queued) = data_queue.try_pop() {
+                            // Hello can be published after the empty control poll above
+                            // but before this data pop. Acquiring the data establishes
+                            // visibility of the preceding Hello; recheck control once.
+                            if !hello_seen {
+                                if let Some(command) = rx.try_recv() {
+                                    if handle_source_control_command(
+                                        &mut engine,
+                                        &mut publisher,
+                                        &metrics_clone,
+                                        &status_clone,
+                                        Some(data_queue.as_ref()),
+                                        source_mode,
+                                        &source_schema,
+                                        &engine_schema,
+                                        worker_engine_name.as_str(),
+                                        worker_source_name.as_str(),
+                                        &mut hello_seen,
+                                        command,
+                                    )? {
+                                        return Ok(());
+                                    }
+                                }
+                            }
                             if !hello_seen {
                                 return fail_worker(
                                     &mut engine,

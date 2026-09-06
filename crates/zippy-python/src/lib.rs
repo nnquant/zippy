@@ -6199,11 +6199,67 @@ struct KeyValueTableMaterializer {
     metrics: SharedMetrics,
     handle: SharedHandle,
     engine: Option<RustKeyValueTableMaterializer>,
+    snapshot: zippy_engines::KeyValueSnapshotHandle,
     remote_source: Option<RemoteSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
+}
+
+/// Native, columnar protocol-v2 consumer. Python orchestration never expands delta rows.
+#[pyclass]
+struct KeyValueState {
+    inner: zippy_engines::KeyValueState,
+}
+
+#[pymethods]
+impl KeyValueState {
+    fn select(&self, py: Python<'_>, keys: Vec<Vec<String>>) -> PyResult<PyObject> {
+        let batch = py
+            .allow_threads(|| self.inner.select(&keys))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        batch
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    #[new]
+    fn new(
+        py: Python<'_>,
+        snapshot: &Bound<'_, PyAny>,
+        max_pending_bytes: usize,
+    ) -> PyResult<Self> {
+        let snapshot = RecordBatch::from_pyarrow_bound(snapshot)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let inner = py
+            .allow_threads(|| {
+                zippy_engines::KeyValueState::from_snapshot(snapshot, max_pending_bytes)
+            })
+            .map_err(|error| py_value_error(error.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    fn apply(&mut self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let batch = RecordBatch::from_pyarrow_bound(batch)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| self.inner.apply(batch))
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let batch = py
+            .allow_threads(|| self.inner.snapshot())
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        batch
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    #[getter]
+    fn sequence(&self) -> u64 {
+        self.inner.sequence()
+    }
 }
 
 #[pymethods]
@@ -6961,6 +7017,16 @@ impl StreamTableMaterializer {
 
 #[pymethods]
 impl KeyValueTableMaterializer {
+    /// Captures data and protocol-v2 cursor under one producer lock.
+    fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let batch = py
+            .allow_threads(|| self.snapshot.snapshot())
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        batch
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_guard=None, replacement_retention_snapshots=None, changelog_name=None, changelog_descriptor_publisher=None, changelog_writer_epoch=None))]
@@ -7062,9 +7128,11 @@ impl KeyValueTableMaterializer {
             xfast,
         )?;
 
+        let snapshot = engine.snapshot_handle();
         Ok(Self {
             name,
             by,
+            snapshot,
             input_schema: schema,
             output_schema,
             target,
@@ -7745,6 +7813,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ReactiveLatestEngine>()?;
     module.add_class::<StreamTableMaterializer>()?;
     module.add_class::<KeyValueTableMaterializer>()?;
+    module.add_class::<KeyValueState>()?;
     module.add_class::<TimeSeriesEngine>()?;
     module.add_class::<BarGeneratorEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;

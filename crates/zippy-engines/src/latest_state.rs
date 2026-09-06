@@ -14,9 +14,8 @@ pub(crate) struct LatestColumnarState {
     key_fields: Vec<String>,
     key_indices: Vec<usize>,
     key_to_slot: BTreeMap<Vec<String>, usize>,
-    slots: Vec<LatestSlot>,
+    snapshot_rows_by_slot: Vec<usize>,
     columns: Vec<LatestColumnStore>,
-    sequence: u64,
 }
 
 #[derive(Debug)]
@@ -37,13 +36,6 @@ impl LatestUpdateSet {
     pub(crate) fn has_new_slots(&self) -> bool {
         !self.new_slots.is_empty()
     }
-}
-
-#[derive(Clone)]
-struct LatestSlot {
-    _key: Vec<String>,
-    occupied: bool,
-    _sequence: u64,
 }
 
 enum LatestColumnStore {
@@ -132,18 +124,13 @@ impl LatestColumnarState {
             key_fields,
             key_indices,
             key_to_slot: BTreeMap::new(),
-            slots: Vec::new(),
+            snapshot_rows_by_slot: Vec::new(),
             columns,
-            sequence: 0,
         })
     }
 
     pub(crate) fn key_fields(&self) -> &[String] {
         &self.key_fields
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.key_to_slot.is_empty()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -170,14 +157,25 @@ impl LatestColumnarState {
         self.materialize_slots(&slots)
     }
 
+    pub(crate) fn select_keys(&self, keys: &[Vec<String>]) -> Result<RecordBatch> {
+        let slots = keys
+            .iter()
+            .map(|key| {
+                self.key_to_slot
+                    .get(key)
+                    .copied()
+                    .ok_or(ZippyError::InvalidState {
+                        status: "requested key is absent from the latest state",
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.materialize_slots(&slots)
+    }
+
     pub(crate) fn snapshot_rows_for_slots(&self, slots: &[usize]) -> Vec<usize> {
-        let mut slot_to_row = BTreeMap::new();
-        for (row_index, slot) in self.key_to_slot.values().copied().enumerate() {
-            slot_to_row.insert(slot, row_index);
-        }
         slots
             .iter()
-            .filter_map(|slot| slot_to_row.get(slot).copied())
+            .filter_map(|slot| self.snapshot_rows_by_slot.get(*slot).copied())
             .collect()
     }
 
@@ -234,18 +232,24 @@ impl LatestColumnarState {
             let slot = match self.key_to_slot.get(&key).copied() {
                 Some(slot) => slot,
                 None => {
-                    let slot = self.allocate_slot(key.clone());
+                    let slot = self.allocate_slot();
+                    self.key_to_slot.insert(key, slot);
                     new_slots.push(slot);
                     slot
                 }
             };
-            self.sequence += 1;
-            self.slots[slot]._sequence = self.sequence;
             for (column, cell) in self.columns.iter_mut().zip(&cells) {
                 column.write_cell(slot, cell)?;
             }
-            self.key_to_slot.insert(key, slot);
             updated_slots.push(slot);
+        }
+
+        // Existing-key updates cannot change sorted snapshot positions. Rebuild only
+        // when new keys invalidate the index, once per batch rather than per key.
+        if !new_slots.is_empty() {
+            for (row, slot) in self.key_to_slot.values().copied().enumerate() {
+                self.snapshot_rows_by_slot[slot] = row;
+            }
         }
 
         Ok(LatestUpdateSet {
@@ -254,14 +258,9 @@ impl LatestColumnarState {
         })
     }
 
-    fn allocate_slot(&mut self, key: Vec<String>) -> usize {
-        let slot = self.slots.len();
-        self.sequence += 1;
-        self.slots.push(LatestSlot {
-            _key: key,
-            occupied: true,
-            _sequence: self.sequence,
-        });
+    fn allocate_slot(&mut self) -> usize {
+        let slot = self.snapshot_rows_by_slot.len();
+        self.snapshot_rows_by_slot.push(0);
         for column in &mut self.columns {
             column.push_default();
         }
@@ -272,11 +271,21 @@ impl LatestColumnarState {
         if slots.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
+        // Slots are append-only and every column grows with their allocation.
+        // Validate once for the whole projection, not once per cell.
+        if slots
+            .iter()
+            .any(|slot| *slot >= self.snapshot_rows_by_slot.len())
+        {
+            return Err(ZippyError::InvalidState {
+                status: "latest state slot is out of bounds",
+            });
+        }
         let columns = self
             .columns
             .iter()
-            .map(|column| column.materialize_slots(slots, &self.slots))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|column| column.materialize_slots(slots))
+            .collect();
         RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(|error| ZippyError::Io {
             reason: format!("failed to build latest state batch error=[{}]", error),
         })
@@ -466,31 +475,29 @@ impl LatestColumnStore {
         Ok(())
     }
 
-    fn materialize_slots(&self, slots: &[usize], slot_meta: &[LatestSlot]) -> Result<ArrayRef> {
+    fn materialize_slots(&self, slots: &[usize]) -> ArrayRef {
         match self {
             Self::Int64 { values, valid, .. } => {
                 let mut builder = Int64Builder::with_capacity(slots.len());
                 for slot in slots {
-                    ensure_occupied(slot_meta, *slot)?;
                     if valid[*slot] {
                         builder.append_value(values[*slot]);
                     } else {
                         builder.append_null();
                     }
                 }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
+                Arc::new(builder.finish()) as ArrayRef
             }
             Self::Float64 { values, valid, .. } => {
                 let mut builder = Float64Builder::with_capacity(slots.len());
                 for slot in slots {
-                    ensure_occupied(slot_meta, *slot)?;
                     if valid[*slot] {
                         builder.append_value(values[*slot]);
                     } else {
                         builder.append_null();
                     }
                 }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
+                Arc::new(builder.finish()) as ArrayRef
             }
             Self::Utf8 { values, valid, .. } => {
                 let value_capacity = slots
@@ -500,14 +507,13 @@ impl LatestColumnStore {
                     .sum();
                 let mut builder = StringBuilder::with_capacity(slots.len(), value_capacity);
                 for slot in slots {
-                    ensure_occupied(slot_meta, *slot)?;
                     if valid[*slot] {
                         builder.append_value(&values[*slot]);
                     } else {
                         builder.append_null();
                     }
                 }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
+                Arc::new(builder.finish()) as ArrayRef
             }
             Self::TimestampNanosecond {
                 values,
@@ -517,17 +523,14 @@ impl LatestColumnStore {
             } => {
                 let materialized = slots
                     .iter()
-                    .map(|slot| {
-                        ensure_occupied(slot_meta, *slot)?;
-                        Ok(valid[*slot].then_some(values[*slot]))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                    .map(|slot| valid[*slot].then_some(values[*slot]))
+                    .collect::<Vec<_>>();
                 let array = TimestampNanosecondArray::from(materialized);
                 let array = match timezone {
                     Some(timezone) => array.with_timezone(timezone.clone()),
                     None => array,
                 };
-                Ok(Arc::new(array) as ArrayRef)
+                Arc::new(array) as ArrayRef
             }
         }
     }
@@ -572,15 +575,6 @@ impl LatestColumnStore {
             }
         }
     }
-}
-
-fn ensure_occupied(slots: &[LatestSlot], slot: usize) -> Result<()> {
-    if slots.get(slot).is_some_and(|slot| slot.occupied) {
-        return Ok(());
-    }
-    Err(ZippyError::InvalidState {
-        status: "latest state slot is not occupied",
-    })
 }
 
 #[cfg(test)]
@@ -671,6 +665,34 @@ mod tests {
         assert_eq!(delta_ids.value(1), "IH2606");
         assert_eq!(snapshot_ids.value(0), "IF2606");
         assert_eq!(snapshot_ids.value(1), "IH2606");
+        assert_eq!(state.snapshot_rows_for_slots(update.slots()), vec![0, 1]);
+
+        // Insert on both sides of existing keys: stable slots must now resolve
+        // to the new sorted snapshot positions, not their allocation order.
+        let inserted = state
+            .apply_batch(&batch(
+                vec![Some("ZZ"), Some("AA")],
+                vec!["CFFEX", "CFFEX"],
+                vec![Some(1.0), Some(2.0)],
+                vec![4, 5],
+                vec![104, 105],
+            ))
+            .unwrap();
+        assert_eq!(state.snapshot_rows_for_slots(update.slots()), vec![1, 2]);
+        assert_eq!(state.snapshot_rows_for_slots(inserted.slots()), vec![0, 3]);
+
+        let existing = state
+            .apply_batch(&batch(
+                vec![Some("IH2606"), Some("AA"), Some("IH2606")],
+                vec!["CFFEX"; 3],
+                vec![Some(3.0), Some(4.0), Some(5.0)],
+                vec![6, 7, 8],
+                vec![106, 107, 108],
+            ))
+            .unwrap();
+        assert!(!existing.has_new_slots());
+        assert_eq!(state.snapshot_rows_for_slots(existing.slots()), vec![0, 2]);
+        assert!(state.materialize_slots(&[usize::MAX]).is_err());
     }
 
     #[test]

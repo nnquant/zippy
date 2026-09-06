@@ -361,6 +361,10 @@ pub struct TableActorHandle {
 }
 
 impl TableActorHandle {
+    /// Reports whether this actor owns a native persistence controller.
+    pub const fn persistence_enabled(&self) -> bool {
+        self.persistence_enabled
+    }
     /// Returns the immutable table identity served by this actor.
     #[must_use]
     pub const fn table_id(&self) -> TableId {

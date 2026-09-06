@@ -1240,6 +1240,7 @@ fn build_tick_segment_table(
     symbol_count: usize,
     target_rows_per_sec: u64,
 ) -> PerfResult<SegmentTableView> {
+    let row_count = tick_symbol_buffer_rows(rows_per_batch, symbol_count)?;
     let schema = compile_schema(&[
         ColumnSpec::new("symbol", ColumnType::Utf8),
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("UTC")),
@@ -1247,12 +1248,12 @@ fn build_tick_segment_table(
         ColumnSpec::new("volume", ColumnType::Float64),
     ])
     .map_err(str::to_string)?;
-    let layout = LayoutPlan::for_schema(&schema, rows_per_batch).map_err(str::to_string)?;
+    let layout = LayoutPlan::for_schema(&schema, row_count).map_err(str::to_string)?;
     let mut writer =
         ActiveSegmentWriter::new_for_runtime(schema, layout, 9_001, 0).map_err(str::to_string)?;
     let step_ns = ((1_000_000_000_u64 / target_rows_per_sec).max(1)) as i64;
 
-    for row_index in 0..rows_per_batch {
+    for row_index in 0..row_count {
         writer.begin_row().map_err(str::to_string)?;
         writer
             .write_utf8("symbol", &format!("S{:04}", row_index % symbol_count))
@@ -1269,7 +1270,31 @@ fn build_tick_segment_table(
         writer.commit_row().map_err(str::to_string)?;
     }
 
-    let span = RowSpanView::from_active_descriptor(writer.active_descriptor(), 0, rows_per_batch)
+    let span = RowSpanView::from_active_descriptor(writer.active_descriptor(), 0, row_count)
+        .map_err(str::to_string)?;
+    Ok(SegmentTableView::from_row_span(span))
+}
+
+fn tick_symbol_buffer_rows(rows_per_batch: usize, symbol_count: usize) -> PerfResult<usize> {
+    if rows_per_batch == 0 || symbol_count == 0 {
+        return Err("tick batch size and symbol count must be positive".to_string());
+    }
+    symbol_count
+        .checked_add(rows_per_batch - 1)
+        .ok_or_else(|| "tick symbol buffer size overflow".to_string())
+}
+
+fn tick_segment_batch(
+    table: &SegmentTableView,
+    config: &PerfConfig,
+    input_rows: u64,
+) -> PerfResult<SegmentTableView> {
+    let start = (input_rows % config.symbols as u64) as usize;
+    let span = table
+        .as_segment_row_view()
+        .ok_or_else(|| "tick segment generator requires a segment-backed table".to_string())?
+        .row_span()
+        .slice_rows(start, start + config.rows_per_batch)
         .map_err(str::to_string)?;
     Ok(SegmentTableView::from_row_span(span))
 }
@@ -1315,6 +1340,8 @@ struct TickBatchFactory {
     step_ns: i64,
     next_dt_ns: i64,
     symbols: ArrayRef,
+    symbol_count: usize,
+    next_symbol: usize,
     prices: ArrayRef,
     volumes: ArrayRef,
 }
@@ -1326,7 +1353,8 @@ impl TickBatchFactory {
         symbol_count: usize,
         target_rows_per_sec: u64,
     ) -> PerfResult<Self> {
-        let symbols = (0..rows_per_batch)
+        let symbol_rows = tick_symbol_buffer_rows(rows_per_batch, symbol_count)?;
+        let symbols = (0..symbol_rows)
             .map(|index| format!("S{:04}", index % symbol_count))
             .collect::<Vec<_>>();
         let prices = (0..rows_per_batch)
@@ -1343,6 +1371,8 @@ impl TickBatchFactory {
             step_ns,
             next_dt_ns: 0,
             symbols: Arc::new(StringArray::from(symbols)) as ArrayRef,
+            symbol_count,
+            next_symbol: 0,
             prices: Arc::new(Float64Array::from(prices)) as ArrayRef,
             volumes: Arc::new(Float64Array::from(volumes)) as ArrayRef,
         })
@@ -1353,11 +1383,13 @@ impl TickBatchFactory {
             .map(|offset| self.next_dt_ns + offset as i64 * self.step_ns)
             .collect::<Vec<_>>();
         self.next_dt_ns += self.rows_per_batch as i64 * self.step_ns;
+        let symbols = self.symbols.slice(self.next_symbol, self.rows_per_batch);
+        self.next_symbol = (self.next_symbol + self.rows_per_batch) % self.symbol_count;
 
         RecordBatch::try_new(
             Arc::clone(&self.schema),
             vec![
-                Arc::clone(&self.symbols),
+                symbols,
                 Arc::new(TimestampNanosecondArray::from(timestamps).with_timezone("UTC"))
                     as ArrayRef,
                 Arc::clone(&self.prices),
@@ -1933,7 +1965,7 @@ where
             thread::sleep(next_tick - now);
         }
         let batch_start = Instant::now();
-        send_table(table.clone())?;
+        send_table(tick_segment_batch(table, config, input_rows_total)?)?;
         let send_elapsed = batch_start.elapsed();
         input_rows_total += config.rows_per_batch as u64;
         if batch_start >= warmup_end {
@@ -2641,7 +2673,7 @@ fn drive_stream_table_to_reader(
         let sample_start = Instant::now();
         let on_data_start = Instant::now();
         materializer
-            .on_data(table.clone())
+            .on_data(tick_segment_batch(table, config, input_rows_total)?)
             .map_err(|error| error.to_string())?;
         let on_data_elapsed = on_data_start.elapsed();
         let span = reader
@@ -3057,6 +3089,47 @@ mod tests {
             max_p95_micros: None,
             max_p99_micros: None,
             max_queue_depth: None,
+        }
+    }
+
+    #[test]
+    fn tick_generators_cover_all_symbols_across_batch_boundaries() {
+        use arrow::array::{Array, StringArray};
+        for (rows, symbols) in [(64, 10_000), (8, 3), (1, 1)] {
+            let mut config = test_config(PerfProfile::InprocTimeseries, String::new());
+            config.rows_per_batch = rows;
+            config.symbols = symbols;
+            let mut factory = super::TickBatchFactory::new(
+                super::build_tick_schema(),
+                rows,
+                symbols,
+                config.target_rows_per_sec,
+            )
+            .unwrap();
+            let table =
+                super::build_tick_segment_table(rows, symbols, config.target_rows_per_sec).unwrap();
+            let mut observed = std::collections::BTreeSet::new();
+            for batch_index in 0..(symbols * 2).div_ceil(rows) {
+                let batch = factory.next_batch().unwrap();
+                let segment =
+                    super::tick_segment_batch(&table, &config, (batch_index * rows) as u64)
+                        .unwrap();
+                let column = segment.column("symbol").unwrap();
+                let segment_symbols = column.as_any().downcast_ref::<StringArray>().unwrap();
+                let batch_symbols = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(segment.num_rows(), rows);
+                for row in 0..rows {
+                    let expected = format!("S{:04}", (batch_index * rows + row) % symbols);
+                    assert_eq!(batch_symbols.value(row), expected);
+                    assert_eq!(segment_symbols.value(row), expected);
+                    observed.insert(expected);
+                }
+            }
+            assert_eq!(observed.len(), symbols);
         }
     }
 

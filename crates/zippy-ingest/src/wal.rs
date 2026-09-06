@@ -431,6 +431,39 @@ impl IngestWalWriter {
         &self.path
     }
 
+    pub(crate) fn rotate(&mut self, wal_root: &Path) -> Result<String> {
+        if self.poisoned || self.pending_records != 0 || self.file_len != self.durable_len {
+            return Err(wal_corruption(
+                self.identity.table_id,
+                &self.path,
+                "cannot rotate an uncommitted or poisoned WAL",
+            ));
+        }
+        let previous = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                wal_corruption(self.identity.table_id, &self.path, "invalid WAL file name")
+            })?
+            .to_string();
+        let (_, segment) = parse_wal_file_name(&previous).ok_or_else(|| {
+            wal_corruption(self.identity.table_id, &self.path, "invalid WAL file name")
+        })?;
+        let mut next = Self::create_segment(
+            wal_root,
+            self.identity,
+            segment
+                .checked_add(1)
+                .ok_or_else(|| wal_space_exhausted(self.identity.table_id))?,
+            self.config,
+        )?;
+        next.last_batch_sequence = self.last_batch_sequence;
+        next.last_log_offset = self.last_log_offset;
+        *self = next;
+        Ok(previous)
+    }
+
     /// Appends one fingerprinted mutation without claiming that it is durable yet.
     pub fn append(
         &mut self,
@@ -585,6 +618,16 @@ pub fn recover_table_wal(
     config: IngestWalConfig,
     fingerprints: &dyn MutationFingerprintComputer,
 ) -> Result<IngestWalRecovery> {
+    recover_table_wal_after(wal_root, table_id, config, fingerprints, None)
+}
+
+pub(crate) fn recover_table_wal_after(
+    wal_root: &Path,
+    table_id: TableId,
+    config: IngestWalConfig,
+    fingerprints: &dyn MutationFingerprintComputer,
+    checkpoint: Option<&crate::checkpoint::WalCheckpoint>,
+) -> Result<IngestWalRecovery> {
     config.validate()?;
     let table_directory = table_wal_directory(wal_root, table_id);
     let entries = match fs::read_dir(&table_directory) {
@@ -621,6 +664,12 @@ pub fn recover_table_wal(
         }
         let (epoch, segment) = parse_wal_file_name(name)
             .ok_or_else(|| wal_corruption(table_id, &entry.path(), "WAL file name is malformed"))?;
+        if let Some(checkpoint) = checkpoint {
+            let through = checkpoint_file_key(checkpoint)?;
+            if (epoch, segment) <= through {
+                continue;
+            }
+        }
         files.push((epoch, segment, entry.path()));
     }
     files.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
@@ -676,7 +725,7 @@ pub fn recover_table_wal(
             .with_retryable(false));
         }
     }
-    validate_recovered_sequence(table_id, &recovery.records)?;
+    validate_recovered_sequence(table_id, &recovery.records, checkpoint)?;
     recovery.committed_log_offset = recovery
         .records
         .last()
@@ -1139,11 +1188,15 @@ fn decode_data_record(
     })
 }
 
-fn validate_recovered_sequence(table_id: TableId, records: &[RecoveredWalRecord]) -> Result<()> {
-    let mut previous_epoch: Option<u64> = None;
-    let mut previous_producer: Option<ProducerId> = None;
-    let mut previous_sequence: Option<u64> = None;
-    let mut previous_offset: Option<OffsetWatermark> = None;
+fn validate_recovered_sequence(
+    table_id: TableId,
+    records: &[RecoveredWalRecord],
+    checkpoint: Option<&crate::checkpoint::WalCheckpoint>,
+) -> Result<()> {
+    let mut previous_epoch = checkpoint.map(|value| value.producer_epoch);
+    let mut previous_producer = checkpoint.map(|value| value.producer_id);
+    let mut previous_sequence = checkpoint.map(|value| value.last_sequence);
+    let mut previous_offset = checkpoint.map(|value| value.log_offset);
     for record in records {
         if record.identity.table_id != table_id {
             return Err(wal_corruption(
@@ -1412,7 +1465,50 @@ fn decode_offsets(
     }
 }
 
-fn table_wal_directory(wal_root: &Path, table_id: TableId) -> PathBuf {
+fn checkpoint_file_key(checkpoint: &crate::checkpoint::WalCheckpoint) -> Result<(u64, u64)> {
+    parse_wal_file_name(&checkpoint.through_file)
+        .filter(|(epoch, _)| *epoch == checkpoint.producer_epoch)
+        .ok_or_else(|| {
+            wal_corruption(
+                checkpoint.table_id,
+                Path::new("<checkpoint>"),
+                "checkpoint WAL boundary is invalid",
+            )
+        })
+}
+
+pub(crate) fn reclaim_checkpointed_wal(
+    wal_root: &Path,
+    checkpoint: &crate::checkpoint::WalCheckpoint,
+) -> Result<()> {
+    let through = checkpoint_file_key(checkpoint)?;
+    let directory = table_wal_directory(wal_root, checkpoint.table_id);
+    for entry in fs::read_dir(&directory)
+        .map_err(|error| wal_io_error("read checkpointed WAL directory", &directory, error))?
+    {
+        let entry = entry
+            .map_err(|error| wal_io_error("read checkpointed WAL entry", &directory, error))?;
+        if !entry
+            .file_type()
+            .map_err(|error| wal_io_error("inspect checkpointed WAL entry", &entry.path(), error))?
+            .is_file()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(parse_wal_file_name)
+            .is_some_and(|key| key <= through)
+        {
+            fs::remove_file(entry.path())
+                .map_err(|error| wal_io_error("reclaim checkpointed WAL", &entry.path(), error))?;
+        }
+    }
+    sync_directory(&directory)
+}
+
+pub(crate) fn table_wal_directory(wal_root: &Path, table_id: TableId) -> PathBuf {
     wal_root.join(table_id.to_string())
 }
 
@@ -1482,6 +1578,23 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 }
 
 const CRC32C_TABLE: [u32; 256] = build_crc32c_table();
+const CRC32C_SLICES: [[u32; 256]; 8] = build_crc32c_slices();
+
+const fn build_crc32c_slices() -> [[u32; 256]; 8] {
+    let mut tables = [[0_u32; 256]; 8];
+    tables[0] = CRC32C_TABLE;
+    let mut slice = 1;
+    while slice < 8 {
+        let mut index = 0;
+        while index < 256 {
+            let previous = tables[slice - 1][index];
+            tables[slice][index] = (previous >> 8) ^ tables[0][(previous & 255) as usize];
+            index += 1;
+        }
+        slice += 1;
+    }
+    tables
+}
 
 const fn build_crc32c_table() -> [u32; 256] {
     let mut table = [0_u32; 256];
@@ -1505,7 +1618,22 @@ const fn build_crc32c_table() -> [u32; 256] {
 
 fn crc32c(bytes: &[u8]) -> u32 {
     let mut checksum = u32::MAX;
-    for byte in bytes {
+    // Slicing-by-eight removes the byte-at-a-time dependency chain without unsafe code
+    // or CPU-specific instructions. It preserves the on-disk Castagnoli checksum exactly.
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let first =
+            u32::from_le_bytes(chunk[..4].try_into().expect("four-byte CRC word")) ^ checksum;
+        checksum = CRC32C_SLICES[7][(first & 255) as usize]
+            ^ CRC32C_SLICES[6][((first >> 8) & 255) as usize]
+            ^ CRC32C_SLICES[5][((first >> 16) & 255) as usize]
+            ^ CRC32C_SLICES[4][(first >> 24) as usize]
+            ^ CRC32C_SLICES[3][chunk[4] as usize]
+            ^ CRC32C_SLICES[2][chunk[5] as usize]
+            ^ CRC32C_SLICES[1][chunk[6] as usize]
+            ^ CRC32C_SLICES[0][chunk[7] as usize];
+    }
+    for byte in chunks.remainder() {
         let index = ((checksum as u8) ^ byte) as usize;
         checksum = CRC32C_TABLE[index] ^ (checksum >> 8);
     }
@@ -1714,6 +1842,82 @@ mod tests {
     #[test]
     fn crc32c_matches_the_castagnoli_check_vector() {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+        let bytes = (0..1025)
+            .map(|value| (value * 37) as u8)
+            .collect::<Vec<_>>();
+        for length in 0..=bytes.len() {
+            let mut expected = u32::MAX;
+            for byte in &bytes[..length] {
+                expected ^= u32::from(*byte);
+                for _ in 0..8 {
+                    expected = (expected >> 1) ^ if expected & 1 == 0 { 0 } else { 0x82F6_3B78 };
+                }
+            }
+            assert_eq!(crc32c(&bytes[..length]), !expected, "length=[{length}]");
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode WAL checksum benchmark"]
+    fn crc32c_throughput_benchmark() {
+        let payload = vec![37_u8; 1024 * 1024];
+        let started = std::time::Instant::now();
+        for _ in 0..256 {
+            std::hint::black_box(crc32c(std::hint::black_box(&payload)));
+        }
+        println!("crc32c_256_mib_seconds={}", started.elapsed().as_secs_f64());
+    }
+
+    #[test]
+    fn checkpoint_recovery_skips_leftover_prefix_and_validates_the_tail_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut wal =
+            IngestWalWriter::create_next(temp.path(), identity(1), IngestWalConfig::new()).unwrap();
+        let first = request(0, &[10, 11]);
+        let first_receipt = receipt(&first, OffsetWatermark::Empty);
+        wal.append(&first, &first_receipt).unwrap();
+        wal.commit().unwrap();
+        let checkpoint = crate::checkpoint::WalCheckpoint {
+            table_id: table_id(1),
+            schema_version: 1,
+            producer_epoch: 1,
+            producer_id: producer_id(2),
+            last_sequence: 0,
+            log_offset: first_receipt.committed_log_offset(),
+            through_file: wal.rotate(temp.path()).unwrap(),
+        };
+        let second = request(1, &[12]);
+        wal.append(&second, &receipt(&second, checkpoint.log_offset))
+            .unwrap();
+        wal.commit().unwrap();
+        let config = IngestWalConfig::new().with_max_recovery_records(1);
+        let recover = || {
+            super::recover_table_wal_after(
+                temp.path(),
+                table_id(1),
+                config,
+                &ArrowIpcMutationFingerprintComputer,
+                Some(&checkpoint),
+            )
+        };
+        assert_eq!(
+            recover().unwrap().records.len(),
+            1,
+            "a crash before unlink must not replay the checkpointed file"
+        );
+        super::reclaim_checkpointed_wal(temp.path(), &checkpoint).unwrap();
+        super::reclaim_checkpointed_wal(temp.path(), &checkpoint).unwrap();
+        assert_eq!(recover().unwrap().records[0].request.batch_sequence(), 1);
+        let mut corrupt = checkpoint;
+        corrupt.last_sequence = 7;
+        assert!(super::recover_table_wal_after(
+            temp.path(),
+            table_id(1),
+            config,
+            &ArrowIpcMutationFingerprintComputer,
+            Some(&corrupt)
+        )
+        .is_err());
     }
 
     #[test]

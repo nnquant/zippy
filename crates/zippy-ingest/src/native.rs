@@ -1,10 +1,11 @@
 //! Producer-fenced native ingest authority with stable offsets and durable WAL acknowledgements.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
 use zippy_types::catalog::{
@@ -22,9 +23,10 @@ use zippy_types::{
     RequestId, Result, SequenceWatermark, ServerError, ServerErrorDetails, TableId,
 };
 
+use crate::checkpoint::{ReceiptArchive, WalCheckpoint};
 use crate::{
-    recover_table_wal, ArrowIpcMutationFingerprintComputer, IngestWalConfig, IngestWalIdentity,
-    IngestWalWriter, RecoveredWalRecord, TableRuntimeRegistry, WalCommitReceipt,
+    ArrowIpcMutationFingerprintComputer, IngestWalConfig, IngestWalIdentity, IngestWalWriter,
+    RecoveredWalRecord, TableRuntimeRegistry, WalCommitReceipt,
 };
 
 /// Default maximum idempotent receipts retained for one active producer epoch.
@@ -48,6 +50,7 @@ pub struct NativeIngestConfig {
     max_pending_durable_acks: usize,
     max_active_operations: usize,
     catalog_actor: CatalogActor,
+    checkpoint_interval: Duration,
 }
 
 impl Default for NativeIngestConfig {
@@ -57,6 +60,7 @@ impl Default for NativeIngestConfig {
             max_receipts_per_epoch: DEFAULT_NATIVE_INGEST_MAX_RECEIPTS_PER_EPOCH,
             max_pending_durable_acks: DEFAULT_NATIVE_INGEST_MAX_PENDING_DURABLE_ACKS,
             max_active_operations: DEFAULT_NATIVE_INGEST_MAX_ACTIVE_OPERATIONS,
+            checkpoint_interval: Duration::from_secs(1),
             catalog_actor: CatalogActor {
                 kind: zippy_types::catalog::CatalogActorKind::Server,
                 principal: "zippy-server-ingest".to_owned(),
@@ -66,6 +70,12 @@ impl Default for NativeIngestConfig {
 }
 
 impl NativeIngestConfig {
+    /// Sets the background persistence cadence; backlog limits still apply between ticks.
+    #[must_use]
+    pub const fn with_checkpoint_interval(mut self, interval: Duration) -> Self {
+        self.checkpoint_interval = interval;
+        self
+    }
     /// Creates conservative production defaults.
     #[must_use]
     pub fn new() -> Self {
@@ -79,7 +89,7 @@ impl NativeIngestConfig {
         self
     }
 
-    /// Replaces the maximum exact receipts retained for an active epoch.
+    /// Replaces the hot receipt budget; archived receipts remain exact within the active epoch.
     #[must_use]
     pub const fn with_max_receipts_per_epoch(mut self, maximum: usize) -> Self {
         self.max_receipts_per_epoch = maximum;
@@ -110,6 +120,14 @@ impl NativeIngestConfig {
     /// Validates all static allocation and recovery limits.
     pub fn validate(&self) -> Result<()> {
         self.wal.validate()?;
+        if self.checkpoint_interval.is_zero() || self.checkpoint_interval > Duration::from_secs(60)
+        {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "checkpoint interval must be positive and at most 60 seconds",
+            )
+            .with_retryable(false));
+        }
         if self.max_receipts_per_epoch == 0
             || self.max_receipts_per_epoch > MAX_NATIVE_INGEST_RECEIPTS_PER_EPOCH
         {
@@ -278,6 +296,23 @@ impl From<ServerError> for NativeIngestSinkError {
 
 /// Server-owned mutation materializer behind the producer and WAL authority.
 pub trait NativeIngestSink: Send + Sync {
+    /// Reports whether this sink can prepare manifest-backed recovery checkpoints.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+
+    /// Freezes the accepted prefix while admission is serialized, then persists it asynchronously.
+    ///
+    /// :param watermark: Complete accepted mutation boundary, already covered by WAL fsync.
+    /// :returns: A job completing only after the manifest durably covers the prefix.
+    fn prepare_checkpoint(
+        &self,
+        _table_id: TableId,
+        _watermark: OffsetWatermark,
+    ) -> Result<Option<BoxFuture<'static, Result<OffsetWatermark>>>> {
+        Ok(None)
+    }
+
     /// Installs one Catalog-committed writer epoch before the first mutation uses it.
     ///
     /// Implementations must be idempotent because retrying the same producer acquisition replays
@@ -324,6 +359,10 @@ pub struct NativeIngestStatus {
     pub rejected_operations_total: u64,
     /// Bytes removed from incomplete WAL tails during startup.
     pub recovered_truncated_tail_bytes: u64,
+    /// Successfully committed recovery checkpoints (not idle reclamation passes).
+    pub checkpoints_total: u64,
+    /// Maintenance attempts deferred by an explicit retryable persistence admission limit.
+    pub checkpoint_backpressure_total: u64,
 }
 
 /// Final state of one bounded native ingest shutdown attempt.
@@ -355,6 +394,8 @@ struct NativeIngestMetrics {
     writer_resumes_total: u64,
     rejected_operations_total: u64,
     recovered_truncated_tail_bytes: u64,
+    checkpoints_total: u64,
+    checkpoint_backpressure_total: u64,
 }
 
 struct NativeIngestAdmission {
@@ -380,6 +421,7 @@ struct TableAuthority {
     schema: SchemaRef,
     open_gate: tokio::sync::Mutex<()>,
     state: Mutex<TableAuthorityState>,
+    archive: Mutex<ReceiptArchive>,
 }
 
 struct TableAuthorityState {
@@ -390,6 +432,9 @@ struct TableAuthorityState {
     committed_log_offset: OffsetWatermark,
     last_accepted_sequence: SequenceWatermark,
     last_durable_sequence: SequenceWatermark,
+    last_archived_sequence: SequenceWatermark,
+    last_checkpoint_sequence: SequenceWatermark,
+    pending_checkpoint: Option<WalCheckpoint>,
     receipts: BTreeMap<u64, CachedWrite>,
     request_sequences: HashMap<RequestId, u64>,
     wal: Option<Arc<Mutex<IngestWalWriter>>>,
@@ -397,11 +442,11 @@ struct TableAuthorityState {
     terminal_error: Option<ServerError>,
 }
 
-#[derive(Clone)]
-struct CachedWrite {
-    request_id: RequestId,
-    fingerprint: MutationFingerprint,
-    receipt: WriteReceipt,
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CachedWrite {
+    pub request_id: RequestId,
+    pub fingerprint: MutationFingerprint,
+    pub receipt: WriteReceipt,
 }
 
 struct NativeIngestOperationPermit {
@@ -428,10 +473,42 @@ pub struct NativeIngestHandle {
     inner: Weak<NativeIngestInner>,
 }
 
+impl NativeIngestHandle {
+    /// Persists and checkpoints each accepted table prefix, including receipt and WAL retirement.
+    ///
+    /// Concurrent writes may continue after the captured prefix. Cancellation does not cancel
+    /// an admitted checkpoint; shutdown waits for its operation permit.
+    pub async fn checkpoint(&self) -> Result<()> {
+        let inner = self.inner.upgrade().ok_or_else(authority_stopped)?;
+        let operation = inner.admit()?;
+        tokio::spawn(async move {
+            let _operation = operation;
+            for table in inner.tables.values() {
+                let _gate = table.open_gate.lock().await;
+                if let Err(error) = run_checkpoint(Arc::clone(&inner), Arc::clone(table)).await {
+                    record_checkpoint_error(&inner, table, error.clone());
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            ServerError::new(
+                ErrorCode::Internal,
+                format!("checkpoint task failed error=[{error}]"),
+            )
+            .with_retryable(false)
+        })?
+    }
+}
+
 /// Exclusive lifecycle owner for producer fencing, WAL recovery, and table authorities.
 pub struct NativeIngestRuntime {
     inner: Arc<NativeIngestInner>,
     shutdown: Option<NativeIngestShutdownOutcome>,
+    maintenance_stop: Option<std::sync::mpsc::SyncSender<()>>,
+    maintenance_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NativeIngestRuntime {
@@ -458,19 +535,48 @@ impl NativeIngestRuntime {
         let mut authorities = BTreeMap::new();
         let mut truncated_tail_bytes = 0_u64;
         for bootstrap in tables {
-            let recovery = recover_table_wal(
+            let archive = ReceiptArchive::open(&crate::wal::table_wal_directory(
+                &wal_root,
+                bootstrap.table_id,
+            ))?;
+            let checkpoint = archive.checkpoint()?;
+            if let Some(checkpoint) = &checkpoint {
+                if checkpoint.table_id != bootstrap.table_id
+                    || checkpoint.schema_version != bootstrap.schema_version
+                    || checkpoint.producer_epoch > bootstrap.writer_epoch
+                    || !watermark_covers(bootstrap.persisted_log_offset, checkpoint.log_offset)
+                {
+                    return Err(ServerError::new(
+                        ErrorCode::DataCorruption,
+                        "ingest checkpoint is not covered by the authoritative catalog",
+                    )
+                    .with_table_id(bootstrap.table_id)
+                    .with_retryable(false));
+                }
+            }
+            let recovery = crate::wal::recover_table_wal_after(
                 &wal_root,
                 bootstrap.table_id,
                 config.wal,
                 &ArrowIpcMutationFingerprintComputer,
+                checkpoint.as_ref(),
             )?;
+            if let Some(checkpoint) = &checkpoint {
+                crate::wal::reclaim_checkpointed_wal(&wal_root, checkpoint)?;
+            }
             truncated_tail_bytes = truncated_tail_bytes
                 .checked_add(recovery.truncated_tail_bytes)
                 .ok_or_else(|| {
                     resource_exhausted("native ingest recovered byte counter overflow")
                 })?;
-            let authority =
-                recover_table_authority(&config, bootstrap, recovery.records, sink.as_ref())?;
+            let authority = recover_table_authority(
+                &config,
+                bootstrap,
+                recovery.records,
+                sink.as_ref(),
+                archive,
+                checkpoint.as_ref(),
+            )?;
             if authorities
                 .insert(authority.table_id, Arc::new(authority))
                 .is_some()
@@ -482,7 +588,7 @@ impl NativeIngestRuntime {
                 .with_retryable(false));
             }
         }
-        Ok(Self {
+        let mut runtime = Self {
             inner: Arc::new(NativeIngestInner {
                 config,
                 wal_root,
@@ -500,7 +606,74 @@ impl NativeIngestRuntime {
                 }),
             }),
             shutdown: None,
-        })
+            maintenance_stop: None,
+            maintenance_thread: None,
+        };
+        if runtime.inner.sink.supports_checkpoint() {
+            let interval = runtime.inner.config.checkpoint_interval;
+            let (stop, receiver) = std::sync::mpsc::sync_channel(1);
+            let inner = Arc::downgrade(&runtime.inner);
+            let worker = std::thread::Builder::new()
+                .name("native-ingest-checkpoint".to_string())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build();
+                    let runtime = match runtime {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            if let Some(inner) = inner.upgrade() {
+                                for table in inner.tables.values() {
+                                    lock_table_state(table).terminal_error =
+                                        Some(internal_table_error(
+                                            table.table_id,
+                                            format!("start checkpoint executor error=[{error}]"),
+                                        ));
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    while matches!(
+                        receiver.recv_timeout(interval),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        let Some(inner) = inner.upgrade() else {
+                            break;
+                        };
+                        runtime.block_on(async {
+                            let mut jobs = tokio::task::JoinSet::new();
+                            for table in inner.tables.values() {
+                                let inner = Arc::clone(&inner);
+                                let table = Arc::clone(table);
+                                jobs.spawn(async move { checkpoint_table(inner, table).await });
+                            }
+                            while let Some(result) = jobs.join_next().await {
+                                if let Err(error) = result {
+                                    for table in inner.tables.values() {
+                                        lock_table_state(table).terminal_error =
+                                            Some(internal_table_error(
+                                                table.table_id,
+                                                format!("checkpoint task panicked error=[{error}]"),
+                                            ));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                })
+                .map_err(|error| {
+                    ServerError::new(
+                        ErrorCode::Unavailable,
+                        format!("start checkpoint worker error=[{error}]"),
+                    )
+                    .with_retryable(false)
+                })?;
+            runtime.maintenance_stop = Some(stop);
+            runtime.maintenance_thread = Some(worker);
+        }
+        Ok(runtime)
     }
 
     /// Builds table bootstraps from the same revision-consistent registry used by table actors.
@@ -548,6 +721,9 @@ impl NativeIngestRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .accepting = false;
+        if let Some(stop) = &self.maintenance_stop {
+            let _ = stop.try_send(());
+        }
     }
 
     /// Drains admitted work and commits every complete in-process WAL tail by one deadline.
@@ -558,6 +734,28 @@ impl NativeIngestRuntime {
         self.close_admission();
         if !self.inner.wait_for_operations(deadline) {
             return NativeIngestShutdownOutcome::TimedOut;
+        }
+        if let Some(worker) = &self.maintenance_thread {
+            while !worker.is_finished() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return NativeIngestShutdownOutcome::TimedOut;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+        if let Some(worker) = self.maintenance_thread.take() {
+            if worker.join().is_err() {
+                let outcome = NativeIngestShutdownOutcome::Failed(
+                    ServerError::new(
+                        ErrorCode::Internal,
+                        "native checkpoint worker panicked during shutdown",
+                    )
+                    .with_retryable(false),
+                );
+                self.shutdown = Some(outcome.clone());
+                return outcome;
+            }
         }
         for table in self.inner.tables.values() {
             let transition = {
@@ -669,6 +867,8 @@ impl NativeIngestInner {
             writer_resumes_total: metrics.writer_resumes_total,
             rejected_operations_total: metrics.rejected_operations_total,
             recovered_truncated_tail_bytes: metrics.recovered_truncated_tail_bytes,
+            checkpoints_total: metrics.checkpoints_total,
+            checkpoint_backpressure_total: metrics.checkpoint_backpressure_total,
         }
     }
 
@@ -1016,6 +1216,9 @@ fn install_new_epoch(state: &mut TableAuthorityState, epoch: u64, producer_id: P
     state.active_connection = None;
     state.last_accepted_sequence = SequenceWatermark::Empty;
     state.last_durable_sequence = SequenceWatermark::Empty;
+    state.last_archived_sequence = SequenceWatermark::Empty;
+    state.last_checkpoint_sequence = SequenceWatermark::Empty;
+    state.pending_checkpoint = None;
     state.receipts.clear();
     state.request_sequences.clear();
     state.wal = None;
@@ -1216,18 +1419,15 @@ fn admit_write(
     validate_mutation(table, &request)?;
     let expected_sequence = next_sequence(table.table_id, state.last_accepted_sequence)?;
     if request.batch_sequence() < expected_sequence {
-        let cached = state
-            .receipts
-            .get(&request.batch_sequence())
-            .ok_or_else(|| {
-                ServerError::new(
-                    ErrorCode::Conflict,
-                    "producer sequence is older than the retained idempotency window",
-                )
-                .with_request_id(request.request_id())
-                .with_table_id(table.table_id)
-                .with_retryable(false)
-            })?;
+        let cached = lookup_receipt(table, &state, request.batch_sequence())?.ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Conflict,
+                "producer sequence is older than the retained idempotency window",
+            )
+            .with_request_id(request.request_id())
+            .with_table_id(table.table_id)
+            .with_retryable(false)
+        })?;
         if cached.request_id != request.request_id()
             || cached.fingerprint != request.mutation_fingerprint()
         {
@@ -1269,7 +1469,7 @@ fn admit_write(
         .with_request_id(request.request_id())
         .with_table_id(table.table_id));
     }
-    if let Some(sequence) = state.request_sequences.get(&request.request_id()) {
+    if let Some(sequence) = lookup_request_sequence(table, &state, request.request_id())? {
         return Err(ServerError::new(
             ErrorCode::Conflict,
             format!(
@@ -1410,21 +1610,15 @@ fn complete_durable_commit(
         }
     };
     promote_wal_commit_locked(&mut state, commit);
-    let sequence = state
-        .request_sequences
-        .get(&request_id)
-        .copied()
-        .ok_or_else(|| {
-            internal_table_error(
-                table.table_id,
-                "durable acknowledgement request disappeared from idempotency state",
-            )
-            .with_request_id(request_id)
-        })?;
-    let receipt = state
-        .receipts
-        .get(&sequence)
-        .map(|cached| cached.receipt.clone())
+    let sequence = lookup_request_sequence(table, &state, request_id)?.ok_or_else(|| {
+        internal_table_error(
+            table.table_id,
+            "durable acknowledgement request disappeared from idempotency state",
+        )
+        .with_request_id(request_id)
+    })?;
+    let receipt = lookup_receipt(table, &state, sequence)?
+        .map(|cached| cached.receipt)
         .ok_or_else(|| {
             internal_table_error(
                 table.table_id,
@@ -1466,14 +1660,18 @@ fn promote_wal_commit_locked(state: &mut TableAuthorityState, commit: WalCommitR
     let SequenceWatermark::Known(last_batch_sequence) = commit.last_batch_sequence else {
         return;
     };
-    if matches!(
-        state.last_durable_sequence,
-        SequenceWatermark::Known(current) if current > last_batch_sequence
-    ) {
-        return;
-    }
+    let start = match state.last_durable_sequence {
+        SequenceWatermark::Known(current) if current >= last_batch_sequence => return,
+        SequenceWatermark::Known(current) => Excluded(current),
+        SequenceWatermark::Empty => Unbounded,
+    };
     state.last_durable_sequence = SequenceWatermark::Known(last_batch_sequence);
-    for cached in state.receipts.range_mut(..=last_batch_sequence) {
+    // Each receipt is promoted once per epoch, including when group commits
+    // complete out of order. Never rescan the already durable prefix.
+    for cached in state
+        .receipts
+        .range_mut((start, Included(last_batch_sequence)))
+    {
         let receipt = &cached.1.receipt;
         if receipt.durability_reached() == Durability::Memory {
             cached.1.receipt = promote_receipt(receipt, Durability::Wal, None);
@@ -1524,12 +1722,18 @@ fn recover_table_authority(
     bootstrap: NativeIngestTableBootstrap,
     records: Vec<RecoveredWalRecord>,
     sink: &dyn NativeIngestSink,
+    archive: ReceiptArchive,
+    checkpoint: Option<&WalCheckpoint>,
 ) -> Result<TableAuthority> {
     let mut visible_watermark = bootstrap.persisted_log_offset;
-    let mut current_producer = None;
+    let current_checkpoint =
+        checkpoint.filter(|value| value.producer_epoch == bootstrap.writer_epoch);
+    let mut current_producer = current_checkpoint.map(|value| value.producer_id);
     let mut current_receipts = BTreeMap::new();
     let mut current_request_sequences = HashMap::new();
-    let mut current_last_sequence = SequenceWatermark::Empty;
+    let mut current_last_sequence = current_checkpoint.map_or(SequenceWatermark::Empty, |value| {
+        SequenceWatermark::Known(value.last_sequence)
+    });
 
     for record in records {
         if record.identity.producer_epoch > bootstrap.writer_epoch {
@@ -1605,6 +1809,7 @@ fn recover_table_authority(
         schema_version: bootstrap.schema_version,
         schema: bootstrap.schema,
         open_gate: tokio::sync::Mutex::new(()),
+        archive: Mutex::new(archive),
         state: Mutex::new(TableAuthorityState {
             current_epoch: bootstrap.writer_epoch,
             current_producer,
@@ -1613,13 +1818,232 @@ fn recover_table_authority(
             committed_log_offset: visible_watermark,
             last_accepted_sequence: current_last_sequence,
             last_durable_sequence: current_last_sequence,
+            last_archived_sequence: current_checkpoint.map_or(SequenceWatermark::Empty, |value| {
+                SequenceWatermark::Known(value.last_sequence)
+            }),
+            last_checkpoint_sequence: current_checkpoint
+                .map_or(SequenceWatermark::Empty, |value| {
+                    SequenceWatermark::Known(value.last_sequence)
+                }),
             receipts: current_receipts,
+            pending_checkpoint: None,
             request_sequences: current_request_sequences,
             wal: None,
             pending_durable_acks: 0,
             terminal_error: None,
         }),
     })
+}
+
+async fn checkpoint_table(inner: Arc<NativeIngestInner>, table: Arc<TableAuthority>) {
+    let Ok(_operation) = inner.admit() else {
+        return;
+    };
+    let _open_gate = table.open_gate.lock().await;
+    let result = run_checkpoint(Arc::clone(&inner), Arc::clone(&table)).await;
+    if let Err(error) = result {
+        record_checkpoint_error(&inner, &table, error);
+    }
+}
+
+fn record_checkpoint_error(inner: &NativeIngestInner, table: &TableAuthority, error: ServerError) {
+    if error.code() == ErrorCode::ResourceExhausted && error.retryable() {
+        let mut metrics = inner.metrics.lock().unwrap();
+        metrics.checkpoint_backpressure_total =
+            metrics.checkpoint_backpressure_total.saturating_add(1);
+    } else {
+        lock_table_state(table).terminal_error = Some(error);
+    }
+}
+
+async fn run_checkpoint(inner: Arc<NativeIngestInner>, table: Arc<TableAuthority>) -> Result<()> {
+    let prepare_inner = Arc::clone(&inner);
+    let prepare_table = Arc::clone(&table);
+    let prepared = tokio::task::spawn_blocking(move || {
+        let mut state = lock_table_state(&prepare_table);
+        require_table_healthy(&prepare_table, &state)?;
+        if state.transitioning {
+            return Ok(None);
+        }
+        let SequenceWatermark::Known(sequence) = state.last_accepted_sequence else {
+            return Ok(None);
+        };
+        let Some(wal) = state.wal.clone() else {
+            return Ok(None);
+        };
+        let commit = wal.lock().unwrap().commit()?;
+        promote_wal_commit_locked(&mut state, commit);
+        record_wal_commit(&prepare_inner, &commit);
+        let job = prepare_inner
+            .sink
+            .prepare_checkpoint(prepare_table.table_id, state.committed_log_offset)?;
+        let Some(job) = job else {
+            return Ok(None);
+        };
+        let checkpoint = if state.last_checkpoint_sequence == SequenceWatermark::Known(sequence) {
+            None
+        } else if state
+            .pending_checkpoint
+            .as_ref()
+            .is_some_and(|value| value.last_sequence == sequence)
+        {
+            state.pending_checkpoint.clone()
+        } else {
+            let checkpoint = WalCheckpoint {
+                table_id: prepare_table.table_id,
+                schema_version: prepare_table.schema_version,
+                producer_epoch: state.current_epoch,
+                producer_id: state.current_producer.ok_or_else(|| {
+                    internal_table_error(prepare_table.table_id, "checkpoint producer is missing")
+                })?,
+                last_sequence: sequence,
+                log_offset: state.committed_log_offset,
+                through_file: wal.lock().unwrap().rotate(&prepare_inner.wal_root)?,
+            };
+            state.pending_checkpoint = Some(checkpoint.clone());
+            Some(checkpoint)
+        };
+        let start = match state.last_archived_sequence {
+            SequenceWatermark::Empty => Unbounded,
+            SequenceWatermark::Known(value) => Excluded(value),
+        };
+        let receipts = if state.last_archived_sequence == SequenceWatermark::Known(sequence) {
+            Vec::new()
+        } else {
+            state
+                .receipts
+                .range((start, Included(sequence)))
+                .map(|(_, cached)| cached.clone())
+                .collect()
+        };
+        Ok::<_, ServerError>(Some((
+            job,
+            checkpoint,
+            receipts,
+            state.current_epoch,
+            sequence,
+        )))
+    })
+    .await
+    .map_err(|error| {
+        internal_table_error(
+            table.table_id,
+            format!("prepare checkpoint task error=[{error}]"),
+        )
+    })??;
+    let Some((job, checkpoint, receipts, epoch, sequence)) = prepared else {
+        return Ok(());
+    };
+    if !receipts.is_empty() {
+        let archive_table = Arc::clone(&table);
+        tokio::task::spawn_blocking(move || {
+            archive_table
+                .archive
+                .lock()
+                .unwrap()
+                .archive(epoch, &receipts)
+        })
+        .await
+        .map_err(|error| {
+            internal_table_error(
+                table.table_id,
+                format!("archive checkpoint task error=[{error}]"),
+            )
+        })??;
+        let mut state = lock_table_state(&table);
+        state.last_archived_sequence = SequenceWatermark::Known(sequence);
+        let keep = (inner.config.max_receipts_per_epoch / 2).min(4096);
+        while state.receipts.len() > keep
+            && state
+                .receipts
+                .first_key_value()
+                .is_some_and(|(key, _)| *key <= sequence)
+        {
+            let (_, cached) = state.receipts.pop_first().expect("first receipt exists");
+            state.request_sequences.remove(&cached.request_id);
+        }
+    }
+    let persisted = job.await?;
+    if let Some(checkpoint) = checkpoint {
+        if !watermark_covers(persisted, checkpoint.log_offset) {
+            return Err(internal_table_error(
+                table.table_id,
+                "checkpoint job did not persist its complete prefix",
+            ));
+        }
+        let checkpoint_table = Arc::clone(&table);
+        let wal_root = inner.wal_root.clone();
+        tokio::task::spawn_blocking(move || {
+            checkpoint_table
+                .archive
+                .lock()
+                .unwrap()
+                .commit_checkpoint(&checkpoint)?;
+            crate::wal::reclaim_checkpointed_wal(&wal_root, &checkpoint)
+        })
+        .await
+        .map_err(|error| {
+            internal_table_error(
+                table.table_id,
+                format!("commit checkpoint task error=[{error}]"),
+            )
+        })??;
+        let mut state = lock_table_state(&table);
+        state.last_checkpoint_sequence = SequenceWatermark::Known(sequence);
+        state.pending_checkpoint = None;
+        drop(state);
+        let mut metrics = inner.metrics.lock().unwrap();
+        metrics.checkpoints_total = metrics.checkpoints_total.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn watermark_covers(cover: OffsetWatermark, target: OffsetWatermark) -> bool {
+    match (cover, target) {
+        (OffsetWatermark::Empty | OffsetWatermark::Known(_), OffsetWatermark::Empty) => true,
+        (OffsetWatermark::Known(cover), OffsetWatermark::Known(target)) => cover >= target,
+        _ => false,
+    }
+}
+
+fn lookup_receipt(
+    table: &TableAuthority,
+    state: &TableAuthorityState,
+    sequence: u64,
+) -> Result<Option<CachedWrite>> {
+    if let Some(cached) = state.receipts.get(&sequence) {
+        return Ok(Some(cached.clone()));
+    }
+    table
+        .archive
+        .lock()
+        .unwrap()
+        .lookup(state.current_epoch, sequence)
+}
+
+fn lookup_request_sequence(
+    table: &TableAuthority,
+    state: &TableAuthorityState,
+    request: RequestId,
+) -> Result<Option<u64>> {
+    if let Some(sequence) = state.request_sequences.get(&request) {
+        return Ok(Some(*sequence));
+    }
+    // Receipt eviction removes only a contiguous prefix. While sequence zero is still
+    // hot, the in-memory request index covers the entire current epoch.
+    if state.last_accepted_sequence == SequenceWatermark::Empty
+        || state
+            .receipts
+            .first_key_value()
+            .is_some_and(|(sequence, _)| *sequence == 0)
+    {
+        return Ok(None);
+    }
+    table
+        .archive
+        .lock()
+        .unwrap()
+        .request_sequence(state.current_epoch, request)
 }
 
 fn record_should_replay(
@@ -2523,15 +2947,30 @@ mod tests {
         let already_durable = wal.lock().unwrap().commit().unwrap();
         assert_eq!(covered.committed_records, 2);
         assert_eq!(already_durable.committed_records, 0);
+        writer.write_memory(write_request(102, 2, &[3])).unwrap();
 
         let mut state = super::lock_table_state(table);
         super::promote_wal_commit_locked(&mut state, already_durable);
         assert_eq!(state.last_durable_sequence, SequenceWatermark::Known(1));
+        assert!(state.receipts.range(..=1).all(|(_, cached)| cached
+            .receipt
+            .durability_reached()
+            .satisfies(Durability::Wal)));
+        assert_eq!(
+            state.receipts[&2].receipt.durability_reached(),
+            Durability::Memory
+        );
+        super::promote_wal_commit_locked(&mut state, covered);
+        drop(state);
+
+        let next = wal.lock().unwrap().commit().unwrap();
+        let mut state = super::lock_table_state(table);
+        super::promote_wal_commit_locked(&mut state, next);
+        assert_eq!(state.last_durable_sequence, SequenceWatermark::Known(2));
         assert!(state.receipts.values().all(|cached| cached
             .receipt
             .durability_reached()
             .satisfies(Durability::Wal)));
-        super::promote_wal_commit_locked(&mut state, covered);
         drop(state);
 
         assert_eq!(

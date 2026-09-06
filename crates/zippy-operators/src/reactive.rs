@@ -58,7 +58,15 @@ struct StatefulFloatUndoLog {
 
 enum StatefulFloatUndoEntry {
     Ema(Option<f64>),
-    Window(Option<WindowHistory>),
+    Window(Option<WindowUndo>),
+}
+
+struct WindowUndo {
+    original_len: usize,
+    sum: f64,
+    mean: f64,
+    m2: f64,
+    removed: Vec<f64>,
 }
 
 /// Lightweight read-only view over the columns visible to a reactive factor.
@@ -492,8 +500,7 @@ impl StatefulFloatById {
                         if history.len() < *size {
                             None
                         } else {
-                            let mean = history.sum() / *size as f64;
-                            let variance = history.sum_squares() / *size as f64 - mean * mean;
+                            let variance = history.m2 / *size as f64;
                             Some(variance.max(0.0).sqrt())
                         }
                     }
@@ -575,7 +582,18 @@ impl StatefulFloatById {
                 for (id, entry) in undo_log.entries {
                     match entry {
                         StatefulFloatUndoEntry::Window(Some(previous)) => {
-                            history_by_id.insert(id, previous);
+                            let history = history_by_id
+                                .get_mut(&id)
+                                .expect("recorded window remains present until rollback");
+                            history
+                                .values
+                                .truncate(previous.original_len - previous.removed.len());
+                            for value in previous.removed.into_iter().rev() {
+                                history.values.push_front(value);
+                            }
+                            history.sum = previous.sum;
+                            history.mean = previous.mean;
+                            history.m2 = previous.m2;
                         }
                         StatefulFloatUndoEntry::Window(None) => {
                             history_by_id.remove(&id);
@@ -627,19 +645,40 @@ impl StatefulFloatById {
             return;
         };
 
-        if undo_log.entries.contains_key(&id) {
-            return;
-        }
-
-        let entry = match &self.state {
+        match &self.state {
             StatefulFloatState::Ema { state_by_id, .. } => {
-                StatefulFloatUndoEntry::Ema(state_by_id.get(&id).copied())
+                undo_log
+                    .entries
+                    .entry(id)
+                    .or_insert_with(|| StatefulFloatUndoEntry::Ema(state_by_id.get(&id).copied()));
             }
-            StatefulFloatState::Window { history_by_id, .. } => {
-                StatefulFloatUndoEntry::Window(history_by_id.get(&id).cloned())
+            StatefulFloatState::Window {
+                history_by_id,
+                size,
+                ..
+            } => {
+                let history = history_by_id.get(&id);
+                let entry = undo_log.entries.entry(id).or_insert_with(|| {
+                    StatefulFloatUndoEntry::Window(history.map(|history| WindowUndo {
+                        original_len: history.len(),
+                        sum: history.sum,
+                        mean: history.mean,
+                        m2: history.m2,
+                        removed: Vec::new(),
+                    }))
+                });
+                if let (Some(history), StatefulFloatUndoEntry::Window(Some(undo))) =
+                    (history, entry)
+                {
+                    // Only retain evicted values from the pre-transaction window.
+                    // New values can be discarded by truncation during rollback.
+                    if history.len() == *size && undo.removed.len() < undo.original_len {
+                        undo.removed
+                            .push(history.front().expect("full window is nonempty"));
+                    }
+                }
             }
-        };
-        undo_log.entries.insert(id, entry);
+        }
     }
 }
 
@@ -846,7 +885,7 @@ impl ClipSpec {
 
     /// Build the clip factor.
     pub fn build(&self) -> Result<Box<dyn ReactiveFactor>> {
-        if self.min > self.max {
+        if self.min.is_nan() || self.max.is_nan() || self.min > self.max {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
                     "clip bounds must satisfy min <= max min=[{}] max=[{}]",
@@ -984,18 +1023,33 @@ enum WindowHistoryKind {
     Return,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct WindowHistory {
     values: VecDeque<f64>,
     sum: f64,
-    sum_squares: f64,
+    mean: f64,
+    m2: f64,
 }
 
 impl WindowHistory {
     fn push_and_trim(&mut self, value: f64, size: usize) {
+        if size == 1 {
+            self.mean = value;
+            self.m2 = 0.0;
+        } else if self.values.len() == size {
+            let removed = self.front().expect("full window is nonempty");
+            let delta = value - removed;
+            let next_mean = self.mean + delta / size as f64;
+            // Fixed-size replacement avoids subtracting two raw squared price levels.
+            self.m2 += delta * ((value - next_mean) + (removed - self.mean));
+            self.mean = next_mean;
+        } else {
+            let delta = value - self.mean;
+            self.mean += delta / (self.values.len() + 1) as f64;
+            self.m2 += delta * (value - self.mean);
+        }
         self.values.push_back(value);
         self.sum += value;
-        self.sum_squares += value * value;
 
         while self.values.len() > size {
             let removed = self
@@ -1003,7 +1057,6 @@ impl WindowHistory {
                 .pop_front()
                 .expect("window history length checked above");
             self.sum -= removed;
-            self.sum_squares -= removed * removed;
         }
     }
 
@@ -1017,10 +1070,6 @@ impl WindowHistory {
 
     fn sum(&self) -> f64 {
         self.sum
-    }
-
-    fn sum_squares(&self) -> f64 {
-        self.sum_squares
     }
 }
 
@@ -1430,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn window_history_maintains_running_sum_and_squares_when_trimmed() {
+    fn window_history_maintains_running_sum_and_centered_moment_when_trimmed() {
         let mut history = WindowHistory::default();
 
         history.push_and_trim(2.0, 3);
@@ -1441,7 +1490,20 @@ mod tests {
         assert_eq!(history.len(), 3);
         assert_eq!(history.front(), Some(4.0));
         assert_eq!(history.sum(), 18.0);
-        assert_eq!(history.sum_squares(), 116.0);
+        assert_eq!(history.m2, 8.0);
+    }
+
+    #[test]
+    fn rolling_std_preserves_small_variations_on_large_price_levels() {
+        let mut state = StatefulFloatById::new(StatefulFloatKind::Std { window: 4 });
+        for index in 1..=100 {
+            let output = state
+                .evaluate_optional("A", Some(1.0e12 + index as f64))
+                .unwrap();
+            if index >= 4 {
+                assert!((output.unwrap() - 1.25_f64.sqrt()).abs() < 1.0e-9);
+            }
+        }
     }
 
     #[test]
@@ -1462,5 +1524,67 @@ mod tests {
             Some(20.0)
         );
         assert_eq!(state.interned_id_count_for_test(), 1);
+    }
+
+    #[test]
+    fn window_transactions_restore_partial_and_fully_evicted_histories() {
+        for kind in [
+            StatefulFloatKind::Mean { window: 4 },
+            StatefulFloatKind::Std { window: 4 },
+            StatefulFloatKind::Delay { period: 4 },
+            StatefulFloatKind::Diff { period: 4 },
+            StatefulFloatKind::Return { period: 4 },
+        ] {
+            for warmup in [0, 2, 4] {
+                for updates in [1, 3, 12] {
+                    let mut state = StatefulFloatById::new(kind);
+                    let mut reference = StatefulFloatById::new(kind);
+                    for value in 1..=warmup {
+                        state.evaluate_optional("A", Some(value as f64)).unwrap();
+                        reference
+                            .evaluate_optional("A", Some(value as f64))
+                            .unwrap();
+                    }
+                    state.begin_transaction();
+                    for value in 10..10 + updates {
+                        state.evaluate_optional("A", Some(value as f64)).unwrap();
+                        state.evaluate_optional("new", Some(value as f64)).unwrap();
+                        assert_eq!(state.evaluate_optional("null", None).unwrap(), None);
+                    }
+                    state.rollback_transaction().unwrap();
+                    assert_eq!(state.interned_id_count_for_test(), usize::from(warmup > 0));
+                    for value in 30..40 {
+                        assert_eq!(
+                            state.evaluate_optional("A", Some(value as f64)).unwrap(),
+                            reference
+                                .evaluate_optional("A", Some(value as f64))
+                                .unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark for transaction cost versus window size"]
+    fn window_transaction_performance() {
+        for window in [1024, 65536] {
+            let mut state = StatefulFloatById::new(StatefulFloatKind::Mean { window });
+            for _ in 0..window {
+                state.evaluate_optional("A", Some(1.0)).unwrap();
+            }
+            let iterations = 20_000;
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                state.begin_transaction();
+                std::hint::black_box(state.evaluate_optional("A", Some(2.0)).unwrap());
+                state.commit_transaction();
+            }
+            eprintln!(
+                "window=[{window}] transaction_ns=[{:.2}]",
+                start.elapsed().as_nanos() as f64 / iterations as f64
+            );
+        }
     }
 }

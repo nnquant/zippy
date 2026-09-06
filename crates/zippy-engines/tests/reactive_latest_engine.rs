@@ -134,7 +134,7 @@ fn reactive_latest_engine_preserves_nullable_values_in_snapshot() {
         )))
         .unwrap();
 
-    let output = engine.on_flush().unwrap()[0].to_record_batch().unwrap();
+    let output = engine.snapshot().unwrap();
     let prices = output
         .column(2)
         .as_any()
@@ -170,7 +170,7 @@ fn reactive_latest_engine_invalid_key_batch_leaves_existing_state_unchanged() {
         .unwrap_err();
     assert!(error.to_string().contains("contains null"));
 
-    let output = engine.on_flush().unwrap()[0].to_record_batch().unwrap();
+    let output = engine.snapshot().unwrap();
     assert_eq!(string_values(&output, 0), vec!["IF2606"]);
     assert_eq!(float_values(&output, 2), vec![3912.4]);
 }
@@ -200,7 +200,7 @@ fn reactive_latest_engine_groups_by_multiple_dimensions() {
 }
 
 #[test]
-fn reactive_latest_engine_flush_emits_full_latest_snapshot() {
+fn reactive_latest_engine_snapshot_is_explicit_and_flush_emits_nothing() {
     let mut engine =
         ReactiveLatestEngine::new("latest_ticks", input_schema(), vec!["instrument_id"]).unwrap();
     engine
@@ -218,9 +218,8 @@ fn reactive_latest_engine_flush_emits_full_latest_snapshot() {
         )))
         .unwrap();
 
-    let outputs = engine.on_flush().unwrap();
-
-    let output = outputs[0].to_record_batch().unwrap();
+    assert!(engine.on_flush().unwrap().is_empty());
+    let output = engine.snapshot().unwrap();
     assert_eq!(string_values(&output, 0), vec!["IF2606", "IH2606"]);
     assert_eq!(float_values(&output, 2), vec![3913.2, 2740.8]);
 }

@@ -35,6 +35,11 @@ impl ReactiveLatestEngine {
     pub fn by(&self) -> &[String] {
         self.state.key_fields()
     }
+
+    /// Explicitly materializes the latest keyed state; flush never emits a full state.
+    pub fn snapshot(&self) -> Result<arrow::record_batch::RecordBatch> {
+        self.state.materialize_snapshot()
+    }
 }
 
 impl Engine for ReactiveLatestEngine {
@@ -72,11 +77,7 @@ impl Engine for ReactiveLatestEngine {
     }
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
-        if self.state.is_empty() {
-            return Ok(vec![]);
-        }
-        let output = self.state.materialize_snapshot()?;
-        Ok(vec![SegmentTableView::from_record_batch(output)])
+        Ok(vec![])
     }
 
     fn drain_metrics(&mut self) -> EngineMetricsDelta {

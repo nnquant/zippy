@@ -3,6 +3,9 @@
 `zippy-client` 是 Zippy 的轻量 Python 客户端发行包。它只包含连接、查询、订阅、写入和
 本地只读 SHM 能力，不包含 Server、Master、Gateway daemon、WebUI、Compaction 或计算引擎。
 
+KeyValue 订阅返回 v2 增量，保留序号、版本和批次边界；不能把单次回调当作完整市场状态。
+完整初始化流程见仓库 `docs/key-value-v2-migration.md`，状态重建前不要过滤或截断增量。
+
 ## 安装
 
 ```bash

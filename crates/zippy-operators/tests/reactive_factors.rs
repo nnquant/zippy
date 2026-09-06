@@ -119,19 +119,6 @@ fn ema_and_return_follow_row_order() {
 }
 
 #[test]
-fn return_outputs_null_during_warmup() {
-    let ret_spec = TsReturnSpec::new("id", "value", 3, "ret_3");
-    let mut ret = ret_spec.build().unwrap();
-
-    let values = float64_values(
-        &ret.evaluate(&batch(vec!["x", "x"], vec![10.0, 11.0]))
-            .unwrap(),
-    );
-
-    assert_eq!(values, vec![None, None]);
-}
-
-#[test]
 fn return_outputs_null_when_base_is_zero() {
     let ret_spec = TsReturnSpec::new("id", "value", 1, "ret_1");
     let mut ret = ret_spec.build().unwrap();
@@ -142,6 +129,48 @@ fn return_outputs_null_when_base_is_zero() {
     );
 
     assert_float_options_eq(&values, &[None, None, Some(0.5)]);
+}
+
+#[test]
+fn clip_rejects_unordered_bounds_before_evaluation() {
+    for (min, max) in [(2.0, 1.0), (f64::NAN, 1.0), (0.0, f64::NAN)] {
+        assert!(matches!(
+            ClipSpec::new("id", "value", min, max, "clipped").build(),
+            Err(ZippyError::InvalidConfig { .. })
+        ));
+    }
+    // Infinite bounds are ordered and remain a supported no-op clip.
+    let mut factor = ClipSpec::new("id", "value", f64::NEG_INFINITY, f64::INFINITY, "clipped")
+        .build()
+        .unwrap();
+    let input = input_batch();
+    assert_eq!(
+        factor.evaluate(&input).unwrap().as_ref(),
+        input.column(1).as_ref()
+    );
+}
+
+#[test]
+fn expression_clip_rejects_nan_bounds_in_all_evaluators() {
+    let input = batch(vec!["a"], vec![f64::NAN]);
+    let context = zippy_operators::ReactiveFactorContext::from_batch(&input);
+    for expression in ["CLIP(0.5, value, 1.0)", "CLIP(0.5, 0.0, value)"] {
+        let spec = ExpressionSpec::new(expression, "clipped");
+        let mut direct = spec.build(input.schema().as_ref()).unwrap();
+        let mut planned = spec
+            .build_reactive_factor(input.schema().as_ref(), "id")
+            .unwrap();
+        for factor in [&mut direct, &mut planned] {
+            assert!(matches!(
+                factor.evaluate(&input),
+                Err(ZippyError::InvalidState { .. })
+            ));
+            assert!(matches!(
+                factor.evaluate_with_context(&context),
+                Err(ZippyError::InvalidState { .. })
+            ));
+        }
+    }
 }
 
 #[test]

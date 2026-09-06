@@ -27,6 +27,8 @@ import warnings
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .state import KeyValueState, StateSubscription
+
 _PROFILE_CLOCK_NS = time.perf_counter_ns
 _NATIVE_IMPORT_ERROR: BaseException | None = None
 _NATIVE_AVAILABLE = os.environ.get("ZIPPY_FORCE_PURE_PYTHON") != "1"
@@ -52,6 +54,8 @@ _STREAM_TABLE_LOGICAL_PARENT_FIELD = "zippy_logical_parent"
 _KV_SEQ_FIELD = "_zippy_kv_seq"
 _KV_OP_FIELD = "_zippy_kv_op"
 _KV_SNAPSHOT_VERSION_FIELD = "_zippy_kv_snapshot_version"
+_KV_BATCH_END_FIELD = "_zippy_kv_batch_last_seq"
+_KV_STREAM_ID_FIELD = "_zippy_kv_stream_id"
 _KV_CHANGELOG_STREAM_FIELD = "zippy_kv_changelog_stream"
 _KV_PARENT_STREAM_FIELD = "zippy_kv_parent_stream"
 _KEY_VALUE_KEYS_FIELD = "zippy_key_value_keys"
@@ -4183,6 +4187,7 @@ class RemoteStreamSubscriber:
         self._started = False
         self._error: BaseException | None = None
         self._reconnects_total = 0
+        self._ready = False
         self._rows_delivered_total = 0
         self._batches_delivered_total = 0
         self._last_event_ns = 0
@@ -4225,6 +4230,7 @@ class RemoteStreamSubscriber:
         return {
             "source": self.source,
             "remote_gateway_endpoint": self.endpoint,
+            "ready": self._ready,
             "state": state,
             "running": state in {"running", "reconnecting"},
             "last_error": None if self._error is None else str(self._error),
@@ -4259,6 +4265,7 @@ class RemoteStreamSubscriber:
                 self._run_once()
                 return
             except OSError:
+                self._ready = False
                 if self._stop_event.is_set():
                     return
                 if not self.reconnect:
@@ -4305,6 +4312,7 @@ class RemoteStreamSubscriber:
                 if header.get("status") != "ok":
                     raise RuntimeError(header.get("reason", "remote subscribe failed"))
                 if header.get("kind") == "subscribed":
+                    self._ready = True
                     continue
                 if header.get("kind") == "row" and not self.table_callback:
                     row = header.get("row")
@@ -7012,6 +7020,8 @@ def _key_value_changelog_schema(schema: object) -> object:
             pa.field(_KV_SEQ_FIELD, pa.int64(), nullable=False),
             pa.field(_KV_OP_FIELD, pa.string(), nullable=False),
             pa.field(_KV_SNAPSHOT_VERSION_FIELD, pa.int64(), nullable=False),
+            pa.field(_KV_BATCH_END_FIELD, pa.int64(), nullable=False),
+            pa.field(_KV_STREAM_ID_FIELD, pa.string(), nullable=False),
             *list(schema),
         ]
     )
@@ -7068,6 +7078,7 @@ def _key_value_table_descriptor_metadata(
         _KEY_VALUE_KEYS_FIELD: list(by),
         _KEY_VALUE_CHANGELOG_STREAM_FIELD: changelog_stream_name,
         _KV_CHANGELOG_STREAM_FIELD: changelog_stream_name,
+        "zippy_kv_protocol_version": 2,
     }
 
 
@@ -7083,27 +7094,6 @@ def _key_value_changelog_descriptor_metadata(
         _LATEST_BY_FIELD: list(by),
         _KEY_VALUE_KEYS_FIELD: list(by),
     }
-
-
-def _uses_key_value_snapshot_subscription(
-    source: str,
-    master: MasterClient,
-    *,
-    wait: bool,
-    timeout: float | str | None,
-) -> bool:
-    get_stream = getattr(master, "get_stream", None)
-    if not callable(get_stream):
-        return False
-    if wait:
-        _wait_for_table_ready(source, master, timeout)
-    try:
-        stream = _get_stream_status_or_full(master, source)
-    except RuntimeError as error:
-        if "stream not found" not in str(error):
-            raise
-        return False
-    return _is_key_value_table_descriptor(stream)
 
 
 def _key_value_changelog_subscription_source(
@@ -7127,28 +7117,11 @@ def _key_value_changelog_subscription_source(
     if not _is_key_value_table_descriptor(stream):
         return None
     changelog_stream = _descriptor_key_value_changelog_stream(stream)
+    if changelog_stream is None:
+        raise RuntimeError("key-value table has no delta stream; republish using protocol v2")
     if changelog_stream is not None and wait:
         _wait_for_table_ready(changelog_stream, master, timeout)
     return changelog_stream
-
-
-def _row_callback_from_snapshot_callback(callback):
-    def on_snapshot(table) -> None:
-        for row in table.to_pylist():
-            callback(Row(row))
-
-    return on_snapshot
-
-
-def _row_callback_without_key_value_internal_columns(callback):
-    def on_row(row) -> None:
-        values = row.to_dict()
-        values.pop(_KV_SEQ_FIELD, None)
-        values.pop(_KV_OP_FIELD, None)
-        values.pop(_KV_SNAPSHOT_VERSION_FIELD, None)
-        callback(Row(values))
-
-    return on_row
 
 
 def _instrument_ids_from_query_filter(filter_expr: object | None) -> list[str] | None:
@@ -7451,257 +7424,6 @@ class StreamSubscriber:
         )
 
 
-class _TableSnapshotWatcher:
-    """
-    Watch a named table by polling master metadata and emitting full snapshots.
-
-    This watcher is intended for key-value/latest tables whose active segment may be
-    rewritten in place. It does not expose row-offset semantics; every callback receives
-    the latest table snapshot for the observed descriptor generation.
-
-    :param source: Named table to watch.
-    :type source: str
-    :param callback: Function called with each latest ``pyarrow.Table`` snapshot.
-    :type callback: callable
-    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
-    :type master: MasterClient | None
-    :param poll_interval_ms: Metadata poll interval in milliseconds.
-    :type poll_interval_ms: int
-    :param filter: Optional ``zp.col`` predicate applied before callbacks.
-    :type filter: object | None
-    :param count: Limit each snapshot callback to the latest ``count`` rows.
-    :type count: int | None
-    :param emit_initial: When true, emit the current snapshot before waiting for changes.
-    :type emit_initial: bool
-    :param wait: When true, wait until the table is ready before starting.
-    :type wait: bool
-    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
-    :type timeout: float | str | None
-    """
-
-    def __init__(
-        self,
-        source: str,
-        callback,
-        master: MasterClient | None = None,
-        *,
-        poll_interval_ms: int = 10,
-        filter: object | None = None,
-        count: int | None = None,
-        emit_initial: bool = True,
-        wait: bool = False,
-        timeout: float | str | None = None,
-        collect_retries: int = 3,
-    ) -> None:
-        if not isinstance(source, str) or not source:
-            raise ValueError("source must be a non-empty string")
-        poll_interval_ms = int(poll_interval_ms)
-        if poll_interval_ms <= 0:
-            raise ValueError("poll_interval_ms must be positive")
-        collect_retries = int(collect_retries)
-        if collect_retries <= 0:
-            raise ValueError("collect_retries must be positive")
-
-        self.source = source
-        self._callback = callback
-        self._master = master or _default_master()
-        self._poll_interval_sec = poll_interval_ms / 1000.0
-        self._filter = filter
-        self._count = _require_positive_optional_int("count", count)
-        self._emit_initial = bool(emit_initial)
-        self._collect_retries = collect_retries
-        self._stop_event = threading.Event()
-        self._stopped_event = threading.Event()
-        self._started = False
-        self._error: BaseException | None = None
-        self._last_transient_error: BaseException | None = None
-        self._last_descriptor_generation: int | None = None
-        self._snapshots_delivered_total = 0
-        self._rows_delivered_total = 0
-        self._descriptor_refresh_errors_total = 0
-        self._snapshot_refresh_errors_total = 0
-        self._last_event_ns = 0
-        self._last_success_ns = 0
-
-        if wait:
-            _wait_for_table_ready(source, self._master, timeout)
-        if not self._emit_initial:
-            try:
-                self._last_descriptor_generation = self._descriptor_generation()
-            except RuntimeError as error:
-                if "stream not found" not in str(error):
-                    raise
-
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"zippy-watch-table-latest-{source}",
-            daemon=True,
-        )
-
-    def start(self) -> "_TableSnapshotWatcher":
-        """
-        Start the background watch thread.
-
-        :returns: This watcher handle.
-        :rtype: _TableSnapshotWatcher
-        """
-        self._started = True
-        self._thread.start()
-        return self
-
-    def stop(self) -> None:
-        """
-        Stop the watch thread and re-raise background errors.
-
-        :raises BaseException: If snapshot collection or callback execution failed.
-        """
-        self._stop_event.set()
-        self.join()
-
-    def join(self) -> None:
-        """
-        Wait for the watch thread to finish and re-raise background errors.
-
-        :raises BaseException: If snapshot collection or callback execution failed.
-        """
-        self._thread.join()
-        if self._error is not None:
-            raise self._error
-
-    def metrics(self) -> dict[str, object]:
-        """
-        Return runtime counters for this snapshot watcher.
-
-        :returns: Snapshot delivery counters and the latest observed descriptor generation.
-        :rtype: dict[str, object]
-        """
-        state = self.status()
-        return {
-            "source": self.source,
-            "state": state,
-            "running": state == "running",
-            "snapshots_delivered_total": self._snapshots_delivered_total,
-            "rows_delivered_total": self._rows_delivered_total,
-            "current_descriptor_generation": self._last_descriptor_generation or 0,
-            "last_error": None if self._error is None else str(self._error),
-            "last_transient_error": (
-                None if self._last_transient_error is None else str(self._last_transient_error)
-            ),
-            "descriptor_refresh_errors_total": self._descriptor_refresh_errors_total,
-            "snapshot_refresh_errors_total": self._snapshot_refresh_errors_total,
-            "last_event_ns": self._last_event_ns,
-            "last_success_ns": self._last_success_ns,
-        }
-
-    def status(self) -> str:
-        """
-        Return normalized snapshot watcher lifecycle status.
-
-        :returns: ``created``, ``running``, ``failed``, or ``stopped``.
-        :rtype: str
-        """
-        if self._error is not None:
-            return "failed"
-        if self._thread.is_alive():
-            return "running"
-        if self._stopped_event.is_set() or self._stop_event.is_set():
-            return "stopped"
-        if self._started:
-            return "stopped"
-        return "created"
-
-    def health(self) -> dict[str, object]:
-        """
-        Return normalized snapshot watcher live health.
-
-        :returns: Normalized live health fields.
-        :rtype: dict[str, object]
-        """
-        return _live_health_from_metrics(
-            kind="table_snapshot_watcher",
-            source=self.source,
-            metrics=self.metrics(),
-        )
-
-    def _run(self) -> None:
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    descriptor_generation = self._descriptor_generation()
-                except RuntimeError as error:
-                    if not self._is_transient_error(error):
-                        raise
-                    self._record_descriptor_refresh_error(error)
-                    self._stop_event.wait(self._poll_interval_sec)
-                    continue
-                if descriptor_generation != self._last_descriptor_generation:
-                    try:
-                        snapshot = self._collect_snapshot()
-                    except RuntimeError as error:
-                        if not self._is_transient_error(error):
-                            raise
-                        self._record_snapshot_refresh_error(error)
-                        self._stop_event.wait(self._poll_interval_sec)
-                        continue
-                    self._callback(snapshot)
-                    self._snapshots_delivered_total += 1
-                    self._rows_delivered_total += int(getattr(snapshot, "num_rows", 0))
-                    self._last_descriptor_generation = descriptor_generation
-                    self._last_event_ns = _current_time_ns()
-                    self._last_success_ns = self._last_event_ns
-                    self._last_transient_error = None
-                self._stop_event.wait(self._poll_interval_sec)
-        except BaseException as error:
-            self._error = error
-            self._stop_event.set()
-        finally:
-            self._stopped_event.set()
-
-    def _descriptor_generation(self) -> int:
-        stream = _get_stream_status_or_full(self._master, self.source)
-        return int(stream.get("descriptor_generation", 0))
-
-    def _collect_snapshot(self):
-        for attempt in range(self._collect_retries):
-            try:
-                table = read_table(self.source, master=self._master, snapshot=False)
-                if self._filter is not None:
-                    table = table.filter(self._filter)
-                if self._count is not None:
-                    table = table.tail(self._count)
-                return table.collect()
-            except RuntimeError as error:
-                is_retryable = "active payload changed during read" in str(error)
-                if not is_retryable or attempt + 1 >= self._collect_retries:
-                    raise
-                time.sleep(self._poll_interval_sec)
-        raise RuntimeError("unreachable table snapshot collect retry state")
-
-    @staticmethod
-    def _is_transient_error(error: RuntimeError) -> bool:
-        message = str(error)
-        return (
-            "active payload changed during read" in message
-            or "stream not found" in message
-            or "stream not registered" in message
-            or "stream is stale" in message
-            or "segment descriptor is not published" in message
-            or "shared memory error: No such file or directory" in message
-            or "os error 2" in message
-            or "segment reader lease target not found" in message
-        )
-
-    def _record_descriptor_refresh_error(self, error: BaseException) -> None:
-        self._descriptor_refresh_errors_total += 1
-        self._last_transient_error = error
-        self._last_event_ns = _current_time_ns()
-
-    def _record_snapshot_refresh_error(self, error: BaseException) -> None:
-        self._snapshot_refresh_errors_total += 1
-        self._last_transient_error = error
-        self._last_event_ns = _current_time_ns()
-
-
 def subscribe(
     source: str,
     callback,
@@ -7762,37 +7484,11 @@ def subscribe(
     )
     if changelog_source is not None:
         if start_from != -1:
-            raise ValueError("key-value snapshot subscribe only supports start_from=-1")
+            raise ValueError("key-value delta subscribe only supports start_from=-1")
         source = changelog_source
-        callback = _row_callback_without_key_value_internal_columns(callback)
         wait = False
-    snapshot_subscription = _uses_key_value_snapshot_subscription(
-        source,
-        selected_master,
-        wait=wait and changelog_source is None,
-        timeout=timeout,
-    )
-    if snapshot_subscription:
-        if start_from != -1:
-            raise ValueError("key-value snapshot subscribe only supports start_from=-1")
-        if filter is not None and instrument_ids is not None:
-            raise ValueError("filter and instrument_ids cannot be used together")
-        table_filter = filter
-        if instrument_ids is not None:
-            instrument_values = (
-                [instrument_ids] if isinstance(instrument_ids, str) else list(instrument_ids)
-            )
-            table_filter = col("instrument_id").is_in(instrument_values)
-        return _watch_table_latest(
-            source,
-            callback=_row_callback_from_snapshot_callback(callback),
-            master=selected_master,
-            poll_interval_ms=poll_interval_ms,
-            filter=table_filter,
-            emit_initial=True,
-            wait=False,
-            timeout=timeout,
-        )
+        if filter is not None or instrument_ids is not None:
+            raise ValueError("key-value deltas must be unfiltered; filter the reconstructed state")
 
     _reject_logical_sharded_subscribe(
         source,
@@ -7849,61 +7545,6 @@ def subscribe(
     return subscriber.start()
 
 
-def _watch_table_latest(
-    source: str,
-    callback,
-    master: MasterClient | None = None,
-    *,
-    poll_interval_ms: int = 10,
-    filter: object | None = None,
-    count: int | None = None,
-    emit_initial: bool = True,
-    wait: bool = False,
-    timeout: float | str | None = None,
-) -> _TableSnapshotWatcher:
-    """
-    Watch a named table and invoke callbacks with full latest snapshots.
-
-    Use this for ``key_value_table(...).publish(...)`` outputs and other key-value
-    snapshot tables. Unlike :func:`subscribe_table`, this API does not
-    follow active-segment row offsets; it treats descriptor generation changes as
-    snapshot boundaries and recollects the table.
-
-    :param source: Named table to watch.
-    :type source: str
-    :param callback: Function called with each latest ``pyarrow.Table`` snapshot.
-    :type callback: callable
-    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
-    :type master: MasterClient | None
-    :param poll_interval_ms: Metadata poll interval in milliseconds.
-    :type poll_interval_ms: int
-    :param filter: Optional ``zp.col`` predicate applied before callbacks.
-    :type filter: object | None
-    :param count: Limit each callback table to the latest ``count`` rows.
-    :type count: int | None
-    :param emit_initial: When true, emit the current snapshot before waiting for changes.
-    :type emit_initial: bool
-    :param wait: When true, wait until the table exists and has an active segment descriptor.
-    :type wait: bool
-    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
-    :type timeout: float | str | None
-    :returns: Started table snapshot watcher handle.
-    :rtype: _TableSnapshotWatcher
-    """
-    watcher = _TableSnapshotWatcher(
-        source,
-        callback,
-        master=master,
-        poll_interval_ms=poll_interval_ms,
-        filter=filter,
-        count=count,
-        emit_initial=emit_initial,
-        wait=wait,
-        timeout=timeout,
-    )
-    return watcher.start()
-
-
 def subscribe_table(
     source: str,
     callback,
@@ -7923,9 +7564,9 @@ def subscribe_table(
     """
     Subscribe to a stream using ``pyarrow.Table`` callbacks.
 
-    Append streams use incremental active-segment row batches. Key-value/latest
-    snapshot tables are detected from table metadata and use full latest snapshot
-    callbacks on each descriptor generation change.
+    Append streams preserve events. Key-value tables deliver ordered protocol-v2 upsert
+    deltas, including cursor and batch boundaries. Bootstrap :class:`KeyValueState`
+    using an explicit atomic producer snapshot; callbacks never imply a full snapshot.
     This is the preferred high-frequency subscription path because it keeps data
     in Arrow batches instead of allocating one Python ``Row`` object per row.
     ``batch_size`` controls delivery throughput only; it does not define a complete
@@ -7966,26 +7607,21 @@ def subscribe_table(
     batch_size = _require_positive_optional_int("batch_size", batch_size)
     throttle_ms = _require_positive_optional_int("throttle_ms", throttle_ms)
     count = _require_positive_optional_int("count", count)
-    snapshot_subscription = _uses_key_value_snapshot_subscription(
+    changelog_source = _key_value_changelog_subscription_source(
         source,
         selected_master,
         wait=wait,
         timeout=timeout,
     )
-    if snapshot_subscription:
+    if changelog_source is not None:
         if start_from != -1:
-            raise ValueError("key-value snapshot subscribe only supports start_from=-1")
-        return _watch_table_latest(
-            source,
-            callback=callback,
-            master=selected_master,
-            poll_interval_ms=poll_interval_ms,
-            filter=filter,
-            count=count,
-            emit_initial=True,
-            wait=False,
-            timeout=timeout,
-        )
+            raise ValueError("key-value delta subscribe only supports start_from=-1")
+        if filter is not None or count is not None:
+            raise ValueError(
+                "key-value deltas cannot be filtered or truncated; filter reconstructed state"
+            )
+        source = changelog_source
+        wait = False
 
     _reject_logical_sharded_subscribe(
         source,
@@ -9300,14 +8936,10 @@ class _AsyncDescriptorEnvelopePublisher:
         self._master = master
         self._stream_name = stream_name
         self._descriptor_metadata = descriptor_metadata
-        self._queue: queue.SimpleQueue[bytes] = queue.SimpleQueue()
+        self._queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
         self._warning_emitted = False
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"zippy-descriptor-publisher-{stream_name}",
-            daemon=True,
-        )
-        self._thread.start()
+        self._lifecycle_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
 
     def publish(self, payload: bytes | bytearray | memoryview) -> None:
         """
@@ -9319,12 +8951,38 @@ class _AsyncDescriptorEnvelopePublisher:
         :rtype: None
         """
 
-        self._queue.put(bytes(payload))
+        with self._lifecycle_lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name=f"zippy-descriptor-publisher-{self._stream_name}",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._queue.put(bytes(payload))
+
+    def close(self) -> None:
+        """
+        Drain queued descriptors and stop the worker before source unregistration.
+
+        Producers must be stopped first. A later publish restarts the worker when its
+        owning Session or Pipeline is restarted.
+
+        :returns: None after all previously queued descriptors have been attempted.
+        :rtype: None
+        """
+        with self._lifecycle_lock:
+            if self._thread is not None:
+                self._queue.put(None)
+                self._thread.join()
+                self._thread = None
 
     def _run(self) -> None:
         publish_envelope = self._master.publish_segment_descriptor_envelope
         while True:
             payload = self._queue.get()
+            if payload is None:
+                return
             try:
                 publish_envelope(self._stream_name, payload, self._descriptor_metadata)
             except BaseException as error:
@@ -9500,9 +9158,11 @@ class Session:
             self.master = _default_master()
         self._engines: list[object] = []
         self._runtime_engines: list[object] = []
+        self._state_materializers: dict[str, object] = {}
         self._pending_output_tables: dict[int, tuple[str, bool]] = {}
         self._materialized_engine_ids: set[int] = set()
         self._materializer_source_names: list[str] = []
+        self._descriptor_publishers: list[_AsyncDescriptorEnvelopePublisher] = []
         self._started = False
         self._needs_master_process = False
         self._shutdown_hook_unregister = None
@@ -9819,6 +9479,21 @@ class Session:
             persist=persist,
             method="publish_key_value_table()",
         )
+
+    def snapshot_state(self, name: str):
+        """Capture an owned KeyValue table and its exact delta cursor atomically.
+
+        :param name: KeyValue table published by this session.
+        :returns: Arrow Table carrying protocol-v2 bootstrap metadata.
+        :raises KeyError: This session does not own the named KeyValue producer.
+        :raises RuntimeError: Producer publication has failed.
+
+        Remote consumers request this through their application control channel after
+        starting the delta subscription. A plain SQL/SHM query is not a cursor snapshot.
+        """
+        import pyarrow as pa
+
+        return pa.Table.from_batches([self._state_materializers[name].snapshot()])
 
     def _publish_key_value_table(
         self,
@@ -10236,6 +9911,8 @@ class Session:
                 if first_error is None:
                     first_error = error
         try:
+            for publisher in self._descriptor_publishers:
+                publisher.close()
             self._unregister_materializer_sources()
         except BaseException as error:
             if first_error is None:
@@ -10503,6 +10180,8 @@ class Session:
                 ),
             )
             materializers.append(materializer)
+            if table_kind == _KEY_VALUE_TABLE_KIND:
+                self._state_materializers[table_name] = materializer
         except BaseException:
             for source_name in reversed(source_names):
                 self._unregister_materializer_source_name(source_name)
@@ -10630,6 +10309,7 @@ class Session:
             )
             self._validate_engine(materializer)
             self._runtime_engines.append(materializer)
+            self._state_materializers[table_name] = materializer
         except BaseException:
             for source_name in reversed(source_names):
                 self._unregister_materializer_source_name(source_name)
@@ -10715,6 +10395,8 @@ class Session:
             if callable(getattr(self.master, "publish_segment_descriptor_envelope", None))
             else None
         )
+        if async_publisher is not None:
+            self._descriptor_publishers.append(async_publisher)
 
         def publish(payload) -> None:
             if isinstance(payload, (bytes, bytearray, memoryview)) and async_publisher is not None:
@@ -10834,6 +10516,7 @@ class Pipeline:
         self._engine: _StreamTableMaterializer | None = None
         self._registered_source_name: str | None = None
         self._registered_source_names: list[str] = []
+        self._descriptor_publishers: list[_AsyncDescriptorEnvelopePublisher] = []
         self._started = False
         self._shutdown_hook_unregister = None
 
@@ -11215,6 +10898,8 @@ class Pipeline:
             self._shutdown_hook_unregister()
             self._shutdown_hook_unregister = None
         try:
+            for publisher in self._descriptor_publishers:
+                publisher.close()
             self._unregister_registered_source()
         except BaseException as error:
             if first_error is None:
@@ -11279,6 +10964,8 @@ class Pipeline:
             if callable(getattr(self.master, "publish_segment_descriptor_envelope", None))
             else None
         )
+        if async_publisher is not None:
+            self._descriptor_publishers.append(async_publisher)
 
         def publish(payload) -> None:
             if isinstance(payload, (bytes, bytearray, memoryview)) and async_publisher is not None:
@@ -12173,6 +11860,8 @@ def CS_DEMEAN(*, column: str, output: str) -> CSDemeanSpec:
 
 
 __all__ = [
+    "KeyValueState",
+    "StateSubscription",
     "AbsSpec",
     "AggCountSpec",
     "AggFirstSpec",

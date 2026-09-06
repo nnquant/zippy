@@ -12,6 +12,7 @@ import pyarrow as pa
 import pytest
 
 from zippy_client.client import (
+    Client,
     _capabilities,
     _int_config,
     _parse_timeout,
@@ -395,3 +396,26 @@ def test_client_configuration_helpers_validate_boundaries() -> None:
     assert capabilities.gateway
     assert capabilities.query_sql
     assert capabilities.gateway_protocol_version == 1
+
+
+def test_key_value_delta_routing_requires_explicit_changelog_metadata(monkeypatch):
+    client = object.__new__(Client)
+    metadata = {
+        "active_segment_descriptor": {
+            "zippy_table_kind": "key_value_table",
+            "zippy_kv_protocol_version": 2,
+            "zippy_key_value_changelog_stream": "quotes.__kv_changelog",
+        }
+    }
+    monkeypatch.setattr(
+        client, "_subscription_stream_info", lambda source, requested: {"stream_name": source}
+    )
+    source, descriptor, keyed = client._delta_subscription_source("quotes", "gateway", metadata)
+    assert source == "quotes.__kv_changelog"
+    assert descriptor["stream_name"] == source
+    assert keyed
+    pending = {"source_configs": [metadata["active_segment_descriptor"]]}
+    assert client._delta_subscription_source("quotes", "gateway", pending)[0] == source
+    del metadata["active_segment_descriptor"]["zippy_key_value_changelog_stream"]
+    with pytest.raises(ProtocolError, match="v2"):
+        client._delta_subscription_source("quotes", "gateway", metadata)

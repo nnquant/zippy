@@ -579,12 +579,12 @@ fn key_value_table_materializer_appends_changelog_and_marks_snapshot_watermark()
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
     let instrument_ids = changelog
-        .column(3)
+        .column(5)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
     let prices = changelog
-        .column(5)
+        .column(7)
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();

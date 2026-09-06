@@ -1,169 +1,88 @@
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+//! 有界快速数据队列，满载时阻塞，关闭时唤醒所有等待中的写者。
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::{Result, ZippyError};
 
-/// 固定容量的单生产者单消费者数据队列。
+/// 保留 SPSC 使用接口的有界队列，也支持安全的并发调用。
 ///
-/// 队列保证先进先出语义，写入在队列满时阻塞，读取在队列空时立即返回 `None`。
-/// 非满写入和非空读取走原子 SPSC ring fast path；只有队列满时生产者才进入等待路径。
+/// 非满写入和非空读取复用 crossbeam 的原子数组队列。只有阻塞写入才注册
+/// 等待；关闭信号使用独立通道，避免检查队列状态与进入等待之间丢失唤醒。
 pub struct SpscDataQueue<T> {
-    inner: Arc<Inner<T>>,
-}
-
-struct Inner<T> {
-    slots: Box<[Slot<T>]>,
-    capacity: usize,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    sender: Sender<T>,
+    receiver: Receiver<T>,
     closed: AtomicBool,
-    full_wait: Mutex<()>,
-    not_full: Condvar,
+    close_sender: Mutex<Option<Sender<()>>>,
+    close_receiver: Receiver<()>,
 }
-
-struct Slot<T> {
-    value: UnsafeCell<MaybeUninit<T>>,
-}
-
-unsafe impl<T: Send> Send for Slot<T> {}
-unsafe impl<T: Send> Sync for Slot<T> {}
-unsafe impl<T: Send> Send for Inner<T> {}
-unsafe impl<T: Send> Sync for Inner<T> {}
 
 impl<T> SpscDataQueue<T> {
-    /// 创建一个固定容量队列。
+    /// 创建固定容量队列。
     ///
     /// :param capacity: 队列容量，必须大于零。
-    /// :type capacity: usize
-    /// :returns: 成功时返回可共享的队列实例。
-    /// :rtype: `crate::Result<Self>`
-    /// :raises ZippyError::InvalidConfig: 当容量为零时返回错误。
+    /// :returns: 空队列。
+    /// :raises ZippyError::InvalidConfig: 容量为零。
     pub fn new(capacity: usize) -> Result<Self> {
         if capacity == 0 {
             return Err(ZippyError::InvalidConfig {
                 reason: "capacity must be greater than zero".to_string(),
             });
         }
-
-        let slots = (0..capacity)
-            .map(|_| Slot {
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
+        let (sender, receiver) = bounded(capacity);
+        let (close_sender, close_receiver) = bounded(0);
         Ok(Self {
-            inner: Arc::new(Inner {
-                slots,
-                capacity,
-                head: AtomicUsize::new(0),
-                tail: AtomicUsize::new(0),
-                closed: AtomicBool::new(false),
-                full_wait: Mutex::new(()),
-                not_full: Condvar::new(),
-            }),
+            sender,
+            receiver,
+            closed: AtomicBool::new(false),
+            close_sender: Mutex::new(Some(close_sender)),
+            close_receiver,
         })
     }
 
-    /// 阻塞写入一个元素。
+    /// 写入一个元素，队列满时等待空位或关闭信号。
     ///
-    /// :param value: 待写入的值。
-    /// :type value: T
-    /// :returns: 写入成功后返回 `Ok(())`。
-    /// :rtype: crate::Result<()>
+    /// :param value: 待写入的元素。
+    /// :returns: 写入成功返回 ``Ok(())``。
+    /// :raises ZippyError::QueueClosed: 队列已关闭。
     pub fn push_blocking(&self, value: T) -> Result<()> {
-        let mut value = Some(value);
-
-        loop {
-            if self.inner.closed.load(Ordering::Acquire) {
-                return Err(ZippyError::QueueClosed);
-            }
-
-            match self.inner.try_push(value.take().unwrap()) {
-                Ok(()) => return Ok(()),
-                Err(pending) => {
-                    value = Some(pending);
-                }
-            }
-
-            let mut guard = self.inner.full_wait.lock().unwrap();
-            while self.inner.is_full() && !self.inner.closed.load(Ordering::Acquire) {
-                guard = self.inner.not_full.wait(guard).unwrap();
-            }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ZippyError::QueueClosed);
+        }
+        let value = match self.sender.try_send(value) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(value)) => value,
+            Err(TrySendError::Disconnected(_)) => return Err(ZippyError::QueueClosed),
+        };
+        crossbeam_channel::select! {
+            send(self.sender, value) -> result => result.map_err(|_| ZippyError::QueueClosed),
+            recv(self.close_receiver) -> _ => Err(ZippyError::QueueClosed),
         }
     }
 
-    /// 尝试弹出一个元素。
+    /// 非阻塞读取队首元素；关闭后仍可排空已经接收的数据。
     ///
-    /// :returns: 队列非空时返回首个元素，否则返回 `None`。
-    /// :rtype: `Option<T>`
+    /// :returns: 队首元素，队列为空时返回 ``None``。
     pub fn try_pop(&self) -> Option<T> {
-        let value = self.inner.try_pop();
-        if value.is_some() {
-            self.inner.not_full.notify_one();
-        }
-        value
+        self.receiver.try_recv().ok()
     }
 
-    /// 关闭队列并唤醒等待中的生产者和消费者。
-    pub fn close(&self) {
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.not_full.notify_all();
-    }
-
-    /// 判断队列是否为空。
+    /// 关闭队列并唤醒所有阻塞写者；可重复调用。
     ///
-    /// :returns: 队列为空时返回 `true`，否则返回 `false`。
-    /// :rtype: bool
+    /// 与关闭并发的在途写入可能成功，关闭返回后的新写入均被拒绝。
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        // Dropping the sole sender makes every current and future close wait
+        // immediately ready, unlike a single consumable notification.
+        self.close_sender.lock().unwrap().take();
+    }
+
+    /// 返回队列当前是否为空。
+    ///
+    /// :returns: 队列为空时返回 ``true``。
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
-
-impl<T> Inner<T> {
-    fn try_push(&self, value: T) -> std::result::Result<(), T> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if tail.wrapping_sub(head) >= self.capacity {
-            return Err(value);
-        }
-
-        let index = tail % self.capacity;
-        unsafe {
-            (*self.slots[index].value.get()).write(value);
-        }
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        Ok(())
-    }
-
-    fn try_pop(&self) -> Option<T> {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        if head == tail {
-            return None;
-        }
-
-        let index = head % self.capacity;
-        let value = unsafe { (*self.slots[index].value.get()).assume_init_read() };
-        self.head.store(head.wrapping_add(1), Ordering::Release);
-        Some(value)
-    }
-
-    fn is_full(&self) -> bool {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-        tail.wrapping_sub(head) >= self.capacity
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
-    }
-}
-
-impl<T> Drop for Inner<T> {
-    fn drop(&mut self) {
-        while self.try_pop().is_some() {}
+        self.receiver.is_empty()
     }
 }

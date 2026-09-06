@@ -58,8 +58,7 @@ impl<'a> CrossSectionalFactorContext<'a> {
     pub fn float64_stats(&mut self, field: &str) -> Result<Float64Stats> {
         if !self.float64_stats_by_field.contains_key(field) {
             let values = self.float64_values(field)?;
-            let samples = values.iter().flatten().copied().collect::<Vec<_>>();
-            let stats = compute_float64_stats(&samples);
+            let stats = compute_float64_stats(values);
             self.float64_stats_by_field.insert(field.to_string(), stats);
         }
 
@@ -209,17 +208,16 @@ impl CrossSectionalFactor for CSZscoreFactor {
 
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
         let values = float64_values(batch, &self.value_field)?;
-        let samples = values.iter().flatten().copied().collect::<Vec<_>>();
-        Ok(zscore_array(&values, compute_float64_stats(&samples)))
+        Ok(zscore_array(&values, compute_float64_stats(&values)))
     }
 
     fn evaluate_with_context(
         &mut self,
         context: &mut CrossSectionalFactorContext<'_>,
     ) -> Result<ArrayRef> {
-        let values = context.float64_values(&self.value_field)?.to_vec();
         let stats = context.float64_stats(&self.value_field)?;
-        Ok(zscore_array(&values, stats))
+        let values = context.float64_values(&self.value_field)?;
+        Ok(zscore_array(values, stats))
     }
 }
 
@@ -235,22 +233,27 @@ impl CrossSectionalFactor for CSDemeanFactor {
 
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
         let values = float64_values(batch, &self.value_field)?;
-        let samples = values.iter().flatten().copied().collect::<Vec<_>>();
-        Ok(demean_array(&values, compute_float64_stats(&samples)))
+        Ok(demean_array(&values, compute_float64_stats(&values)))
     }
 
     fn evaluate_with_context(
         &mut self,
         context: &mut CrossSectionalFactorContext<'_>,
     ) -> Result<ArrayRef> {
-        let values = context.float64_values(&self.value_field)?.to_vec();
         let stats = context.float64_stats(&self.value_field)?;
-        Ok(demean_array(&values, stats))
+        let values = context.float64_values(&self.value_field)?;
+        Ok(demean_array(values, stats))
     }
 }
 
-fn compute_float64_stats(samples: &[f64]) -> Float64Stats {
-    if samples.is_empty() {
+fn compute_float64_stats(values: &[Option<f64>]) -> Float64Stats {
+    let mut sample_count = 0;
+    let mut sum = 0.0;
+    for value in values.iter().flatten() {
+        sample_count += 1;
+        sum += value;
+    }
+    if sample_count == 0 {
         return Float64Stats {
             sample_count: 0,
             mean: 0.0,
@@ -259,18 +262,19 @@ fn compute_float64_stats(samples: &[f64]) -> Float64Stats {
         };
     }
 
-    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-    let variance = samples
+    let mean = sum / sample_count as f64;
+    let variance = values
         .iter()
+        .flatten()
         .map(|value| {
             let delta = *value - mean;
             delta * delta
         })
         .sum::<f64>()
-        / samples.len() as f64;
+        / sample_count as f64;
 
     Float64Stats {
-        sample_count: samples.len(),
+        sample_count,
         mean,
         variance,
         std: variance.sqrt(),
@@ -309,7 +313,7 @@ fn zscore_array(values: &[Option<f64>], stats: Float64Stats) -> ArrayRef {
     let mut builder = Float64Builder::with_capacity(values.len());
 
     if stats.sample_count == 0 {
-        append_optional_values(&mut builder, &vec![None; values.len()]);
+        builder.append_nulls(values.len());
         return Arc::new(builder.finish());
     }
 
@@ -328,7 +332,7 @@ fn demean_array(values: &[Option<f64>], stats: Float64Stats) -> ArrayRef {
     let mut builder = Float64Builder::with_capacity(values.len());
 
     if stats.sample_count == 0 {
-        append_optional_values(&mut builder, &vec![None; values.len()]);
+        builder.append_nulls(values.len());
         return Arc::new(builder.finish());
     }
 

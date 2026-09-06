@@ -23,10 +23,10 @@ class _FixtureMaster:
         return self._streams[source]
 
 
-def test_table_semantics_v1_matches_publish_query_and_subscribe_contracts() -> None:
-    fixture = _load_fixture("table_semantics_v1.json")
+def test_table_semantics_v2_matches_publish_query_and_subscribe_contracts() -> None:
+    fixture = _load_fixture("table_semantics_v2.json")
     tables = fixture["tables"]
-    assert fixture["format_version"] == 1
+    assert fixture["format_version"] == 2
     assert isinstance(tables, list)
 
     builders = {
@@ -53,15 +53,6 @@ def test_table_semantics_v1_matches_publish_query_and_subscribe_contracts() -> N
         assert callable(getattr(zippy, table["subscribe"]["api"]))
 
     master = cast(zippy.MasterClient, _FixtureMaster(streams))
-    assert not zippy._uses_key_value_snapshot_subscription(
-        "factor_events", master, wait=False, timeout=None
-    )
-    assert not zippy._uses_key_value_snapshot_subscription(
-        "cross_section_frames", master, wait=False, timeout=None
-    )
-    assert zippy._uses_key_value_snapshot_subscription(
-        "latest_factors", master, wait=False, timeout=None
-    )
     assert (
         zippy._key_value_changelog_subscription_source(
             "latest_factors", master, wait=False, timeout=None
@@ -69,12 +60,8 @@ def test_table_semantics_v1_matches_publish_query_and_subscribe_contracts() -> N
         == "latest_factors.__kv_changelog"
     )
 
-    legacy = fixture["legacy_kind_fallback"]
-    legacy_stream: dict[str, object] = {"source_configs": [legacy["descriptor"]]}
-    assert zippy._descriptor_table_kind(legacy_stream) == legacy["kind"]
 
-
-def test_table_semantics_v1_freezes_public_parameter_names() -> None:
+def test_table_semantics_v2_freezes_public_parameter_names() -> None:
     frame_parameters = inspect.signature(zippy.Session.frame_table).parameters
     key_value_parameters = inspect.signature(zippy.Session.key_value_table).parameters
 

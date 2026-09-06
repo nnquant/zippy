@@ -1,13 +1,19 @@
 //! Native append materialization and serialized TableActor publication.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
 use zippy_core::{Engine, SegmentTableView, ZippyError};
 use zippy_engines::{StreamTableLiveSegment, StreamTableMaterializer};
-use zippy_types::table::{SourceSegmentIdentity, TableDefinition};
+use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
+use zippy_types::table::{
+    MetadataMap, NativeDataFileProvenance, SourceSegmentIdentity, SourceSegmentLineage,
+    SourceSegmentLineages, TableDefinition,
+};
 use zippy_types::{
-    BoxFuture, ErrorCode, LogOffset, OffsetRange, OffsetWatermark, Result, ServerError, TableId,
+    BoxFuture, ErrorCode, FileId, LogOffset, OffsetRange, OffsetWatermark, RequestId, Result,
+    ServerError, TableId,
 };
 
 use crate::{
@@ -29,6 +35,7 @@ pub const MAX_NATIVE_APPEND_LIVE_SEGMENTS: usize = 1_024;
 pub struct NativeAppendMaterializerConfig {
     row_capacity: usize,
     max_live_segments: usize,
+    max_buffered_bytes: usize,
 }
 
 impl Default for NativeAppendMaterializerConfig {
@@ -36,6 +43,7 @@ impl Default for NativeAppendMaterializerConfig {
         Self {
             row_capacity: DEFAULT_NATIVE_APPEND_ROW_CAPACITY,
             max_live_segments: DEFAULT_NATIVE_APPEND_MAX_LIVE_SEGMENTS,
+            max_buffered_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -61,8 +69,19 @@ impl NativeAppendMaterializerConfig {
         self
     }
 
+    /// Sets the maximum accepted Arrow input bytes not yet reclaimed by a checkpoint.
+    pub const fn with_max_buffered_bytes(mut self, maximum: usize) -> Self {
+        self.max_buffered_bytes = maximum;
+        self
+    }
+
     /// Validates static allocation bounds.
     pub fn validate(self) -> Result<()> {
+        if self.max_buffered_bytes == 0 || self.max_buffered_bytes > 256 * 1024 * 1024 {
+            return Err(invalid(
+                "native append buffered byte limit must be between 1 and 256 MiB",
+            ));
+        }
         if self.row_capacity == 0 {
             return Err(invalid("native append row capacity must be positive"));
         }
@@ -79,7 +98,7 @@ impl NativeAppendMaterializerConfig {
 /// Server-owned append materializer that publishes fixed logical prefixes through TableActor.
 pub struct NativeAppendMaterializerSink {
     config: NativeAppendMaterializerConfig,
-    tables: BTreeMap<TableId, NativeAppendTable>,
+    tables: BTreeMap<TableId, Arc<NativeAppendTable>>,
 }
 
 impl NativeAppendMaterializerSink {
@@ -106,10 +125,13 @@ impl NativeAppendMaterializerSink {
                     persisted_log_offset: bootstrap.persisted_log_offset(),
                     last_applied_log_offset: bootstrap.persisted_log_offset(),
                     live_rows: 0,
+                    retained_start: next_offset(table_id, bootstrap.persisted_log_offset())?,
+                    buffered_bytes: 0,
+                    batch_bytes: VecDeque::new(),
                     epochs: Vec::new(),
                 }),
             };
-            if tables.insert(table_id, table).is_some() {
+            if tables.insert(table_id, Arc::new(table)).is_some() {
                 return Err(ServerError::new(
                     ErrorCode::DataCorruption,
                     "native append materializer contains a duplicate table",
@@ -128,7 +150,7 @@ impl NativeAppendMaterializerSink {
     }
 
     fn table(&self, table_id: TableId) -> Result<&NativeAppendTable> {
-        self.tables.get(&table_id).ok_or_else(|| {
+        self.tables.get(&table_id).map(Arc::as_ref).ok_or_else(|| {
             ServerError::new(
                 ErrorCode::UnsupportedPlan,
                 "native materializer currently supports append tables only",
@@ -152,6 +174,9 @@ struct NativeAppendTableState {
     persisted_log_offset: OffsetWatermark,
     last_applied_log_offset: OffsetWatermark,
     live_rows: u64,
+    retained_start: u64,
+    buffered_bytes: usize,
+    batch_bytes: VecDeque<(u64, usize)>,
     epochs: Vec<EpochMaterializer>,
 }
 
@@ -161,6 +186,48 @@ struct EpochMaterializer {
 }
 
 impl NativeIngestSink for NativeAppendMaterializerSink {
+    fn supports_checkpoint(&self) -> bool {
+        self.tables
+            .values()
+            .any(|table| table.actor.persistence_enabled())
+    }
+
+    fn prepare_checkpoint(
+        &self,
+        table_id: TableId,
+        watermark: OffsetWatermark,
+    ) -> Result<Option<BoxFuture<'static, Result<OffsetWatermark>>>> {
+        let table = Arc::clone(
+            self.tables
+                .get(&table_id)
+                .ok_or_else(|| invalid("checkpoint table missing"))?,
+        );
+        if !table.actor.persistence_enabled() {
+            return Ok(None);
+        }
+        {
+            let mut state = table.state.lock().unwrap();
+            if state.last_applied_log_offset != watermark {
+                return Err(invalid(
+                    "checkpoint does not match the accepted mutation boundary",
+                ));
+            }
+            if let Some(current) = state.epochs.last_mut() {
+                current
+                    .materializer
+                    .seal_active_for_writer_handoff()
+                    .map_err(|error| materializer_error("seal checkpoint prefix", error))?;
+            }
+            table
+                .actor
+                .try_publish_live_segments(build_publication(&table, &state, state.live_rows)?)?
+                .wait_blocking()?;
+        }
+        Ok(Some(Box::pin(async move {
+            persist_checkpoint_prefix(table, watermark).await
+        })))
+    }
+
     fn fence_writer(&self, table_id: TableId, writer_epoch: u64) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let table = self.table(table_id)?;
@@ -237,6 +304,22 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        let batch_bytes = batch.get_array_memory_size();
+        if batch_bytes
+            > self
+                .config
+                .max_buffered_bytes
+                .saturating_sub(state.buffered_bytes)
+        {
+            return Err(NativeIngestSinkError::Rejected(
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "native append persistence backlog exhausted its byte budget",
+                )
+                .with_table_id(table.table_id)
+                .with_retryable(true),
+            ));
+        }
         if context.identity.producer_epoch > state.actor_writer_epoch {
             return Err(NativeIngestSinkError::Rejected(
                 ServerError::new(
@@ -295,8 +378,162 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
             .map_err(NativeIngestSinkError::Indeterminate)?;
         state.live_rows = new_live_rows;
         state.last_applied_log_offset = context.receipt.committed_log_offset();
+        state.buffered_bytes += batch_bytes;
+        if let OffsetWatermark::Known(last) = context.receipt.committed_log_offset() {
+            state.batch_bytes.push_back((last.get(), batch_bytes));
+        }
         Ok(())
     }
+}
+
+async fn persist_checkpoint_prefix(
+    table: Arc<NativeAppendTable>,
+    watermark: OffsetWatermark,
+) -> Result<OffsetWatermark> {
+    let snapshot = table.actor.snapshot().await?;
+    if snapshot.committed_log_offset != watermark {
+        let first = next_offset(table.table_id, snapshot.committed_log_offset)?;
+        let OffsetWatermark::Known(last) = watermark else {
+            return Err(invalid("empty checkpoint cannot follow persisted rows"));
+        };
+        if first > last.get() {
+            return Err(invalid("checkpoint watermark regressed"));
+        }
+        let mut batches = Vec::new();
+        let mut lineage = Vec::new();
+        for segment in snapshot.live_segments.iter() {
+            if segment.offsets().first().get() > last.get() {
+                break;
+            }
+            let end = segment.offsets().last().get().min(last.get());
+            let count = usize::try_from(end - segment.offsets().first().get() + 1)
+                .map_err(|_| invalid("checkpoint row count exceeds platform usize"))?;
+            let span = segment
+                .span()
+                .slice_rows(0, count)
+                .map_err(|error| invalid(format!("checkpoint row span failed error=[{error}]")))?;
+            batches.push(
+                SegmentTableView::from_row_span(span)
+                    .to_record_batch()
+                    .map_err(|error| materializer_error("read checkpoint prefix", error))?,
+            );
+            lineage.push(SourceSegmentLineage {
+                source: segment.identity(),
+                offsets: OffsetRange::new(segment.offsets().first(), LogOffset::new(end))
+                    .map_err(|error| invalid(error.to_string()))?,
+            });
+        }
+        let offsets = OffsetRange::new(LogOffset::new(first), last)
+            .map_err(|error| invalid(error.to_string()))?;
+        let provenance = NativeDataFileProvenance::new(
+            offsets,
+            SourceSegmentLineages::new(lineage).map_err(|error| invalid(error.to_string()))?,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let mut digest = Sha256::new();
+        digest.update(b"zippy.native.checkpoint.v1");
+        digest.update(table.table_id.to_string().as_bytes());
+        digest.update(table.schema_version.to_le_bytes());
+        digest.update(first.to_le_bytes());
+        digest.update(last.get().to_le_bytes());
+        let hash = digest.finalize();
+        let mut id_bytes: [u8; 16] = hash[..16].try_into().expect("sha256 has at least 16 bytes");
+        id_bytes[0] |= 1;
+        let file_id = FileId::from_bytes(id_bytes).map_err(|error| invalid(error.to_string()))?;
+        let request_id =
+            RequestId::from_bytes(id_bytes).map_err(|error| invalid(error.to_string()))?;
+        let created_at_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invalid(error.to_string()))?
+            .as_nanos();
+        let candidate = PersistCandidateInput::new(
+            ParquetCandidateSpec {
+                file_id,
+                table_id: table.table_id,
+                schema_version: table.schema_version,
+                schema: Arc::clone(&table.schema),
+                provenance,
+                partition: MetadataMap::new(),
+                metadata: MetadataMap::new(),
+                created_at_ns: u64::try_from(created_at_ns)
+                    .map_err(|_| invalid("checkpoint timestamp exceeds u64 nanoseconds"))?,
+            },
+            batches,
+        )?;
+        let request = PersistRequest::new(
+            request_id,
+            table.table_id,
+            snapshot.persisted_snapshot_version,
+            vec![candidate],
+            watermark,
+        )?;
+        table.actor.persist(request).await?;
+    }
+    drop(snapshot);
+    // Keep publication ordered with synchronous admissions without blocking an async executor.
+    tokio::task::spawn_blocking(move || {
+        let mut state = table.state.lock().unwrap();
+        state.persisted_log_offset = watermark;
+        reclaim_materialized_prefix(&table, &mut state)
+    })
+    .await
+    .map_err(|error| {
+        invalid(format!(
+            "checkpoint reclamation task failed error=[{error}]"
+        ))
+    })??;
+    Ok(watermark)
+}
+
+fn reclaim_materialized_prefix(
+    table: &NativeAppendTable,
+    state: &mut NativeAppendTableState,
+) -> Result<()> {
+    let end = next_offset(table.table_id, state.persisted_log_offset)?;
+    let mut budget = end.saturating_sub(state.retained_start);
+    let mut reclaimed = 0_u64;
+    for epoch in &mut state.epochs {
+        let rows = epoch
+            .materializer
+            .retire_persisted_append_prefix(usize::try_from(budget).unwrap_or(usize::MAX))
+            .map_err(|error| materializer_error("retire persisted append prefix", error))?
+            as u64;
+        budget -= rows;
+        reclaimed += rows;
+        if epoch
+            .materializer
+            .append_live_segment_count()
+            .map_err(|error| materializer_error("count retained checkpoint segments", error))?
+            != 0
+        {
+            break;
+        }
+    }
+    state.retained_start += reclaimed;
+    state.live_rows -= reclaimed;
+    while state
+        .batch_bytes
+        .front()
+        .is_some_and(|(end, _)| *end < state.retained_start)
+    {
+        state.buffered_bytes -= state.batch_bytes.pop_front().expect("front exists").1;
+    }
+    while state.epochs.len() > 1 {
+        if state.epochs[0]
+            .materializer
+            .append_live_segment_count()
+            .map_err(|error| materializer_error("count retired epoch segments", error))?
+            != 0
+        {
+            break;
+        }
+        state.epochs.remove(0);
+    }
+    table
+        .actor
+        .try_publish_live_segments(build_publication(table, state, state.live_rows)?)?
+        .wait_blocking()?;
+    Ok(())
 }
 
 fn validate_receipt_prefix(
@@ -378,16 +615,13 @@ fn preflight_live_segment_budget(
     let rows = batch.num_rows();
     let mut projected = 0_usize;
     for epoch in &state.epochs {
-        let segments = epoch
+        let segment_count = epoch
             .materializer
-            .append_live_segments()
+            .append_live_segment_count()
             .map_err(|error| materializer_error("inspect native append segments", error))?;
         if epoch.writer_epoch == writer_epoch {
             let active_rows = epoch.materializer.active_committed_row_count();
-            let sealed = segments
-                .iter()
-                .filter(|segment| segment.is_sealed())
-                .count();
+            let sealed = segment_count - usize::from(active_rows != 0);
             projected = projected
                 .checked_add(sealed)
                 .and_then(|value| {
@@ -399,7 +633,7 @@ fn preflight_live_segment_budget(
                 .ok_or_else(|| resource_exhausted_no_table("live segment count overflow"))?;
         } else {
             projected = projected
-                .checked_add(segments.len())
+                .checked_add(segment_count)
                 .ok_or_else(|| resource_exhausted_no_table("live segment count overflow"))?;
         }
     }
@@ -434,7 +668,7 @@ fn build_publication(
     state: &NativeAppendTableState,
     expected_live_rows: u64,
 ) -> Result<TableActorLiveSegmentsPublication> {
-    let mut next = next_offset(table.table_id, state.persisted_log_offset)?;
+    let mut next = state.retained_start;
     let mut publications = Vec::new();
     let mut row_count = 0_u64;
     for epoch in &state.epochs {

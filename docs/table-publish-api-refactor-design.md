@@ -236,15 +236,15 @@ The suffix is an internal storage detail. Public API and documentation should us
 - For `frame_table`, it is not the recommended consumer because row callbacks discard the frame
   boundary at the Python API.
 - For `key_value_table`, it follows the internal changelog stream and emits key-value
-  changes. Internal `_zippy_*` fields are hidden from normal callbacks.
+  changes. Protocol-v2 `_zippy_kv_*` cursor and batch-boundary fields are preserved.
 
 `subscribe_table(source, callback)` is table-oriented:
 
 - For `append_table`, it preserves existing compatible table callback behavior.
 - For `frame_table`, it remains a generic Arrow subscription. Consumers whose correctness depends
   on callback boundaries must use `subscribe_frames()`.
-- For `key_value_table`, it emits full latest snapshots when the snapshot descriptor
-  advances.
+- For `key_value_table`, it emits protocol-v2 incremental batches. Consumers reconstruct state
+  from an explicit atomic snapshot and continuous deltas; see ADR 0006.
 
 `subscribe_frames(source, callback)` is frame-oriented:
 
@@ -254,8 +254,8 @@ The suffix is an internal storage detail. Public API and documentation should us
 - It emits one complete retained frame per callback and restores intermediate sealed descriptor
   generations in order.
 
-Do not add a separate `watch_table()` API in this refactor. `subscribe_table()` remains
-the public snapshot-watch entry point.
+`subscribe_table()` is not a full-snapshot watch API. `StateSubscription` bootstraps and maintains
+keyed state; full state is materialized only when explicitly requested.
 
 ## Replay And Recovery
 
@@ -328,8 +328,8 @@ not silently present a live-only table as a complete replay-backed table.
 - `frame_table()` requires a `CrossSectionalEngine` and `by=engine.dt_column`.
 - `ReactiveStateEngine.append_table(...).publish(...)` remains supported.
 - `subscribe()` on append tables emits appended rows.
-- `subscribe()` on key-value tables emits changelog events and hides internal fields.
-- `subscribe_table()` on key-value tables emits full snapshots.
+- `subscribe()` on key-value tables emits changelog events and preserves v2 protocol fields.
+- `subscribe_table()` on key-value tables emits deltas with cursor and atomic-version boundaries.
 - `subscribe_frames()` rejects plain append and key-value tables.
 - `subscribe_frames()` preserves ordered frame boundaries while callbacks lag.
 - `read_table()` on key-value tables returns a consistent snapshot.

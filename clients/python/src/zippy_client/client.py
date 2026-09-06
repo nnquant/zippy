@@ -22,6 +22,7 @@ from .endpoints import (
 from .errors import (
     CapabilityError,
     ProtocolError,
+    QueryError,
     TransportUnavailableError,
     ZippyConnectionError,
 )
@@ -410,6 +411,11 @@ class Client:
             self._wait_for_source(source, timeout)
         requested = transport or self.default_transport
         stream_info = self._subscription_stream_info(source, requested)
+        source, stream_info, keyed = self._delta_subscription_source(source, requested, stream_info)
+        if keyed and (
+            filter is not None or instrument_ids is not None or start_from != -1 or allow_data_loss
+        ):
+            raise ValueError("key-value deltas require an unfiltered, lossless tail subscription")
         allow_shm = self._allow_auto_shm and filter is None
         decision = self.router.select(
             Operation.SUBSCRIBE,
@@ -476,6 +482,13 @@ class Client:
             self._wait_for_source(source, timeout)
         requested = transport or self.default_transport
         stream_info = self._subscription_stream_info(source, requested)
+        source, stream_info, keyed = self._delta_subscription_source(source, requested, stream_info)
+        if keyed and (
+            filter is not None or count is not None or start_from != -1 or allow_data_loss
+        ):
+            raise ValueError(
+                "key-value deltas cannot be filtered, truncated, or allowed to lose data"
+            )
         allow_shm = (
             self._allow_auto_shm and filter is None and batch_size is None and throttle_ms is None
         )
@@ -519,6 +532,31 @@ class Client:
         subscriber.start()
         self._subscriptions.add(subscriber)
         return subscriber
+
+    def _delta_subscription_source(self, source, requested, stream_info):
+        if stream_info is None:
+            try:
+                stream_info, _ = self.gateway.get_stream(source)
+            except QueryError as error:
+                if "stream not found" not in str(error):
+                    raise
+                # Gateway resolves a not-yet-registered source when its writer appears.
+                return source, None, False
+        candidates = [stream_info.get("active_segment_descriptor"), stream_info]
+        candidates.extend(stream_info.get("source_configs") or [])
+
+        def metadata(name):
+            return next(
+                (item[name] for item in candidates if isinstance(item, dict) and name in item), None
+            )
+
+        keyed = metadata("zippy_table_kind") == "key_value_table"
+        if not keyed:
+            return source, stream_info, False
+        delta = metadata("zippy_key_value_changelog_stream")
+        if not isinstance(delta, str) or not delta:
+            raise ProtocolError("key-value producer must be republished with the v2 delta protocol")
+        return delta, self._subscription_stream_info(delta, requested), True
 
     def close(self) -> None:
         """Stop active subscriptions and release the control process lease."""

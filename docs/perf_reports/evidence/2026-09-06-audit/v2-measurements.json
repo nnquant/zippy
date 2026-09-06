@@ -1,0 +1,56 @@
+{
+  "date": "2026-09-06",
+  "build": "release",
+  "filesystem": "ext4",
+  "key_value_contract": "v2 deltas instead of implicit full snapshots",
+  "key_value_8192_keys_128_updates_of_32_keys": {
+    "includes_initialization": true,
+    "criterion_interval_ms": [11.062, 11.411, 11.558],
+    "prior_stage_ms_approximate": 28,
+    "same_output_semantics": false
+  },
+  "crc32c_256_mib": {
+    "before_seconds": 0.425232066,
+    "after_seconds": 0.093150849,
+    "same_checksum_and_disk_format": true
+  },
+  "native_append_single_int64_control": {
+    "rows": 983040,
+    "checkpoints": 30,
+    "elapsed_seconds": 0.672607882,
+    "rows_per_second": 1461535.0582525586,
+    "admission_p99_us": 370
+  },
+  "native_append_wide": {
+    "schema": "instrument_id:utf8 + 40 int64 bid/ask depth fields",
+    "symbols": 10000,
+    "batch_rows": 1024,
+    "batches_per_checkpoint": 32,
+    "rows": 983040,
+    "before_crc_optimization": {
+      "elapsed_seconds": 2.771056061,
+      "rows_per_second": 354752.8373154772,
+      "admission_p99_us": 2844
+    },
+    "after_crc_optimization": {
+      "elapsed_seconds": 2.402209534,
+      "rows_per_second": 409223.25304533576,
+      "admission_p99_us": 2140
+    },
+    "extended_run": {
+      "rows": 16384000,
+      "checkpoints": 500,
+      "elapsed_seconds": 42.616105874,
+      "rows_per_second": 384455.58701307443,
+      "admission_p99_us": 2477,
+      "process_peak_rss_kib": 118248
+    }
+  },
+  "limitations": [
+    "synthetic compressible data, not an exchange replay",
+    "includes fingerprint, WAL, SHM, receipts, Parquet, manifest and checkpoint",
+    "excludes setup and input data generation",
+    "not a full trading day, network latency, or production capacity guarantee",
+    "per-table Arrow backlog budgets are not global RSS limits"
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "date": "2026-09-06",
+  "base_commit": "f1df4201e1faf179b1dd928ab15cfeb57b9b38b1",
+  "modified_worktree": true,
+  "scope": "followup: counted append preflight, immutable sealed descriptor cache, rolling undo journal and centered variance, async publisher lifecycle, corrected symbol rotation",
+  "cpu": "AMD Ryzen 9 9950X, 16 cores / 32 threads, Microsoft hypervisor",
+  "rustc": "1.86.0",
+  "limitations": "Local release measurements without CPU affinity. Microbenchmarks are single wall-clock runs, not latency percentiles. Inproc percentiles measure write admission only, exclude durable storage and strategy completion. No before/after market-capacity comparison because the old generator did not cover all configured symbols.",
+  "inproc_1024": {
+    "profile": "InprocTimeseries",
+    "config": {
+      "profile": "InprocTimeseries",
+      "rows_per_batch": 1024,
+      "target_rows_per_sec": 1000000,
+      "duration_sec": 30,
+      "warmup_sec": 2,
+      "symbols": 10000,
+      "endpoint": "tcp://127.0.0.1:5560",
+      "buffer_capacity": 4096,
+      "overflow_policy": "Block",
+      "max_p95_micros": 1000,
+      "max_p99_micros": 5000,
+      "max_queue_depth": 64
+    },
+    "metadata": {
+      "git_sha": "f1df4201e1fa",
+      "target": "linux-x86_64",
+      "started_at_unix_ms": 1788631849181
+    },
+    "input_rows_total": 32000000,
+    "output_rows_total": 32000000,
+    "actual_average_rows_per_sec": 999857.9110144882,
+    "actual_peak_rows_per_sec": 1000448,
+    "batches_per_sec": 976.4237412250861,
+    "latency": {
+      "sample_count": 29296,
+      "p50_micros": 16,
+      "p95_micros": 19,
+      "p99_micros": 28,
+      "max_micros": 323
+    },
+    "secondary_latency": null,
+    "engine_status": "stopped",
+    "engine_metrics": {
+      "processed_batches_total": 31250,
+      "processed_rows_total": 32000000,
+      "output_batches_total": 31242,
+      "dropped_batches_total": 0,
+      "late_rows_total": 0,
+      "publish_errors_total": 0,
+      "queue_depth": 0,
+      "max_observed_queue_depth": 10
+    },
+    "source_metrics": null,
+    "pass": true
+  },
+  "inproc_64": {
+    "profile": "InprocTimeseries",
+    "config": {
+      "profile": "InprocTimeseries",
+      "rows_per_batch": 64,
+      "target_rows_per_sec": 500000,
+      "duration_sec": 10,
+      "warmup_sec": 2,
+      "symbols": 10000,
+      "endpoint": "tcp://127.0.0.1:5560",
+      "buffer_capacity": 4096,
+      "overflow_policy": "Block",
+      "max_p95_micros": 1000,
+      "max_p99_micros": 5000,
+      "max_queue_depth": 64
+    },
+    "metadata": {
+      "git_sha": "f1df4201e1fa",
+      "target": "linux-x86_64",
+      "started_at_unix_ms": 1788632058512
+    },
+    "input_rows_total": 6000000,
+    "output_rows_total": 6000000,
+    "actual_average_rows_per_sec": 499804.4794864518,
+    "actual_peak_rows_per_sec": 500032,
+    "batches_per_sec": 7809.444991975809,
+    "latency": {
+      "sample_count": 78125,
+      "p50_micros": 15,
+      "p95_micros": 19,
+      "p99_micros": 22,
+      "max_micros": 515
+    },
+    "secondary_latency": null,
+    "engine_status": "stopped",
+    "engine_metrics": {
+      "processed_batches_total": 93750,
+      "processed_rows_total": 6000000,
+      "output_batches_total": 93595,
+      "dropped_batches_total": 0,
+      "late_rows_total": 0,
+      "publish_errors_total": 0,
+      "queue_depth": 0,
+      "max_observed_queue_depth": 41
+    },
+    "source_metrics": null,
+    "pass": true
+  },
+  "window_before": "   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)\n    Finished `release` profile [optimized] target(s) in 2.94s\n     Running unittests src/lib.rs (target/release/deps/zippy_operators-4f4b8b5c84458f8b)\n\nrunning 1 test\nwindow=[1024] transaction_ns=[200.20]\nwindow=[65536] transaction_ns=[6328.83]\ntest reactive::tests::window_transaction_performance ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.13s\n\n",
+  "window_final": "   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)\n    Finished `release` profile [optimized] target(s) in 1.17s\n     Running unittests src/lib.rs (target/release/deps/zippy_operators-4f4b8b5c84458f8b)\n\nrunning 1 test\nwindow=[1024] transaction_ns=[87.62]\nwindow=[65536] transaction_ns=[87.25]\ntest reactive::tests::window_transaction_performance ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.01s\n\n",
+  "append_before": "   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)\n   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)\n    Finished `release` profile [optimized] target(s) in 4.96s\n     Running unittests src/lib.rs (target/release/deps/zippy_engines-b7a7658b88403314)\n\nrunning 1 test\nsealed=[64] publication_us=[287.51]\nsealed=[512] publication_us=[2409.18]\ntest stream_table::sharded_materializer_tests::append_descriptor_performance ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 1.41s\n\n",
+  "append_final": "   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)\n   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)\n    Finished `release` profile [optimized] target(s) in 3.91s\n     Running unittests src/lib.rs (target/release/deps/zippy_engines-b7a7658b88403314)\n\nrunning 1 test\nsealed=[64] publication_us=[6.34]\nsealed=[512] publication_us=[51.26]\ntest stream_table::sharded_materializer_tests::append_descriptor_performance ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.06s\n\n"
+}

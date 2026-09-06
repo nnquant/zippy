@@ -1349,12 +1349,7 @@ fn evaluate_planned_column_op(
                 let Some(max) = max else {
                     return Ok(EvalValue::Null);
                 };
-                if min > max {
-                    return Err(ZippyError::InvalidState {
-                        status: EXPRESSION_CLIP_BOUNDS_INVALID,
-                    });
-                }
-                Ok(EvalValue::Float64(value.clamp(min, max)))
+                clip_value(value, min, max)
             }
             PlannedFunctionOp::Cast(kind) => {
                 cast_value(kind, row_values[inputs[0].as_usize()].clone())
@@ -1435,13 +1430,7 @@ fn evaluate_expr(expr: &TypedExpr, batch: &RecordBatch, row: usize) -> Result<Ev
                 let Some(max) = max.as_f64()? else {
                     return Ok(EvalValue::Null);
                 };
-                if min > max {
-                    return Err(ZippyError::InvalidState {
-                        status: EXPRESSION_CLIP_BOUNDS_INVALID,
-                    });
-                }
-
-                Ok(EvalValue::Float64(value.clamp(min, max)))
+                clip_value(value, min, max)
             }
             FunctionKind::Cast(kind) => {
                 let value = evaluate_expr(&args[0], batch, row)?;
@@ -1533,13 +1522,7 @@ fn evaluate_expr_context(
                 let Some(max) = max.as_f64()? else {
                     return Ok(EvalValue::Null);
                 };
-                if min > max {
-                    return Err(ZippyError::InvalidState {
-                        status: EXPRESSION_CLIP_BOUNDS_INVALID,
-                    });
-                }
-
-                Ok(EvalValue::Float64(value.clamp(min, max)))
+                clip_value(value, min, max)
             }
             FunctionKind::Cast(kind) => {
                 let value = evaluate_expr_context(&args[0], ctx, row)?;
@@ -1601,6 +1584,15 @@ fn cast_value(kind: CastKind, value: EvalValue) -> Result<EvalValue> {
             .as_string()
             .map(|value| value.map_or(EvalValue::Null, EvalValue::String)),
     }
+}
+
+fn clip_value(value: f64, min: f64, max: f64) -> Result<EvalValue> {
+    if min.is_nan() || max.is_nan() || min > max {
+        return Err(ZippyError::InvalidState {
+            status: EXPRESSION_CLIP_BOUNDS_INVALID,
+        });
+    }
+    Ok(EvalValue::Float64(value.clamp(min, max)))
 }
 
 fn build_output_array(data_type: &DataType, values: Vec<EvalValue>) -> Result<ArrayRef> {

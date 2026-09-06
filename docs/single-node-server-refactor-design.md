@@ -953,8 +953,11 @@ pub enum SubscriptionStart {
 | --- | --- | --- | --- |
 | `subscribe()` | log rows | 不推荐 | changelog events |
 | `subscribe_frames()` | 拒绝 | frame records | 拒绝 |
-| `subscribe_table()` | incremental batches | complete frames/batches | full latest snapshots |
+| `subscribe_table()` | incremental batches | complete frames/batches | v2 ordered delta batches |
 | `read_table()` | point-in-time history | point-in-time history | current state snapshot |
+
+KeyValue 当前实现与初始化迁移以 [ADR 0006](adr/0006-bounded-ingest-and-delta-state.md) 为准；
+普通查询结果不含原子捕获的订阅游标，初始化应使用显式生产者快照。
 
 ### 8.4 delivery contract
 

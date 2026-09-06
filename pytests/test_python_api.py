@@ -817,9 +817,7 @@ def test_session_descriptor_publisher_prefers_envelope_publish_fast_path() -> No
     )
     publish(b'{"segment_id":1,"generation":0}')
 
-    deadline = time.time() + 1.0
-    while not master.envelopes and time.time() < deadline:
-        time.sleep(0.01)
+    session.stop()
 
     assert master.envelopes == [
         (
@@ -829,6 +827,37 @@ def test_session_descriptor_publisher_prefers_envelope_publish_fast_path() -> No
         )
     ]
     assert master.descriptors == []
+
+
+@pytest.mark.parametrize("owner_type", [zippy.Session, zippy.Pipeline])
+def test_descriptor_publisher_drains_before_unregister_and_restarts(owner_type) -> None:
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.events: list[bytes | str] = []
+
+        def publish_segment_descriptor_envelope(self, stream_name, payload, metadata) -> None:
+            self.events.append(payload)
+
+        def unregister_source(self, source_name) -> None:
+            self.events.append("unregistered")
+
+    master = FakeMaster()
+    owner = owner_type(name="descriptor_lifecycle", master=master)
+    publish = owner._descriptor_publisher("ticks")
+    publisher = owner._descriptor_publishers[0]
+    assert publisher._thread is None
+    for _ in range(2):
+        if isinstance(owner, zippy.Session):
+            owner._materializer_source_names.append("source")
+        else:
+            owner._registered_source_names.append("source")
+        for index in range(100):
+            publish(str(index).encode())
+        owner.stop()
+        assert master.events == [str(index).encode() for index in range(100)] + ["unregistered"]
+        assert publisher._thread is None
+        owner.stop()
+        master.events.clear()
 
 
 def test_session_publish_append_table_sets_append_table_kind(monkeypatch) -> None:
@@ -16576,7 +16605,7 @@ def test_reactive_latest_stream_table_tail_returns_key_value_snapshot(tmp_path: 
         server.stop()
 
 
-def test_subscribe_table_auto_watches_reactive_latest_active_rewrites(tmp_path: Path) -> None:
+def test_subscribe_table_applies_key_value_deltas_to_explicit_state(tmp_path: Path) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
         reset_default_master()
@@ -16605,12 +16634,17 @@ def test_subscribe_table_auto_watches_reactive_latest_active_rewrites(tmp_path: 
     received: list[pa.Table] = []
     updated = threading.Event()
 
-    def on_snapshot(table: pa.Table) -> None:
+    state = zippy.KeyValueState(session.snapshot_state("ctp_ticks_latest"))
+
+    def on_snapshot(delta: pa.Table) -> None:
+        state.apply(delta)
+        table = state.snapshot()
         received.append(table)
         if table.num_rows == 2 and table.column("last_price").to_pylist() == [4103.5, 2711.0]:
             updated.set()
 
     subscriber = None
+    tracked = None
     try:
         session.run()
         subscriber = zippy.subscribe_table(
@@ -16636,7 +16670,20 @@ def test_subscribe_table_auto_watches_reactive_latest_active_rewrites(tmp_path: 
         assert updated.wait(timeout=2.0)
         assert received[-1].column("instrument_id").to_pylist() == ["IF2606", "IH2606"]
         assert received[-1].column("last_price").to_pylist() == [4103.5, 2711.0]
+        tracked = zippy.StateSubscription(
+            "ctp_ticks_latest", lambda: session.snapshot_state("ctp_ticks_latest")
+        ).start()
+        engine.write({"instrument_id": ["IH2606"], "last_price": [2712.0]})
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            latest = tracked.snapshot()
+            if latest.column("last_price").to_pylist() == [4103.5, 2712.0]:
+                break
+            time.sleep(0.005)
+        assert latest.column("last_price").to_pylist() == [4103.5, 2712.0]
     finally:
+        if tracked is not None:
+            tracked.stop()
         if subscriber is not None:
             subscriber.stop()
         session.stop()
@@ -16645,7 +16692,7 @@ def test_subscribe_table_auto_watches_reactive_latest_active_rewrites(tmp_path: 
         server.stop()
 
 
-def test_subscribe_auto_watches_reactive_latest_rows(tmp_path: Path) -> None:
+def test_subscribe_key_value_rows_preserve_control_fields(tmp_path: Path) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
         reset_default_master()
@@ -16677,7 +16724,7 @@ def test_subscribe_auto_watches_reactive_latest_rows(tmp_path: Path) -> None:
     def on_row(row: zippy.Row) -> None:
         item = row.to_dict()
         received.append(item)
-        if item == {"instrument_id": "IF2606", "last_price": 4103.5}:
+        if item["instrument_id"] == "IF2606" and item["last_price"] == 4103.5:
             updated.set()
 
     subscriber = None
@@ -16687,7 +16734,6 @@ def test_subscribe_auto_watches_reactive_latest_rows(tmp_path: Path) -> None:
             "ctp_ticks_latest",
             callback=on_row,
             poll_interval_ms=5,
-            filter=zippy.col("instrument_id") == "IF2606",
             wait=True,
             timeout=2.0,
         )
@@ -16705,7 +16751,9 @@ def test_subscribe_auto_watches_reactive_latest_rows(tmp_path: Path) -> None:
         )
 
         assert updated.wait(timeout=2.0)
-        assert {"instrument_id": "IF2606", "last_price": 4103.5} in received
+        assert received[-1]["_zippy_kv_seq"] == 3
+        assert received[-1]["_zippy_kv_batch_last_seq"] == 3
+        assert received[-1]["_zippy_kv_op"] == "upsert"
     finally:
         if subscriber is not None:
             subscriber.stop()
@@ -16713,52 +16761,6 @@ def test_subscribe_auto_watches_reactive_latest_rows(tmp_path: Path) -> None:
         if reset_default_master is not None:
             reset_default_master()
         server.stop()
-
-
-def test_table_snapshot_watcher_retries_transient_metadata_errors(monkeypatch) -> None:
-    class FakeMaster:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def get_stream(self, source: str) -> dict[str, object]:
-            self.calls += 1
-            if self.calls <= 2:
-                raise RuntimeError("stream not found")
-            return {"descriptor_generation": 1}
-
-    class FakeQuery:
-        def filter(self, _filter):
-            return self
-
-        def tail(self, _count: int):
-            return self
-
-        def collect(self) -> pa.Table:
-            return pa.table({"instrument_id": ["IF2606"], "last_price": [4102.5]})
-
-    monkeypatch.setattr(zippy, "read_table", lambda *args, **kwargs: FakeQuery())
-
-    delivered = threading.Event()
-    snapshots: list[pa.Table] = []
-    watcher = zippy._watch_table_latest(
-        "ctp_ticks_latest",
-        callback=lambda table: (snapshots.append(table), delivered.set()),
-        master=FakeMaster(),
-        poll_interval_ms=5,
-    )
-
-    try:
-        assert delivered.wait(timeout=1.0)
-        metrics = watcher.metrics()
-        health = watcher.health()
-        assert metrics["running"] is True
-        assert metrics["descriptor_refresh_errors_total"] == 2
-        assert metrics["snapshots_delivered_total"] == 1
-        assert health["state"] == "running"
-        assert health["healthy"] is True
-        assert health["last_error"] is None
-    finally:
-        watcher.stop()
 
 
 def test_remote_stream_subscriber_metrics_use_live_health_contract() -> None:
@@ -17141,11 +17143,15 @@ def test_subscribe_reactive_latest_routes_to_changelog_rows(tmp_path: Path) -> N
         )
 
         assert delivered.wait(timeout=2.0)
-        assert received == [
+        assert [
+            {"instrument_id": row["instrument_id"], "last_price": row["last_price"]}
+            for row in received
+        ] == [
             {"instrument_id": "IF2606", "last_price": 4102.5},
             {"instrument_id": "IH2606", "last_price": 2711.0},
             {"instrument_id": "IF2606", "last_price": 4103.5},
         ]
+        assert [row["_zippy_kv_seq"] for row in received] == [1, 2, 3]
 
         deadline = time.time() + 2.0
         descriptor = zippy._DEFAULT_MASTER.get_stream("ctp_ticks_latest")[

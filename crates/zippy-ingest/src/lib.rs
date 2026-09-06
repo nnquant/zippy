@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod checkpoint;
 mod materializer;
 mod memory;
 mod native;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -25,6 +25,7 @@ use zippy_segment_store::{
 
 use crate::stream_table_shard::{ShardConfig, ShardRouter};
 
+use crate::key_value_state::{KeyValueSnapshotHandle, SnapshotState, BATCH_END, STREAM_ID};
 use crate::latest_state::{LatestColumnarState, LatestUpdateSet};
 
 const STREAM_TABLE_PARTITION: &str = "all";
@@ -105,8 +106,8 @@ pub struct StreamTableMaterializer {
     frame_per_batch: bool,
     store: SegmentStore,
     partition: PartitionHandle,
-    sealed_segment_descriptors: Vec<serde_json::Value>,
-    replacement_retained_snapshots: Vec<Vec<serde_json::Value>>,
+    sealed_segment_descriptors: VecDeque<RetainedSegmentDescriptor>,
+    replacement_retained_snapshots: VecDeque<Vec<serde_json::Value>>,
     retention_segments: Option<usize>,
     replacement_retention_snapshots: usize,
     persisted_segment_identities: BTreeSet<SegmentIdentity>,
@@ -127,6 +128,21 @@ pub struct StreamTableLiveSegment {
     descriptor: ActiveSegmentDescriptor,
     row_count: usize,
     sealed: bool,
+}
+
+struct RetainedSegmentDescriptor {
+    envelope: serde_json::Value,
+    // Sealed prefixes are immutable; the cache is dropped with the retained descriptor.
+    append_segment: OnceLock<StreamTableLiveSegment>,
+}
+
+impl From<serde_json::Value> for RetainedSegmentDescriptor {
+    fn from(envelope: serde_json::Value) -> Self {
+        Self {
+            envelope,
+            append_segment: OnceLock::new(),
+        }
+    }
 }
 
 impl StreamTableLiveSegment {
@@ -204,17 +220,15 @@ impl DescriptorForwardingFallbackReason {
     }
 }
 
-/// Materializes keyed rows into a replace-style active segment snapshot.
+/// Maintains queryable keyed state and emits ordered upsert deltas, never implicit full snapshots.
 pub struct KeyValueTableMaterializer {
     name: String,
     input_schema: SchemaRef,
     by: Vec<String>,
-    latest_state: LatestColumnarState,
+    snapshot: KeyValueSnapshotHandle,
     table: StreamTableMaterializer,
     changelog_table: Option<StreamTableMaterializer>,
-    changelog_schema: Option<SchemaRef>,
-    snapshot_version: u64,
-    last_changelog_seq: u64,
+    changelog_schema: SchemaRef,
     descriptor_metadata: Arc<Mutex<KeyValueDescriptorMetadata>>,
 }
 
@@ -263,6 +277,7 @@ impl StreamTableDescriptorPublisher for KeyValueSnapshotDescriptorPublisher {
 
 impl KeyValueDescriptorMetadata {
     fn annotate(&self, descriptor: &mut serde_json::Value) {
+        descriptor["zippy_kv_protocol_version"] = serde_json::Value::from(2);
         descriptor[KEY_VALUE_SNAPSHOT_VERSION_FIELD] =
             serde_json::Value::from(self.snapshot_version);
         descriptor[KEY_VALUE_SNAPSHOT_VERSION_PUBLIC_FIELD] =
@@ -861,8 +876,8 @@ impl StreamTableMaterializer {
             frame_per_batch: false,
             store,
             partition,
-            sealed_segment_descriptors: Vec::new(),
-            replacement_retained_snapshots: Vec::new(),
+            sealed_segment_descriptors: VecDeque::new(),
+            replacement_retained_snapshots: VecDeque::new(),
             retention_segments: None,
             replacement_retention_snapshots: DEFAULT_REPLACEMENT_RETAINED_SNAPSHOTS,
             persisted_segment_identities: BTreeSet::new(),
@@ -962,8 +977,12 @@ impl StreamTableMaterializer {
             }
             None => self.active_descriptor_value()?,
         };
-        descriptor["sealed_segments"] =
-            serde_json::Value::Array(self.sealed_segment_descriptors.clone());
+        descriptor["sealed_segments"] = serde_json::Value::Array(
+            self.sealed_segment_descriptors
+                .iter()
+                .map(|retained| retained.envelope.clone())
+                .collect(),
+        );
         let retained_replacements = self
             .replacement_retained_snapshots
             .iter()
@@ -1003,8 +1022,12 @@ impl StreamTableMaterializer {
             self.sealed_segment_descriptors.len()
                 + usize::from(self.active_committed_row_count() != 0),
         );
-        for encoded in &self.sealed_segment_descriptors {
-            let bytes = serde_json::to_vec(encoded).map_err(|error| ZippyError::Io {
+        for retained in &self.sealed_segment_descriptors {
+            if let Some(segment) = retained.append_segment.get() {
+                segments.push(segment.clone());
+                continue;
+            }
+            let bytes = serde_json::to_vec(&retained.envelope).map_err(|error| ZippyError::Io {
                 reason: format!("failed to encode retained append descriptor error=[{error}]"),
             })?;
             let descriptor = ActiveSegmentDescriptor::from_envelope_bytes(
@@ -1024,11 +1047,13 @@ impl StreamTableMaterializer {
                 .ok_or(ZippyError::InvalidState {
                     status: "retained append descriptor is not shared-memory backed",
                 })?;
-            segments.push(StreamTableLiveSegment {
+            let segment = StreamTableLiveSegment {
                 row_count,
                 descriptor,
                 sealed: true,
-            });
+            };
+            let _ = retained.append_segment.set(segment.clone());
+            segments.push(segment);
         }
         let active_rows = self.active_committed_row_count();
         if active_rows != 0 {
@@ -1039,6 +1064,49 @@ impl StreamTableMaterializer {
             });
         }
         Ok(segments)
+    }
+
+    /// Counts retained append segments without decoding or attaching their descriptors.
+    ///
+    /// :returns: Nonempty active segment plus retained sealed segments.
+    /// :raises ZippyError::InvalidState: Frame-per-batch mode is configured.
+    pub fn append_live_segment_count(&self) -> Result<usize> {
+        if self.frame_per_batch {
+            return Err(ZippyError::InvalidState {
+                status: "append live segment publication does not support frame-per-batch mode",
+            });
+        }
+        Ok(self.sealed_segment_descriptors.len()
+            + usize::from(self.active_committed_row_count() != 0))
+    }
+
+    /// Retires a durable append prefix without invalidating pinned readers.
+    ///
+    /// :param max_rows: Prefix rows already covered by the authoritative manifest.
+    /// :returns: Rows actually retired; pinned segments can stop reclamation early.
+    /// :raises ZippyError: Descriptor validation or retention guard failure.
+    pub fn retire_persisted_append_prefix(&mut self, max_rows: usize) -> Result<usize> {
+        let segments = self.append_live_segments()?;
+        let mut rows = 0_usize;
+        let mut count = 0;
+        for segment in &segments {
+            if !segment.sealed || segment.row_count > max_rows - rows {
+                break;
+            }
+            rows += segment.row_count;
+            count += 1;
+            self.persisted_segment_identities.insert((
+                segment.descriptor.segment_id(),
+                segment.descriptor.generation(),
+            ));
+        }
+        let before = self.sealed_segment_descriptors.len();
+        self.trim_published_retained_segments(before - count)?;
+        let removed = before - self.sealed_segment_descriptors.len();
+        Ok(segments[..removed]
+            .iter()
+            .map(|segment| segment.row_count)
+            .sum())
     }
 
     /// Seals a non-empty append prefix before ownership moves to another writer epoch.
@@ -1059,7 +1127,8 @@ impl StreamTableMaterializer {
             .writer()
             .rollover_without_persistence()
             .map_err(segment_error)?;
-        self.sealed_segment_descriptors.push(sealed_descriptor);
+        self.sealed_segment_descriptors
+            .push_back(sealed_descriptor.into());
         Ok(())
     }
 
@@ -1204,7 +1273,7 @@ impl StreamTableMaterializer {
             .rollover_without_persistence()
             .map_err(segment_error)?;
         self.sealed_segment_descriptors
-            .push(sealed_descriptor.clone());
+            .push_back(sealed_descriptor.clone().into());
         self.apply_retention()?;
         self.publish_active_descriptor()?;
         self.enqueue_persist_task(sealed, &sealed_descriptor)
@@ -1248,7 +1317,7 @@ impl StreamTableMaterializer {
                         .rollover_without_persistence()
                         .map_err(segment_error)?;
                     self.sealed_segment_descriptors
-                        .push(sealed_descriptor.clone());
+                        .push_back(sealed_descriptor.clone().into());
                     if publish_rollovers {
                         self.publish_active_descriptor()?;
                     }
@@ -1297,7 +1366,7 @@ impl StreamTableMaterializer {
                         .rollover_without_persistence()
                         .map_err(segment_error)?;
                     self.sealed_segment_descriptors
-                        .push(sealed_descriptor.clone());
+                        .push_back(sealed_descriptor.clone().into());
                     if publish_rollovers {
                         self.publish_active_descriptor()?;
                     }
@@ -1375,7 +1444,7 @@ impl StreamTableMaterializer {
                         .rollover_without_persistence()
                         .map_err(segment_error)?;
                     self.sealed_segment_descriptors
-                        .push(sealed_descriptor.clone());
+                        .push_back(sealed_descriptor.clone().into());
                     if publish_rollovers {
                         self.publish_active_descriptor()?;
                     }
@@ -1562,7 +1631,11 @@ impl StreamTableMaterializer {
 
         let old_descriptor = self.active_descriptor_value()?;
         let mut old_snapshot = Vec::with_capacity(self.sealed_segment_descriptors.len() + 1);
-        old_snapshot.extend(self.sealed_segment_descriptors.iter().cloned());
+        old_snapshot.extend(
+            self.sealed_segment_descriptors
+                .iter()
+                .map(|retained| retained.envelope.clone()),
+        );
         old_snapshot.push(old_descriptor);
         let writer = self.partition.writer();
         let _sealed = writer
@@ -1570,7 +1643,7 @@ impl StreamTableMaterializer {
             .map_err(segment_error)?;
         self.forwarded_active_descriptor = None;
         self.forwarded_active_row_span = None;
-        self.replacement_retained_snapshots.push(old_snapshot);
+        self.replacement_retained_snapshots.push_back(old_snapshot);
         self.sealed_segment_descriptors.clear();
         self.persisted_segment_identities.clear();
 
@@ -1966,9 +2039,9 @@ impl StreamTableMaterializer {
     fn trim_published_retained_segments(&mut self, retention_segments: usize) -> Result<bool> {
         let mut published_changed = false;
         while self.sealed_segment_descriptors.len() > retention_segments {
-            let Some(identity) =
-                descriptor_segment_identity(self.sealed_segment_descriptors.first().unwrap())
-            else {
+            let Some(identity) = descriptor_segment_identity(
+                &self.sealed_segment_descriptors.front().unwrap().envelope,
+            ) else {
                 break;
             };
             if self.persist_config.is_some()
@@ -1988,7 +2061,8 @@ impl StreamTableMaterializer {
                     break;
                 }
             }
-            self.sealed_segment_descriptors.remove(0);
+            self.sealed_segment_descriptors.pop_front();
+            self.persisted_segment_identities.remove(&identity);
             self.partition
                 .release_retired_segment(identity.0, identity.1);
             published_changed = true;
@@ -1998,7 +2072,7 @@ impl StreamTableMaterializer {
 
     fn trim_replacement_retained_segments(&mut self) -> Result<()> {
         while self.replacement_retained_snapshots.len() > self.replacement_retention_snapshots {
-            let snapshot = self.replacement_retained_snapshots.first().unwrap();
+            let snapshot = self.replacement_retained_snapshots.front().unwrap();
             let identities = snapshot
                 .iter()
                 .map(descriptor_segment_identity)
@@ -2022,7 +2096,7 @@ impl StreamTableMaterializer {
                 }
             }
 
-            self.replacement_retained_snapshots.remove(0);
+            self.replacement_retained_snapshots.pop_front();
             for identity in identities {
                 self.partition
                     .release_retired_segment(identity.0, identity.1);
@@ -2085,7 +2159,7 @@ impl StreamTableMaterializer {
         self.forwarded_active_descriptor = None;
         self.forwarded_active_row_span = None;
         self.sealed_segment_descriptors
-            .push(sealed_descriptor.clone());
+            .push_back(sealed_descriptor.clone().into());
         self.enqueue_persist_task(sealed, &sealed_descriptor)?;
         Ok(true)
     }
@@ -2357,6 +2431,15 @@ impl KeyValueTableMaterializer {
         let name = name.into();
         let by = by.into_iter().map(Into::into).collect::<Vec<_>>();
         validate_latest_by_columns(input_schema.as_ref(), &by)?;
+        if input_schema
+            .fields()
+            .iter()
+            .any(|field| field.name().starts_with("_zippy_kv_"))
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: "reserved key-value protocol column prefix".into(),
+            });
+        }
         let latest_state = LatestColumnarState::new(Arc::clone(&input_schema), by.clone())?;
         let table = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
             name.clone(),
@@ -2365,16 +2448,28 @@ impl KeyValueTableMaterializer {
             writer_epoch,
         )?;
 
+        let descriptor = table.active_descriptor_value()?;
+        let allocation = descriptor["shm_os_id"]
+            .as_str()
+            .ok_or(ZippyError::InvalidState {
+                status: "key-value producer allocation identity missing",
+            })?;
+        let stream_id = format!("{:x}", md5::compute(allocation.as_bytes()));
+        let snapshot = KeyValueSnapshotHandle(Arc::new(Mutex::new(SnapshotState {
+            latest: latest_state,
+            sequence: 0,
+            version: 0,
+            stream_id,
+            healthy: true,
+        })));
         Ok(Self {
             name,
+            changelog_schema: key_value_changelog_schema(Arc::clone(&input_schema)),
             input_schema,
             by,
-            latest_state,
+            snapshot,
             table,
             changelog_table: None,
-            changelog_schema: None,
-            snapshot_version: 0,
-            last_changelog_seq: 0,
             descriptor_metadata: Arc::new(Mutex::new(KeyValueDescriptorMetadata::default())),
         })
     }
@@ -2395,7 +2490,7 @@ impl KeyValueTableMaterializer {
             writer_epoch,
         )?;
         self.descriptor_metadata.lock().unwrap().changelog_stream = Some(changelog_name);
-        self.changelog_schema = Some(changelog_schema);
+        self.changelog_schema = changelog_schema;
         self.changelog_table = Some(changelog_table);
         Ok(self)
     }
@@ -2487,11 +2582,9 @@ impl KeyValueTableMaterializer {
         changelog_table.active_record_batch()
     }
 
-    fn build_snapshot_batch(&self) -> Result<RecordBatch> {
-        if self.latest_state.is_empty() {
-            return Ok(RecordBatch::new_empty(Arc::clone(&self.input_schema)));
-        }
-        self.latest_state.materialize_snapshot()
+    /// Returns an independent capability for atomic, explicit snapshot requests.
+    pub fn snapshot_handle(&self) -> KeyValueSnapshotHandle {
+        self.snapshot.clone()
     }
 
     fn build_changelog_batch(
@@ -2499,12 +2592,9 @@ impl KeyValueTableMaterializer {
         update: &RecordBatch,
         snapshot_version: u64,
         first_seq: u64,
+        stream_id: &str,
     ) -> Result<RecordBatch> {
-        let Some(changelog_schema) = self.changelog_schema.as_ref() else {
-            return Err(ZippyError::InvalidState {
-                status: "key-value changelog schema is not configured",
-            });
-        };
+        let changelog_schema = &self.changelog_schema;
         let rows = update.num_rows();
         let mut seq_values = Vec::with_capacity(rows);
         let mut version_values = Vec::with_capacity(rows);
@@ -2520,10 +2610,15 @@ impl KeyValueTableMaterializer {
                 }
             })?);
         }
-        let mut columns = Vec::with_capacity(update.num_columns() + 3);
+        let mut columns = Vec::with_capacity(update.num_columns() + 5);
         columns.push(Arc::new(Int64Array::from(seq_values)) as ArrayRef);
         columns.push(Arc::new(StringArray::from(vec!["upsert"; rows])) as ArrayRef);
         columns.push(Arc::new(Int64Array::from(version_values)) as ArrayRef);
+        columns.push(Arc::new(Int64Array::from(vec![
+            (first_seq + rows as u64 - 1) as i64;
+            rows
+        ])) as ArrayRef);
+        columns.push(Arc::new(StringArray::from(vec![stream_id; rows])) as ArrayRef);
         columns.extend(update.columns().iter().cloned());
         RecordBatch::try_new(Arc::clone(changelog_schema), columns).map_err(|error| {
             ZippyError::Io {
@@ -2535,17 +2630,21 @@ impl KeyValueTableMaterializer {
         })
     }
 
-    fn update_descriptor_metadata(&mut self) {
+    fn update_descriptor_metadata(&mut self, state: &SnapshotState) {
         let mut metadata = self.descriptor_metadata.lock().unwrap();
-        metadata.snapshot_version = self.snapshot_version;
-        metadata.last_changelog_seq = self.last_changelog_seq;
+        metadata.snapshot_version = state.version;
+        metadata.last_changelog_seq = state.sequence;
     }
 
-    fn in_place_snapshot_rows(&self, update: &LatestUpdateSet) -> Option<Vec<usize>> {
-        if self.snapshot_version == 0 || update.has_new_slots() {
+    fn in_place_snapshot_rows(
+        &self,
+        update: &LatestUpdateSet,
+        state: &SnapshotState,
+    ) -> Option<Vec<usize>> {
+        if state.version == 0 || update.has_new_slots() {
             return None;
         }
-        if self.table.active_committed_row_count() != self.latest_state.len() {
+        if self.table.active_committed_row_count() != state.latest.len() {
             return None;
         }
         if self.input_schema.fields().iter().any(|field| {
@@ -2554,7 +2653,7 @@ impl KeyValueTableMaterializer {
             return None;
         }
 
-        let rows = self.latest_state.snapshot_rows_for_slots(update.slots());
+        let rows = state.latest.snapshot_rows_for_slots(update.slots());
         if rows.len() != update.slots().len() {
             return None;
         }
@@ -2571,17 +2670,19 @@ impl KeyValueTableMaterializer {
         &mut self,
         update: &LatestUpdateSet,
         update_batch: &RecordBatch,
-    ) -> Result<SegmentTableView> {
-        let snapshot = self.build_snapshot_batch()?;
-        let view = SegmentTableView::from_record_batch(snapshot);
-        if let Some(rows) = self.in_place_snapshot_rows(update) {
+        state: &SnapshotState,
+    ) -> Result<()> {
+        if let Some(rows) = self.in_place_snapshot_rows(update, state) {
             let skip_columns = self.by.iter().cloned().collect::<BTreeSet<_>>();
             self.table
                 .update_rows_in_place(update_batch, &rows, &skip_columns)?;
-        } else if !self.table.try_rewrite_active_with_table(&view)? {
-            self.table.replace_with_table(&view)?;
+        } else {
+            let view = SegmentTableView::from_record_batch(state.latest.materialize_snapshot()?);
+            if !self.table.try_rewrite_active_with_table(&view)? {
+                self.table.replace_with_table(&view)?;
+            }
         }
-        Ok(view)
+        Ok(())
     }
 }
 
@@ -2595,7 +2696,7 @@ impl Engine for KeyValueTableMaterializer {
     }
 
     fn output_schema(&self) -> SchemaRef {
-        Arc::clone(&self.input_schema)
+        Arc::clone(&self.changelog_schema)
     }
 
     fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
@@ -2611,28 +2712,49 @@ impl Engine for KeyValueTableMaterializer {
             return Ok(vec![]);
         }
 
-        let update = self.latest_state.apply_batch(&table)?;
+        let handle = self.snapshot.clone();
+        let mut state = handle.0.lock().unwrap();
+        if !state.healthy {
+            return Err(ZippyError::InvalidState {
+                status: "key-value producer requires restart after failed publication",
+            });
+        }
+        if state.version >= i64::MAX as u64
+            || table.num_rows() as u64 > (i64::MAX as u64).saturating_sub(state.sequence)
+        {
+            return Err(ZippyError::InvalidState {
+                status: "key-value protocol cursor exhausted",
+            });
+        }
+        let update = state.latest.apply_batch(&table)?;
         if update.is_empty() {
             return Ok(vec![]);
         }
-        let update_batch = self.latest_state.materialize_update(&update)?;
-        if self.changelog_table.is_some() {
-            let next_snapshot_version = self.snapshot_version.saturating_add(1);
-            let first_seq = self.last_changelog_seq.saturating_add(1);
-            let changelog_batch =
-                self.build_changelog_batch(&update_batch, next_snapshot_version, first_seq)?;
-            let changelog_rows = changelog_batch.num_rows() as u64;
-            if let Some(changelog_table) = self.changelog_table.as_mut() {
-                changelog_table.on_data(SegmentTableView::from_record_batch(changelog_batch))?;
-            }
-            self.last_changelog_seq = self.last_changelog_seq.saturating_add(changelog_rows);
-            self.snapshot_version = next_snapshot_version;
-        } else {
-            self.snapshot_version = self.snapshot_version.saturating_add(1);
+        state.healthy = false;
+        let update_batch = state.latest.materialize_update(&update)?;
+        let next_snapshot_version = state.version + 1;
+        let first_seq = state.sequence + 1;
+        let changelog_batch = self.build_changelog_batch(
+            &update_batch,
+            next_snapshot_version,
+            first_seq,
+            &state.stream_id,
+        )?;
+        let last_seq = first_seq
+            .checked_add(changelog_batch.num_rows() as u64 - 1)
+            .ok_or(ZippyError::InvalidState {
+                status: "key-value changelog sequence exhausted",
+            })?;
+        if let Some(changelog_table) = self.changelog_table.as_mut() {
+            changelog_table
+                .on_data(SegmentTableView::from_record_batch(changelog_batch.clone()))?;
         }
-        self.update_descriptor_metadata();
-        let view = self.update_snapshot_storage(&update, &update_batch)?;
-        Ok(vec![view])
+        state.sequence = last_seq;
+        state.version = next_snapshot_version;
+        self.update_descriptor_metadata(&state);
+        self.update_snapshot_storage(&update, &update_batch, &state)?;
+        state.healthy = true;
+        Ok(vec![SegmentTableView::from_record_batch(changelog_batch)])
     }
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
@@ -2640,12 +2762,7 @@ impl Engine for KeyValueTableMaterializer {
             changelog_table.on_flush()?;
         }
         self.table.on_flush()?;
-        if self.latest_state.is_empty() {
-            return Ok(vec![]);
-        }
-        Ok(vec![SegmentTableView::from_record_batch(
-            self.build_snapshot_batch()?,
-        )])
+        Ok(vec![])
     }
 
     fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
@@ -2653,12 +2770,7 @@ impl Engine for KeyValueTableMaterializer {
             changelog_table.on_stop()?;
         }
         self.table.on_stop()?;
-        if self.latest_state.is_empty() {
-            return Ok(vec![]);
-        }
-        Ok(vec![SegmentTableView::from_record_batch(
-            self.build_snapshot_batch()?,
-        )])
+        Ok(vec![])
     }
 }
 
@@ -2679,6 +2791,8 @@ fn key_value_changelog_schema(input_schema: SchemaRef) -> SchemaRef {
             DataType::Int64,
             false,
         )),
+        Arc::new(Field::new(BATCH_END, DataType::Int64, false)),
+        Arc::new(Field::new(STREAM_ID, DataType::Utf8, false)),
     ];
     fields.extend(input_schema.fields().iter().cloned());
     Arc::new(Schema::new(fields))
@@ -3490,6 +3604,102 @@ fn segment_error(error: ZippySegmentStoreError) -> ZippyError {
 #[cfg(test)]
 mod sharded_materializer_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual release benchmark for retained append descriptor publication"]
+    fn append_descriptor_performance() {
+        for sealed in [64, 512] {
+            let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(0..sealed * 2 + 1)) as ArrayRef],
+            )
+            .unwrap();
+            let mut materializer =
+                StreamTableMaterializer::new_with_row_capacity("bench_append", schema, 2).unwrap();
+            materializer
+                .on_data(SegmentTableView::from_record_batch(batch))
+                .unwrap();
+            materializer.append_live_segments().unwrap();
+            let iterations = 500;
+            let start = Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(materializer.append_live_segments().unwrap());
+            }
+            eprintln!(
+                "sealed=[{sealed}] publication_us=[{:.2}]",
+                start.elapsed().as_micros() as f64 / iterations as f64
+            );
+        }
+    }
+
+    #[test]
+    fn retention_releases_completed_identities_with_their_segments() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..17)) as ArrayRef],
+        )
+        .unwrap();
+        let mut materializer =
+            StreamTableMaterializer::new_with_row_capacity("retention", schema, 2).unwrap();
+        materializer
+            .on_data(SegmentTableView::from_record_batch(batch))
+            .unwrap();
+        let identities = materializer
+            .sealed_segment_descriptors
+            .iter()
+            .map(|descriptor| descriptor_segment_identity(&descriptor.envelope).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(identities.len(), 8);
+        assert_eq!(materializer.append_live_segment_count().unwrap(), 9);
+        for _ in 0..2 {
+            let segments = materializer.append_live_segments().unwrap();
+            assert_eq!(
+                segments
+                    .iter()
+                    .map(StreamTableLiveSegment::row_count)
+                    .sum::<usize>(),
+                17
+            );
+            assert!(segments[..8].iter().all(StreamTableLiveSegment::is_sealed));
+        }
+
+        // Simulate the completion queue after a backlog drains. No persistence
+        // worker is needed to exercise the retention bookkeeping itself.
+        materializer.persisted_segment_identities = identities;
+        assert!(materializer.trim_published_retained_segments(1).unwrap());
+        let retained = descriptor_segment_identity(
+            &materializer
+                .sealed_segment_descriptors
+                .front()
+                .unwrap()
+                .envelope,
+        )
+        .unwrap();
+        assert_eq!(
+            materializer.persisted_segment_identities,
+            BTreeSet::from([retained])
+        );
+        assert!(!materializer.trim_published_retained_segments(1).unwrap());
+        assert_eq!(materializer.append_live_segment_count().unwrap(), 2);
+        assert_eq!(materializer.sealed_segment_descriptors.len(), 1);
+        let segments = materializer.append_live_segments().unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .map(StreamTableLiveSegment::row_count)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        materializer.seal_active_for_writer_handoff().unwrap();
+        assert_eq!(materializer.append_live_segment_count().unwrap(), 2);
+        assert!(materializer
+            .append_live_segments()
+            .unwrap()
+            .iter()
+            .all(StreamTableLiveSegment::is_sealed));
+    }
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![

@@ -916,67 +916,80 @@ mod tests {
     }
 
     #[test]
-    fn shard_router_date32_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "trade_date",
-            DataType::Date32,
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["trade_date".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Date32Array::from(vec![20_000, 20_001])) as ArrayRef],
-        )
-        .unwrap();
-
-        assert_eq!(router.route_batch(&batch).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn shard_router_large_utf8_batch_and_direct_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "instrument_id",
-            DataType::LargeUtf8,
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["instrument_id".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(LargeStringArray::from(vec!["IF2606", "IH2606"])) as ArrayRef],
-        )
-        .unwrap();
-        let routes = router.route_batch(&batch).unwrap();
-        let direct = router
-            .route_record_values(&[ShardValue::LargeUtf8("IF2606".to_string())])
-            .unwrap();
-
-        assert_eq!(routes.len(), 2);
-        assert_eq!(routes[0], direct);
-    }
-
-    #[test]
-    fn shard_router_int64_batch_and_direct_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "strategy_id",
-            DataType::Int64,
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["strategy_id".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![-1_i64, 42_i64])) as ArrayRef],
-        )
-        .unwrap();
-        let routes = router.route_batch(&batch).unwrap();
-        let direct = router
-            .route_record_values(&[ShardValue::Int64(-1)])
-            .unwrap();
-
-        assert_eq!(routes.len(), 2);
-        assert_eq!(routes[0], direct);
+    fn shard_router_typed_batch_matches_direct_routing() {
+        let cases: Vec<(ArrayRef, [ShardValue; 2])> = vec![
+            (
+                Arc::new(Date32Array::from(vec![20_000, 20_001])),
+                [ShardValue::Date32(20_000), ShardValue::Date32(20_001)],
+            ),
+            (
+                Arc::new(LargeStringArray::from(vec!["IF2606", "IH2606"])),
+                [
+                    ShardValue::LargeUtf8("IF2606".into()),
+                    ShardValue::LargeUtf8("IH2606".into()),
+                ],
+            ),
+            (
+                Arc::new(Int64Array::from(vec![-1, 42])),
+                [ShardValue::Int64(-1), ShardValue::Int64(42)],
+            ),
+            (
+                Arc::new(UInt64Array::from(vec![1, u64::MAX])),
+                [ShardValue::UInt64(1), ShardValue::UInt64(u64::MAX)],
+            ),
+            (
+                Arc::new(Float64Array::from(vec![1.25, -0.0])),
+                [ShardValue::Float64(1.25), ShardValue::Float64(-0.0)],
+            ),
+        ];
+        let timestamps: Vec<(ArrayRef, TimeUnit)> = vec![
+            (
+                Arc::new(TimestampSecondArray::from(vec![0, 1]).with_timezone("UTC")),
+                TimeUnit::Second,
+            ),
+            (
+                Arc::new(TimestampMillisecondArray::from(vec![0, 1]).with_timezone("UTC")),
+                TimeUnit::Millisecond,
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![0, 1]).with_timezone("UTC")),
+                TimeUnit::Microsecond,
+            ),
+            (
+                Arc::new(TimestampNanosecondArray::from(vec![0, 1]).with_timezone("UTC")),
+                TimeUnit::Nanosecond,
+            ),
+        ];
+        let timestamp_cases = timestamps.into_iter().map(|(array, unit)| {
+            (
+                array,
+                [
+                    ShardValue::Timestamp { value: 0, unit },
+                    ShardValue::Timestamp { value: 1, unit },
+                ],
+            )
+        });
+        for (array, values) in cases.into_iter().chain(timestamp_cases) {
+            let dtype = array.data_type().clone();
+            let schema = Arc::new(Schema::new(vec![Field::new("key", dtype.clone(), false)]));
+            let config = ShardConfig::new(vec!["key".to_owned()], 4, 1).unwrap();
+            let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
+            let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+            let routes = router.route_batch(&batch).unwrap();
+            let expected = values
+                .iter()
+                .map(|value| {
+                    router
+                        .route_record_values(std::slice::from_ref(value))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                routes, expected,
+                "batch/direct routing mismatch type=[{dtype}]"
+            );
+            assert!(routes.iter().all(|route| *route < 4));
+        }
     }
 
     #[test]
@@ -1000,42 +1013,6 @@ mod tests {
 
         assert_eq!(routes[0], 7);
         assert_eq!(direct, 7);
-    }
-
-    #[test]
-    fn shard_router_uint64_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "account_id",
-            DataType::UInt64,
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["account_id".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(UInt64Array::from(vec![1_u64, u64::MAX])) as ArrayRef],
-        )
-        .unwrap();
-
-        assert_eq!(router.route_batch(&batch).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn shard_router_float64_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "price",
-            DataType::Float64,
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["price".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Float64Array::from(vec![1.25_f64, -0.0_f64])) as ArrayRef],
-        )
-        .unwrap();
-
-        assert_eq!(router.route_batch(&batch).unwrap().len(), 2);
     }
 
     #[test]
@@ -1096,95 +1073,5 @@ mod tests {
         assert!(error
             .to_string()
             .contains("shard key value column [price] is nan"));
-    }
-
-    #[test]
-    fn shard_router_timestamp_ns_tz_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "dt",
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["dt".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(
-                TimestampNanosecondArray::from(vec![
-                    1_710_000_000_000_000_000_i64,
-                    1_710_000_000_100_000_000_i64,
-                ])
-                .with_timezone("UTC"),
-            ) as ArrayRef],
-        )
-        .unwrap();
-
-        assert_eq!(router.route_batch(&batch).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn shard_router_timestamp_second_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "dt",
-            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["dt".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(
-                TimestampSecondArray::from(vec![1_710_000_000_i64, 1_710_000_001_i64])
-                    .with_timezone("UTC"),
-            ) as ArrayRef],
-        )
-        .unwrap();
-
-        assert_eq!(router.route_batch(&batch).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn shard_router_timestamp_millisecond_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "dt",
-            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["dt".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(
-                TimestampMillisecondArray::from(vec![1_710_000_000_000_i64, 1_710_000_001_000_i64])
-                    .with_timezone("UTC"),
-            ) as ArrayRef],
-        )
-        .unwrap();
-
-        assert_eq!(router.route_batch(&batch).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn shard_router_timestamp_microsecond_routing_smoke_test() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "dt",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]));
-        let config = ShardConfig::new(vec!["dt".to_string()], 4, 1).unwrap();
-        let router = ShardRouter::try_new(Arc::clone(&schema), config).unwrap();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(
-                TimestampMicrosecondArray::from(vec![
-                    1_710_000_000_000_000_i64,
-                    1_710_000_001_000_000_i64,
-                ])
-                .with_timezone("UTC"),
-            ) as ArrayRef],
-        )
-        .unwrap();
-
-        assert_eq!(router.route_batch(&batch).unwrap().len(), 2);
     }
 }

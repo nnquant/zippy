@@ -4,6 +4,9 @@
 Windows 客户端和远程应用，只包含连接、查询、订阅、写入及本地只读 SHM reader，不携带
 Master、Gateway、Server、WebUI、Compaction 或计算引擎。
 
+KeyValue 订阅已切换为保留控制字段的 v2 增量，不再返回每批完整状态。生产者、消费者须
+同步升级；初始化和下游修改见 [KeyValue v2 迁移指南](key-value-v2-migration.md)。
+
 ## 安装和导入
 
 ```bash

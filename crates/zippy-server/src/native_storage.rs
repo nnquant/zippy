@@ -648,6 +648,20 @@ impl NativeStorageRuntime {
         &mut self,
         wal_root: impl Into<PathBuf>,
     ) -> Result<NativeIngestHandle> {
+        self.start_native_ingest_with_config(
+            wal_root,
+            NativeIngestConfig::new(),
+            NativeAppendMaterializerConfig::new(),
+        )
+    }
+
+    /// Starts native ingestion with explicit receipt, WAL, and materialization budgets.
+    pub fn start_native_ingest_with_config(
+        &mut self,
+        wal_root: impl Into<PathBuf>,
+        ingest_config: NativeIngestConfig,
+        materializer_config: NativeAppendMaterializerConfig,
+    ) -> Result<NativeIngestHandle> {
         if let Some(runtime) = &self.native_ingest {
             return Ok(runtime.handle());
         }
@@ -661,7 +675,7 @@ impl NativeStorageRuntime {
         let wal_root = wal_root.into();
         let bootstraps = self.native_ingest_bootstraps.to_vec();
         let sink = Arc::new(NativeAppendMaterializerSink::start(
-            NativeAppendMaterializerConfig::new(),
+            materializer_config,
             &bootstraps,
             &self.table_actors,
         )?);
@@ -669,13 +683,7 @@ impl NativeStorageRuntime {
         let runtime = thread::Builder::new()
             .name(NATIVE_INGEST_START_THREAD_NAME.to_owned())
             .spawn(move || {
-                NativeIngestRuntime::start(
-                    NativeIngestConfig::new(),
-                    wal_root,
-                    catalog,
-                    bootstraps,
-                    sink,
-                )
+                NativeIngestRuntime::start(ingest_config, wal_root, catalog, bootstraps, sink)
             })
             .map_err(|error| {
                 ServerError::new(
