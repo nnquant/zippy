@@ -1,5 +1,8 @@
 # Zippy 单机数据库服务器完整重构方案
 
+> 历史设计：旧 Python Session/Pipeline、全局连接及表发布 API 已于 2026-09-22 删除。
+> 当前 API 见[原生示例指南](../examples/examples_guide.md)，当前实现边界见[能力表](current-capabilities-2026-09-21.md)。
+
 日期：2026-07-13
 
 状态：实施中（Phase 0-6 已完成，Phase 7 Stage 7.3 durable Flight ingest 已完成）

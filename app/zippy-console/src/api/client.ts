@@ -1,33 +1,20 @@
 export type StatusValue = string | number | boolean | null | undefined;
 
-export interface AlertInfo {
-  severity?: string;
-  kind?: string;
-  message?: string;
-  summary?: string;
-  reason?: string;
-  table_name?: string;
+export interface TableSummary {
+  name: string;
+  namespace: string;
+  catalog: string;
+  table_type: string;
+  schema?: { fields: SchemaField[] };
+  snapshots?: Array<Record<string, StatusValue>>;
 }
 
-export interface TableSummary {
-  stream_name: string;
-  status?: string;
-  health_status?: string;
-  schema_hash?: string;
-  writer_process_id?: string;
-  writer_epoch?: StatusValue;
-  descriptor_generation?: StatusValue;
-  row_count?: StatusValue;
-  active_rows?: StatusValue;
-  reader_count?: StatusValue;
-  sealed_count?: StatusValue;
-  persisted_count?: StatusValue;
-  persist_event_count?: StatusValue;
-  alerts?: AlertInfo[];
-  fields?: SchemaField[];
-  schema?: {
-    fields?: SchemaField[];
-  };
+export function tableKey(table: TableSummary): string {
+  return JSON.stringify([table.namespace, table.name]);
+}
+
+export function tableLabel(table: TableSummary): string {
+  return `${table.namespace} / ${table.name}`;
 }
 
 export interface SchemaField {
@@ -69,43 +56,26 @@ export interface DashboardPayload {
     host: string;
     port: number;
   };
-  master: {
-    status?: string;
-    error?: string | null;
-  };
-  overall_status?: string;
-  gateway?: {
-    status?: string;
-    healthy?: boolean;
-  };
-  gateway_status?: string;
-  totals: {
-    tables: number;
-    tasks: number;
-    alerts: number;
-    readers: number;
-    sealed_segments: number;
-    persisted_files: number;
-  };
+  catalog: { status: string; error: string | null };
+  pm: { status: string; error: string | null };
+  totals: { tables: number; namespaces: number; tasks: number };
   tasks: TaskInfo[];
   tables: TableSummary[];
-  stale_error_tables: TableSummary[];
   log_tail: Array<LogEntry | string>;
 }
 
 export interface TableDetailPayload {
   ok: boolean;
   table?: TableSummary;
-  health?: {
-    status?: string;
-    alerts?: AlertInfo[];
-  };
   error?: string;
 }
 
 export interface TableDataPayload {
   ok: boolean;
   table_name: string;
+  namespace: string;
+  schema?: { fields: SchemaField[] };
+  snapshots?: Array<Record<string, StatusValue>>;
   mode: "head" | "tail";
   limit: number;
   columns: string[];
@@ -119,24 +89,31 @@ export async function fetchDashboard(): Promise<DashboardPayload> {
   return fetchJson("/api/dashboard");
 }
 
-export async function fetchTableDetail(tableName: string): Promise<TableDetailPayload> {
-  return fetchJson(`/api/table/${encodeURIComponent(tableName)}`);
+export async function fetchTableDetail(
+  table: TableSummary,
+  signal?: AbortSignal,
+): Promise<TableDetailPayload> {
+  const params = new URLSearchParams({ namespace: table.namespace });
+  return fetchJson(`/api/table/${encodeURIComponent(table.name)}?${params}`, signal);
 }
 
 export async function fetchTableData(
-  tableName: string,
+  table: TableSummary,
   mode: "head" | "tail",
   limit: number,
+  orderBy: string[],
+  descending: boolean,
+  signal?: AbortSignal,
 ): Promise<TableDataPayload> {
   const params = new URLSearchParams({
-    mode,
-    limit: String(limit),
+    namespace: table.namespace, mode, limit: String(limit), descending: String(descending),
   });
-  return fetchJson(`/api/table/${encodeURIComponent(tableName)}/data?${params.toString()}`);
+  orderBy.forEach((column) => params.append("order_by", column));
+  return fetchJson(`/api/table/${encodeURIComponent(table.name)}/data?${params}`, signal);
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { cache: "no-store" });
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(url, { cache: "no-store", signal });
   if (!response.ok) {
     throw new Error(`request failed status=[${response.status}] url=[${url}]`);
   }

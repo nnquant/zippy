@@ -1,0 +1,243 @@
+{
+  "batch": 48,
+  "date": "2026-09-22",
+  "overall_complete": false,
+  "audit_closed_total": 32,
+  "closed_this_batch": [],
+  "audit_remaining": [
+    "F08",
+    "F28"
+  ],
+  "net_removed_rust_lines": 2206,
+  "server_ready_schema_version": 11,
+  "catalog_layout_version": 11,
+  "rust_affected_crates": {
+    "crates": [
+      "zippy-engines",
+      "zippy-ingest",
+      "zippy-storage",
+      "zippy-server"
+    ],
+    "passed": 480,
+    "ignored": 6
+  },
+  "clippy": "workspace all-targets all-features -D warnings",
+  "pytest_passed": 544,
+  "mypy_source_files": 91,
+  "client_mypy_files": 27,
+  "native_recovery": {
+    "catalog_v11_native_files_watermarks_and_request_versions": true,
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+    "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+    "sdk_only_flight_examples_write_query_callbacks_and_restart": true,
+    "flight_short_session_snapshot_cleanup_capacity_reuse": true,
+    "public_examples_three_kinds_compute_and_restart_without_legacy_api": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "flight_only_buffered_writer_lazy_plan_and_restart": true,
+    "independent_client_native_child_without_main_import": true,
+    "server_launch": "repository_binary",
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "default_native_storage_query_and_flight_without_feature_switches": true,
+    "native_restart_never_creates_legacy_registry": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_changes_since_batch_47": [
+    {
+      "path": "Cargo.lock",
+      "before_sha256": "91351bf9b806dbf8ba413ae13b6e4faa27a4a8a9a1ff49d70a25128571106b16",
+      "after_sha256": "bf64b8df22a3adf7819c7ce371de2669011902c5707e66e4ed8f70ba542898a4",
+      "before_lines": 4363,
+      "after_lines": 4362
+    },
+    {
+      "path": "ROADMAP.md",
+      "before_sha256": "8abbfee3c29a6422674d61bd5398aec44f953045667b831f95ad903471d6e047",
+      "after_sha256": "c861c0cb24d1161a13c7fc67925862a5a421f74463cc2ce1c22b6e0a7bffba9d",
+      "before_lines": 18,
+      "after_lines": 18
+    },
+    {
+      "path": "crates/zippy-engines/Cargo.toml",
+      "before_sha256": "999d8eeec91ad6ecfe3b4e074c259b5ee6e1cb0984dd9a2ccd844da7fa3726bc",
+      "after_sha256": "ff6e0c51c1b071e59f35799be2239ebf1d9688eb1a8f7b90134118cf38ec3798",
+      "before_lines": 39,
+      "after_lines": 38
+    },
+    {
+      "path": "crates/zippy-engines/src/lib.rs",
+      "before_sha256": "a964e0bd274da5d45b45f6b864e294ec513e30b05dbefd148a0a2fb75d4b2643",
+      "after_sha256": "12e666fc34ffa41490fc45cdd195c3a3b5250a39f5bb185a75b711f19878a1bb",
+      "before_lines": 36,
+      "after_lines": 35
+    },
+    {
+      "path": "crates/zippy-engines/src/stream_table.rs",
+      "before_sha256": "ab9546b1bf1a7827e657323107dcb58b2116703ea6af3b7076cdb7f426548086",
+      "after_sha256": "4a32a07d7d49c0009de900c4987fe51dc6d861ce341776d80f9757c0604e49d7",
+      "before_lines": 3785,
+      "after_lines": 2451
+    },
+    {
+      "path": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "before_sha256": "68086b05f1cd585c3375e221e06853a05c44a9e08552f392ded925453508a9d8",
+      "after_sha256": "2ce644aa2b1973021f665b48f46c0a98e9cb7f169f9208ce81cb4f2d159623c4",
+      "before_lines": 2227,
+      "after_lines": 1356
+    },
+    {
+      "path": "docs/architecture-convergence-audit-2026-09-18.md",
+      "before_sha256": "6aaeb2ebbc7fcf878293b1fe916503523352d2424cfbdc3a4dc4fd9b8f31e56d",
+      "after_sha256": "835519d3d0fe70d44d6280a235e474a11d097b1626d93f7d8d5c9496f8cf326e",
+      "before_lines": 223,
+      "after_lines": 223
+    },
+    {
+      "path": "docs/current-capabilities-2026-09-21.md",
+      "before_sha256": "0e84906a8cb5e8ebcf3e8a42ad9458cf78d3f31c13c21e4685b3aedbf93d55f1",
+      "after_sha256": "3f455bc3b1a756dff30c0126e8a07584d15c0783cbc64375bd0503cda58f663a",
+      "before_lines": 60,
+      "after_lines": 60
+    },
+    {
+      "path": "docs/single-node-server-runtime.md",
+      "before_sha256": "18fb959903b497ae690710ba7908e89ae0707d61b6d0200e27e05311b12dd01d",
+      "after_sha256": "9a2f7d39dd3c007fe7117d52c21a43d01f28e8254200c6e224ac16a72b94ebcc",
+      "before_lines": 78,
+      "after_lines": 80
+    }
+  ],
+  "test_retirement_sha256": "119eb6dd99d17b86e9c19979be77e1a0b4b8102d8fff5f565881fea34665a46b",
+  "report_sha256": "28368d38bdf468a16d60b37672434fb8cb2a21e3839b9c0880d1dd087a8f8fc5",
+  "logs": {
+    "tests": {
+      "path": "/tmp/zippy-materializer-persistence-tests.log",
+      "sha256": "d1e392db3334bfe55fd3d7cf534e93ef9122ed23715c576194953fa543616f4a",
+      "bytes": 47027
+    },
+    "clippy": {
+      "path": "/tmp/zippy-materializer-persistence-clippy.log",
+      "sha256": "df363892f4418fbe9b66fa488b5bb4c30df11fdd296fc804120e9c36ef547981",
+      "bytes": 2495
+    },
+    "build": {
+      "path": "/tmp/zippy-materializer-persistence-build.log",
+      "sha256": "d7a1a13596fdca13c086f18e97fe50ab1506bf4c596eafe6b40d6279e3d1d483",
+      "bytes": 2894
+    },
+    "pytest": {
+      "path": "/tmp/zippy-materializer-persistence-pytest.log",
+      "sha256": "7a9c1f7bbd97cf83a132223aec60308e94b3cd6d0b388522c801e4b619d00923",
+      "bytes": 660
+    },
+    "native-matrix": {
+      "path": "/tmp/zippy-materializer-persistence-native-matrix.log",
+      "sha256": "75608ee1c0fb1a742a2d05d65e65068a1a47dbfc1634132a959a717dba197af2",
+      "bytes": 30427
+    },
+    "mypy": {
+      "path": "/tmp/zippy-materializer-persistence-mypy.log",
+      "sha256": "6e48d2986ce0d91c8cd60bff9ed577f4baf14c949620883ab530992e6c52e53a",
+      "bytes": 934
+    },
+    "mypy-client": {
+      "path": "/tmp/zippy-materializer-persistence-mypy-client.log",
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f",
+      "bytes": 44
+    },
+    "ruff": {
+      "path": "/tmp/zippy-materializer-persistence-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "bytes": 19
+    },
+    "black": {
+      "path": "/tmp/zippy-materializer-persistence-black.log",
+      "sha256": "161579e1a9a654d62a83f487d90f72be3d8e9379f20fa777ad6cc1d93115ac60",
+      "bytes": 57
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-materializer-persistence-rustfmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "diff": {
+      "path": "/tmp/zippy-materializer-persistence-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "extension-links": {
+      "path": "/tmp/zippy-materializer-persistence-extension-links.log",
+      "sha256": "7975948ad03b51bd3bf208ba60fc61f0724787050a0c93aef3cca029ab45094d",
+      "bytes": 445
+    }
+  },
+  "current_binary_evidence": {
+    "target/debug/zippy-server": "e7e50057397f58717851b8cc84c4271e689fb032a9bcdf8cf1925a67dcb35cfd",
+    "python/zippy/_internal.cpython-311-x86_64-linux-gnu.so": "e4da86304c85d6b7011a9de9aabee35b08d8fab20a328b7421c73f82667a71a4"
+  },
+  "limitations": [
+    "Master transient registry still has old table/producer control RPCs and internal source/publisher and key-value/sharded materializer implementations.",
+    "Full Rust workspace execution belongs to batch 45; batch 48 runs four affected crates and checks all targets/features.",
+    "Native matrix uses repository binary on Linux CPython 3.11 Arrow 23.0.1.",
+    "No new distribution build or Windows/macOS execution.",
+    "No commit, push, deployment or user data migration."
+  ]
+}

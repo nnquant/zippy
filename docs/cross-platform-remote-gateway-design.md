@@ -1,5 +1,8 @@
 # Zippy Cross-platform Remote Gateway 设计
 
+> 历史设计/验收说明：以下描述对应文中日期，不作为新版本安装和 API 指南。
+> 当前入口见[客户端使用指南](../clients/python/README.md)与[能力表](current-capabilities-2026-09-21.md)。
+
 > 日期：2026-05-05
 >
 > 目标：让 Windows 侧行情源和策略/交易程序可以写入、订阅和查询 WSL/Linux 中的 Zippy
@@ -131,8 +134,7 @@ worker 数和 persisted file scan 共享 worker pool 大小。它目前是各组
 不是覆盖所有独立线程池的进程级硬 semaphore。`[query].parallelism` 是可选的单次查询预算；
 省略时继承全局上限，配置时不得超过全局上限。对应环境变量是 `ZIPPY_MAX_CPU_CORES` 和
 `ZIPPY_QUERY_PARALLELISM`，有效范围为 `1..=256`。旧的 `[runtime].max_parallelism` 和
-`ZIPPY_MAX_PARALLELISM` 保留一个兼容周期；同一层级同时配置新旧字段时值必须相等，环境变量
-层整体覆盖 TOML 层。
+`ZIPPY_MAX_PARALLELISM` 一律拒绝；新名称的环境变量层覆盖 TOML 层。
 多个并发 collect 请求各自拥有这个预算，进程总负载还受 Gateway
 `max_blocking_requests` 限制。
 
@@ -528,7 +530,7 @@ Windows 原生 master + Windows 原生 segment backend
   该 subscriber、释放 lease，并累计 `subscribe_write_timeouts_total`、
   `subscribe_slow_clients_total`、`subscribe_last_close_reason` 和写耗时 metrics；
 - token：当前 `gateway.token` 可由 master config 下发，GatewayServer 校验请求 token；
-- CLI：`zippy gateway run` 保留为高级调试入口；日常推荐由 master 管理 native
+- CLI：独立 `zippy gateway run` 已删除；统一由 server 管理 native
   GatewayServer；
 - Smoke：已提供 `zippy gateway smoke`，用独立子进程模拟远端客户端写入和查询；
 - Windows client smoke：已提供 `zippy gateway smoke-client --uri zippy://host:port/default`，

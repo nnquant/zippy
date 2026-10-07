@@ -16,8 +16,7 @@ from .pm_bridge import (
     PmTaskInfo,
     add_task,
     custom_task,
-    gateway_task,
-    master_task,
+    server_task,
 )
 
 
@@ -78,12 +77,12 @@ def add_group() -> None:
     """
 
 
-@add_group.command("master")
+@add_group.command("server")
 @click.option(
     "--master-uri",
     default=DEFAULT_MASTER_URI,
     show_default=True,
-    help="TCP master URI passed to zippy master run.",
+    help="TCP master URI passed to zippy server run --foreground.",
 )
 @click.option(
     "-f",
@@ -94,50 +93,20 @@ def add_group() -> None:
     type=click.Path(dir_okay=False, path_type=str),
     help="Path to zippy process-manager TOML config.",
 )
-def add_master(master_uri: str, config_file: str) -> None:
-    """
-    Add the default zippy master task.
-    """
-    try:
-        add_task(config_file, "master", master_task(master_uri))
-    except (OSError, TypeError, ValueError) as error:
-        cli_error(str(error))
-    click.echo(f"added [master] file=[{config_file}]")
-
-
-@add_group.command("gateway")
 @click.option(
-    "--master-uri",
-    default=DEFAULT_MASTER_URI,
-    show_default=True,
-    help="Master URI used by the gateway.",
-)
-@click.option("--endpoint", default=None, help="Gateway endpoint.")
-@click.option("--token", default=None, help="Gateway access token.")
-@click.option(
-    "-f",
-    "--file",
-    "config_file",
-    default=DEFAULT_PM_CONFIG_FILE,
-    show_default=True,
+    "--server-config",
     type=click.Path(dir_okay=False, path_type=str),
-    help="Path to zippy process-manager TOML config.",
+    help="Server TOML configuration for the owned Gateway and Flight listeners.",
 )
-def add_gateway(
-    master_uri: str,
-    endpoint: str | None,
-    token: str | None,
-    config_file: str,
-) -> None:
+def add_server(master_uri: str, config_file: str, server_config: str | None) -> None:
     """
-    Add the default zippy gateway task.
+    Add the single zippy server task.
     """
     try:
-        task = gateway_task(master_uri, endpoint=endpoint, token=token)
-        add_task(config_file, "gateway", task)
+        add_task(config_file, "server", server_task(master_uri, config=server_config))
     except (OSError, TypeError, ValueError) as error:
         cli_error(str(error))
-    click.echo(f"added [gateway] file=[{config_file}]")
+    click.echo(f"added [server] file=[{config_file}]")
 
 
 @add_group.command("custom")
@@ -272,11 +241,46 @@ def _task_action(action: str, name: str | None) -> None:
 
 
 def _print_task_table(tasks: list[PmTaskInfo]) -> None:
-    try:
-        from rspm.render import format_task_table
-    except ImportError as error:
-        raise RuntimeError(
-            "rspm Python package is required for zippy pm table rendering"
-        ) from error
-
-    click.echo(format_task_table(tasks), nl=False)
+    """Render daemon task data without an external Python SDK dependency."""
+    rows = [
+        [
+            "TASK_ID",
+            "NAME",
+            "MODE",
+            "PID",
+            "STATUS",
+            "HEALTH",
+            "RESTARTS",
+            "UPTIME_S",
+            "STARTED_AT",
+            "STOPPED_AT",
+            "CPU_%",
+            "MEM_MiB",
+            "NEXT",
+        ]
+    ]
+    for task in tasks:
+        rows.append(
+            [
+                str(task.task_id),
+                task.name,
+                task.run_mode or "-",
+                str(task.pid) if task.pid is not None else "-",
+                task.status,
+                task.health or "-",
+                str(task.restart_count),
+                f"{task.uptime_ms / 1000:.1f}" if task.uptime_ms is not None else "-",
+                task.started_at or "-",
+                task.stopped_at or "-",
+                f"{task.cpu_percent:.1f}" if task.cpu_percent is not None else "-",
+                (
+                    f"{task.memory_bytes / (1024 * 1024):.1f}"
+                    if task.memory_bytes is not None
+                    else "-"
+                ),
+                task.schedule_state or "-",
+            ]
+        )
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    for row in rows:
+        click.echo("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())

@@ -1,84 +1,66 @@
-# KeyValue v2：下游迁移
+# KeyValue v2：原生状态订阅
 
-本次直接切换新契约，没有“每批全量”兼容开关。需一起更新生产者、Python 扩展和消费者，
-重新发布表描述符；不能把旧进程的增量流接到新状态对象上。
+更新：2026-09-22。仅支持新契约；`StateSubscription` 的 `snapshot_loader` 和 `master`
+入口已删除。主包正式依赖 `zippy-client`，两包均要求 PyArrow >=23。
 
-## 现在收到什么
+## 完整状态与增量
 
-| 接口 | 新行为 |
-| --- | --- |
-| 原始 append 订阅 | 完整保留事件与顺序，不按股票合并逐笔 |
-| `KeyValueTableMaterializer` 主输出 | 本批更新的键，每个键携带最新整行；同批同键只保留最后值 |
-| `subscribe()` / `subscribe_table()` 订阅 KeyValue 名称 | 路由到增量日志，保留全部协议字段，不再自动发完整快照 |
-| KeyValue / ReactiveLatest 的 flush/stop | 不再附送完整状态；flush 仍刷新内部日志与描述符 |
-| `Session.snapshot_state(name)` | 显式获取本 Session 拥有的状态及一致游标 |
-| `KeyValueState.select(keys)` | 只读取指定键，不构造整个市场快照 |
-| `KeyValueState.snapshot()` | 显式构造完整状态，适合低频展示、导出，不要每个 tick 调用 |
+原生 key-value 表支持 upsert/delete、WAL/Persisted 确认、重启恢复以及一致快照与游标 RPC。
+`Client.snapshot_state()` 返回完整状态及其原子游标；`Client.open_log()` 返回完整 mutation，
+单个 mutation 不代表完整市场。`KeyValueState` 继续复用 Rust 列式状态引擎。
 
-增量前五列固定为：
+增量控制列依次为：
 
-```
-_zippy_kv_seq                 int64   从 1 开始的连续行序号
-_zippy_kv_op                  utf8    当前实现为 upsert
-_zippy_kv_snapshot_version    int64   每个非空更新批次递增一次
-_zippy_kv_batch_last_seq      int64   本原子批次的最后一个序号
-_zippy_kv_stream_id           utf8    本次生产者实例的身份
-```
+| 列 | 类型 | 含义 |
+| --- | --- | --- |
+| `_zippy_kv_seq` | int64 | 从 1 开始的连续行序号 |
+| `_zippy_kv_op` | utf8 | upsert 或 delete |
+| `_zippy_kv_snapshot_version` | int64 | 非空 mutation 的版本 |
+| `_zippy_kv_batch_last_seq` | int64 | 本次完整 mutation 的结束序号 |
+| `_zippy_kv_stream_id` | utf8 | 原生 Catalog 不可变 table ID 的十六进制字符串 |
 
-其后是业务列。`upsert` 是替换该键的整行，不是仅更新非空字段。空批次不推进版本。
-不支持 delete；消费者遇到未知操作必须失败，不能当成 upsert。
-批次可能因传输而拆分或合并：以版本和 `batch_last_seq` 判断完整性，不能以回调次数判断。
-输入业务 schema 不能占用 `_zippy_kv_` 前缀。
+其后为业务列。upsert 替换整行；delete 按键移除状态。空批次不推进版本。
+传输可以拆分或合并批次，消费者按版本和结束序号识别原子边界，不能按回调次数判断。
+输入业务 schema 不得占用 `_zippy_kv_` 前缀。
 
 ## 推荐接法
 
 ```python
-import zippy as zp
+from zippy import StateSubscription
 
-# producer_session 是发布 quotes 的 Session。
-subscription = zp.StateSubscription(
-    "quotes",
-    snapshot_loader=lambda: producer_session.snapshot_state("quotes"),
-    master=master,
-    max_pending_bytes=64 * 1024 * 1024,
-).start()
-
-try:
-    # 组合键按 by 声明顺序给出。缺少键会明确报错，不返回伪造行情。
-    selected = subscription.select([["000001.SZ"], ["600000.SH"]])
-    # 展示/导出时才取全量：
-    full = subscription.snapshot()
-finally:
-    subscription.stop()
+# client 是调用方持有的 zippy_client.Client，已配置原生 Flight 地址及读取凭据。
+with StateSubscription("quotes", client=client, namespace="market", timeout=5.0) as state:
+    selected = state.select([["000001.SZ"], ["600000.SH"]])
+    full = state.snapshot()  # 展示或导出时才构造全量
+    metrics = state.metrics()
 ```
 
-启动顺序由 `StateSubscription` 实现：先挂增量读者并等待 ready → 有界缓存增量 → 调用
-快照加载器 → 安装快照并跳过已覆盖序号 → 连续应用后续完整版本。半个版本不可见。
+启动先附着日志、固定表身份和水位，再按同一 table ID 请求完整快照；安装快照后跳过快照
+已经覆盖的完整 mutation，继续应用后续连续版本。开流和快照 RPC 均有截止，组装缓存受
+`max_pending_bytes` 约束。只在完整版本提交后对外暴露状态。
 
-跨进程/远端场景下，`snapshot_loader` 通过你的控制 RPC 调用生产者的
-`Session.snapshot_state()`，传回 Arrow 数据并保留 schema metadata。加载器自身应有超时。
-这次没有新增跨机器快照 RPC 服务；不能拿普通 `read_table().collect()` 代替它：普通查询
-没有与数据原子绑定的增量游标，描述符中的异步版本号也不能代替这个证明。
+断连或连续性丢失时，旧状态立即失效，`select`/`snapshot`/`sequence` 明确失败。恢复会重新
+认证、按原 table ID 附着新日志、重新获取完整快照；表身份和 schema 必须一致，不按同名表
+重新绑定。`metrics()` 显示 recovering/failed、重建次数和最后错误。
+`wait_for_sequence()` 可等待已应用水位。指数退避可取消，重试次数有上限；权限、协议错误及
+不可重试的管理员取消直接终止。`stop()` 取消读取并等待工作线程，不关闭调用方的 Client。
 
-如果你已有自己的订阅/队列，可以直接使用 `KeyValueState(snapshot)` 和 `state.apply(delta)`。
-本地和远端增量应用在 Rust 内按列进行，不会先把整批变成 Python 行字典。
-轻量 `zippy_client` 已同步 KeyValue 路由与协议列保留，但它仍是传输客户端，不内置这套
-状态引擎；可把它的 Arrow 批次接入 `zippy.KeyValueState`，或按上述协议维护自己的状态。
+这是当前状态恢复：重建期间的中间事件不保证逐条交付。逐笔消费需使用日志游标和持久化事件
+回放，不能用状态快照代替；游标也不等于业务处理成功或服务端 durable consumer ACK。
 
-## 必须改变的使用习惯
+## 本地计算边界
 
-- 不再把每次回调直接覆盖成“整个市场”。增量里没有出现的股票，保留原状态。
-- 不在状态重建前使用 `filter`、`instrument_ids`、`count` 或允许丢数据的订阅选项。
-  过滤应发生在完整状态或已验证的增量应用之后。传输分片可以，但不能丢行。
-- 序号缺口、版本跳变、实例变化、缓存超限，均停止使用当前状态并重新 bootstrap。
-  `StateSubscription` 还会拒绝把发生重连的传输当作连续状态；不会静默补接尾部。
-- 快照覆盖的完整旧版本可以重复投递；尚未完成版本中的乱序/重复片段直接失败。
-- 原始逐笔缺口不能用 KeyValue 快照修补，须从持久化事件重放。
-- 连续性校验不等于行情新鲜度校验。交易端仍须检查源时间戳、心跳和可接受的延迟，不能
-  仅因本地状态可读就认定生产者仍在更新。
+`Session.snapshot_state()` 和本地计算引擎的 v2 输出仍保留；它们尚未迁入原生 Catalog/ingest。
+此类进程内消费者可显式使用 `KeyValueState(snapshot)`/`apply(delta)`，自行保证先附着增量再
+取得一致快照。新 `StateSubscription` 只接受原生 Client；不再为旧生产者 RPC 提供 loader 桥接。
+旧 callback 订阅及 Gateway 的整体删除属于后续主干迁移，不意味着本地计算能力被删除。
 
-KeyValue 仍是进程内状态物化，不提供 KeyValue Parquet 持久化或 delete。生产者重启后，
-应先按业务需求重建完整状态，再对外提供初始化快照。原生 append 的持久化回收与这一点不同。
+## 使用约束
 
-查询用 SHM 最新状态视图仍维护：已有键的定长值更新走原位写；新增键、非键字符串值或
-容量变化可能重建该视图。这不是旧全量订阅模式，但这些边界仍可能有 O(N) 成本，需纳入压测。
+- 状态重建前不得 filter、截断或丢弃增量；过滤应在完整状态或验证后的增量应用之后进行。
+- 普通 SQL 结果不携带原子状态游标，不能替代 `snapshot_state()`。
+- 缺口、未知操作、版本跳变和缓存超限必须明确失败；不能把缺失的股票视为自动删除。
+- 快照覆盖的完整旧版本允许重复交付，未完成版本中的重复或乱序片段失败。
+- 连续性不等于行情新鲜度。使用方仍应检查源时间戳、心跳和可接受的延迟。
+
+实现与恢复证据见[第十二批实施记录](convergence-native-state-2026-09-22.md)。

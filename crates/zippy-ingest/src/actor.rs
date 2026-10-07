@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use arrow::datatypes::SchemaRef;
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
@@ -208,8 +208,6 @@ impl TableActorLiveSegmentsPublication {
 /// Observable state of one table's serialized native persistence pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TablePersistenceStatus {
-    /// This registry was started through the read-only compatibility entrypoint.
-    Disabled,
     /// No persist operation is currently active and the actor can accept one.
     Idle,
     /// One accepted operation is writing files or awaiting its Catalog receipt.
@@ -357,14 +355,130 @@ pub struct TableActorHandle {
     accepting: Arc<AtomicBool>,
     global_budget: Arc<Semaphore>,
     persist_budget: Arc<Semaphore>,
-    persistence_enabled: bool,
+    changes: watch::Receiver<()>,
+    lifecycle: Arc<Mutex<TableActorLifecycle>>,
+    retirement: watch::Sender<bool>,
+    transition_finished: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableActorLifecycle {
+    Active,
+    Quiescing,
+    Retired(zippy_types::table::TableRetirementReason),
+}
+
+struct TableActorSignals {
+    changes: watch::Sender<()>,
+    retirement: watch::Receiver<bool>,
+}
+
+/// Coalesced wakeups for actor-owned data and fencing changes.
+///
+/// Create this receiver before pinning a read snapshot, then wait after exhausting that
+/// snapshot. Wakeups carry no data or cursor authority: always pin another snapshot to
+/// discover committed progress. Slow readers retain one notification, never a batch queue.
+#[derive(Debug, Clone)]
+pub struct TableActorChanges {
+    table_id: TableId,
+    receiver: watch::Receiver<()>,
+    lifecycle: Arc<Mutex<TableActorLifecycle>>,
+    transition_finished: Arc<tokio::sync::Notify>,
+}
+
+impl TableActorChanges {
+    /// Waits for reversible quiescence to resolve, returning whether a wait was needed.
+    ///
+    /// A rolled-back transition resumes the same actor. Committed retirement returns its
+    /// precise reason, preventing temporary admission pressure from ending a live log first.
+    pub async fn wait_for_transition(&self) -> Result<bool> {
+        let mut waited = false;
+        loop {
+            let notified = self.transition_finished.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let lifecycle = *self.lifecycle.lock().unwrap();
+            match lifecycle {
+                TableActorLifecycle::Active => return self.check_active().map(|()| waited),
+                TableActorLifecycle::Retired(reason) => return Err(reason.error(self.table_id)),
+                TableActorLifecycle::Quiescing => {
+                    waited = true;
+                    notified.await;
+                }
+            }
+        }
+    }
+
+    /// Checks whether the actor can still back a continuous subscriber.
+    pub fn check_active(&self) -> Result<()> {
+        if let TableActorLifecycle::Retired(reason) = *self.lifecycle.lock().unwrap() {
+            return Err(reason.error(self.table_id));
+        }
+        self.receiver
+            .has_changed()
+            .map(|_| ())
+            .map_err(|_| actor_closed(self.table_id))
+    }
+
+    /// Waits for retirement or actor termination, ignoring ordinary data notifications.
+    pub async fn wait_for_stop(&mut self) -> ServerError {
+        loop {
+            if let Err(error) = self.check_active() {
+                return error;
+            }
+            if let Err(error) = self.changed().await {
+                return error;
+            }
+        }
+    }
+
+    /// Waits for a publication, persistence completion, or writer epoch transition.
+    ///
+    /// Cancellation leaves unseen notifications available to the next call. Retirement returns
+    /// `NotFound` after deletion or `SchemaMismatch` after schema evolution; other actor exit,
+    /// including panic, returns `Unavailable` even with a live handle.
+    pub async fn changed(&mut self) -> Result<()> {
+        self.receiver
+            .changed()
+            .await
+            .map_err(|_| match *self.lifecycle.lock().unwrap() {
+                TableActorLifecycle::Retired(reason) => reason.error(self.table_id),
+                _ => actor_closed(self.table_id),
+            })
+    }
 }
 
 impl TableActorHandle {
-    /// Reports whether this actor owns a native persistence controller.
-    pub const fn persistence_enabled(&self) -> bool {
-        self.persistence_enabled
+    /// Starts observing future changes without retaining segments or mailbox permits.
+    #[must_use]
+    pub fn changes(&self) -> TableActorChanges {
+        let mut receiver = self.changes.clone();
+        receiver.borrow_and_update();
+        TableActorChanges {
+            table_id: self.table_id,
+            receiver,
+            lifecycle: Arc::clone(&self.lifecycle),
+            transition_finished: Arc::clone(&self.transition_finished),
+        }
     }
+
+    fn admit_command(&self) -> Result<MutexGuard<'_, TableActorLifecycle>> {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(actor_closed(self.table_id));
+        }
+        match *lifecycle {
+            TableActorLifecycle::Active => Ok(lifecycle),
+            TableActorLifecycle::Retired(reason) => Err(reason.error(self.table_id)),
+            TableActorLifecycle::Quiescing => Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "table actor is quiescing for a table transition",
+            )
+            .with_table_id(self.table_id)
+            .with_retryable(true)),
+        }
+    }
+
     /// Returns the immutable table identity served by this actor.
     #[must_use]
     pub const fn table_id(&self) -> TableId {
@@ -373,9 +487,7 @@ impl TableActorHandle {
 
     /// Attempts immediate bounded admission without waiting for queue capacity.
     pub fn try_snapshot(&self) -> Result<TableActorSnapshotRequest> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(actor_closed(self.table_id));
-        }
+        let _admission = self.admit_command()?;
         let permit = Arc::clone(&self.global_budget)
             .try_acquire_owned()
             .map_err(|_| actor_global_budget_exhausted(self.table_id))?;
@@ -415,9 +527,7 @@ impl TableActorHandle {
             .with_table_id(self.table_id)
             .with_retryable(false));
         }
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(actor_closed(self.table_id));
-        }
+        let _admission = self.admit_command()?;
         let permit = Arc::clone(&self.global_budget)
             .try_acquire_owned()
             .map_err(|_| actor_global_budget_exhausted(self.table_id))?;
@@ -450,9 +560,7 @@ impl TableActorHandle {
         &self,
         writer_epoch: u64,
     ) -> Result<TableActorWriterEpochUpdateRequest> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(actor_closed(self.table_id));
-        }
+        let _admission = self.admit_command()?;
         let permit = Arc::clone(&self.global_budget)
             .try_acquire_owned()
             .map_err(|_| actor_global_budget_exhausted(self.table_id))?;
@@ -492,12 +600,9 @@ impl TableActorHandle {
                 request_id,
             ));
         }
-        if !self.persistence_enabled {
-            return Err(persistence_disabled(self.table_id, request_id));
-        }
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(actor_closed(self.table_id).with_request_id(request_id));
-        }
+        let _admission = self
+            .admit_command()
+            .map_err(|error| error.with_request_id(request_id))?;
         let persist_permit = Arc::clone(&self.persist_budget)
             .try_acquire_owned()
             .map_err(|_| table_persist_inflight(self.table_id, request_id))?;
@@ -538,7 +643,7 @@ impl TableActorHandle {
 #[derive(Clone)]
 pub struct TableActorRegistryHandle {
     catalog_revision: u64,
-    tables: Arc<BTreeMap<TableId, TableActorHandle>>,
+    tables: Arc<RwLock<BTreeMap<TableId, TableActorHandle>>>,
     accepting: Arc<AtomicBool>,
 }
 
@@ -595,13 +700,13 @@ impl TableActorRegistryHandle {
     /// Returns the number of table actors published atomically at startup.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tables.len()
+        self.tables.read().unwrap().len()
     }
 
     /// Returns whether no active table actor was recovered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.tables.read().unwrap().is_empty()
     }
 
     /// Returns whether this registry still admits actor commands.
@@ -612,11 +717,195 @@ impl TableActorRegistryHandle {
 
     /// Resolves a table actor by immutable identity.
     pub fn table(&self, table_id: TableId) -> Result<TableActorHandle> {
-        self.tables.get(&table_id).cloned().ok_or_else(|| {
-            ServerError::new(ErrorCode::NotFound, "native table actor was not found")
+        self.tables
+            .read()
+            .unwrap()
+            .get(&table_id)
+            .cloned()
+            .ok_or_else(|| {
+                ServerError::new(ErrorCode::NotFound, "native table actor was not found")
+                    .with_table_id(table_id)
+                    .with_retryable(false)
+            })
+    }
+}
+
+/// Server-owned capability for installing actors without restarting the registry.
+#[derive(Clone)]
+pub struct TableActorRegistrar {
+    inner: Arc<TableActorFactory>,
+}
+
+struct TableActorFactory {
+    handle: TableActorRegistryHandle,
+    config: TableActorRegistryConfig,
+    global_budget: Arc<Semaphore>,
+    persistence: Arc<dyn PersistSubmitter>,
+    executor: tokio::runtime::Handle,
+    shutdown: watch::Receiver<bool>,
+    failure: watch::Sender<Option<ServerError>>,
+    actors: Mutex<Vec<(TableId, JoinHandle<Result<()>>)>>,
+}
+
+impl TableActorRegistrar {
+    /// Closes this table's command admission and observes all previously accepted commands.
+    ///
+    /// Fails retryably if persistence or command budgets are occupied. On cancellation or
+    /// rollback the returned guard reopens admission; no Catalog mutation is performed here.
+    pub async fn prepare_retirement(&self, table_id: TableId) -> Result<TableActorRetirement> {
+        let handle = self.inner.handle.table(table_id)?;
+        let (guard, request) = {
+            let mut lifecycle = handle.admit_command()?;
+            let persist = Arc::clone(&handle.persist_budget)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    ServerError::new(
+                        ErrorCode::ResourceExhausted,
+                        "table actor persistence must finish before a table transition",
+                    )
+                    .with_table_id(table_id)
+                    .with_retryable(true)
+                })?;
+            let permit = Arc::clone(&handle.global_budget)
+                .try_acquire_owned()
+                .map_err(|_| actor_global_budget_exhausted(table_id))?;
+            *lifecycle = TableActorLifecycle::Quiescing;
+            drop(lifecycle);
+            let guard = TableActorRetirement {
+                factory: Arc::clone(&self.inner),
+                handle: handle.clone(),
+                _persist: persist,
+                committed: false,
+            };
+            let (response, receiver) = oneshot::channel();
+            handle
+                .sender
+                .try_send(TableActorCommand::Snapshot {
+                    response,
+                    _permit: permit,
+                })
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => actor_mailbox_full(table_id),
+                    mpsc::error::TrySendError::Closed(_) => actor_closed(table_id),
+                })?;
+            (
+                guard,
+                TableActorSnapshotRequest {
+                    table_id,
+                    response: receiver,
+                },
+            )
+        };
+        request.wait().await?;
+        Ok(guard)
+    }
+
+    /// Installs exactly one actor in the original supervisor's executor.
+    ///
+    /// Registration and drain share the join-list lock; a concurrent shutdown
+    /// either rejects this registration or joins the newly accepted actor.
+    pub fn register(&self, runtime: Arc<TableRuntime>) -> Result<TableActorHandle> {
+        let inner = &self.inner;
+        let mut actors = inner.actors.lock().unwrap();
+        let table_id = runtime.table_id();
+        if !inner.handle.is_accepting() {
+            return Err(actor_closed(table_id));
+        }
+        let mut tables = inner.handle.tables.write().unwrap();
+        if tables.contains_key(&table_id) {
+            return Err(
+                ServerError::new(ErrorCode::AlreadyExists, "table actor already exists")
+                    .with_table_id(table_id),
+            );
+        }
+        let (sender, receiver) = mpsc::channel(inner.config.per_table_mailbox_capacity);
+        let (changes_sender, changes) = watch::channel(());
+        let (retirement, retiring) = watch::channel(false);
+        let actor = inner.executor.spawn(run_supervised_table_actor(
+            runtime,
+            receiver,
+            inner.shutdown.clone(),
+            inner.persistence.clone(),
+            Arc::clone(&inner.handle.accepting),
+            inner.failure.clone(),
+            TableActorSignals {
+                changes: changes_sender,
+                retirement: retiring,
+            },
+        ));
+        let handle = TableActorHandle {
+            table_id,
+            sender,
+            accepting: Arc::clone(&inner.handle.accepting),
+            global_budget: Arc::clone(&inner.global_budget),
+            persist_budget: Arc::new(Semaphore::new(1)),
+            changes,
+            lifecycle: Arc::new(Mutex::new(TableActorLifecycle::Active)),
+            retirement,
+            transition_finished: Arc::new(tokio::sync::Notify::new()),
+        };
+        actors.push((table_id, actor));
+        tables.insert(table_id, handle.clone());
+        Ok(handle)
+    }
+}
+
+/// Reversible quiescence owned by the Server's cancellation-independent table management task.
+///
+/// Existing snapshot spans retain their own segment ownership. This guard only controls new
+/// actor commands and task lifetime; dropping before Catalog commit restores admission.
+pub struct TableActorRetirement {
+    factory: Arc<TableActorFactory>,
+    handle: TableActorHandle,
+    _persist: OwnedSemaphorePermit,
+    committed: bool,
+}
+
+impl TableActorRetirement {
+    /// Closes an obsolete actor after the corresponding Catalog mutation and joins its task.
+    pub async fn retire(mut self, reason: zippy_types::table::TableRetirementReason) -> Result<()> {
+        let table_id = self.handle.table_id;
+        *self.handle.lifecycle.lock().unwrap() = TableActorLifecycle::Retired(reason);
+        self.handle.transition_finished.notify_waiters();
+        self.committed = true;
+        self.factory
+            .handle
+            .tables
+            .write()
+            .unwrap()
+            .remove(&table_id);
+        self.handle.retirement.send_replace(true);
+        let task = {
+            let mut actors = self.factory.actors.lock().unwrap();
+            actors
+                .iter()
+                .position(|(id, _)| *id == table_id)
+                .map(|index| actors.swap_remove(index).1)
+        };
+        if let Some(task) = task {
+            task.await.map_err(|error| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    format!("join retired table actor failed error=[{error}]"),
+                )
                 .with_table_id(table_id)
                 .with_retryable(false)
-        })
+            })??;
+        } else {
+            // Global shutdown already owns this task and will join it. Ensure its receiver
+            // is closed before finishing the table management operation.
+            self.handle.sender.closed().await;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TableActorRetirement {
+    fn drop(&mut self) {
+        if !self.committed {
+            *self.handle.lifecycle.lock().unwrap() = TableActorLifecycle::Active;
+            self.handle.transition_finished.notify_waiters();
+        }
     }
 }
 
@@ -628,39 +917,30 @@ impl TableActorRegistryHandle {
 pub struct TableActorRegistry {
     handle: TableActorRegistryHandle,
     shutdown: watch::Sender<bool>,
-    actors: Vec<(TableId, JoinHandle<Result<()>>)>,
+    registrar: TableActorRegistrar,
     failure: watch::Receiver<Option<ServerError>>,
     _failure_sender: watch::Sender<Option<ServerError>>,
     shutdown_started: bool,
 }
 
 impl TableActorRegistry {
-    /// Starts one bounded read-only actor for every bootstrapped active table.
-    ///
-    /// This compatibility entrypoint preserves startup introspection without
-    /// granting actors access to native persistence. Production servers should
-    /// use [`Self::start_with_persistence`].
-    pub fn start(config: TableActorRegistryConfig, runtimes: TableRuntimeRegistry) -> Result<Self> {
-        Self::start_internal(config, runtimes, None)
-    }
-
     /// Starts one persistence-capable serial actor for every active table.
     ///
     /// The controller handle is retained only behind the actors. Normal table
     /// handles can submit bounded requests but cannot close or drain the shared
     /// persistence controller.
-    pub fn start_with_persistence(
+    pub fn start(
         config: TableActorRegistryConfig,
         runtimes: TableRuntimeRegistry,
         persistence: PersistControllerHandle,
     ) -> Result<Self> {
-        Self::start_internal(config, runtimes, Some(Arc::new(persistence)))
+        Self::start_internal(config, runtimes, Arc::new(persistence))
     }
 
     fn start_internal(
         config: TableActorRegistryConfig,
         runtimes: TableRuntimeRegistry,
-        persistence: Option<Arc<dyn PersistSubmitter>>,
+        persistence: Arc<dyn PersistSubmitter>,
     ) -> Result<Self> {
         config.validate()?;
         tokio::runtime::Handle::try_current().map_err(|error| {
@@ -675,55 +955,47 @@ impl TableActorRegistry {
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (failure, failure_receiver) = watch::channel(None);
         let catalog_revision = runtimes.catalog_revision();
-        let mut tables = BTreeMap::new();
-        let mut actors = Vec::with_capacity(runtimes.len());
-        let persistence_enabled = persistence.is_some();
-
+        let handle = TableActorRegistryHandle {
+            catalog_revision,
+            tables: Arc::new(RwLock::new(BTreeMap::new())),
+            accepting: Arc::clone(&accepting),
+        };
+        let registrar = TableActorRegistrar {
+            inner: Arc::new(TableActorFactory {
+                handle: handle.clone(),
+                config,
+                global_budget,
+                persistence,
+                executor: tokio::runtime::Handle::current(),
+                shutdown: shutdown_receiver,
+                failure: failure.clone(),
+                actors: Mutex::new(Vec::new()),
+            }),
+        };
         for runtime in runtimes.iter() {
-            let table_id = runtime.table_id();
-            let (sender, receiver) = mpsc::channel(config.per_table_mailbox_capacity);
-            let actor = tokio::spawn(run_supervised_table_actor(
-                Arc::clone(runtime),
-                receiver,
-                shutdown_receiver.clone(),
-                persistence.as_ref().map(Arc::clone),
-                Arc::clone(&accepting),
-                failure.clone(),
-            ));
-            let handle = TableActorHandle {
-                table_id,
-                sender,
-                accepting: Arc::clone(&accepting),
-                global_budget: Arc::clone(&global_budget),
-                persist_budget: Arc::new(Semaphore::new(1)),
-                persistence_enabled,
-            };
-            if tables.insert(table_id, handle).is_some() {
+            if let Err(error) = registrar.register(Arc::clone(runtime)) {
                 accepting.store(false, Ordering::Release);
                 let _ = shutdown.send(true);
-                return Err(corruption(format!(
-                    "table actor registry contains duplicate table id table_id=[{table_id}]"
-                ))
-                .with_table_id(table_id));
+                return Err(error);
             }
-            actors.push((table_id, actor));
         }
-        drop(shutdown_receiver);
         Ok(Self {
-            handle: TableActorRegistryHandle {
-                catalog_revision,
-                tables: Arc::new(tables),
-                accepting,
-            },
+            handle,
             shutdown,
-            actors,
+            registrar,
             failure: failure_receiver,
             _failure_sender: failure,
             shutdown_started: false,
         })
     }
 
-    /// Returns the cloneable, read-only admission and lookup surface.
+    /// Returns the server-owned capability for adding online table actors.
+    #[must_use]
+    pub fn registrar(&self) -> TableActorRegistrar {
+        self.registrar.clone()
+    }
+
+    /// Returns the cloneable admission and lookup surface.
     #[must_use]
     pub fn handle(&self) -> TableActorRegistryHandle {
         self.handle.clone()
@@ -759,7 +1031,8 @@ impl TableActorRegistry {
     pub async fn drain(mut self) -> Result<()> {
         self.close_admission();
         let mut first_error = None;
-        for (table_id, actor) in self.actors.drain(..) {
+        let actors = std::mem::take(&mut *self.registrar.inner.actors.lock().unwrap());
+        for (table_id, actor) in actors {
             let outcome = actor.await.map_err(|error| {
                 ServerError::new(
                     ErrorCode::Internal,
@@ -873,14 +1146,13 @@ struct TableActorState {
     schema: SchemaRef,
     writer_epoch: u64,
     current_snapshot: TableSnapshot,
-    persistence_enabled: bool,
     persistence: ActorPersistenceState,
     command_sequence: u64,
     live_segments: Arc<[TableActorLiveSegmentSnapshot]>,
 }
 
 impl TableActorState {
-    fn new(runtime: &TableRuntime, persistence_enabled: bool) -> Self {
+    fn new(runtime: &TableRuntime) -> Self {
         Self {
             table_id: runtime.table_id(),
             table_kind: runtime.table().kind(),
@@ -888,7 +1160,6 @@ impl TableActorState {
             schema: Arc::clone(runtime.schema()),
             writer_epoch: runtime.writer_epoch(),
             current_snapshot: runtime.snapshot().clone(),
-            persistence_enabled,
             persistence: ActorPersistenceState::Idle,
             command_sequence: 0,
             live_segments: Arc::from([]),
@@ -928,14 +1199,6 @@ impl TableActorState {
         let persisted_offset = match persisted {
             OffsetWatermark::Empty => None,
             OffsetWatermark::Known(offset) => Some(offset),
-            OffsetWatermark::LegacyUnknown => {
-                return Err(ServerError::new(
-                    ErrorCode::DataCorruption,
-                    "live segments cannot follow a legacy-unknown persisted watermark",
-                )
-                .with_table_id(self.table_id)
-                .with_retryable(false));
-            }
         };
 
         let mut visible = Vec::with_capacity(self.live_segments.len());
@@ -1010,13 +1273,6 @@ impl TableActorState {
                 "live segment publication table identity changed before actor validation",
             ));
         }
-        if self.table_kind != TableKind::Append {
-            return Err(live_publication_error(
-                self.table_id,
-                ErrorCode::UnsupportedPlan,
-                "live query snapshots currently support append tables only",
-            ));
-        }
         if segments.len() > MAX_LIVE_SEGMENTS_PER_TABLE {
             return Err(live_publication_error(
                 self.table_id,
@@ -1042,13 +1298,6 @@ impl TableActorState {
                     "persisted watermark exhausted before live segment publication",
                 )
             })?,
-            OffsetWatermark::LegacyUnknown => {
-                return Err(live_publication_error(
-                    self.table_id,
-                    ErrorCode::DataCorruption,
-                    "cannot publish live segments after a legacy-unknown watermark",
-                ));
-            }
         };
         let segment_count = segments.len();
         let mut identities = BTreeSet::new();
@@ -1056,6 +1305,15 @@ impl TableActorState {
         let mut previous_writer_epoch = None;
 
         for (index, segment) in segments.into_iter().enumerate() {
+            if self.table_kind == TableKind::Frame
+                && segment.role != TableActorLiveSegmentRole::RetainedSealed
+            {
+                return Err(live_publication_error(
+                    self.table_id,
+                    ErrorCode::InvalidArgument,
+                    "frame publication requires complete sealed segments",
+                ));
+            }
             if segment.role == TableActorLiveSegmentRole::Active && index + 1 != segment_count {
                 return Err(live_publication_error(
                     self.table_id,
@@ -1233,9 +1491,6 @@ impl TableActorState {
 
     fn persistence_status(&self) -> TablePersistenceStatus {
         match &self.persistence {
-            ActorPersistenceState::Idle if !self.persistence_enabled => {
-                TablePersistenceStatus::Disabled
-            }
             ActorPersistenceState::Idle => TablePersistenceStatus::Idle,
             ActorPersistenceState::InFlight(active) => TablePersistenceStatus::InFlight {
                 request_id: active.request_id,
@@ -1335,14 +1590,23 @@ async fn run_supervised_table_actor(
     runtime: Arc<TableRuntime>,
     receiver: mpsc::Receiver<TableActorCommand>,
     shutdown: watch::Receiver<bool>,
-    persistence: Option<Arc<dyn PersistSubmitter>>,
+    persistence: Arc<dyn PersistSubmitter>,
     accepting: Arc<AtomicBool>,
     failure: watch::Sender<Option<ServerError>>,
+    signals: TableActorSignals,
 ) -> Result<()> {
     let mut guard =
         TableActorTaskGuard::new(runtime.table_id(), Arc::clone(&accepting), failure.clone());
-    let outcome =
-        run_table_actor(runtime, receiver, shutdown, persistence, accepting, failure).await;
+    let outcome = run_table_actor(
+        runtime,
+        receiver,
+        shutdown,
+        persistence,
+        accepting,
+        failure,
+        signals,
+    )
+    .await;
     guard.complete(&outcome);
     outcome
 }
@@ -1351,11 +1615,17 @@ async fn run_table_actor(
     runtime: Arc<TableRuntime>,
     mut receiver: mpsc::Receiver<TableActorCommand>,
     mut shutdown: watch::Receiver<bool>,
-    persistence: Option<Arc<dyn PersistSubmitter>>,
+    persistence: Arc<dyn PersistSubmitter>,
     accepting: Arc<AtomicBool>,
     failure: watch::Sender<Option<ServerError>>,
+    signals: TableActorSignals,
 ) -> Result<()> {
-    let mut state = TableActorState::new(&runtime, persistence.is_some());
+    let TableActorSignals {
+        changes,
+        mut retirement,
+    } = signals;
+    let mut retirement_observed = false;
+    let mut state = TableActorState::new(&runtime);
     let mut completion: Option<PersistCompletion> = None;
     let mut shutdown_observed = false;
     let mut mailbox_closed = false;
@@ -1376,7 +1646,16 @@ async fn run_table_actor(
                 biased;
                 outcome = active_completion.as_mut() => {
                     completion = None;
+                    let previous_version = state.current_snapshot.snapshot_version;
                     complete_persist(&mut state, outcome, &accepting, &failure)?;
+                    if state.current_snapshot.snapshot_version != previous_version {
+                        changes.send_replace(());
+                    }
+                }
+                changed = retirement.changed(), if !retirement_observed => {
+                    let _ = changed;
+                    retirement_observed = true;
+                    receiver.close();
                 }
                 changed = shutdown.changed(), if !shutdown_observed => {
                     let _ = changed;
@@ -1388,10 +1667,11 @@ async fn run_table_actor(
                         Some(command) => {
                             let unexpected = process_command(
                                 &mut state,
-                                persistence.as_deref(),
+                                persistence.as_ref(),
                                 command,
                                 &accepting,
                                 &failure,
+                                &changes,
                             );
                             debug_assert!(unexpected.is_none());
                             if let Some(error) = state.terminal_persistence_error() {
@@ -1405,6 +1685,11 @@ async fn run_table_actor(
         } else {
             tokio::select! {
                 biased;
+                changed = retirement.changed(), if !retirement_observed => {
+                    let _ = changed;
+                    retirement_observed = true;
+                    receiver.close();
+                }
                 changed = shutdown.changed(), if !shutdown_observed => {
                     let _ = changed;
                     shutdown_observed = true;
@@ -1415,10 +1700,11 @@ async fn run_table_actor(
                         Some(command) => {
                             completion = process_command(
                                 &mut state,
-                                persistence.as_deref(),
+                                persistence.as_ref(),
                                 command,
                                 &accepting,
                                 &failure,
+                                &changes,
                             );
                             if let Some(error) = state.terminal_persistence_error() {
                                 return Err(error);
@@ -1434,10 +1720,11 @@ async fn run_table_actor(
 
 fn process_command(
     state: &mut TableActorState,
-    persistence: Option<&dyn PersistSubmitter>,
+    persistence: &dyn PersistSubmitter,
     command: TableActorCommand,
     accepting: &Arc<AtomicBool>,
     failure: &watch::Sender<Option<ServerError>>,
+    changes: &watch::Sender<()>,
 ) -> Option<PersistCompletion> {
     match command {
         TableActorCommand::Snapshot { response, _permit } => {
@@ -1463,15 +1750,9 @@ fn process_command(
                         .map_err(PersistCompletionFailure::Rejected)
                 });
             let result = match validated {
-                Ok(disposition) => match persistence {
-                    Some(submitter) => submitter
-                        .submit(request, disposition.persist_mode())
-                        .map(|completion| (completion, disposition)),
-                    None => Err(PersistCompletionFailure::Rejected(persistence_disabled(
-                        state.table_id,
-                        request_id,
-                    ))),
-                },
+                Ok(disposition) => persistence
+                    .submit(request, disposition.persist_mode())
+                    .map(|completion| (completion, disposition)),
                 Err(failure) => Err(failure),
             };
             match result {
@@ -1516,6 +1797,9 @@ fn process_command(
             let result = state
                 .advance_command()
                 .and_then(|()| state.install_live_segments(publication));
+            if result.is_ok() {
+                changes.send_replace(());
+            }
             drop(_permit);
             let _ = response.send(result);
             None
@@ -1528,6 +1812,9 @@ fn process_command(
             let result = state
                 .advance_command()
                 .and_then(|()| state.update_writer_epoch(writer_epoch));
+            if result.is_ok() {
+                changes.send_replace(());
+            }
             drop(_permit);
             let _ = response.send(result);
             None
@@ -1542,9 +1829,6 @@ fn validate_persist_request(
     request: &PersistRequest,
 ) -> Result<PersistDisposition> {
     let request_id = request.request_id();
-    if !state.persistence_enabled {
-        return Err(persistence_disabled(state.table_id, request_id));
-    }
     match &state.persistence {
         ActorPersistenceState::Idle => {}
         ActorPersistenceState::InFlight(active) => {
@@ -1667,15 +1951,6 @@ fn validate_persist_request(
             .with_table_id(state.table_id)
             .with_retryable(false)
         })?,
-        OffsetWatermark::LegacyUnknown => {
-            return Err(ServerError::new(
-                ErrorCode::DataCorruption,
-                "cannot append to a legacy snapshot with unknown log watermark",
-            )
-            .with_request_id(request_id)
-            .with_table_id(state.table_id)
-            .with_retryable(false));
-        }
     };
     if request.first_log_offset() != expected_first {
         return Err(ServerError::new(
@@ -1694,6 +1969,59 @@ fn validate_persist_request(
             actual: request.first_log_offset().get(),
         })
         .expect("sequence details match the sequence-gap error code"));
+    }
+    if state.table_kind == TableKind::Frame
+        && !state.live_segments.iter().any(|segment| {
+            request.committed_log_offset() == OffsetWatermark::Known(segment.offsets.last())
+        })
+    {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "frame persistence must end at a complete published frame boundary",
+        )
+        .with_request_id(request_id)
+        .with_table_id(state.table_id));
+    }
+    if state.table_kind == TableKind::KeyValue {
+        use arrow::array::Array;
+        let OffsetWatermark::Known(end) = request.committed_log_offset() else {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "key-value persistence requires an explicit event boundary",
+            ));
+        };
+        let segment = state
+            .live_segments
+            .iter()
+            .find(|segment| segment.offsets.contains(end))
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "key-value persistence boundary is outside the published log",
+                )
+            })?;
+        let column = segment
+            .span
+            .column(zippy_types::key_value::BATCH_END)
+            .map_err(|error| ServerError::new(ErrorCode::DataCorruption, error.to_string()))?;
+        let ends = column
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::DataCorruption,
+                    "key-value event boundary column is invalid",
+                )
+            })?;
+        let row = (end.get() - segment.offsets.first().get()) as usize;
+        if ends.is_null(row) || ends.value(row) <= 0 || ends.value(row) as u64 - 1 != end.get() {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "key-value persistence must end at a complete mutation boundary",
+            )
+            .with_request_id(request_id)
+            .with_table_id(state.table_id));
+        }
     }
     Ok(PersistDisposition::Advance)
 }
@@ -1929,16 +2257,6 @@ fn table_persist_inflight(table_id: TableId, request_id: RequestId) -> ServerErr
     .with_retryable(true)
 }
 
-fn persistence_disabled(table_id: TableId, request_id: RequestId) -> ServerError {
-    ServerError::new(
-        ErrorCode::UnsupportedPlan,
-        "native table actor persistence is disabled for this runtime",
-    )
-    .with_request_id(request_id)
-    .with_table_id(table_id)
-    .with_retryable(false)
-}
-
 fn persist_table_mismatch(
     expected: TableId,
     actual: TableId,
@@ -1951,10 +2269,6 @@ fn persist_table_mismatch(
     .with_request_id(request_id)
     .with_table_id(expected)
     .with_retryable(false)
-}
-
-fn corruption(message: impl Into<String>) -> ServerError {
-    ServerError::new(ErrorCode::DataCorruption, message).with_retryable(false)
 }
 
 #[cfg(test)]
@@ -2084,6 +2398,7 @@ mod tests {
             request_id,
             table_id,
             expected_snapshot_version,
+            writer_epoch,
             vec![candidate],
             OffsetWatermark::Known(LogOffset::new(last)),
         )
@@ -2112,6 +2427,17 @@ mod tests {
             },
             intent_cleanup_pending: false,
         }
+    }
+
+    fn start_test_registry(
+        config: TableActorRegistryConfig,
+        runtimes: TableRuntimeRegistry,
+    ) -> zippy_types::Result<TableActorRegistry> {
+        TableActorRegistry::start_internal(
+            config,
+            runtimes,
+            immediate_error_submitter(ErrorCode::ResourceExhausted, false),
+        )
     }
 
     struct FakeSubmission {
@@ -2233,10 +2559,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn online_actor_registration_is_visible_and_drained_by_original_owner() {
+        let mut registry =
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[])).unwrap();
+        let handle = registry.handle();
+        let registrar = registry.registrar();
+        assert!(handle.is_empty());
+        let runtimes = runtime_registry(&[10, 20]);
+        let mut tables = runtimes.iter();
+        let first = Arc::clone(tables.next().unwrap());
+        let second = Arc::clone(tables.next().unwrap());
+        registrar.register(Arc::clone(&first)).unwrap();
+        assert_eq!(handle.len(), 1);
+        assert_eq!(
+            handle
+                .table(table_id(10))
+                .unwrap()
+                .snapshot()
+                .await
+                .unwrap()
+                .writer_epoch,
+            7
+        );
+        assert!(
+            matches!(registrar.register(first), Err(error) if error.code() == ErrorCode::AlreadyExists)
+        );
+        registry.close_admission();
+        assert!(
+            matches!(registrar.register(second), Err(error) if error.code() == ErrorCode::Unavailable)
+        );
+        registry.drain().await.unwrap();
+        assert!(!handle.is_accepting());
+    }
+
+    #[tokio::test]
+    async fn retirement_quiesces_commands_rolls_back_and_stops_only_its_actor() {
+        let registry =
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10, 20]))
+                .unwrap();
+        let handle = registry.handle();
+        let actor = handle.table(table_id(10)).unwrap();
+        let sibling = handle.table(table_id(20)).unwrap();
+        let registrar = registry.registrar();
+        let mut changes = actor.changes();
+        let queued = actor.try_update_writer_epoch(8).unwrap();
+        let retirement = registrar.prepare_retirement(table_id(10)).await.unwrap();
+        queued.wait().await.unwrap();
+        changes.changed().await.unwrap();
+        assert!(actor.try_snapshot().unwrap_err().retryable());
+        assert!(actor.try_update_writer_epoch(9).unwrap_err().retryable());
+        sibling.snapshot().await.unwrap();
+        let observer = changes.clone();
+        let resumed = observer.wait_for_transition();
+        tokio::pin!(resumed);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(resumed.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(retirement);
+        assert!(resumed.await.unwrap());
+        assert_eq!(actor.snapshot().await.unwrap().writer_epoch, 8);
+        let retirement = registrar.prepare_retirement(table_id(10)).await.unwrap();
+        let observer = changes.clone();
+        let stopped = observer.wait_for_transition();
+        tokio::pin!(stopped);
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(stopped.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        retirement
+            .retire(zippy_types::table::TableRetirementReason::Dropped)
+            .await
+            .unwrap();
+        assert_eq!(stopped.await.unwrap_err().code(), ErrorCode::NotFound);
+        assert_eq!(handle.len(), 1);
+        assert!(handle.is_accepting());
+        assert_eq!(
+            actor.snapshot().await.unwrap_err().code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            changes.changed().await.unwrap_err().code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(registrar.inner.actors.lock().unwrap().len(), 1);
+        sibling.snapshot().await.unwrap();
+        assert!(registry.failure_monitor().receiver.borrow().is_none());
+        registry.drain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_retirement_admission_leaves_actor_usable() {
+        let registry = start_test_registry(
+            TableActorRegistryConfig::new().with_max_outstanding_commands(1),
+            runtime_registry(&[10]),
+        )
+        .unwrap();
+        let actor = registry.handle().table(table_id(10)).unwrap();
+        let queued = actor.try_snapshot().unwrap();
+        let failed = registry.registrar().prepare_retirement(table_id(10)).await;
+        assert!(
+            matches!(failed, Err(error) if error.code() == ErrorCode::ResourceExhausted && error.retryable())
+        );
+        queued.wait().await.unwrap();
+        actor.snapshot().await.unwrap();
+        registry.drain().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn actor_serializes_observations_and_drains_cleanly() {
         let registry =
-            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
-                .unwrap();
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10])).unwrap();
         let handle = registry.handle();
         let actor = handle.table(table_id(10)).unwrap();
 
@@ -2247,13 +2682,14 @@ mod tests {
         assert_eq!(second.actor_command_sequence, 2);
         assert_eq!(second.writer_epoch, 7);
         assert_eq!(second.committed_log_offset, OffsetWatermark::Empty);
-        assert_eq!(second.persistence_status, TablePersistenceStatus::Disabled);
+        assert_eq!(second.persistence_status, TablePersistenceStatus::Idle);
         assert_eq!(
             actor
-                .try_persist(persist_request(1, 10, 1, 1, 7, 0, vec![1]))
+                .persist(persist_request(1, 10, 1, 1, 7, 0, vec![1]))
+                .await
                 .unwrap_err()
                 .code(),
-            ErrorCode::UnsupportedPlan
+            ErrorCode::ResourceExhausted
         );
         registry.drain().await.unwrap();
         assert!(!handle.is_accepting());
@@ -2263,12 +2699,62 @@ mod tests {
         );
     }
 
+    async fn pending_change(changes: &mut super::TableActorChanges) -> bool {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        let mut future = std::pin::pin!(changes.changed());
+        poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+    }
+
+    #[tokio::test]
+    async fn change_notifications_coalesce_without_losing_snapshot_races() {
+        let registry =
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10])).unwrap();
+        let actor = registry.handle().table(table_id(10)).unwrap();
+        let mut changes = actor.changes();
+        let mut independent = actor.changes();
+        assert!(pending_change(&mut changes).await);
+        actor.snapshot().await.unwrap();
+        assert!(pending_change(&mut changes).await);
+
+        // A publication between registration and snapshot acquisition remains observable.
+        actor.update_writer_epoch(8).await.unwrap();
+        assert_eq!(actor.snapshot().await.unwrap().writer_epoch, 8);
+        changes.changed().await.unwrap();
+        independent.changed().await.unwrap();
+        assert!(pending_change(&mut changes).await);
+
+        // Slow consumers coalesce notifications; no delivery queue can block the writer.
+        for epoch in 9..109 {
+            actor.update_writer_epoch(epoch).await.unwrap();
+        }
+        changes.changed().await.unwrap();
+        assert!(pending_change(&mut changes).await);
+        assert_eq!(actor.snapshot().await.unwrap().writer_epoch, 108);
+        actor.update_writer_epoch(7).await.unwrap_err();
+        assert!(pending_change(&mut changes).await);
+        let mut fresh = actor.changes();
+        assert!(pending_change(&mut fresh).await);
+
+        registry.drain().await.unwrap();
+        assert_eq!(
+            changes.changed().await.unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+        // Pending notifications can be consumed once, then shutdown is terminal.
+        independent.changed().await.unwrap();
+        assert_eq!(
+            independent.changed().await.unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+    }
+
     #[tokio::test]
     async fn actor_publishes_fixed_active_prefix_and_rejects_rewrite() {
         let registry =
-            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
-                .unwrap();
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10])).unwrap();
         let actor = registry.handle().table(table_id(10)).unwrap();
+        let mut changes = actor.changes();
         let segment_schema =
             compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
         let layout = LayoutPlan::for_schema(&segment_schema, 4).unwrap();
@@ -2302,6 +2788,8 @@ mod tests {
             .await
             .unwrap();
 
+        changes.changed().await.unwrap();
+        assert!(pending_change(&mut changes).await);
         let pinned = actor.snapshot().await.unwrap();
         assert_eq!(pinned.live_segments.len(), 1);
         assert_eq!(pinned.live_segments[0].offsets(), offsets);
@@ -2323,6 +2811,22 @@ mod tests {
             2
         );
 
+        registry
+            .registrar()
+            .prepare_retirement(table_id(10))
+            .await
+            .unwrap()
+            .retire(zippy_types::table::TableRetirementReason::Dropped)
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned.live_segments[0]
+                .span()
+                .as_record_batch()
+                .unwrap()
+                .num_rows(),
+            2
+        );
         writer.begin_payload_mutation_for_test().unwrap();
         writer.finish_payload_mutation_for_test().unwrap();
         let error = pinned.live_segments[0]
@@ -2338,8 +2842,7 @@ mod tests {
     #[tokio::test]
     async fn actor_publishes_retained_sealed_then_active_segments_in_offset_order() {
         let registry =
-            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
-                .unwrap();
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10])).unwrap();
         let actor = registry.handle().table(table_id(10)).unwrap();
         let segment_schema =
             compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
@@ -2351,7 +2854,7 @@ mod tests {
 
         writer.write_row(|row| row.write_i64("price", 101)).unwrap();
         let retained_descriptor = handle.active_descriptor_for_test();
-        writer.rollover_without_persistence().unwrap();
+        writer.rollover().unwrap();
         writer.write_row(|row| row.write_i64("price", 102)).unwrap();
         let active_descriptor = handle.active_descriptor_for_test();
 
@@ -2425,8 +2928,7 @@ mod tests {
     #[tokio::test]
     async fn actor_keeps_monotonic_live_prefix_across_writer_epochs() {
         let registry =
-            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
-                .unwrap();
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10])).unwrap();
         let actor = registry.handle().table(table_id(10)).unwrap();
         actor.update_writer_epoch(8).await.unwrap();
         let segment_schema =
@@ -2445,7 +2947,7 @@ mod tests {
             .write_row(|row| row.write_i64("price", 101))
             .unwrap();
         let old_descriptor = old_handle.active_descriptor_for_test();
-        old_handle.writer().rollover_without_persistence().unwrap();
+        old_handle.writer().rollover().unwrap();
 
         let current_store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
         let current_handle = current_store
@@ -2508,7 +3010,7 @@ mod tests {
     fn actor_snapshot_removes_persisted_prefix_without_copying_live_rows() {
         let runtimes = runtime_registry(&[10]);
         let runtime = runtimes.get(table_id(10)).unwrap();
-        let mut state = TableActorState::new(&runtime, true);
+        let mut state = TableActorState::new(&runtime);
         let segment_schema =
             compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).unwrap();
         let layout = LayoutPlan::for_schema(&segment_schema, 4).unwrap();
@@ -2553,7 +3055,7 @@ mod tests {
     fn actor_rechecks_every_persist_state_precondition() {
         let runtimes = runtime_registry(&[10]);
         let runtime = runtimes.get(table_id(10)).unwrap();
-        let mut state = TableActorState::new(&runtime, true);
+        let state = TableActorState::new(&runtime);
 
         let wrong_table = persist_request(1, 20, 1, 1, 7, 0, vec![1]);
         assert_eq!(
@@ -2610,14 +3112,6 @@ mod tests {
                 .code(),
             ErrorCode::SequenceGap
         );
-        state.current_snapshot.committed_log_offset = OffsetWatermark::LegacyUnknown;
-        let legacy_unknown = persist_request(6, 10, 1, 1, 7, 0, vec![1]);
-        assert_eq!(
-            validate_persist_request(&state, &legacy_unknown)
-                .unwrap_err()
-                .code(),
-            ErrorCode::DataCorruption
-        );
     }
 
     #[tokio::test]
@@ -2626,10 +3120,11 @@ mod tests {
         let registry = TableActorRegistry::start_internal(
             TableActorRegistryConfig::new(),
             runtime_registry(&[10]),
-            Some(submitter),
+            submitter,
         )
         .unwrap();
         let actor = registry.handle().table(table_id(10)).unwrap();
+        let mut changes = actor.changes();
 
         assert_eq!(
             actor.snapshot().await.unwrap().persistence_status,
@@ -2644,6 +3139,10 @@ mod tests {
             .try_persist(persist_request(10, 10, 1, 1, 7, 0, vec![1, 2]))
             .unwrap();
         let first_submission = submissions.recv().await.unwrap();
+        assert!(
+            matches!(registry.registrar().prepare_retirement(table_id(10)).await,
+            Err(error) if error.code() == ErrorCode::ResourceExhausted && error.retryable())
+        );
         assert_eq!(first_submission.request_id, request_id(10));
         assert_eq!(first_submission.mode, PersistMode::Advance);
         let duplicate = actor
@@ -2675,6 +3174,8 @@ mod tests {
             )))
             .unwrap();
         let first_receipt = first.wait().await.unwrap();
+        changes.changed().await.unwrap();
+        assert!(pending_change(&mut changes).await);
         assert_eq!(first_receipt.snapshot.snapshot_version, 2);
 
         let second = actor
@@ -2729,7 +3230,7 @@ mod tests {
         let registry = TableActorRegistry::start_internal(
             TableActorRegistryConfig::new(),
             runtime_registry(&[10]),
-            Some(submitter),
+            submitter,
         )
         .unwrap();
         let handle = registry.handle();
@@ -2824,7 +3325,7 @@ mod tests {
         let registry = TableActorRegistry::start_internal(
             TableActorRegistryConfig::new(),
             runtime_registry(&[10]),
-            Some(submitter),
+            submitter,
         )
         .unwrap();
         let handle = registry.handle();
@@ -2881,7 +3382,7 @@ mod tests {
         let registry = TableActorRegistry::start_internal(
             TableActorRegistryConfig::new(),
             runtime_registry(&[10, 20]),
-            Some(submitter),
+            submitter,
         )
         .unwrap();
         let handle = registry.handle();
@@ -2923,7 +3424,7 @@ mod tests {
         let unavailable_registry = TableActorRegistry::start_internal(
             TableActorRegistryConfig::new(),
             runtime_registry(&[10]),
-            Some(immediate_error_submitter(ErrorCode::Unavailable, true)),
+            immediate_error_submitter(ErrorCode::Unavailable, true),
         )
         .unwrap();
         let unavailable_handle = unavailable_registry.handle();
@@ -2954,10 +3455,7 @@ mod tests {
         let backpressure_registry = TableActorRegistry::start_internal(
             TableActorRegistryConfig::new(),
             runtime_registry(&[20]),
-            Some(immediate_error_submitter(
-                ErrorCode::ResourceExhausted,
-                false,
-            )),
+            immediate_error_submitter(ErrorCode::ResourceExhausted, false),
         )
         .unwrap();
         let backpressure_handle = backpressure_registry.handle();
@@ -2987,7 +3485,7 @@ mod tests {
         let registry = TableActorRegistry::start_internal(
             TableActorRegistryConfig::new(),
             runtime_registry(&[10]),
-            Some(submitter),
+            submitter,
         )
         .unwrap();
         let actor = registry.handle().table(table_id(10)).unwrap();
@@ -3018,7 +3516,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn per_table_and_global_admission_are_strictly_bounded() {
-        let registry = TableActorRegistry::start(
+        let registry = start_test_registry(
             TableActorRegistryConfig::new()
                 .with_per_table_mailbox_capacity(1)
                 .with_max_outstanding_commands(2),
@@ -3046,8 +3544,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_drains_requests_accepted_before_admission_closed() {
         let registry =
-            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
-                .unwrap();
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10])).unwrap();
         let handle = registry.handle();
         let actor = handle.table(table_id(10)).unwrap();
         let accepted = actor.try_snapshot().unwrap();
@@ -3063,10 +3560,11 @@ mod tests {
     #[tokio::test]
     async fn actor_panic_closes_global_admission_and_is_reported_immediately() {
         let registry =
-            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10, 20]))
+            start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10, 20]))
                 .unwrap();
         let handle = registry.handle();
         let actor = handle.table(table_id(10)).unwrap();
+        let mut changes = actor.changes();
         let unaffected_actor = handle.table(table_id(20)).unwrap();
         let mut failure_monitor = registry.failure_monitor();
         assert!(actor.sender.try_send(TableActorCommand::Panic).is_ok());
@@ -3076,6 +3574,10 @@ mod tests {
                 .await
                 .expect("actor panic must be published without waiting for registry drain");
         assert_eq!(observed.code(), ErrorCode::Internal);
+        assert_eq!(
+            changes.changed().await.unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
         assert_eq!(observed.table_id(), Some(table_id(10)));
         assert!(!observed.retryable());
         assert!(!handle.is_accepting());
@@ -3091,7 +3593,7 @@ mod tests {
 
     #[test]
     fn invalid_actor_budget_fails_before_spawning_tasks() {
-        let error = TableActorRegistry::start(
+        let error = start_test_registry(
             TableActorRegistryConfig::new().with_per_table_mailbox_capacity(0),
             runtime_registry(&[10]),
         )
@@ -3102,10 +3604,9 @@ mod tests {
 
     #[test]
     fn actor_registry_requires_an_explicit_tokio_runtime() {
-        let error =
-            TableActorRegistry::start(TableActorRegistryConfig::new(), runtime_registry(&[10]))
-                .err()
-                .expect("starting actors without a runtime must fail structurally");
+        let error = start_test_registry(TableActorRegistryConfig::new(), runtime_registry(&[10]))
+            .err()
+            .expect("starting actors without a runtime must fail structurally");
         assert_eq!(error.code(), ErrorCode::Unavailable);
     }
 }

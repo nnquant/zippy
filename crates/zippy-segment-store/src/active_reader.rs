@@ -191,7 +191,7 @@ fn read_control_snapshot(
             "active segment committed row count offset mismatch",
         ));
     }
-    let payload_version = read_payload_version_capability(descriptor, shm_region)?;
+    let payload_version = read_payload_version(descriptor, shm_region)?;
 
     let schema_id = read_u64_header(shm_region, SHM_SCHEMA_ID_OFFSET)?;
     if schema_id != descriptor.schema().schema_id() {
@@ -277,22 +277,17 @@ fn read_control_snapshot(
     })
 }
 
-fn read_payload_version_capability(
+fn read_payload_version(
     descriptor: &ActiveSegmentDescriptor,
     shm_region: &ShmRegion,
-) -> Result<Option<u64>, ZippySegmentStoreError> {
-    let Some(offset) = descriptor.payload_version_offset() else {
-        return Err(ZippySegmentStoreError::Layout(
-            "active segment payload version capability missing",
-        ));
-    };
+) -> Result<u64, ZippySegmentStoreError> {
+    let offset = descriptor.payload_version_offset();
     if offset != SHM_PAYLOAD_VERSION_OFFSET {
         return Err(ZippySegmentStoreError::Layout(
             "active segment payload version offset mismatch",
         ));
     }
-    let version = shm_region.load_u64_acquire(offset)?;
-    Ok(Some(version))
+    shm_region.load_u64_acquire(offset)
 }
 
 fn read_sealed_flag(shm_region: &ShmRegion) -> Result<bool, ZippySegmentStoreError> {

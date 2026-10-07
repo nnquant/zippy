@@ -1,0 +1,75 @@
+{
+  "date": "2026-09-22",
+  "batch": 4,
+  "overall_complete": false,
+  "audit_closed_total": 20,
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "closed_this_batch": [
+    "F17",
+    "F33"
+  ],
+  "new_fixed_findings": [
+    "F37"
+  ],
+  "validation": {
+    "rust_workspace_passed": 1711,
+    "rust_workspace_ignored": 10,
+    "subsequent_types_test_passed": 100,
+    "client_passed": 92,
+    "client_coverage_percent": 81.39,
+    "client_mypy_checked_files": 25,
+    "clippy": "passed",
+    "cross_language": "passed",
+    "pyarrow_version": "23.0.1",
+    "full_repository_mypy": "not rerun; previous 982 errors remain open"
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-persisted-workspace.log",
+      "sha256": "9af3b94dde5e5854e746a97fde3a3dc6bc18c2cb95b340738bc09e2e1925d805"
+    },
+    "rust_types_final": {
+      "path": "/tmp/zippy-persisted-types.log",
+      "sha256": "1d3f11bb770432c86b567983ef8a798bfc50cebf2f99b2ff2e5a53a22e899b93"
+    },
+    "client": {
+      "path": "/tmp/zippy-persisted-client-full.log",
+      "sha256": "e630d040a3bf7b4f0aa16cbef7df0e32396a64cf6cf094f41ca54c45c029bae5"
+    },
+    "client_mypy": {
+      "path": "/tmp/zippy-persisted-mypy.log",
+      "sha256": "521e53066a363ec69a3862127d20de642114463485e6923ba593c38250537f8d"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-persisted-clippy-verified.log",
+      "sha256": "49a85f8a329bf5ec4f90880017225ee390af9e974eedd7b4d67a5df9e68575b7"
+    },
+    "black": {
+      "path": "/tmp/zippy-persisted-black.log",
+      "sha256": "26a5fd9505f2b5608a20c4fed4b4c4795e0783d03b72ade02a6af34dae8ad086"
+    },
+    "cross_language": {
+      "path": "/tmp/zippy-persisted-native-client2.log",
+      "sha256": "6dc8c032ad52bf496603de8a90548a09d6ce9be02f7ff3b0d0c8f3b117d2f3a8"
+    },
+    "cross_language_failure_before_fix": {
+      "path": "/tmp/zippy-persisted-native-client.log",
+      "sha256": "3cc7b8c306d70c96c0dce2e8e1cadac3fab7f841087e23f41dceff17a8e9eee0"
+    }
+  }
+}

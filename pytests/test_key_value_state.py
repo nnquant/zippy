@@ -5,6 +5,8 @@ import pytest
 
 import zippy
 
+from state_fixtures import changelog_schema
+
 
 def snapshot():
     schema = pa.schema(
@@ -18,6 +20,7 @@ def snapshot():
             "zippy_kv_version": "0",
             "zippy_kv_stream_id": "test-stream",
             "zippy_kv_keys": '["symbol"]',
+            "source": "state-fixture",
         },
     )
     return pa.Table.from_arrays(
@@ -26,7 +29,7 @@ def snapshot():
 
 
 def delta():
-    schema = zippy._key_value_changelog_schema(snapshot().schema.remove_metadata())
+    schema = changelog_schema(snapshot().schema.remove_metadata())
     return pa.Table.from_arrays(
         [
             pa.array([1, 2]),
@@ -47,6 +50,7 @@ def test_state_fragments_are_atomic_and_gap_requires_rebuild():
     assert state.snapshot().num_rows == 0
     assert state.apply(delta().slice(1, 1)) == 1
     assert state.sequence == 2
+    assert state.snapshot().schema.metadata[b"source"] == b"state-fixture"
     assert state.apply(delta()) == 0
     assert state.snapshot().column("price").to_pylist() == [10, 20]
     assert state.select([["B"], ["A"]]).column("price").to_pylist() == [20, 10]
@@ -59,66 +63,38 @@ def test_state_fragments_are_atomic_and_gap_requires_rebuild():
         broken.snapshot()
 
 
-def test_bootstrap_buffers_deltas_during_snapshot_request_and_rejects_reconnect(monkeypatch):
-    class FakeSubscriber:
-        def __init__(self):
-            self.callback = None
-            self.reconnects = 0
-            self.running = True
-
-        def metrics(self):
-            return {"ready": True, "reconnects_total": self.reconnects, "running": self.running}
-
-        def stop(self):
-            pass
-
-    subscriber = FakeSubscriber()
-
-    def subscribe(source, callback, **kwargs):
-        subscriber.callback = callback
-        return subscriber
-
-    def load():
-        subscriber.callback(delta())
-        return snapshot()
-
-    monkeypatch.setattr(zippy, "subscribe_table", subscribe)
-    handle = zippy.StateSubscription("quotes", load).start()
-    assert handle.sequence == 2
-    assert handle.snapshot().num_rows == 2
-    subscriber.reconnects = 1
-    with pytest.raises(RuntimeError, match="lost continuity"):
-        _ = handle.sequence
-    with pytest.raises(RuntimeError, match="lost continuity"):
-        handle.snapshot()
-    subscriber.reconnects = 0
-    subscriber.running = False
-    with pytest.raises(RuntimeError, match="no longer live"):
-        handle.snapshot()
-    handle.stop()
-    with pytest.raises(RuntimeError):
-        _ = handle.sequence
-
-
-def test_bootstrap_memory_budget_fails_closed(monkeypatch):
-    class FakeSubscriber:
-        def metrics(self):
-            return {"ready": True}
-
-        def stop(self):
-            pass
-
-    callback = None
-
-    def subscribe(source, on_delta, **kwargs):
-        nonlocal callback
-        callback = on_delta
-        return FakeSubscriber()
-
-    def load():
-        callback(delta())
-        return snapshot()
-
-    monkeypatch.setattr(zippy, "subscribe_table", subscribe)
-    with pytest.raises(RuntimeError, match="byte budget"):
-        zippy.StateSubscription("quotes", load, max_pending_bytes=1).start()
+def test_state_deletes_commit_after_complete_version_and_reinsert():
+    state = zippy.KeyValueState(snapshot())
+    state.apply(delta())
+    schema = delta().schema
+    deleted = pa.Table.from_arrays(
+        [
+            pa.array([3, 4]),
+            pa.array(["delete", "delete"]),
+            pa.array([2, 2]),
+            pa.array([4, 4]),
+            pa.array(["test-stream", "test-stream"]),
+            pa.array(["A", "absent"]),
+            pa.array([0, 0]),
+        ],
+        schema=schema,
+    )
+    assert state.apply(deleted.slice(0, 1)) == 0
+    assert state.snapshot().column("symbol").to_pylist() == ["A", "B"]
+    assert state.apply(deleted.slice(1, 1)) == 1
+    assert state.snapshot().column("symbol").to_pylist() == ["B"]
+    assert state.apply(deleted) == 0
+    inserted = pa.Table.from_arrays(
+        [
+            pa.array([5]),
+            pa.array(["upsert"]),
+            pa.array([3]),
+            pa.array([5]),
+            pa.array(["test-stream"]),
+            pa.array(["A"]),
+            pa.array([99]),
+        ],
+        schema=schema,
+    )
+    assert state.apply(inserted) == 1
+    assert state.snapshot().column("price").to_pylist() == [99, 20]

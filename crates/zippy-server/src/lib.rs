@@ -1,64 +1,36 @@
-//! Composition root for the incremental single-node server refactor.
+//! Owning single-node server runtime for control, storage, ingest and query services.
 //!
-//! Phase 1 keeps the existing master and gateway implementations behind the
-//! stable service contracts. Capability metadata makes every compatibility
-//! limitation explicit so callers cannot mistake an adapter for the future
-//! SQLite catalog or DataFusion query engine.
+//! SQLite owns durable metadata; DataFusion and Flight serve the native data path.
+//! The control registry owns only process leases and boot-scoped runtime observations.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-mod catalog_command_shadow;
-mod catalog_shadow;
-mod composition;
+mod consumer_log;
+mod fixed_snapshot;
 mod flight_query;
 mod flight_security;
-mod gateway_query;
 mod health;
-mod legacy_catalog_migration;
-mod legacy_query;
-mod memory_ingest;
+mod native_log;
 mod native_query;
 mod native_query_canary;
 mod native_storage;
-// Remove this allowance when the native query frontend owns execution leases directly.
-#[allow(dead_code)]
 mod query_execution;
-// Remove this allowance when the native planner constructs the coordinator directly.
-#[allow(dead_code)]
-mod query_service;
-// Remove this allowance when the native executor opens admitted Parquet sources directly.
-#[allow(dead_code)]
 mod query_physical;
-#[allow(dead_code)]
+mod query_service;
 mod query_snapshot;
 mod runtime;
+mod table_admin;
 
-pub use catalog_command_shadow::{
-    LegacyCatalogShadowPublisherStatus, LegacyCatalogShadowShutdownOutcome,
-    LegacyCatalogShadowState, LegacyCatalogShadowStatus,
-};
-pub use composition::LegacyServerServices;
+pub use consumer_log::{NativeConsumerDelivery, NativeConsumerLog, NativeConsumerLogService};
 pub use flight_query::NativeFlightQueryFrontend;
-pub use health::{LegacyServerCapabilities, LegacyServerHealth, ServiceHealth};
-pub use legacy_catalog_migration::{
-    plan_legacy_catalog_metadata_import, LegacyCatalogCommandDisposition,
-    LegacyCatalogMetadataImportPlan, LegacyCatalogMetadataMigrationReport,
-    LegacyCatalogMigrationDegradation, LegacyCatalogMigrationDegradedReason,
-    LegacyCatalogMigrationState, LegacyCatalogMigrationStatus, LegacyCatalogTableMigrationOutcome,
-    LegacyCatalogTableMigrationReport, LegacyCatalogTablePlan, LegacyCatalogTablePlanStatus,
-    LegacyCatalogV2ImportRequirement, LEGACY_CATALOG_METADATA_MIGRATION_VERSION,
-    LEGACY_CATALOG_TARGET_REVISION_BASE, LEGACY_EMPTY_NATIVE_SNAPSHOT_BASE,
-    LEGACY_MIGRATION_VERSION_CONFIG_KEY, LEGACY_REVISION_BASE_CONFIG_KEY,
-    LEGACY_SOURCE_SNAPSHOT_HASH_CONFIG_KEY, LEGACY_STREAM_NAME_CONFIG_KEY,
-    NATIVE_SNAPSHOT_BASE_CONFIG_KEY,
-};
-pub use legacy_query::{
-    LegacyGatewayPlan, LegacyQueryEngineAdapter, LegacyQueryEngineConfig,
-    LEGACY_GATEWAY_PLAN_FORMAT_VERSION,
+pub use health::{ServerCapabilities, ServerHealth, ServiceHealth};
+pub use native_log::{
+    NativeLogBatch, NativeLogRequest, NativeLogStream, NativeLogSubscription, NativeLogWindow,
 };
 pub use native_query::{
-    NativePreparedQuery, NativeQueryBinding, NativeQueryEngine, NativeQueryExplanation,
+    NativeFixedSnapshot, NativeFixedSnapshotRequest, NativePreparedQuery, NativeQueryBinding,
+    NativeQueryEngine, NativeQueryExplanation,
 };
 pub use native_query_canary::{
     NativeQueryCanaryBinding, NativeQueryCanaryComparison, NativeQueryCanaryDigestBuilder,
@@ -71,6 +43,7 @@ pub use native_storage::{
     NativeStorageStartOutcome, NativeStorageStartup,
 };
 pub use runtime::{
-    run_server_daemon, LegacyServerMode, LegacyServerReadiness, LegacyServerRuntime,
-    LegacyServerRuntimeConfig, LegacyServerRuntimeHealth, LegacyServerShutdownOutcome,
+    run_server_daemon, ServerMode, ServerReadiness, ServerRuntime, ServerRuntimeConfig,
+    ServerRuntimeHealth, ServerShutdownOutcome,
 };
+pub use table_admin::NativeTableAdmin;

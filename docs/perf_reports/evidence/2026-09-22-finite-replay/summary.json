@@ -1,0 +1,211 @@
+{
+  "date": "2026-09-22",
+  "batch": 33,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F14",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "removed": [
+    "TableReplayEngine",
+    "zippy.replay",
+    "ParquetReplayEngine SHM publisher",
+    "_CallbackReplayHandle",
+    "replay mode option",
+    "_iter_arrow_rows"
+  ],
+  "main_module_lines": 9915,
+  "validation": {
+    "native_examples": {
+      "path": "/tmp/zippy-replay-native-examples.log",
+      "exit_code": 0,
+      "sha256": "d7411f741c554bfb0e6e874f760e234b3a16702878d7a949a6ad3776d8ff4079",
+      "tail": [
+        "2026-09-22 15:49:12.468 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 15:49:12.509 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 15:49:12.549 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_finite_replay_examples_presubscription_and_output_after_stop\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "pytest": {
+      "path": "/tmp/zippy-replay-pytest-final.log",
+      "exit_code": 0,
+      "sha256": "da41e93aa03f05b27b4b99b9cefdf4c636095c214f2a6866af9cf686e481e294",
+      "tail": [
+        "........................................................................ [ 90%]",
+        "........................................................................ [ 98%]",
+        ".............                                                            [100%]",
+        "876 passed, 1 skipped in 65.38s (0:01:05)"
+      ]
+    },
+    "coverage": {
+      "path": "/tmp/zippy-replay-coverage.log",
+      "exit_code": 0,
+      "sha256": "8e0587348eaa882a7bd413a3dade524e3bfe6b78c4e5030ca0f900aea5a97e6d",
+      "tail": [
+        "-------------------------------------------------------------",
+        "TOTAL                             654     69    89%",
+        "Required test coverage of 80% reached. Total coverage: 89.45%",
+        "56 passed in 0.46s"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-replay-black-final.log",
+      "exit_code": 0,
+      "sha256": "f0e9a6806b9eebd5fa05801ef8e1e4b5223ecdb379a45d1291a7302f0888ef4e",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "102 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-replay-ruff-final.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-replay-mypy-root-final.log",
+      "exit_code": 0,
+      "sha256": "59cc4d21606d1f60735af82101c6094ef4d27a1054cb5061988711c9db04c37e",
+      "tail": [
+        "Success: no issues found in 17 source files"
+      ]
+    },
+    "mypy_changed": {
+      "path": "/tmp/zippy-replay-mypy-changed-final.log",
+      "exit_code": 0,
+      "sha256": "8b88f6d12bd312c1b024b66d07a7f7619a68482ac4d64e475759b1823199faa5",
+      "tail": [
+        "Success: no issues found in 12 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-replay-mypy-all-final.log",
+      "exit_code": 1,
+      "sha256": "84646ba57b5de5becf10338e46bdac1ce779d08e88337bbc2ae40b514d658824",
+      "tail": [
+        "pytests/test_python_cli.py:956: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:1043: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:1044: error: Value of type \"object\" is not indexable  [index]",
+        "Found 961 errors in 10 files (checked 101 source files)"
+      ]
+    },
+    "rust_format": {
+      "path": "/tmp/zippy-replay-fmt.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    },
+    "diff": {
+      "path": "/tmp/zippy-replay-diff-final.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    }
+  },
+  "coverage_percent": 89.45,
+  "native_matrix": {
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_sha256": {
+    "python/zippy/__init__.py": "b27f3f1c4108a96de117ebdb4ba5f2f82a64416a1a40697591e3c28136753b05",
+    "python/zippy/source_input.py": "5f9a69b4ecdd75ca50728e48a6c0094374009fcd4674216d2b9e9aa5a0800c83",
+    "python/zippy/replay_source.py": "9bd5d640871c94d785bf46bfc50601f3baeaceb6039aa69984df0a4cc254ba68",
+    "pyproject.toml": "769e945d392a6774ce3a0171ad85c3c6e3c760f311992e6b9022311775c6f5ce",
+    "pytests/test_replay_source.py": "6f9c718d050951695ed5ff88a777ab8f0429f7762716c9f555325e5fb57f2a20",
+    "pytests/test_native_source_input.py": "47a3885c106e897c1703beb808fb81656efc7338669cf032fce561baccb90447",
+    "pytests/test_shared_client_values.py": "32e0843633fe6e22df3bc18bf4474b39cbc7733d76471a73bce4aabfaa48f74a",
+    "pytests/test_python_api.py": "16adde64bb5dac8764cb9377d52beb71c4486c57e0948720901a3855b785906d",
+    "scripts/check_compute_plugin.py": "a38ad67839f61656620e5aa3f1af75abb63c5d1833dcf80c455da7286c3634bc",
+    "scripts/check_native_client.py": "2b896f8c5d17f0310132515db154409d8894c78e6d6ce36939a4bf76c523a93b",
+    "scripts/check_replay_examples.py": "cbf5be8f4632d02b7e9c28cac4caf7231228fade44ba2b4e9deabc3617387223",
+    "docs/native-compute.md": "874ccb535e7765a8aa9ea00dc48f42fe568db1e3b28e88ddeaac76fa26a26364",
+    "docs/convergence-finite-replay-2026-09-22.md": "2aa27978266bc2a9e8601d716f2dc2048fc4564d2ea4220b723e0d79bb15d051",
+    "docs/current-capabilities-2026-09-21.md": "108bf7c9e260a1cbcb2f23d486c1fb98ad1d66d7d231b3cd5d08830cfcf1bdfa",
+    "examples/examples_guide.md": "dda15bcbf38a28766ea1afd98387193d142b6925a1afccc708f34585bfc9c392",
+    "examples/06_replay/02_replay_parity_check.py": "bdee70d064472d141eb3af600f5b5ba7b37260bcbd48e376075f27a02dfe1221",
+    "examples/06_replay/01_parquet_replay_to_stream_table.py": "80f2ac1cca6c5d4c7144f2d574e6aff2b5d40c0ec9e57a0119fd26f35f5cf461",
+    "examples/06_replay/03_replay_to_reactive_latest_engine.py": "d96bce4ba5c33bc31dca02343a39095522aac6ad79b1751a0a058d036d7380f0"
+  },
+  "rust_modified": false,
+  "main_distribution_and_cross_platform_rerun": false,
+  "test_migration": "Old registry/SHM replay checks replaced with real native three-kind output, frame pre-subscription, result-after-stop and three public example runs; exact four-unit timestamps retained through the callback entry."
+}

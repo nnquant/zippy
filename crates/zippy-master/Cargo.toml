@@ -4,23 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-arrow.workspace = true
-parquet.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tempfile = "3"
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
-zippy-gateway = { path = "../zippy-gateway" }
-zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
-tracing-subscriber.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-signal-hook = { version = "0.3", features = ["iterator"] }
+tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

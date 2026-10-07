@@ -1,4 +1,4 @@
-"""Transport-neutral lazy table query exposed by :mod:`zippy_client`."""
+"""Native Flight lazy table query exposed by :mod:`zippy_client`."""
 
 from __future__ import annotations
 
@@ -7,16 +7,12 @@ from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
-from .errors import CapabilityError
+from .errors import QueryError
 from .expressions import (
     Expr,
     col,
-    expression_supported_by_gateway,
-    expression_to_json,
     normalize_expressions,
-    normalize_temporal_filter,
 )
-from .models import Transport
 from .sql import compile_flight_table_sql
 
 if TYPE_CHECKING:
@@ -55,7 +51,7 @@ class _SnapshotLease:
         self._released = True
         snapshot_id = self.snapshot.get("snapshot_id")
         if snapshot_id is not None:
-            self.client.gateway.release_snapshot(self.source, str(snapshot_id))
+            self.client.flight.release_snapshot(str(snapshot_id))
 
 
 class Table:
@@ -66,8 +62,8 @@ class Table:
     :type source: str
     :param client: Explicit connected client.
     :type client: Client
-    :param snapshot: Reuse a Gateway snapshot across terminal operations. Flight
-        always creates one consistent snapshot per terminal query.
+    :param snapshot: Request a fixed snapshot across terminal operations.
+        Unsupported transports reject this request; the default is per-query isolation.
     :type snapshot: bool
     :param namespace: Catalog namespace used by Flight bindings.
     :type namespace: str
@@ -78,20 +74,20 @@ class Table:
         source: str,
         client: Client,
         *,
-        snapshot: bool = True,
+        snapshot: bool = False,
         namespace: str = "default",
     ) -> None:
         self.source = str(source)
         self.namespace = str(namespace)
         self._client = client
-        self._snapshot_enabled = bool(snapshot)
         self._fixed_snapshot: _SnapshotLease | None = None
-        self._manual_snapshots: list[_SnapshotLease] = []
         self._schema: Any | None = None
         self._info: dict[str, object] | None = None
         self._plan: list[tuple[str, object]] = []
         self._last_metrics: dict[str, object] = {}
         self._closed = False
+        if snapshot:
+            self.snapshot()
 
     def filter(self, predicate: object | None = None, **equals: object) -> Table:
         """Return a query with an additional filter predicate."""
@@ -102,10 +98,6 @@ class Table:
         if expression is None:
             return self
         return self._clone(("filter", expression))
-
-    def where(self, predicate: object | None = None, **equals: object) -> Table:
-        """Compatibility alias for :meth:`filter`."""
-        return self.filter(predicate, **equals)
 
     def select(self, *expressions: object, **named_expressions: object) -> Table:
         """Return a query projecting columns or supported expressions."""
@@ -129,14 +121,10 @@ class Table:
             raise ValueError("n must be non-negative")
         return self._clone(("head", int(n)))
 
-    def limit(self, n: int) -> Table:
-        """Compatibility alias for :meth:`head`."""
-        return self.head(n)
-
     def slice(self, offset: int, length: int | None = None) -> Table:
         """Return a query slicing rows by offset and optional length."""
         if offset < 0:
-            raise ValueError("offset must be non-negative for Gateway queries")
+            raise ValueError("offset must be non-negative for queries")
         if length is not None and length < 0:
             raise ValueError("length must be non-negative")
         return self._clone(("slice", {"offset": int(offset), "length": length}))
@@ -176,11 +164,15 @@ class Table:
         """Return a join query, validated against server capabilities at collect time."""
         if not isinstance(other, Table):
             raise TypeError("join other must be a zippy_client.Table")
+        if self._client is not other._client:
+            raise ValueError("joined tables must share one client")
+        if self._fixed_snapshot is not other._fixed_snapshot:
+            raise ValueError("fixed joins require tables from the same Client.open_snapshot scope")
         keys = [on] if isinstance(on, str) else [str(item) for item in on]
         return self._clone(
             (
                 "join",
-                {"other": other, "on": keys, "how": str(how), "suffix": str(suffix)},
+                {"other": other._clone(), "on": keys, "how": str(how), "suffix": str(suffix)},
             )
         )
 
@@ -201,73 +193,86 @@ class Table:
         self._load_metadata(refresh=True)
         return dict(self._info or {})
 
-    def stream_info(self) -> dict[str, object]:
-        """Compatibility alias for :meth:`info`."""
-        return self.info()
-
     def snapshot(self) -> dict[str, object]:
-        """Return the fixed or latest server-owned query snapshot."""
-        if self._uses_flight():
-            query = self._last_metrics.get("query")
-            if isinstance(query, dict):
-                return dict(query)
-            return {
-                "mode": "per_query",
-                "source": self.source,
-                "namespace": self.namespace,
-            }
-        if self._snapshot_enabled and self._fixed_snapshot is not None:
+        """Pin this query and its clones to one server-owned snapshot."""
+        if self._closed:
+            raise RuntimeError("table query is closed")
+        if self._fixed_snapshot is not None:
             return dict(self._fixed_snapshot.snapshot)
-        snapshot = self._client.gateway.create_snapshot(self.source)
-        if self._snapshot_enabled:
-            self._fixed_snapshot = _SnapshotLease(self.source, self._client, snapshot)
-        else:
-            self._manual_snapshots.append(_SnapshotLease(self.source, self._client, snapshot))
+        sources: dict[tuple[str, str], None] = {}
+        visiting: set[int] = set()
+        visited: set[int] = set()
+        tables: list[Table] = []
+
+        def collect_sources(table: Table) -> None:
+            identity = id(table)
+            if identity in visiting:
+                raise ValueError("cyclic table join cannot be snapshotted")
+            if identity in visited:
+                return
+            visiting.add(identity)
+            tables.append(table)
+            sources[(table.namespace, table.source)] = None
+            for operation, arguments in table._plan:
+                if operation == "join":
+                    if not isinstance(arguments, dict) or not isinstance(
+                        arguments.get("other"), Table
+                    ):
+                        raise ValueError("table join has no source query")
+                    collect_sources(arguments["other"])
+            visiting.remove(identity)
+            visited.add(identity)
+
+        collect_sources(self)
+        if len(tables) > 32:
+            raise ValueError("fixed snapshot query exceeds 32 table bindings")
+        bindings = {
+            f"zippy_snapshot_{index}": {"namespace": namespace, "table": name}
+            for index, (namespace, name) in enumerate(sources)
+        }
+        snapshot = self._client.flight.create_snapshot(bindings)
+        lease = _SnapshotLease(self.source, self._client, snapshot)
+        for table in tables:
+            table._fixed_snapshot = lease if table is self else lease.acquire()
+            table._schema = None
+            table._info = None
         return dict(snapshot)
 
-    def collect(self, *, stream: bool = False):
+    def collect(self):
         """Execute this query and return a PyArrow table."""
-        table, _ = self._execute(stream=stream)
+        table, _ = self._execute()
         return table
 
-    def profile(self, *, stream: bool = False) -> dict[str, object]:
+    def profile(self) -> dict[str, object]:
         """Execute this query and return its table plus client/server metrics."""
         started_ns = time.perf_counter_ns()
-        table, metrics = self._execute(stream=stream)
+        table, metrics = self._execute()
         profile: dict[str, object] = {
-            "executor": str(metrics.get("executor", "gateway")),
+            "executor": str(metrics.get("executor", "flight")),
             "transport": self._client.query_transport.value,
             "returned_rows": int(table.num_rows),
             "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000.0,
         }
-        if self._uses_flight():
-            profile["flight_endpoint"] = self._client.flight.endpoint
-            profile["flight"] = dict(metrics)
-        else:
-            profile["gateway_endpoint"] = self._client.gateway.endpoint
-            profile["gateway"] = dict(metrics)
+        profile["flight_endpoint"] = self._client.flight.endpoint
+        profile["flight"] = dict(metrics)
         profile.update(metrics)
         return {"result": table, "metrics": profile}
 
     def explain(self) -> dict[str, object]:
         """Return the normalized server plan without executing it."""
-        if self._uses_flight():
-            compiled = compile_flight_table_sql(self)
-            return {
-                "source": self.source,
-                "namespace": self.namespace,
-                "transport": self._client.query_transport.value,
-                "flight_endpoint": self._client.flight.endpoint,
-                "snapshot": "per_query",
-                "sql": compiled.sql,
-                "bindings": compiled.bindings,
-            }
+        compiled = compile_flight_table_sql(self)
         return {
             "source": self.source,
+            "namespace": self.namespace,
             "transport": self._client.query_transport.value,
-            "gateway_endpoint": self._client.gateway.endpoint,
-            "snapshot": self._snapshot_enabled,
-            "plan": self._serialized_plan(),
+            "flight_endpoint": self._client.flight.endpoint,
+            "snapshot": (
+                dict(self._fixed_snapshot.snapshot)
+                if self._fixed_snapshot is not None
+                else "per_query"
+            ),
+            "sql": compiled.sql,
+            "bindings": compiled.bindings,
         }
 
     def close(self) -> None:
@@ -275,13 +280,26 @@ class Table:
         if self._closed:
             return
         self._closed = True
+        plan, self._plan = self._plan, []
         fixed_snapshot = self._fixed_snapshot
         self._fixed_snapshot = None
-        manual_snapshots, self._manual_snapshots = self._manual_snapshots, []
+        first_error: BaseException | None = None
+        for operation, arguments in plan:
+            if operation != "join" or not isinstance(arguments, dict):
+                continue
+            other = arguments.get("other")
+            if isinstance(other, Table):
+                try:
+                    other.close()
+                except BaseException as error:
+                    first_error = first_error or error
         if fixed_snapshot is not None:
-            fixed_snapshot.release()
-        for snapshot in manual_snapshots:
-            snapshot.release()
+            try:
+                fixed_snapshot.release()
+            except BaseException as error:
+                first_error = first_error or error
+        if first_error is not None:
+            raise first_error
 
     def __enter__(self) -> Table:
         return self
@@ -300,172 +318,79 @@ class Table:
                 error,
             )
 
-    def _execute(self, *, stream: bool) -> tuple[Any, dict[str, object]]:
+    def _execute(self) -> tuple[Any, dict[str, object]]:
         if self._closed:
             raise RuntimeError("table query is closed")
-        if self._uses_flight():
-            compiled = compile_flight_table_sql(self)
-            table, metrics = self._client.flight.read_sql(
-                compiled.sql,
-                compiled.bindings,
-                stream=stream,
-            )
-            self._last_metrics = dict(metrics)
-            return table, dict(metrics)
-        snapshot: bool | dict[str, object]
-        snapshot = self.snapshot() if self._snapshot_enabled else False
-        table, metrics = self._client.gateway.collect(
-            self.source,
-            self._serialized_plan(),
-            snapshot=snapshot,
-            stream=stream,
+        compiled = compile_flight_table_sql(self)
+        table, metrics = self._client.flight.read_sql(
+            compiled.sql, compiled.bindings, fixed_snapshot_id=self._native_snapshot_id()
         )
         self._last_metrics = dict(metrics)
         return table, dict(metrics)
 
-    def _serialized_plan(self) -> list[dict[str, object]]:
-        schema = self.schema()
-        plan: list[dict[str, object]] = []
-        for kind, value in _move_row_range_to_front(self._plan):
-            if kind == "filter":
-                expression = normalize_temporal_filter(value, schema)
-                if not expression_supported_by_gateway(expression):
-                    raise CapabilityError(
-                        "Gateway cannot execute this filter expression exactly; "
-                        "client-side query fallback is intentionally disabled"
-                    )
-                plan.append({"op": "filter", "expr": expression_to_json(expression)})
-            elif kind == "select":
-                expressions = _require_list(value, "select")
-                if not _column_expressions(expressions):
-                    raise CapabilityError("Gateway select currently supports column names only")
-                plan.append(
-                    {
-                        "op": "select",
-                        "exprs": [expression_to_json(item) for item in expressions],
-                    }
-                )
-            elif kind in {"tail", "head"}:
-                plan.append({"op": kind, "n": _require_int(value, kind)})
-            elif kind == "slice":
-                spec = _require_dict(value, "slice")
-                plan.append(
-                    {
-                        "op": "slice",
-                        "offset": _require_int(spec.get("offset"), "slice.offset"),
-                        "length": spec.get("length"),
-                    }
-                )
-            elif kind == "sort":
-                spec = _require_dict(value, "sort")
-                keys = _require_list(spec.get("by"), "sort.by")
-                if not _column_expressions(keys):
-                    raise CapabilityError("Gateway sort currently supports column names only")
-                plan.append(
-                    {
-                        "op": "sort",
-                        "by": [expression_to_json(item) for item in keys],
-                        "descending": spec.get("descending", False),
-                    }
-                )
-            elif kind == "drop":
-                plan.append({"op": "drop", "columns": _require_list(value, "drop")})
-            elif kind == "rename":
-                plan.append({"op": "rename", "mapping": _require_dict(value, "rename")})
-            else:
-                raise CapabilityError(f"Gateway does not advertise table plan operation=[{kind}]")
-        return plan
-
     def _load_metadata(self, *, refresh: bool = False) -> None:
+        if self._closed:
+            raise RuntimeError("table query is closed")
         if not refresh and self._schema is not None and self._info is not None:
             return
-        if self._uses_flight():
-            self._schema = self._client.flight.get_table_schema(
-                self.source,
-                namespace=self.namespace,
-            )
-            try:
-                self._info = self._client.control.get_stream(self.source)
-            except Exception as error:
-                logger.debug(
-                    "failed to resolve Flight table metadata source=[{}] namespace=[{}] error=[{}]",
-                    self.source,
-                    self.namespace,
-                    error,
-                )
-                self._info = {
-                    "name": self.source,
-                    "namespace": self.namespace,
-                    "transport": "flight",
-                }
+        self._schema = self._client.flight.get_table_schema(
+            self.source,
+            namespace=self.namespace,
+            fixed_snapshot_id=self._native_snapshot_id(),
+        )
+        if self._fixed_snapshot is not None:
+            self._info = {
+                "name": self.source,
+                "namespace": self.namespace,
+                "catalog": "zippy",
+                "table_type": "TABLE",
+                "snapshot_id": self._native_snapshot_id(),
+            }
             return
-        info, schema = self._client.gateway.get_stream(self.source)
-        self._info = info
-        self._schema = schema
+        matches = [
+            table
+            for table in self._client.flight.list_tables(namespace=self.namespace)
+            if table["name"] == self.source
+        ]
+        if len(matches) != 1:
+            raise QueryError(f"table metadata is missing or ambiguous source=[{self.source}]")
+        self._info = matches[0]
+        return
 
-    def _clone(self, operation: tuple[str, object]) -> Table:
+    def _clone(self, operation: tuple[str, object] | None = None) -> Table:
+        if self._closed:
+            raise RuntimeError("table query is closed")
         clone = Table(
             self.source,
             self._client,
-            snapshot=self._snapshot_enabled,
+            snapshot=False,
             namespace=self.namespace,
         )
         if self._fixed_snapshot is not None:
             clone._fixed_snapshot = self._fixed_snapshot.acquire()
         clone._schema = self._schema
         clone._info = self._info
-        clone._plan = [*self._plan, operation]
+        clone._plan = []
+        for kind, arguments in self._plan:
+            if (
+                kind == "join"
+                and isinstance(arguments, dict)
+                and isinstance(arguments.get("other"), Table)
+            ):
+                clone._plan.append((kind, {**arguments, "other": arguments["other"]._clone()}))
+            else:
+                clone._plan.append((kind, arguments))
+        if operation is not None:
+            clone._plan.append(operation)
         return clone
 
-    def _uses_flight(self) -> bool:
-        return self._client.query_transport in {
-            Transport.FLIGHT_LOCAL,
-            Transport.FLIGHT_REMOTE,
-        }
+    def _native_snapshot_id(self) -> str | None:
+        if self._fixed_snapshot is None:
+            return None
+        return str(self._fixed_snapshot.snapshot["snapshot_id"])
 
 
 def _column_names(columns: tuple[object, ...]) -> list[str]:
     if len(columns) == 1 and isinstance(columns[0], (list, tuple)):
         columns = tuple(columns[0])
     return [str(column) for column in columns]
-
-
-def _column_expressions(expressions: object) -> bool:
-    if not isinstance(expressions, list):
-        return False
-    return all(
-        isinstance(item, str) or (isinstance(item, Expr) and item.kind == "col")
-        for item in expressions
-    )
-
-
-def _move_row_range_to_front(
-    plan: list[tuple[str, object]],
-) -> list[tuple[str, object]]:
-    commutable = {"select", "drop", "rename"}
-    for index, (kind, value) in enumerate(plan):
-        if kind in {"head", "tail", "slice"}:
-            if all(prefix_kind in commutable for prefix_kind, _ in plan[:index]):
-                return [(kind, value), *plan[:index], *plan[index + 1 :]]
-            break
-        if kind not in commutable:
-            break
-    return list(plan)
-
-
-def _require_list(value: object, name: str) -> list[object]:
-    if not isinstance(value, list):
-        raise TypeError(f"query plan value must be a list operation=[{name}]")
-    return value
-
-
-def _require_dict(value: object, name: str) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise TypeError(f"query plan value must be an object operation=[{name}]")
-    return {str(key): item for key, item in value.items()}
-
-
-def _require_int(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise TypeError(f"query plan value must be an integer operation=[{name}]")
-    return int(value)

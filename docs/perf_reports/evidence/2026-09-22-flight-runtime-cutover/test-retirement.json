@@ -1,0 +1,902 @@
+{
+  "retired_or_renamed": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_accepts_explicit_sqlite_authority_without_gateway",
+      "action": "renamed",
+      "replacement": "zippy_config_accepts_explicit_sqlite_authority_with_native_storage",
+      "reason": "removed Gateway-specific name while retaining applicable assertions"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_builds_gateway_endpoint_from_host_and_port",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_derives_gateway_endpoint_from_master_port",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_does_not_derive_disabled_gateway_endpoint",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_enabled_gateway_without_endpoint_or_master_port",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_sqlite_authority_with_legacy_gateway",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "async_master_control_accepts_normal_response_at_eof",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "async_master_control_deadline_interrupts_stalled_response",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "async_master_control_preserves_structured_error_at_exact_limit",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "async_master_control_rejects_response_over_line_limit",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "blocking_first_registration_is_single_flight_across_callers",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_dependency_probe_uses_configured_master_control_endpoint",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_filter_accepts_typed_timestamp_literal",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_is_in_filter_uses_compiled_membership_for_common_types",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_is_in_large_literal_membership_profile",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_master_request_timeout_inherits_write_timeout",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_query_parallelism_is_validated_and_reported",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_snapshot_expiry_removes_only_idle_snapshots",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_writer_creation_fetches_writer_epoch_with_stream_status_request",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "gateway_writer_handle_is_cloneable_for_per_stream_locking",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "materialized_stream_producer_splits_batches_by_chunk_rows",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "ordered_file_results_emit_in_file_index_order",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "ordered_file_results_reject_duplicate_and_stale_indices",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "ordered_file_results_reject_unfinished_gap",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_file_filter_pruning_preserves_nanosecond_precision",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_file_order_keeps_writer_epochs_contiguous",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_only_stream_keeps_files_overlapping_stale_sealed_segments",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_overlap_distinguishes_writer_epochs",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_parquet_reader_exposes_batches_before_concat",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_parquet_reader_prunes_non_matching_row_groups",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_parquet_row_range_returns_no_rows_for_zero_length",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_partition_filter_handles_mixed_scalar_encodings_conservatively",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_read_entrypoints_share_injected_snapshot_source",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_read_source_rejects_a_mismatched_stream_snapshot",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_scan_fails_closed_for_missing_catalog_file",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_stream_backpressure_does_not_pin_shared_scan_worker",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_stream_producer_bounds_buffered_batches_by_bytes",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_stream_producer_classifies_invalid_parquet_as_data_corruption",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_stream_producer_defers_file_scan_until_first_batch",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_stream_producer_does_not_prefetch_past_in_flight_window",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "persisted_stream_producer_rejects_batch_larger_than_file_budget",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "shutdown_budget_bounds_stalled_heartbeat_and_does_not_retry_on_drop",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "shutdown_gate_prevents_process_reregistration",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "shutdown_gate_prevents_retry_after_master_rejects_existing_process",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "shutdown_reports_writer_cleanup_that_outlives_deadline",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "tail_persisted_file_batches_preserve_batch_order_within_file",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "unexpected_runtime_exit_marks_gateway_stopped",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "zero_shutdown_budget_does_not_fall_back_to_drop_timeout",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_accepts_arrow_write_batch_and_publishes_descriptor",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_applies_lazy_shape_collect_plan",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_binds_writer_epoch_to_master_source_epoch",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_applies_filter_then_final_select_for_persisted_files",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_head_matches_default_collect",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_keeps_mixed_persisted_and_live_on_materialized_fallback",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_live_segment_applies_projection_and_filter_by_chunk",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_rejects_residual_plan_before_start",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_rejects_row_range_then_filter_before_start",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_reports_streaming_metrics",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_returns_start_chunks_and_end_frames",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_slice_matches_default_collect",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_stream_tail_matches_default_collect",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_streams_persisted_files_in_default_order",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collect_uses_pinned_snapshot_high_watermark",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collects_existing_segment_stream",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_collects_persisted_parquet_catalog_rows_without_live_segment",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_idle_connection_does_not_block_metrics_request",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_pushes_head_collect_into_segment_reader",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_pushes_slice_collect_into_segment_reader",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_pushes_tail_collect_into_persisted_catalog_files",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_pushes_tail_collect_into_segment_reader",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_rejects_bad_token_before_reading_payload",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_rejects_blocking_requests_over_configured_limit",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_rejects_connections_over_configured_limit",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_rejects_invalid_resource_limits",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_rejects_oversized_payload_length_before_allocation",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_rejects_subscribers_over_configured_limit",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_reports_async_master_control_requests",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_reports_configured_resource_limits",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_reports_writer_segment_timing_metrics",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_reregisters_master_process_after_lease_expiry",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_runtime_starts_and_stops_cleanly",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_slow_subscribe_client_does_not_block_writes_or_metrics",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_slow_subscribe_client_times_out_and_reports_reason",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_stop_releases_active_subscribe_reader_lease",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_disconnect_releases_metrics_and_reader_lease",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_perf_smoke_reports_delivery_metrics",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_rows_follows_active_segment_rollover",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_rows_follows_writer_restart_descriptor",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_rows_rejects_table_controls",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_rows_returns_row_frames_without_table_payload",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_table_batches_rows_across_flushes",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_table_filters_before_batching_and_applies_count_on_flush",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_table_follows_active_segment_rollover",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_table_rejects_instrument_ids",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_table_rejects_non_positive_controls",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_table_throttle_flushes_pending_rows",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_gateway_subscribe_table_uses_active_segment_notifications",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_query_client_disconnect_drops_a_pending_result_stream",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_query_explain_returns_server_plan_without_result_execution",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-gateway/tests/native_gateway.rs",
+      "test": "native_query_frontend_streams_one_owned_batch_at_a_time",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-ingest/src/memory.rs",
+      "test": "close_writer_releases_registration_and_allows_reopen",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-ingest/src/memory.rs",
+      "test": "shared_handle_owns_one_writer_and_returns_active_rows",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-ingest/src/memory.rs",
+      "test": "table_limit_schema_mismatch_and_closed_admission_fail_explicitly",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/src/health.rs",
+      "test": "stopped_gateway_only_removes_query_readiness",
+      "action": "renamed",
+      "replacement": "control_only_health_does_not_advertise_queries",
+      "reason": "removed Gateway-specific name while retaining applicable assertions"
+    },
+    {
+      "file": "crates/zippy-server/src/memory_ingest.rs",
+      "test": "publisher_heartbeats_until_bounded_close_unregisters_process",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "native_query_canary_is_explicit_and_does_not_open_gateway_sql_capability",
+      "action": "renamed",
+      "replacement": "native_query_canary_is_explicit",
+      "reason": "removed Gateway-specific name while retaining applicable assertions"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "native_query_resources_are_independent_from_gateway_buffer_budget",
+      "action": "renamed",
+      "replacement": "native_query_resources_use_query_buffer_budget",
+      "reason": "removed Gateway-specific name while retaining applicable assertions"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "readiness_requires_configured_memory_ingest_authority",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "readiness_requires_gateway_listener_and_dependency_when_configured",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "readiness_treats_disabled_gateway_as_not_applicable",
+      "action": "renamed",
+      "replacement": "readiness_allows_control_only_mode",
+      "reason": "removed Gateway-specific name while retaining applicable assertions"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "zero_remaining_server_budget_does_not_fall_back_to_default_gateway_timeout",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/tests/legacy_runtime_baseline.rs",
+      "test": "gateway_bind_conflict_leaves_no_gateway_runtime_or_bound_port",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_binary.rs",
+      "test": "server_binary_starts_native_gateway_when_enabled",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "full_runtime_opens_admission_only_after_gateway_master_probe",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "gateway_bind_failure_also_closes_configured_native_storage",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "gateway_bind_failure_rolls_back_ready_master_listener",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "gateway_write_uses_server_owned_memory_ingest_authority",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "pytests/test_server_process.py",
+      "test": "test_server_detached_gateway_probe_does_not_persist_token",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "pytests/test_server_process.py",
+      "test": "test_server_ready_record_rejects_removed_gateway_facade_fact",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "pytests/test_server_process.py",
+      "test": "test_server_ready_record_requires_boolean_gateway_configuration",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "pytests/test_server_process.py",
+      "test": "test_server_ready_record_requires_boolean_memory_ingest_configuration",
+      "action": "retired",
+      "replacement": "native Flight query, subscription, durability and recovery matrix; server startup and shutdown tests",
+      "reason": "removed Gateway or duplicate memory ingest contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_watch_gateway_config_returns_current_config",
+      "action": "retired",
+      "reason": "removed GatewayConfig control discovery event",
+      "replacement": "native Flight metadata discovery tests"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_accepts_explicit_sqlite_authority_with_native_storage"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_removed_gateway_configuration"
+    },
+    {
+      "file": "crates/zippy-server/src/health.rs",
+      "test": "control_only_health_does_not_advertise_queries"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "listener_cleanup_retries_after_receive_and_join_deadlines"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "native_query_canary_is_explicit"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "native_query_resources_use_query_buffer_budget"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "readiness_allows_control_only_mode"
+    }
+  ],
+  "counts_by_action": {
+    "retired": 117,
+    "renamed": 5
+  },
+  "retained_or_migrated": [
+    "Gateway bind rollback migrated to real Flight occupied port with valid token and log assertion",
+    "all native table, ACK, callback, compute and restart checks",
+    "runtime lifecycle, native resource and query canary tests retained",
+    "ready version rejection adds v8, rejects future v10"
+  ],
+  "new_regressions": [
+    "control listener receive and join deadlines retain ownership and permit retry",
+    "removed Gateway TOML and environment inputs fail explicitly"
+  ]
+}

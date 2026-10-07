@@ -1,0 +1,223 @@
+{
+  "date": "2026-09-22",
+  "batch": 30,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F08",
+    "F13",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "plugin_input": {
+    "schema_checked_before_kernel_transfer": true,
+    "synchronous_start_emissions": true,
+    "ordered_complete_arrow_units": true,
+    "internal_prefetch_queue": false,
+    "output_confirmation_before_callback_return": true,
+    "master_registration": false,
+    "gateway_or_shm_publisher": false,
+    "same_native_processor_and_writer": true,
+    "late_cancelled_delivery_does_not_write": true,
+    "plugin_join_wait_sec": 5,
+    "plugin_stop_must_return_promptly": true,
+    "plugin_checkpoint": false,
+    "old_session_pipeline_removed": false
+  },
+  "validation": {
+    "full_python": {
+      "path": "/tmp/zippy-source-input-full.log",
+      "exit_code": 0,
+      "sha256": "4740a4559f857ffdfbb2e3bcb3a7c17ab34c62411a177540420a812bee7f2ac4",
+      "tail": [
+        "........................................................................ [ 84%]",
+        "........................................................................ [ 92%]",
+        "...............................................................          [100%]",
+        "854 passed, 1 skipped in 69.50s (0:01:09)"
+      ]
+    },
+    "compute_source_coverage": {
+      "path": "/tmp/zippy-source-input-coverage.log",
+      "exit_code": 0,
+      "sha256": "f7942d2229b496194fd8e353c5f868df305862de1682eb1360b9cc9ca4b06f60",
+      "tail": [
+        "------------------------------------------------------------",
+        "TOTAL                            366     40    89%",
+        "Required test coverage of 80% reached. Total coverage: 89.07%",
+        "28 passed in 0.36s"
+      ]
+    },
+    "initial_native_matrix": {
+      "path": "/tmp/zippy-source-input-native.log",
+      "exit_code": 0,
+      "sha256": "8d0c068163649d8b39617235da723eb7cff7fadd1142e0f537763e542533e59e",
+      "tail": [
+        "2026-09-22 14:33:13.179 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:33:13.225 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:33:13.272 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "native_restart_initial": {
+      "path": "/tmp/zippy-source-input-native-final.log",
+      "exit_code": 1,
+      "sha256": "58fec073e6826b6978176165a0287604def34e21cb14e603ef13610487e4da83",
+      "tail": [
+        "            ^^^^^^^^^^^^^^^^^^",
+        "  File \"/home/jiangda/develop/zippy/clients/python/src/zippy_client/log_reader.py\", line 318, in _read_chunk",
+        "    raise _translate_flight_error(error, \"DoExchange.log\") from error",
+        "zippy_client.errors.QueryError: Flight request timed out operation=[DoExchange.log]"
+      ]
+    },
+    "native_restart_recheck": {
+      "path": "/tmp/zippy-source-input-native-final-recheck.log",
+      "exit_code": 0,
+      "sha256": "13bddf5c0f984c08a0b73484c4fd3fa6854c8e8a55e1fdd095fab322e84db7dd",
+      "tail": [
+        "2026-09-22 14:39:10.303 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:39:10.350 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:39:10.398 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-source-input-mypy-root.log",
+      "exit_code": 0,
+      "sha256": "ca16d6d1a06c6903f5407ba5268cb8b5eb5d8c7811b7532282916ec31807c328",
+      "tail": [
+        "Success: no issues found in 16 source files"
+      ]
+    },
+    "mypy_changed": {
+      "path": "/tmp/zippy-source-input-mypy.log",
+      "exit_code": 0,
+      "sha256": "e317872697c2cbfdefa321527a6efe73290dff3a390b0fa8723b87092eccba6a",
+      "tail": [
+        "Success: no issues found in 5 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-source-input-mypy-full.log",
+      "exit_code": 1,
+      "sha256": "5a89b4f7f352bb6bfdab73943f2366327fb64528e03c8ad07fb005305e4fa9b1",
+      "tail": [
+        "pytests/test_python_cli.py:956: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:1043: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:1044: error: Value of type \"object\" is not indexable  [index]",
+        "Found 976 errors in 12 files (checked 97 source files)"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-source-input-black-all.log",
+      "exit_code": 0,
+      "sha256": "a7c840aed037176d0880b6b590a13fa3cfc487765f7aacd9533a95f35c86cccc",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "98 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-source-input-ruff.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "diff": {
+      "path": "/tmp/zippy-source-input-diff.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    }
+  },
+  "native_matrix": {
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "unresolved_observation": "existing output recovery log read timed out once; unchanged five-second deadline and assertions passed on recheck, cause unproven; tracked under F11/F13",
+  "rust_and_client_changes_this_batch": false,
+  "rust_workspace_clippy_and_client_distributions_rerun_this_batch": false,
+  "source_sha256": {
+    "python/zippy/source_input.py": "4cf1479f3a331d797f893dff6fde57e4402cff0a8231b961012f2ee8396f0907",
+    "python/zippy/compute.py": "a6742f6874508ea4eec4f6a7208336bc4210579070a562a55a21b850e1264dc7",
+    "pyproject.toml": "a4e1419538c77bcbf886565e7e8918f2128ff11b0e05196cdfc351cace9e5094",
+    "pytests/test_native_source_input.py": "9790614e76a4243abc6683c69427661d2c82effc1d12fe66d5d745d3398f9363",
+    "scripts/check_compute_plugin.py": "f959e583aa6aa460b848d899b704ba795809c3fa1e05614405cad4824fd0c9fb",
+    "scripts/check_compute_recovery.py": "dfad62258b3bce0dfc14c300a9591aefee7b5020fa992cc08521f1854edf7294",
+    "scripts/check_native_client.py": "521a49bfd1d427b8ab0208bcc916de802dcef04c491a7e4363f8cdac78bcad2b",
+    "docs/native-compute.md": "48f2a290da573f73cf9bb6fbb98c957a2c4a5d12ab8c9e3b990d2c7e95c86026",
+    "docs/convergence-source-input-2026-09-22.md": "ea47937de68d951c9a6593287c2c088684994a438375b97f207a4609faa19576"
+  },
+  "server_sha256": "05572a341f970070fae99e8c41f7fa5052cfa3d192404cae14cade3ccef493d9",
+  "environment": "Linux x86_64, CPython 3.11, Arrow 23.0.1"
+}

@@ -21,15 +21,18 @@ use zippy_types::query::{
     QueryResultBatch, QueryStatus, RecordBatchStream, SendableRecordBatchStream,
 };
 use zippy_types::table::TableRef;
-use zippy_types::{BoxFuture, ErrorCode, ResourceLimit, Result, ServerError, SessionId};
+use zippy_types::{BoxFuture, ErrorCode, ResourceLimit, Result, ServerError, SessionId, TableId};
 
 use crate::query_execution::{
     NativeExecutionLease, NativeQueryBatch, NativeQueryExecutionConfig, NativeQueryResultStream,
 };
 use crate::query_service::{
-    QueryResourceBudget, QueryResourceCoordinator, QueryRuntimeStatus, QuerySubmissionMetadata,
+    QueryExecutionScope, QueryPlanningToken, QueryResourceBudget, QueryResourceCoordinator,
+    QueryRuntimeStatus, QuerySubmissionMetadata,
 };
-use crate::query_snapshot::NativeQuerySnapshotCoordinator;
+use crate::query_snapshot::{
+    NativeKeyValueSnapshotOutput, NativeQueryReadSnapshot, NativeQuerySnapshotCoordinator,
+};
 
 static NEXT_NATIVE_ENGINE_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -93,6 +96,7 @@ pub struct NativePreparedQuery {
     policy: QuerySessionPolicy,
     execution: NativeQueryExecutionConfig,
     process_memory: QueryProcessMemoryPool,
+    snapshot_output: Option<Arc<NativeKeyValueSnapshotOutput>>,
 }
 
 impl NativePreparedQuery {
@@ -124,6 +128,7 @@ impl NativePreparedQuery {
             policy,
             execution,
             process_memory,
+            snapshot_output,
         } = self;
         let plan_metrics = lease.plan_metrics();
         let stream = lease.execute_in(policy, execution, &process_memory)?;
@@ -132,6 +137,7 @@ impl NativePreparedQuery {
             schema,
             stream,
             plan_metrics,
+            snapshot_output,
         )))
     }
 }
@@ -195,6 +201,119 @@ struct NativeQueryEngineInner {
     process_memory: QueryProcessMemoryPool,
 }
 
+/// Explicit resource and table boundary for a reusable fixed snapshot.
+#[derive(Debug, Clone)]
+pub struct NativeFixedSnapshotRequest {
+    /// Fresh caller identity for the resource reservation.
+    pub query_id: zippy_types::QueryId,
+    /// Table references captured together, including persisted files and live rows.
+    pub tables: Vec<TableRef>,
+    /// Mandatory absolute UTC expiry in Unix nanoseconds.
+    pub expires_at_ns: u64,
+    /// QueryService memory ceiling for the snapshot reservation.
+    pub memory_limit_bytes: ResourceLimit,
+}
+
+/// A bounded, immutable multi-table snapshot reusable by its owning server session.
+///
+/// Every query forks separately admitted manifests. Dropping this handle prevents future use;
+/// already-prepared queries retain the original GC pins until their readers finish. The handle
+/// is process-local and cannot be restored after a server restart.
+///
+/// :example: engine.capture_fixed_snapshot(owner, request).await?
+pub struct NativeFixedSnapshot {
+    engine_nonce: u64,
+    session_id: SessionId,
+    expires_at_ns: u64,
+    tables: Vec<(TableRef, TableId)>,
+    info: QueryPlanInfo,
+    execution: QueryExecutionScope,
+}
+
+impl NativeFixedSnapshot {
+    /// Returns the exact registered query identity owning this snapshot's resource reservation.
+    #[must_use]
+    pub fn instance_id(&self) -> QueryInstanceId {
+        self.execution.instance_id()
+    }
+
+    /// Borrows immutable table versions and the Catalog revision captured by this handle.
+    #[must_use]
+    pub const fn info(&self) -> &QueryPlanInfo {
+        &self.info
+    }
+
+    /// Returns the absolute UTC expiry; expiration never refreshes the observed data.
+    #[must_use]
+    pub const fn expires_at_ns(&self) -> u64 {
+        self.expires_at_ns
+    }
+
+    /// Returns whether expiry or cancellation has revoked admission of further queries.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        unix_time_ns() >= self.expires_at_ns || self.execution.cancellation().is_cancelled()
+    }
+
+    /// Finishes the snapshot reservation, retaining any pins owned by already-forked queries.
+    pub fn close(self) -> Result<()> {
+        self.execution.finish()
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        let cancellation = self.execution.cancellation();
+        if let Some(terminal) = cancellation.terminal_signal() {
+            return Err(terminal.error.unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Cancelled, "fixed snapshot was cancelled")
+            }));
+        }
+        if cancellation.is_cancelled() {
+            return Err(ServerError::new(
+                ErrorCode::Cancelled,
+                "fixed snapshot was cancelled",
+            ));
+        }
+        if unix_time_ns() >= self.expires_at_ns {
+            return Err(ServerError::new(
+                ErrorCode::DeadlineExceeded,
+                "fixed snapshot expired",
+            ));
+        }
+        Ok(())
+    }
+
+    fn fork(
+        &self,
+        planning: &QueryPlanningToken,
+        tables: &[TableRef],
+    ) -> Result<NativeQueryReadSnapshot> {
+        self.ensure_active()?;
+        let requested = tables
+            .iter()
+            .map(|reference| {
+                self.tables
+                    .iter()
+                    .find_map(|(captured, id)| {
+                        (captured == reference
+                            || matches!(reference, TableRef::Id { table_id } if table_id == id))
+                        .then_some(*id)
+                    })
+                    .ok_or_else(|| invalid("query table is outside the fixed snapshot"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Never reserve resources while holding the source snapshot ownership mutex.
+        let charge = self
+            .execution
+            .with_snapshot::<NativeQueryReadSnapshot, _>(|snapshot| snapshot.retained_charge())?;
+        let memory = planning.reserve_snapshot_memory(charge)?;
+        self.execution
+            .with_snapshot::<NativeQueryReadSnapshot, _>(|snapshot| {
+                self.ensure_active()?;
+                snapshot.fork_for_query(planning, &requested, memory)
+            })
+    }
+}
+
 /// Server-owned native SQL planner, lifecycle registry, and DataFusion executor.
 #[derive(Clone)]
 pub struct NativeQueryEngine {
@@ -225,6 +344,199 @@ impl NativeQueryEngine {
         self.inner.resources.owner(session_id)
     }
 
+    pub(crate) fn cancel_authenticated_session(
+        &self,
+        session_id: SessionId,
+        instance_id: QueryInstanceId,
+    ) -> Result<()> {
+        self.inner
+            .resources
+            .cancel_authenticated_session(session_id, instance_id)
+    }
+
+    /// Pins one finite, ordered native event window without SQL interpretation or state collapse.
+    pub async fn prepare_log_window(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        request: crate::native_log::NativeLogRequest,
+    ) -> Result<crate::native_log::NativeLogWindow> {
+        use zippy_types::query::QueryPriority;
+        let resources = QueryRequest {
+            query_id: request.query_id,
+            session_id: owner.session_id(),
+            input: QueryInput::Sql(String::new()),
+            tables: Vec::new(),
+            priority: QueryPriority::Normal,
+            deadline_ns: request.deadline_ns,
+            memory_limit_bytes: request.memory_limit_bytes,
+            spill_limit_bytes: ResourceLimit::Disabled,
+            result_batch_rows: request.batch_rows,
+        };
+        let (policy, budget, _) = self.resolve_resources(&resources)?;
+        let planning = self.inner.resources.submit(
+            owner,
+            QuerySubmissionMetadata {
+                query_id: request.query_id,
+                deadline_ns: request.deadline_ns,
+            },
+            budget,
+        )?;
+        let instance_id = planning.instance_id();
+        let pinned: Result<_> = async {
+            let admission = self.inner.snapshots.admit_event_window(&planning).await?;
+            let mut snapshot = self
+                .inner
+                .snapshots
+                .pin_persisted(&planning, &[request.table])
+                .await?;
+            let plan = snapshot.log_plan(&planning, request.start)?;
+            Ok((admission, snapshot, plan))
+        }
+        .await;
+        let (_admission, snapshot, plan) = match pinned {
+            Ok(pinned) => pinned,
+            Err(error) => return Err(fail_planning(&self.inner.resources, planning, error)),
+        };
+        let draft = snapshot.plan_draft();
+        let token = self
+            .inner
+            .resources
+            .complete_planning(planning, draft, snapshot)?;
+        let info = token.info().clone();
+        let execution = self
+            .inner
+            .resources
+            .begin_execution(token, unix_time_ns())?;
+        Ok(crate::native_log::NativeLogWindow {
+            instance_id,
+            info,
+            plan,
+            execution,
+            coordinator: self.inner.snapshots.clone(),
+            batch_rows: policy.batch_size(),
+        })
+    }
+
+    /// Opens an event subscription whose windows share one resource and cancellation identity.
+    pub async fn subscribe_log(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        request: crate::native_log::NativeLogRequest,
+    ) -> Result<crate::native_log::NativeLogSubscription> {
+        let start = request.start;
+        self.prepare_log_window(owner, request)
+            .await?
+            .follow(start)
+            .await
+    }
+
+    /// Captures a fixed persisted/live boundary with an explicit deadline and resource owner.
+    ///
+    /// :param owner: Authenticated session capability from this engine.
+    /// :param request: Fresh query identity, table references, budget and mandatory expiry.
+    /// :returns: Exclusive snapshot handle that can be shared with Arc by a bounded lease store.
+    /// :raises ServerError: If ownership, deadline, table resolution, or resource admission fails.
+    pub async fn capture_fixed_snapshot(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        request: NativeFixedSnapshotRequest,
+    ) -> Result<NativeFixedSnapshot> {
+        let expires_at_ns = request.expires_at_ns;
+        if request.tables.is_empty() || request.tables.len() > self.inner.config.plan.max_bindings()
+        {
+            return Err(invalid(
+                "fixed snapshot requires a bounded nonempty table set",
+            ));
+        }
+        let resources = QueryRequest {
+            query_id: request.query_id,
+            session_id: owner.session_id(),
+            input: QueryInput::Sql(String::new()),
+            tables: Vec::new(),
+            priority: zippy_types::query::QueryPriority::Normal,
+            deadline_ns: Some(expires_at_ns),
+            memory_limit_bytes: request.memory_limit_bytes,
+            spill_limit_bytes: ResourceLimit::Disabled,
+            result_batch_rows: None,
+        };
+        let (_, budget, _) = self.resolve_resources(&resources)?;
+        let planning = self.inner.resources.submit(
+            owner,
+            QuerySubmissionMetadata {
+                query_id: request.query_id,
+                deadline_ns: Some(expires_at_ns),
+            },
+            budget,
+        )?;
+        let pinned: Result<_> = async {
+            let mut snapshot = self
+                .inner
+                .snapshots
+                .pin_persisted(&planning, &request.tables)
+                .await?;
+            snapshot.compact_memory(&planning)?;
+            Ok(snapshot)
+        }
+        .await;
+        let snapshot = match pinned {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Err(fail_planning(&self.inner.resources, planning, error)),
+        };
+        let tables = request
+            .tables
+            .into_iter()
+            .zip(snapshot.requested_table_ids().iter().copied())
+            .collect();
+        let token =
+            self.inner
+                .resources
+                .complete_planning(planning, snapshot.plan_draft(), snapshot)?;
+        let info = token.info().clone();
+        let execution = self
+            .inner
+            .resources
+            .begin_execution(token, unix_time_ns())?;
+        Ok(NativeFixedSnapshot {
+            engine_nonce: self.inner.nonce,
+            session_id: owner.session_id(),
+            expires_at_ns,
+            tables,
+            info,
+            execution,
+        })
+    }
+
+    /// Prepares SQL against an existing fixed boundary without resolving current Catalog names.
+    ///
+    /// :param snapshot: Live snapshot issued by this engine for the same session.
+    /// :param owner: Authenticated query owner.
+    /// :param request: Independently identified and budgeted SQL request.
+    /// :param bindings: Names or captured IDs selecting tables within the snapshot.
+    /// :returns: Prepared query whose pins outlive release of the fixed snapshot handle.
+    /// :raises ServerError: If the snapshot is expired, foreign, or lacks a requested table.
+    pub fn prepare_fixed<'a>(
+        &'a self,
+        snapshot: &'a NativeFixedSnapshot,
+        owner: &'a dyn QueryOwnerCapability,
+        request: QueryRequest,
+        bindings: Vec<NativeQueryBinding>,
+    ) -> BoxFuture<'a, Result<NativePreparedQuery>> {
+        Box::pin(async move {
+            if snapshot.engine_nonce != self.inner.nonce
+                || snapshot.session_id != owner.session_id()
+            {
+                return Err(permission(
+                    request.query_id,
+                    "fixed snapshot belongs to another engine or session",
+                ));
+            }
+            let token = self
+                .plan_bound_inner(owner, request, bindings, false, Some(snapshot))
+                .await?;
+            self.prepare_token(transfer_native_token(token)?).await
+        })
+    }
+
     /// Plans SQL using explicit relation-to-table bindings.
     pub fn plan_bound<'a>(
         &'a self,
@@ -232,7 +544,10 @@ impl NativeQueryEngine {
         request: QueryRequest,
         bindings: Vec<NativeQueryBinding>,
     ) -> BoxFuture<'a, Result<OpaqueQueryExecutionToken>> {
-        Box::pin(async move { self.plan_bound_inner(owner, request, bindings).await })
+        Box::pin(async move {
+            self.plan_bound_inner(owner, request, bindings, false, None)
+                .await
+        })
     }
 
     /// Plans and physically prepares SQL against one exact snapshot without
@@ -244,9 +559,35 @@ impl NativeQueryEngine {
         bindings: Vec<NativeQueryBinding>,
     ) -> BoxFuture<'a, Result<NativePreparedQuery>> {
         Box::pin(async move {
-            let token = self.plan_bound_inner(owner, request, bindings).await?;
+            let token = self
+                .plan_bound_inner(owner, request, bindings, false, None)
+                .await?;
             let transferred = transfer_native_token(token)?;
             self.prepare_token(transferred).await
+        })
+    }
+
+    /// Prepares one complete key-value state and its cursor from a single pinned boundary.
+    pub fn prepare_key_value_snapshot<'a>(
+        &'a self,
+        owner: &'a dyn QueryOwnerCapability,
+        request: QueryRequest,
+        bindings: Vec<NativeQueryBinding>,
+    ) -> BoxFuture<'a, Result<NativePreparedQuery>> {
+        Box::pin(async move {
+            if request.input
+                != QueryInput::Sql(zippy_protocol::query::KEY_VALUE_SNAPSHOT_SQL.to_owned())
+                || bindings.len() != 1
+                || bindings[0].sql_name() != zippy_protocol::query::KEY_VALUE_SNAPSHOT_BINDING
+            {
+                return Err(invalid(
+                    "state snapshot requires the canonical complete-state query",
+                ));
+            }
+            let token = self
+                .plan_bound_inner(owner, request, bindings, true, None)
+                .await?;
+            self.prepare_token(transfer_native_token(token)?).await
         })
     }
 
@@ -258,7 +599,9 @@ impl NativeQueryEngine {
         bindings: Vec<NativeQueryBinding>,
     ) -> BoxFuture<'a, Result<NativeQueryExplanation>> {
         Box::pin(async move {
-            let token = self.plan_bound_inner(owner, request, bindings).await?;
+            let token = self
+                .plan_bound_inner(owner, request, bindings, false, None)
+                .await?;
             let plan = token.info().clone();
             let transferred = transfer_native_token(token)?;
             let instance_id = transferred.instance_id;
@@ -294,6 +637,8 @@ impl NativeQueryEngine {
         owner: &dyn QueryOwnerCapability,
         request: QueryRequest,
         bindings: Vec<NativeQueryBinding>,
+        key_value_snapshot: bool,
+        fixed_snapshot: Option<&NativeFixedSnapshot>,
     ) -> Result<OpaqueQueryExecutionToken> {
         if owner.session_id() != request.session_id {
             return Err(permission(
@@ -328,7 +673,11 @@ impl NativeQueryEngine {
             budget,
         )?;
         let instance_id = planning.instance_id();
-        let snapshot = match self.inner.snapshots.pin_persisted(&planning, &tables).await {
+        let pinned = match fixed_snapshot {
+            Some(snapshot) => snapshot.fork(&planning, &tables),
+            None => self.inner.snapshots.pin_persisted(&planning, &tables).await,
+        };
+        let snapshot = match pinned {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return Err(fail_planning(&self.inner.resources, planning, error));
@@ -368,6 +717,14 @@ impl NativeQueryEngine {
                 return Err(fail_planning(&self.inner.resources, planning, error));
             }
         };
+        let snapshot_output = if key_value_snapshot {
+            match snapshot.key_value_snapshot_output(&planning) {
+                Ok(output) => Some(output),
+                Err(error) => return Err(fail_planning(&self.inner.resources, planning, error)),
+            }
+        } else {
+            None
+        };
         let draft = snapshot.plan_draft();
         let inner_token = self
             .inner
@@ -380,6 +737,7 @@ impl NativeQueryEngine {
             instance_id,
             info,
             inner_token: Some(inner_token),
+            snapshot_output,
             sql,
             bindings: persisted_bindings,
             policy,
@@ -515,6 +873,7 @@ impl NativeQueryEngine {
         let info = transferred.info.clone();
         let policy = transferred.policy;
         let execution = transferred.execution;
+        let snapshot_output = transferred.snapshot_output.clone();
         let lease = self.prepare_transferred(transferred).await?;
         if lease.instance_id() != instance_id || lease.catalog_revision() != info.catalog_revision {
             return Err(internal(
@@ -522,7 +881,18 @@ impl NativeQueryEngine {
                 "prepared native query identity differs from its fixed plan metadata",
             ));
         }
-        let schema = lease.plan().schema();
+        let schema = match &snapshot_output {
+            Some(output) => {
+                if output.schema.fields() != lease.plan().schema().fields() {
+                    return Err(internal(
+                        instance_id.query_id(),
+                        "state snapshot schema differs from its query",
+                    ));
+                }
+                output.schema.clone()
+            }
+            None => lease.plan().schema(),
+        };
         Ok(NativePreparedQuery {
             instance_id,
             info,
@@ -531,6 +901,7 @@ impl NativeQueryEngine {
             policy,
             execution,
             process_memory: self.inner.process_memory.clone(),
+            snapshot_output,
         })
     }
 }
@@ -604,6 +975,7 @@ struct NativePlanToken {
     instance_id: QueryInstanceId,
     info: QueryPlanInfo,
     inner_token: Option<OpaqueQueryExecutionToken>,
+    snapshot_output: Option<Arc<NativeKeyValueSnapshotOutput>>,
     sql: String,
     bindings: Vec<PersistedTableBinding>,
     policy: QuerySessionPolicy,
@@ -632,6 +1004,7 @@ impl QueryExecutionToken for NativePlanToken {
                 .inner_token
                 .take()
                 .expect("armed native plan token retains its QueryService token"),
+            snapshot_output: self.snapshot_output.take(),
             sql: std::mem::take(&mut self.sql),
             bindings: std::mem::take(&mut self.bindings),
             policy: self.policy,
@@ -645,6 +1018,7 @@ struct NativeTransferredToken {
     instance_id: QueryInstanceId,
     info: QueryPlanInfo,
     inner_token: OpaqueQueryExecutionToken,
+    snapshot_output: Option<Arc<NativeKeyValueSnapshotOutput>>,
     sql: String,
     bindings: Vec<PersistedTableBinding>,
     policy: QuerySessionPolicy,
@@ -675,6 +1049,8 @@ struct NativeRecordBatchStream {
     result_memory_bytes: u64,
     started_at: Instant,
     terminal: bool,
+    // Drop all schema/batch references before the extra snapshot memory lease.
+    snapshot_output: Option<Arc<NativeKeyValueSnapshotOutput>>,
 }
 
 impl NativeRecordBatchStream {
@@ -683,9 +1059,11 @@ impl NativeRecordBatchStream {
         schema: SchemaRef,
         stream: NativeQueryResultStream,
         plan_metrics: PersistedPlanMetrics,
+        snapshot_output: Option<Arc<NativeKeyValueSnapshotOutput>>,
     ) -> Self {
         let operator_memory_status = stream.operator_memory_status();
         Self {
+            snapshot_output,
             instance_id,
             schema,
             plan_metrics,
@@ -788,7 +1166,29 @@ impl RecordBatchStream for NativeRecordBatchStream {
                         self.result_memory_bytes = self
                             .result_memory_bytes
                             .saturating_add(batch.memory_bytes().get());
-                        Poll::Ready(Some(Ok(batch.into_public())))
+                        let output = if let Some(snapshot) = &self.snapshot_output {
+                            match batch
+                                .record_batch()
+                                .clone()
+                                .with_schema(snapshot.schema.clone())
+                            {
+                                Ok(record) => Ok(QueryResultBatch::with_owner(
+                                    record,
+                                    (batch, snapshot.clone()),
+                                )),
+                                Err(error) => {
+                                    self.terminal = true;
+                                    drop(self.stream.take());
+                                    Err(internal(
+                                        self.instance_id.query_id(),
+                                        format!("state result schema error=[{error}]"),
+                                    ))
+                                }
+                            }
+                        } else {
+                            Ok(batch.into_public())
+                        };
+                        Poll::Ready(Some(output))
                     }
                     Ok(None) => {
                         self.terminal = true;
@@ -817,7 +1217,7 @@ fn fail_planning(
     }
 }
 
-fn fail_execution(
+pub(crate) fn fail_execution(
     execution: crate::query_service::QueryExecutionScope,
     error: ServerError,
 ) -> ServerError {

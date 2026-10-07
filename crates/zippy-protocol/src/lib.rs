@@ -7,9 +7,12 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod auth;
 pub mod error;
+pub mod fixed_snapshot;
 pub mod ingest;
+pub mod log;
 pub mod query;
 pub mod runtime;
 pub mod server;
@@ -29,11 +32,11 @@ pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
 /// Binary response metadata key carrying a serialized structured Zippy error.
 pub const ERROR_METADATA_KEY: &str = "x-zippy-error-bin";
 
-/// Request metadata key that identifies the owning Zippy client session.
-pub const SESSION_METADATA_KEY: &str = "x-zippy-session-id";
-
 /// Standard request metadata key carrying bootstrap or session bearer credentials.
 pub const AUTHORIZATION_METADATA_KEY: &str = "authorization";
 
 /// Flight action returning server protocol capabilities.
 pub const CAPABILITIES_ACTION: &str = "zippy.capabilities.v1";
+
+/// Flight action revoking the current authenticated session and its pending resources.
+pub const CLOSE_SESSION_ACTION: &str = "zippy.close_session.v1";

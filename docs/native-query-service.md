@@ -1,185 +1,94 @@
-# Native QueryService
+# 原生 QueryService
 
-## 定位
+本页说明当前原生查询入口。主包和独立客户端通过同一个显式 `Client` 使用 Flight，
+持久表目录来自 SQLite Catalog，通用查询由 Server 持有的 DataFusion 执行。
+旧 Table/Gateway 查询实现已经退出；下面的 API 是当前唯一公开查询主干。
+整体切换状态见[当前能力表](current-capabilities-2026-09-21.md)。
 
-Phase 5 的 QueryService 让单机 `zippy server` 拥有查询的完整计划、快照、执行和资源生命周期。
-Python 客户端只发送 SQL 和明确的 Catalog table binding；projection、filter、slice、sort、aggregate、
-join 和 window 都在 Server 的 DataFusion 执行器中完成。native 模式不允许“服务器拉全表、Python 再做
-residual”这种隐式回退。
+## 启用与连接
 
-该能力默认关闭，适合先在测试环境或指定查询流量上灰度。关闭后，现有 Gateway legacy collect 路径和
-本地共享内存订阅路径保持不变。native query frontend 至少需要 Gateway 或 Flight 之一；两者可同时启用，
-也可仅启用 Flight。Flight Stage 6.2 的边界见 [`flight-query-service.md`](flight-query-service.md)。
+SQLite Catalog、原生存储和原生查询默认启用，旧开关
+`server.native_storage_enabled`、`catalog.backend`、`query.native_enabled` 已删除，输入会被拒绝。
+Flight 默认启用；写入另需启用 `flight.ingest`。通过 `zippy server run` 启动，
+客户端 URI 指向用于发现 Flight endpoint 的服务控制地址。
 
-## 启用
-
-正式 native query frontend 依赖 native storage、SQLite shadow Catalog，以及 Gateway/Flight 中至少一个
-frontend。现有 Python 客户端仍使用 Gateway 时按以下方式配置：
-
-```toml
-[server]
-native_storage_enabled = true
-
-[catalog]
-backend = "sqlite_shadow"
-
-[gateway]
-enabled = true
-endpoint = "0.0.0.0:17666"
-
-[runtime]
-max_cpu_cores = 4
-max_query_buffer_bytes = 536870912
-
-[query]
-native_enabled = true
-parallelism = 4
-operator_memory_bytes = 67108864
-max_buffered_bytes = 67108864
-plan_ttl_ms = 30000
-
-[query.resources]
-max_concurrent_queries = 64
-max_active_tasks = 16
-max_memory_bytes = 536870912
-```
-
-对应的主要环境变量是：
-
-```text
-ZIPPY_QUERY_NATIVE_ENABLED
-ZIPPY_QUERY_OPERATOR_MEMORY_BYTES
-ZIPPY_QUERY_PARALLELISM
-ZIPPY_QUERY_MAX_BUFFERED_BYTES
-ZIPPY_QUERY_PLAN_TTL_MS
-ZIPPY_QUERY_MAX_CONCURRENT_QUERIES
-ZIPPY_QUERY_MAX_ACTIVE_TASKS
-ZIPPY_QUERY_MAX_MEMORY_BYTES
-ZIPPY_MAX_CPU_CORES
-ZIPPY_MAX_QUERY_BUFFER_BYTES
-```
-
-若只验证标准 Arrow Flight 查询，可关闭 `[gateway]`，增加：
-
-```toml
-[flight]
-enabled = true
-endpoint = "127.0.0.1:17667"
-protocol_version = 1
-max_message_bytes = 2097152
-max_pending_tickets = 64
-```
-
-Stage 6.2 允许在同时启用 `[flight.tls]` 和 `[flight.auth]` 时使用非 loopback endpoint；完整安全配置、
-Handshake 和凭据文件约束见 [Arrow Flight 查询服务](flight-query-service.md)。Stage 6.5 的独立
-`zippy-client` 已默认把 Table query 和显式 binding SQL 切到 Flight；Gateway 仅保留为旧客户端和
-DoExchange 上线前订阅的 compatibility adapter。
-
-`operator_memory_bytes` 未配置时取 `min(64 MiB, query.resources.max_memory_bytes / 2)`，且至少为
-1 byte。它是单查询 DataFusion buffering operator 上限；`query.resources.max_memory_bytes` 是全局
-QueryService 账本上限；`max_buffered_bytes` 是单查询 Gateway transport 上限。三者用途不同，不应通过
-扩大其中一个来规避另外两个。
-
-## Python API
-
-既有 Table API 保持不变。连接到开启 native capability 的远端 Server 后，完整计划自动在服务端执行：
+Flight Handshake 签发短期会话。读取、写入、管理使用各自的 bootstrap 凭据；服务端 token
+文件需权限 0600。客户端读取凭据可用 `flight_token` 或 `ZIPPY_FLIGHT_AUTH_TOKEN`；远端部署
+需 TLS，相关配置见[Flight 查询服务](flight-query-service.md)。不要在示例或仓库中写真实凭据。
 
 ```python
-import zippy as zp
+from zippy import Client, col
 
-session = zp.connect("zippy://10.0.0.8:17690/default")
-ticks = zp.read_table("ticks", master=session)
-instruments = zp.read_table("instruments", master=session)
-
-query = (
-    ticks.filter(zp.col("price") > 100.0)
-    .join(instruments, on="instrument_id")
-    .with_columns(
-        (zp.col("price") * zp.col("multiplier")).alias("notional")
+# 凭据由进程环境提供；调用者显式管理连接生命周期。
+with Client("zippy://127.0.0.1:17690/default") as client:
+    ticks = client.read_table("ticks", namespace="market")
+    instruments = client.read_table("instruments", namespace="market")
+    query = (
+        ticks.filter(col("price") > 100.0)
+        .join(instruments, on="instrument_id")
+        .with_columns((col("price") * col("multiplier")).alias("notional"))
+        .select("instrument_id", "ts", "notional")
+        .sort("ts")
+        .tail(100)
     )
-    .select("instrument_id", "ts", "notional")
-    .sort("ts")
-    .tail(100)
-)
-
-result = query.collect()
-explanation = query.explain()
-profile = query.profile()
+    result = query.collect()
 ```
 
-`tail(n)` 必须有显式、确定的前置 `sort(...)`。没有排序的关系结果不存在稳定的“最后 n 行”语义，native
-模式会直接报错，不会退回 Python 全表处理。
+`from zippy_client import Client` 提供同一个类，无主包全局默认连接。惰性 Table API 的 Flight
+分支使用共享 SQL 编译器；tail 需要显式前置 sort。业务存在相同时间值时，应补充稳定的排序键。
+复杂派生查询的规划预留量当前偏保守；真实 join 验收明确使用 4 GiB，并不代表默认 512 MiB
+能够执行同样的计划。内存参数应根据具体计划及资源门禁确定。
 
-任意 SQL 可使用 `read_sql`。简单 `FROM`/`JOIN` 可自动推断 binding；复杂命名、子查询或需要固定
-namespace 时应显式传入：
+## 任意 SQL 的唯一公开入口
+
+使用 `Client.read_sql()`，显式将 SQL relation 绑定到 Catalog 表。主包 `zippy.read_sql()`
+及其正则推断绑定已经删除；独立客户端不再发送或接收 Gateway SQL 协议。
+Gateway 数据路径和服务端适配器已删除，SQL 请求统一由 Flight 交给原生查询引擎。
 
 ```python
-result = zp.read_sql(
-    """
-    SELECT instrument_id, avg(price) AS avg_price
-    FROM ticks
-    GROUP BY instrument_id
-    ORDER BY instrument_id
-    """,
-    master=session,
-    tables={"ticks": "market_ticks"},
-    memory_limit_bytes=128 * 1024 * 1024,
-    result_batch_rows=8192,
-)
+with Client("zippy://127.0.0.1:17690/default") as client:
+    result = client.read_sql(
+        """
+        SELECT instrument_id, avg(price) AS avg_price
+        FROM ticks
+        GROUP BY instrument_id
+        ORDER BY instrument_id
+        """,
+        bindings={"ticks": {"namespace": "market", "table": "market_ticks"}},
+        result_batch_rows=8192,
+    )
 ```
 
-`Table.explain()` 会请求 Server 固定一次真实 snapshot、构建物理计划、返回 schema/plan/operator 指标，
-随后立即释放计划，不执行结果算子。`Table.profile()` 会执行查询，并在结果之外返回同一组计划指标、
-operator memory 峰值、结果 batch/row/byte 和 Gateway transport 指标。
+`bindings` 必填；不猜测 FROM/JOIN，也不在客户端执行 SQL。已删除仅用于 Gateway 的
+`parameters` 参数，需要值绑定时使用 Table 表达式 API。已删除 Flight 中被忽略的 SQL `stream`
+参数：传输始终采用 Flight 批次流，返回值仍为合并后的 Arrow Table，不是有界结果迭代器。
+请求支持 UTC 纳秒 deadline、优先级、查询内存预算和结果批次行数；错误、认证失败或不支持的
+能力直接传播。此处是任意 SQL 的契约。
 
-## 快照与实时数据
+## 快照、资源和恢复
 
-每次 native 查询都固定一个 Catalog revision、每张表的 persisted snapshot/schema version，以及能够证明
-逻辑 offset 连续性的 active segment publication。查询开始后的 append 不可见；已固定 payload 被原地改写
-时返回 `DATA_CORRUPTION`，不会返回混合版本。
+每次查询固定 Catalog revision、各表的 persisted snapshot/schema version，以及具有精确逻辑
+offset 的 live publication。查询期间新写入不改变已固定边界。持久化发布与 WAL 确认不同：
+WAL 可恢复不等于对应 Parquet 已进入 Catalog。三类表的完整行、帧与 KV 状态语义由原生表定义决定。
 
-真正由 native table actor 发布且携带精确 logical offset 的 active/sealed segment 可以和 Parquet 使用同一
-DataFusion 计划。旧版生产 writer descriptor 没有这项 provenance 时，Server 必须继续走 legacy live 路径；
-不得猜测 offset，也不得把 legacy descriptor 伪装成 native active snapshot。这个边界不影响 persisted native
-查询，生产 writer publication 的完整迁移属于后续 authority cutover 工作。
+跨次查询需显式固定快照，见[固定快照实施记录](convergence-fixed-snapshot-2026-09-22.md)。
+它绑定服务会话、有期限和数量上限；过期或重启后明确失败，不是持久算子 checkpoint。
+普通表首次调用 `Table.snapshot()` 后，返回的固定快照会绑定该表后续查询及其派生查询；
+多表查询使用同一 `Client.open_snapshot()` 作用域。重复调用同一表的 `snapshot()`
+返回相同快照，不重新捕获当前数据。
 
-## 背压、取消和资源边界
+QueryService 对规划、执行、结果以及快照资源分别记账，Flight 传输保持结果所有权，断连/取消
+释放相应资源。扩大传输 batch 上限不能绕过查询内存预算。当前没有实现有配额保障的磁盘 spill，
+非零 spill budget 返回 UNSUPPORTED_PLAN，超限返回 RESOURCE_EXHAUSTED。
 
-Gateway 每次只从 QueryService 拉取一个 permit-owned Arrow batch。该 batch 在编码和 socket write 完成前
-持续持有 QueryService result-memory permit；写完并释放后才拉下一批。transport 还要取得全局 bounded byte
-reservation，因此慢客户端不会让 Server 无界预取结果。
+`Table.explain()` 返回服务端计划；`profile()` 执行并返回计划/执行指标。关注 plan、operator、
+result 各组指标及实际错误，不以某个 operator 名称或单次小查询成功推断所有负载可用。
 
-Gateway 在规划、transport admission 和每次等待下一批时同时监听连接断开。客户端断连会 drop result stream，
-QueryService 发布取消并释放 DataFusion task、operator memory、Catalog snapshot pin 和 active segment lease。
-deadline 使用请求携带的 UTC Unix nanoseconds，并覆盖 planning 和 running 生命周期。
+空目录建表、三类结果、共享表达式、显式 SQL 聚合及重启验收使用
+[真实原生客户端脚本](../scripts/check_native_client.py)。原生查询是唯一 SQL 主干；
+旧权威、主包旧 Table/Session 与相关配置已退出。
 
-DataFusion 44 的 disk manager 在本 profile 中显式关闭。当前没有可证明配额的 spill/temp directory，因此
-sort/hash aggregate/join/window 超过查询或进程内存预算时返回稳定的 `RESOURCE_EXHAUSTED`；不会写入未受管
-临时文件。请求非零 spill budget 会返回 `UNSUPPORTED_PLAN`。这是有意的 fail-closed 行为。
-
-## Explain/Profile 指标
-
-指标名称是有界的稳定集合，不包含 SQL、table 名或 operator 实例 ID 等高基数标签：
-
-- `plan.*`：profile version、SQL bytes、binding/input 数、逻辑/表达式/物理节点数、scan 数、计划构建峰值和
-  retained bytes；
-- `operator.<kind>.count`：scan、filter、projection、sort、aggregate、join、window、limit、union、exchange
-  和 other 的物理节点数；
-- `operator.memory_*`：单查询 operator limit、当前值、峰值和拒绝次数；
-- `result.*`：QueryService 交付的 batch、row 和 accounted bytes；
-- `transport.*`：Gateway 实际写出的 batch 和 row。
-
-`operator.other.count` 非零并不自动表示错误；DataFusion 可能使用 empty/placeholder 等基础节点。诊断复杂查询时
-应结合 `plan.physical_nodes` 与各已知 category，而不是把单个节点数当作性能结论。
-
-## 推荐灰度顺序
-
-1. 保持 `native_enabled=false`，先用 canary 对 persisted golden query 做等价性验证。
-2. 在测试 Server 开启 native frontend，验证 `explain()`、小结果 projection/filter 和预算拒绝。
-3. 验证 sort/aggregate/join/window，并观察 `operator.memory_peak_bytes` 和首批延迟。
-4. 注入客户端断连、deadline、低内存预算，确认 query/pin/operator/transport 资源归零。
-5. 对比开启前后的本地 row/table subscription 延迟 gate；DataFusion 不应进入该热路径。
-6. 只对具备 exact logical-offset provenance 的 writer 打开 native active snapshot publication。
-
-回滚只需关闭 `query.native_enabled` 并重启 Server，查询会回到 legacy capability 路由。native 模式运行中
-遇到不支持的计划会明确失败，不会自动拉全表执行 residual。
+独立客户端所有数据操作现已统一 Flight。表查询的 `collect/profile` 不再接收 `stream` 参数；
+Gateway transport 与 token 参数均已删除。排序后的 head/slice/tail 在相同 SQL 查询层绑定
+ORDER BY 与 LIMIT/OFFSET，保证截取的行符合明确排序。验收见
+[第三十四批记录](convergence-flight-only-client-2026-09-22.md)。

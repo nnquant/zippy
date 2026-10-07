@@ -1,0 +1,697 @@
+{
+  "retired": [
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "callback_flush_deadline_rejects_unrepresentable_duration",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "descriptor_retry_keeps_retained_sealed_segment_before_latest_active",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "descriptor_update_sequence_restores_intermediate_sealed_segments",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "descriptor_update_slot_is_consumed_only_after_empty_segment_poll",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "descriptor_update_slot_preserves_multiple_generations_in_order",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "descriptor_update_slot_refreshes_pending_active_descriptor_when_it_seals",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "descriptor_watcher_uses_long_poll_timeout_instead_of_hot_polling",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "drop_table_internal_stream_detection_uses_metadata_before_name_fallback",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "drop_table_logical_shard_names_reads_active_descriptor_metadata",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "drop_table_logical_shard_names_reads_source_config_metadata_fallback",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "drop_table_logical_shard_names_rejects_invalid_metadata",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "drop_table_shard_parent_name_rejects_non_shard_names",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "format_subscriber_driver_poll_trace_renders_expected_segments",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "in_process_publisher_routes_source_batches_to_downstream_engine",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "live_segment_record_batches_reads_retained_sealed_before_active_boundary",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "master_server_python_config_dict_uses_typed_overlay_resolution",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "parse_instrument_ids_normalizes_scalar_and_sequences",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "query_snapshot_value_separates_active_descriptor_from_retained_sealed_segments",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_descriptor_watcher_reregisters_after_process_lease_expired",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_commits_swap_before_releasing_old_lease",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_does_not_acquire_lease_for_missing_shm_descriptor",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_drains_row_committed_after_empty_poll_before_descriptor_rebind",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_master_refresh_rechecks_notify_after_prepare_before_swap",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_pending_retry_rechecks_notify_after_prepare_before_swap",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_queued_update_rechecks_notify_after_prepare_before_swap",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_refetches_latest_descriptor_after_sealed_reader",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_refreshes_master_descriptor_without_sealed_reader_or_watcher_update",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_retries_missing_shm_descriptor_update",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_row_commit_wakes_before_idle_timeout",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_skips_missing_shm_descriptor_update",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_switches_descriptor_only_after_draining_current_rows",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_driver_treats_schema_mismatch_descriptor_update_as_transient",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_lease_acquire_reregisters_after_process_lease_expired",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "segment_reader_lease_release_uses_original_process_capability",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_row_instrument_filter_skips_non_matching_rows_before_python_conversion",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_table_materializer_accepts_shard_config_and_exposes_metadata",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_table_materializer_reads_failed_shards_after_sharded_engine_start",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_table_materializer_rejects_non_default_shard_stream_names",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_table_materializer_rejects_partial_shard_config",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_table_materializer_rejects_shard_writer_epoch_length_mismatch",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_table_materializer_rejects_shard_writer_epochs_without_sharding",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "stream_table_materializer_rejects_unsupported_sharded_options",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "crates/zippy-python/src/lib.rs",
+      "test": "wait_for_initial_segment_reader_handle_preserves_tail_start_after_recovery",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_accepts_duration_trigger_interval_and_exposes_output_schema",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_accepts_timeseries_source_pipeline",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_config_and_lifecycle",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_config_exposes_runtime_xfast",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_emits_bucketed_output_over_zmq",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_rejects_reactive_source",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_rejects_unsupported_late_data_policy",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_cross_sectional_engine_start_can_retry_after_publisher_failure",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_downstream_stop_requires_source_stopped",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_engine_constructor_signatures_hide_removed_sink_archive_parameters",
+      "reason": "removed obsolete constructor or policy-constant contract",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_engine_parquet_sink_keyword_is_rejected",
+      "reason": "removed obsolete constructor or policy-constant contract",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_engine_rejects_invalid_runtime_config_keywords",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_engines_reject_wrong_policy_constant_categories",
+      "reason": "removed obsolete constructor or policy-constant contract",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_key_value_table_materializer_uses_materializer_name",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_columnar_dict_input",
+      "reason": "removed legacy input coercion; NativeProcessor requires exact Arrow RecordBatch",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_polars_and_flushes",
+      "reason": "removed legacy input coercion; NativeProcessor requires exact Arrow RecordBatch",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_pyarrow_record_batch",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_pyarrow_table",
+      "reason": "removed legacy input coercion; NativeProcessor requires exact Arrow RecordBatch",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_rollback_state_failure_policy",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_row_oriented_input",
+      "reason": "removed legacy input coercion; NativeProcessor requires exact Arrow RecordBatch",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_scalar_dict_input",
+      "reason": "removed legacy input coercion; NativeProcessor requires exact Arrow RecordBatch",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_target_list",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_accepts_zmq_target",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_config_exposes_runtime_xfast",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_exposes_output_schema_before_and_after_start",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_exposes_status_metrics_and_config_lifecycle",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_filters_remote_zmq_source_rows_by_id_filter",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_id_filter_filters_rows_and_updates_config_and_metrics",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_legacy_parquet_sink_is_rejected",
+      "reason": "removed obsolete constructor or policy-constant contract",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_processes_remote_zmq_source",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_engine_rejects_non_string_id_filter_elements",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_latest_engine_accepts_single_and_multi_by",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_reactive_latest_engine_named_source_requires_master",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_source_mode_constants_and_zmq_source_are_exposed",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_source_write_requires_downstream_started",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_can_drive_timeseries_downstream_pipeline",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_can_publish_to_zmq",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_can_publish_to_zmq_direct_reader",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_exposes_input_schema_as_output_schema",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_passthrough_publishes_remote_stream",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_persists_rollover_parquet_without_master",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_rejects_legacy_parquet_sink",
+      "reason": "removed obsolete constructor or policy-constant contract",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_rejects_removed_sink_keyword",
+      "reason": "removed obsolete constructor or policy-constant contract",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_runtime_xfast_defaults_false",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_engine_supports_source_and_target_config",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_stream_table_source_stop_can_reenter_engine_status",
+      "reason": "removed SHM reader/source/lease or legacy table materializer binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_accepts_duration_window_api",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_accepts_polars_and_exposes_output_schema",
+      "reason": "removed legacy input coercion; NativeProcessor requires exact Arrow RecordBatch",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_accepts_reactive_source_pipeline",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_accepts_zmq_stream_target_for_remote_pipeline",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_config_and_lifecycle_roundtrip",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_config_exposes_runtime_xfast",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_filters_remote_zmq_source_rows_by_id_filter",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_id_filter_filters_rows_and_updates_config_and_metrics",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_metrics_report_late_rows",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_rejects_non_string_id_filter_elements",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_rejects_remote_source_schema_mismatch",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_rejects_source_schema_mismatch_at_construction",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_timeseries_engine_rejects_string_policy_arguments",
+      "reason": "removed obsolete constructor or policy-constant contract",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_write_after_stop_raises_runtime_error",
+      "reason": "removed background worker and its configuration/lifecycle API",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_zmq_source_consumer_mode_ignores_upstream_flush_until_local_flush",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_zmq_source_pipeline_can_drive_cross_sectional_engine",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_zmq_subscriber_receives_record_batch_from_engine",
+      "reason": "removed old source, publisher and transport binding",
+      "replacement": "native kernel semantics and explicit Arrow schema tests; Flight query/log/ACK/identity and three-kind recovery matrix; absence checks for retired bindings"
+    }
+  ],
+  "added": [
+    {
+      "file": "pytests/test_native_compute.py",
+      "test": "test_native_filters_preserve_exact_nonblank_instrument_identity"
+    },
+    {
+      "file": "pytests/test_native_package_boundary.py",
+      "test": "test_native_extension_has_no_legacy_runtime_bindings"
+    }
+  ],
+  "migrated_to_native_processor": [
+    "test_bar_engine_accepts_plugin_profile_protocol",
+    "test_cross_sectional_engine_rejects_non_cross_sectional_factor_specs",
+    "test_expression_factor_rejects_unknown_identifier",
+    "test_expression_factor_rejects_unsupported_function",
+    "test_reactive_engine_accepts_all_v1_operators_via_design_helpers",
+    "test_reactive_engine_accepts_expression_factor_helper",
+    "test_reactive_engine_expr_supports_ts_nodes",
+    "test_reactive_engine_rejects_blank_id_filter_values",
+    "test_reactive_engine_rejects_empty_id_filter",
+    "test_reactive_engine_rejects_invalid_state_failure_policy",
+    "test_reactive_factor_uses_its_own_id_column",
+    "test_timeseries_engine_accepts_all_v1_aggregation_operators_via_design_helpers",
+    "test_timeseries_engine_accepts_pre_and_post_expression_factors",
+    "test_timeseries_engine_flush_runs_post_factors",
+    "test_timeseries_engine_post_factors_reject_ts_expr_nodes",
+    "test_timeseries_engine_pre_factors_reject_ts_expr_nodes",
+    "test_timeseries_engine_rejects_blank_id_filter_values",
+    "test_timeseries_engine_rejects_empty_id_filter",
+    "test_timeseries_engine_rejects_non_expression_phase_factors",
+    "test_timeseries_engine_rejects_post_factors_referencing_raw_input_columns"
+  ],
+  "logging_test_migrated": "test_setup_log_file_contains_runtime_message",
+  "unchanged_contract_tests": [
+    "test_compare_replay_sorts_by_keys_and_reports_equal",
+    "test_expr_factory_replaces_expr",
+    "test_expression_factor_exposes_native_attributes",
+    "test_parquet_replay_engine_callback_errors_propagate",
+    "test_parquet_replay_engine_table_callback_matches_row_callback_order",
+    "test_parquet_replay_source_emits_parquet_batches",
+    "test_python_package_release_version_and_build_revision",
+    "test_row_reuses_exact_dict_values_without_copy",
+    "test_run_server_daemon_expands_user_path_and_creates_parent_dir",
+    "test_setup_log_returns_snapshot_and_log_path",
+    "test_zippy_io_does_not_export_removed_parquet_sink_api"
+  ],
+  "new_parameter_cases": {
+    "retired_exports": 23,
+    "exact_filters": 2
+  },
+  "preserved_validation": "initial four empty/blank ID failures fixed in NativeProcessor; old assertions retained"
+}

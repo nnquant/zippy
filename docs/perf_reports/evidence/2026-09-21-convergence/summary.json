@@ -1,0 +1,156 @@
+{
+  "date": "2026-09-21",
+  "baseline_commit": "1d1be4d",
+  "status": "partial_implementation_not_ready_for_merge",
+  "closed_findings": [
+    "F01",
+    "F02",
+    "F03",
+    "F04",
+    "F05",
+    "F06",
+    "F18",
+    "F19",
+    "F20",
+    "F21",
+    "F23",
+    "F24",
+    "F27",
+    "F30",
+    "F31",
+    "F32",
+    "F34"
+  ],
+  "partial_findings": [
+    "F22",
+    "F25",
+    "F28",
+    "F29",
+    "F33"
+  ],
+  "remaining_findings": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F17",
+    "F22",
+    "F25",
+    "F26",
+    "F28",
+    "F29",
+    "F33"
+  ],
+  "rust_tests": {
+    "passed_result_blocks_total": 1704,
+    "ignored": 10,
+    "failed": 0,
+    "result_blocks": 114,
+    "log": "/tmp/zippy-rust-verified.log"
+  },
+  "python_client_tests": {
+    "passed": 77,
+    "coverage_percent": 81.3,
+    "coverage_threshold_percent": 80,
+    "log": "/tmp/zippy-client-verified.log"
+  },
+  "clippy": "passed",
+  "rustfmt": "passed",
+  "ruff_repository": "passed",
+  "black_package_scopes": "passed",
+  "black_repository": {
+    "status": "passed",
+    "files_checked": 82
+  },
+  "mypy_configured": {
+    "main_files": 14,
+    "client_files": 24,
+    "status": "passed"
+  },
+  "mypy_repository": {
+    "status": "failed",
+    "errors": 982,
+    "files_with_errors": 11,
+    "files_checked": 81,
+    "log": "/tmp/zippy-mypy-all-final.log"
+  },
+  "no_git_build_script": "passed",
+  "production_data_modified": false,
+  "committed": false,
+  "deployed": false,
+  "fixture_correction": "table_semantics_v1.json is still referenced by master golden tests and is retained",
+  "additional_closed_findings": [
+    "F35"
+  ],
+  "retained_product_capabilities": [
+    "append",
+    "frame",
+    "key_value",
+    "remote_live_subscription",
+    "local_engines"
+  ],
+  "python_combined_tests": {
+    "passed": 681,
+    "skipped": 1,
+    "log": "/tmp/zippy-python-verified.log"
+  },
+  "native_storage_regression": {
+    "passed": 14,
+    "ignored": 1,
+    "log": "/tmp/zippy-shutdown-fix.log"
+  },
+  "previous_regression_failure": {
+    "finding": "F35",
+    "test": "native_checkpoint_worker_persists_without_an_explicit_flush",
+    "reason": "storage dependencies stopped before ingest checkpoint drain",
+    "log": "/tmp/zippy-rust-final.log"
+  },
+  "protocol_generation_check": "passed",
+  "protocol_generator_clippy_and_fmt": "passed",
+  "frontend_bundle": {
+    "status": "passed",
+    "files": 3
+  },
+  "archive_distributions": {
+    "status": "passed",
+    "git_metadata_present": false,
+    "separate_cargo_cache": true,
+    "sibling_rspm_required": false,
+    "runtime_version": "0.5.0",
+    "build_revision": null,
+    "wheels": [
+      {
+        "path": "/tmp/zippy-distributions-verified/wheels/zippy-0.5.0-cp311-cp311-manylinux_2_31_x86_64.whl",
+        "sha256": "7ac678768906023e0b517377e27ccf1084187e61133417560822457128fdbb70",
+        "bytes": 183946016
+      },
+      {
+        "path": "/tmp/zippy-distributions-verified/wheels/zippy_client-0.1.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+        "sha256": "e1ed7148d695184463c5e1bb316a45361a08bee3d64f73a8e0de6c5d0d7bc219",
+        "bytes": 21090720
+      }
+    ],
+    "log": "/tmp/zippy-distributions-verified.log"
+  },
+  "installed_wheel_smoke": {
+    "status": "passed",
+    "pyarrow_version": "25.0.1",
+    "python_version": "3.11",
+    "platform": "linux_x86_64",
+    "probe": "/tmp/zippy-installed-smoke.py",
+    "log": "/tmp/zippy-installed-smoke-verified.log"
+  },
+  "development_pyarrow_version": "23.0.1",
+  "unverified": [
+    "Windows and macOS native execution",
+    "full Python and Arrow support matrix",
+    "long-running pressure and disk-failure validation",
+    "native create/write/query/subscribe/restart/drop for all table types"
+  ]
+}

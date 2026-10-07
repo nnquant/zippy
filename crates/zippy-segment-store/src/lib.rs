@@ -1,6 +1,3 @@
-#[cfg(all(feature = "test-failpoints", not(debug_assertions)))]
-compile_error!("test-failpoints must not be enabled when debug assertions are disabled");
-
 mod active_reader;
 mod arrow_bridge;
 mod builder;
@@ -11,12 +8,9 @@ mod layout;
 mod lifecycle;
 mod notify;
 pub mod perf;
-mod persistence;
 mod schema;
 mod segment;
 mod shm;
-#[cfg(feature = "test-failpoints")]
-pub mod test_failpoints;
 mod view;
 
 pub use active_reader::ActiveSegmentReader;
@@ -30,10 +24,6 @@ pub use debug::debug_snapshot_record_batch_for_test;
 pub use layout::{ColumnLayout, LayoutPlan};
 pub use lifecycle::{ReaderSession, SegmentLease};
 pub use notify::SegmentNotifier;
-pub use persistence::{
-    PersistenceQueue, PersistenceRetryPolicy, PersistenceWorker, PersistenceWorkerMetricsSnapshot,
-    PersistenceWorkerShutdownReport,
-};
 pub use schema::{compile_schema, ColumnSpec, ColumnType, CompiledSchema};
 pub use segment::{
     ActiveSegmentDescriptor, SealedSegmentHandle, SegmentControlSnapshot, SegmentHeader,

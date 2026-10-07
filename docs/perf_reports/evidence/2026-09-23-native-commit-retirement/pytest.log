@@ -1,0 +1,38 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.14, pytest-9.0.2, pluggy-1.6.0
+rootdir: /home/jiangda/develop/zippy
+configfile: pyproject.toml
+plugins: cov-7.1.0, anyio-4.13.0
+collected 543 items
+
+clients/python/tests/test_endpoints_router.py .......................... [  4%]
+............                                                             [  6%]
+clients/python/tests/test_expressions_protocol.py ...                    [  7%]
+clients/python/tests/test_flight_subscriber.py ......................... [ 12%]
+...................                                                      [ 15%]
+clients/python/tests/test_flight_transport.py .......................... [ 20%]
+.....................................................                    [ 30%]
+clients/python/tests/test_log_reader.py ......................           [ 34%]
+clients/python/tests/test_temporal_contract.py ...................       [ 37%]
+clients/python/tests/test_unit_contracts.py ..............               [ 40%]
+pytests/test_control_uri.py .........                                    [ 41%]
+pytests/test_flight_examples.py .............                            [ 44%]
+pytests/test_key_value_state.py ..                                       [ 44%]
+pytests/test_native_chain.py .....                                       [ 45%]
+pytests/test_native_compute.py ...................                       [ 49%]
+pytests/test_native_package_boundary.py ................................ [ 55%]
+...................                                                      [ 58%]
+pytests/test_native_source_input.py .............                        [ 60%]
+pytests/test_native_state_subscription.py .......                        [ 62%]
+pytests/test_native_table_cli.py ..............                          [ 64%]
+pytests/test_native_webui.py ....................                        [ 68%]
+pytests/test_python_api.py ..................................            [ 74%]
+pytests/test_python_cli.py ................................              [ 80%]
+pytests/test_python_pm_cli.py ...........................                [ 85%]
+pytests/test_replay_compare.py ....                                      [ 86%]
+pytests/test_replay_source.py .....................                      [ 90%]
+pytests/test_server_process.py ......................................... [ 97%]
+.......                                                                  [ 99%]
+pytests/test_shared_client_values.py .....                               [100%]
+
+============================= 543 passed in 14.83s =============================

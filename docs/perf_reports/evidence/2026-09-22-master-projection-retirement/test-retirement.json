@@ -1,0 +1,295 @@
+{
+  "retired": [
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "effective_scan_order_matches_gateway_key_and_registry_tie_breaking",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "malformed_migration_file_fails_the_complete_table_snapshot",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "migration_file_projection_accepts_mixed_legacy_and_audited_metadata",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "migration_snapshot_is_atomic_deterministic_and_preserves_legacy_file_order",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "migration_snapshot_marks_custom_schema_metadata_as_noncanonical_ipc",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "migration_snapshot_v1_fixture_hash_does_not_drift_with_typed_projection",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_capture_uses_one_budget_for_the_complete_public_snapshot",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_custom_metadata_uses_native_hash_and_validates_legacy_hash_format",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_digest_excludes_runtime_liveness_and_catalog_revision",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_digest_tracks_stable_source_writer_and_file_revision",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_enforces_shared_table_schema_contract",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_fails_closed_for_schema_and_config_resource_corruption",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_fails_closed_for_unbound_duplicate_and_malformed_sources",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_file_count_boundary_and_duplicate_path_fail_closed",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_ignores_oversized_config_on_non_public_stream",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_metadata_budget_accumulates_across_public_tables",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_metadata_budget_is_enforced_without_allocating_canonical_bytes",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_publishes_only_source_declared_tables_and_types_json_numbers",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_retains_declared_table_when_runtime_source_unregisters",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_retains_drop_tombstone_across_same_name_recreation",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "projection_v4_table_config_excludes_all_migration_bookkeeping",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog_commit.rs",
+      "test": "closing_mutation_admission_drains_existing_permits_and_rejects_new_work",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog_commit.rs",
+      "test": "event_is_fixed_capacity_and_preserves_full_table_identity",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog_commit.rs",
+      "test": "full_queue_latches_continuity_loss_without_blocking",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/server.rs",
+      "test": "committed_compaction_publishes_after_manifest_replacement",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/src/server.rs",
+      "test": "staged_shutdown_seals_commits_while_final_catalog_snapshot_remains_readable",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/legacy_catalog_commit_events.rs",
+      "test": "committed_events_preserve_catalog_revision_order",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/legacy_catalog_commit_events.rs",
+      "test": "full_queue_does_not_change_primary_response_and_latches_gap",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/legacy_catalog_commit_events.rs",
+      "test": "installation_seeds_baseline_and_shutdown_seals_empty_queue",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/legacy_catalog_commit_events.rs",
+      "test": "snapshot_write_failure_rolls_back_without_publishing",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v2.rs",
+      "test": "legacy_import_v2_decodes_frozen_historical_response_bytes",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v2.rs",
+      "test": "legacy_import_v2_fingerprint_bytes_and_digest_are_frozen",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v2.rs",
+      "test": "legacy_import_v2_response_bytes_are_frozen_and_round_trip",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v2.rs",
+      "test": "legacy_import_v2_response_rejects_unknown_top_and_deep_fields",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v2.rs",
+      "test": "legacy_import_v2_response_rejects_unknown_version",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v2.rs",
+      "test": "legacy_import_v2_response_round_trips_every_table_definition",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v3.rs",
+      "test": "reconcile_v3_fingerprint_binds_revisions_epochs_and_file_order",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v3.rs",
+      "test": "reconcile_v3_fingerprint_has_a_frozen_golden",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v3.rs",
+      "test": "reconcile_v3_rejects_oversized_actor_and_wrong_format",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v4.rs",
+      "test": "projection_v4_drop_source_hash_option_has_frozen_goldens",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v4.rs",
+      "test": "projection_v4_fingerprint_binds_epoch_source_and_complete_typed_state",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v4.rs",
+      "test": "projection_v4_fingerprint_has_a_frozen_golden",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v4.rs",
+      "test": "projection_v4_response_round_trips_and_rejects_unknown_fields",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v4.rs",
+      "test": "projection_v4_source_codec_enforces_canonical_byte_limit",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v4.rs",
+      "test": "projection_v4_source_codec_enforces_value_depth_limit",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    },
+    {
+      "file": "crates/zippy-types/src/catalog/wire_v4.rs",
+      "test": "projection_v4_source_codec_enforces_value_node_limit",
+      "reason": "removed migration snapshot, shadow event publisher, or V2/V3/V4 codec",
+      "replacement": "native v1 fingerprint and response checks; rejected versions 2/3/4; retained registry recovery tests; native three-kind recovery and lifecycle checks"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-server/src/flight_query.rs",
+      "test": "metadata_retry_preserves_resource_corruption_and_unavailable_errors"
+    },
+    {
+      "file": "crates/zippy-server/src/flight_query.rs",
+      "test": "metadata_revision_conflict_restarts_capture_and_returns_only_stable_result"
+    },
+    {
+      "file": "crates/zippy-server/src/flight_query.rs",
+      "test": "repeated_metadata_revision_changes_stop_at_budget_with_last_conflict"
+    }
+  ],
+  "retained_integration_assertions": "master_server reads table descriptors and persisted source definitions/tombstones directly; no projection dependency"
+}

@@ -5,14 +5,6 @@ use zippy_types::{ErrorCode, RequestId, Result, ServerError};
 
 use crate::encoding::{decode_u64, encode_u64};
 
-pub(crate) const V2_IMPORT_OPERATION: &str = "legacy_import_table";
-pub(crate) const V3_RECONCILE_OPERATION: &str = "legacy_reconcile_files";
-pub(crate) const V4_BOOTSTRAP_OPERATION: &str = "legacy_bootstrap_table";
-pub(crate) const V4_ADOPT_OPERATION: &str = "legacy_adopt_existing_table";
-pub(crate) const V4_SYNC_OPERATION: &str = "legacy_sync_table_metadata";
-pub(crate) const V4_DROP_OPERATION: &str = "legacy_drop_table";
-pub(crate) const V4_CHECKPOINT_OPERATION: &str = "legacy_advance_checkpoint";
-
 struct RequestOwner {
     format_version: i64,
     operation: String,
@@ -49,30 +41,6 @@ pub(crate) fn exact_owner_exists(
     .with_retryable(false))
 }
 
-/// Returns whether a request id belongs to one format/operation namespace without comparing a
-/// command fingerprint. This is only for fixed-cost replay probes that do not possess a command.
-pub(crate) fn namespace_owner_exists(
-    connection: &Connection,
-    request_id: RequestId,
-    format_version: i64,
-    operation: &str,
-) -> Result<bool> {
-    let Some(owner) = load_owner(connection, request_id)? else {
-        return Ok(false);
-    };
-    validate_owner(&owner)?;
-    if owner.format_version == format_version && owner.operation == operation {
-        Ok(true)
-    } else {
-        Err(ServerError::new(
-            ErrorCode::Conflict,
-            "catalog request id is already owned by another committed command",
-        )
-        .with_request_id(request_id)
-        .with_retryable(false))
-    }
-}
-
 /// Permanently records one request id after its version-specific fact row is prepared.
 pub(crate) fn insert_owner(
     connection: &Connection,
@@ -82,7 +50,7 @@ pub(crate) fn insert_owner(
     fingerprint: &[u8; 32],
     committed_at_ns: u64,
 ) -> Result<()> {
-    if !(1..=4).contains(&format_version) || operation.is_empty() {
+    if format_version != 1 || operation.is_empty() {
         return Err(ServerError::new(
             ErrorCode::Internal,
             "invalid Catalog request owner attempted to enter the ledger",
@@ -129,10 +97,7 @@ fn load_owner(connection: &Connection, request_id: RequestId) -> Result<Option<R
 }
 
 fn validate_owner(owner: &RequestOwner) -> Result<()> {
-    if !(1..=4).contains(&owner.format_version)
-        || owner.operation.is_empty()
-        || owner.fingerprint.len() != 32
-    {
+    if owner.format_version != 1 || owner.operation.is_empty() || owner.fingerprint.len() != 32 {
         return Err(ServerError::new(
             ErrorCode::DataCorruption,
             "global Catalog request owner violates intrinsic invariants",

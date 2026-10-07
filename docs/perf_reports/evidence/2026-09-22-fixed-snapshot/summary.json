@@ -1,0 +1,265 @@
+{
+  "date": "2026-09-22",
+  "batch": 26,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F14",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "native_fixed_snapshot": {
+    "capability": "query.fixed_snapshot.v1",
+    "table_kinds": [
+      "append",
+      "frame",
+      "key_value"
+    ],
+    "default_requested_ttl_ms": 60000,
+    "maximum_requested_ttl_ms": 300000,
+    "expiry_clamped_to_session": true,
+    "lease_capacity": 32,
+    "frozen_catalog_schema_and_live_boundary": true,
+    "subset_query_and_multi_table_join": true,
+    "per_query_metadata_budget_and_parent_pin_lifetime": true,
+    "prepared_child_survives_root_release_and_later_write": true,
+    "schema_drop_same_name_replacement_keep_original_identity": true,
+    "original_session_retained_across_early_refresh": true,
+    "scope_table_and_join_views_independently_owned": true,
+    "wait_for_table_precedes_capture": true,
+    "writer_and_foreign_session_rejected": true,
+    "expiry_and_restart_never_refresh_snapshot": true,
+    "unsupported_frontend_rejected_before_query_admission": true,
+    "shutdown_closes_inflight_capture_publication": true,
+    "atomic_key_value_cursor_cannot_mix_with_fixed_query_snapshot": true,
+    "status_field": "active_fixed_snapshots",
+    "durable_checkpoint": false
+  },
+  "verification": {
+    "rust_workspace": {
+      "passed": 1768,
+      "ignored": 10,
+      "result_blocks": 111,
+      "exit_code": 0,
+      "note": "includes nested subprocess output; later protocol capability guard validated separately"
+    },
+    "final_protocol": "28 unit + 22 integration passed",
+    "catalog_fork": "1 targeted passed",
+    "native_runtime": "24 passed / 1 ignored",
+    "python_rebuilt_final_extension": "809 passed / 1 skipped",
+    "full_client": "184 passed / 84.75% coverage",
+    "isolated_client": {
+      "23.0.1": "179 passed / 1 skipped / 81.51% coverage",
+      "25.0.1": "179 passed / 1 skipped / 81.51% coverage"
+    },
+    "native_matrix": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+      "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+      "native_fixed_snapshot_expiry_roles_and_capacity": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_six_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "configured_mypy": "root 15 and client/tests/native acceptance 30 files passed",
+    "extended_mypy": "978 errors / 12 files / 90 checked; failed; F29 open",
+    "clippy": "workspace all-targets all-features -D warnings passed",
+    "formatting": "Black 91 files, Ruff, rustfmt, git diff --check passed",
+    "generated_protocol": "regeneration byte equality passed",
+    "platform": "Linux x86_64 / Python 3.11",
+    "cross_platform_ci_executed": false,
+    "full_package_isolated_distribution_rerun": false
+  },
+  "remaining_boundaries": [
+    "main query/snapshot and callbacks still require native migration",
+    "legacy Gateway/control and Legacy/shadow remain until all capabilities migrate",
+    "KV compute input and compute output session recovery incomplete",
+    "durable operator checkpoint is not implemented",
+    "derived planning budget remains conservative",
+    "full typecheck and remote OS/Python matrix incomplete"
+  ],
+  "source_sha256": {
+    "crates/zippy-catalog/src/pinned_snapshot.rs": "bf3c650dac64243b538621283f1b2268178a812c43b83373b2fc25a1a41ebea3",
+    "crates/zippy-catalog/tests/sqlite_catalog.rs": "ebc858e87cb6a21153f033567f038e68108b06d4d94f3f6f1d032aef0cc0ca09",
+    "crates/zippy-server/src/fixed_snapshot.rs": "79bc4efb648d675ccb78ab4cf946d8894729b69d7be049ce7a9dc73e4a6d55ab",
+    "crates/zippy-server/src/native_query.rs": "3a49d92bdda2f2e8db7a3bb93e226e814dc16dcd71e5b8fd42dd2607366fe458",
+    "crates/zippy-server/src/query_snapshot.rs": "a91fc5f3bd6297058aeccafb4b9965ca053ce9de28676b1f976b026997275a33",
+    "crates/zippy-server/src/flight_query.rs": "059e0e6b137aff3fb06430b9acc59f16204328155f14ee6790e18cde0396a978",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "06a053846f357b72ebfbafbf73962166174532b438c5e9dcc2bb92b8ba8458ec",
+    "crates/zippy-protocol/src/fixed_snapshot.rs": "7b6369609fa41ea0cc601e8af5dc47de98520d04376f032513941ca68c299389",
+    "crates/zippy-protocol/src/query.rs": "9b44edf03215fe47813e4bf45d9f6f76acd9e7b7fc11b40cd3d4c14c428a2a61",
+    "crates/zippy-protocol/src/server.rs": "567bd568920652a756451ddce11c7a8e4c0987bf7f332f7470e3bb47003f49b8",
+    "crates/zippy-protocol/src/auth.rs": "e7f87e7b83ab3a2fab45c640a075e1fdff21e1b8baaf23ab82bdd8780b57ebac",
+    "crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto": "6f1c8d5c1694fa7f5addb3a5cd95840ab87e5f30851f16c5526ee152b3ec6a6d",
+    "clients/python/src/zippy_client/snapshot.py": "20a5c8f79e19e8de29183efe0ff0e01e71aaa5b6d481df4096a41e9253353430",
+    "clients/python/src/zippy_client/query.py": "1f9a4b82cd625dfc246b5ac2797332a26c375910825866b2bae42c344e4bed17",
+    "clients/python/src/zippy_client/client.py": "8e58feae43c62594aa4cb61661f607278750cb993abe646f634811f1de91035d",
+    "clients/python/src/zippy_client/transports/flight.py": "33884f558b2da7b19aecd2d17f738a930d2fec3d7faff9f635bc335645b0575d",
+    "clients/python/tests/test_flight_transport.py": "03fe974139cb5f05c9dc1601eed419312794e555c8e763a5c26ca07ded758623",
+    "scripts/check_native_fixed_snapshot.py": "3f009b608a208dd24adce2230e118b565ec2056f1adae0daf36261a5b410de05",
+    "scripts/check_native_client.py": "e799dfbf06104149783a2dbc0636a3c4125d8edf63e8408806299d72e507f9d4",
+    "scripts/check_distributions.py": "336134ba4fcb1e49c10346be27a761f5e37420e71559807984e0d52eee296a74"
+  },
+  "server_binary_sha256": "e65cb99f6b95c28e0236961b78e101fa35bd0a78f14baad2efe032b060145da3",
+  "logs": {
+    "workspace": {
+      "path": "/tmp/zippy-fixed-snapshot-workspace.log",
+      "bytes": 165113,
+      "sha256": "2bed67c87229c56698c48c3bf0cfe2c00c61663d9a63ad5531ee73c700d3b2a2"
+    },
+    "protocol-tests": {
+      "path": "/tmp/zippy-fixed-snapshot-protocol-tests.log",
+      "bytes": 4571,
+      "sha256": "e6bfd4c7c8fe915ee57d10e90909fae71470e57fd0a5646da3dcd371bd6eaa42"
+    },
+    "catalog": {
+      "path": "/tmp/zippy-fixed-snapshot-catalog.log",
+      "bytes": 439,
+      "sha256": "0877272abbe2dede1ee7df36ca24237c16af736131dd0543da4277d56e7bdb41"
+    },
+    "runtime": {
+      "path": "/tmp/zippy-fixed-snapshot-runtime.log",
+      "bytes": 2363,
+      "sha256": "dabb163a879b328db9f333fc6a61ffa5b6bf9e122a7ff3d6a45e8b643ace2b84"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-fixed-snapshot-clippy.log",
+      "bytes": 2526,
+      "sha256": "4054197faea3c3ea8c9e9ab8a96240e44a826f7ade64212bf31b8483b9b8e0ef"
+    },
+    "build": {
+      "path": "/tmp/zippy-fixed-snapshot-build.log",
+      "bytes": 243,
+      "sha256": "b461b89a2f09b3b5d629cd32b663f22aee9e94f051f53c9ed1ebaa52e0ec70df"
+    },
+    "extension-final": {
+      "path": "/tmp/zippy-fixed-snapshot-extension-final.log",
+      "bytes": 2960,
+      "sha256": "7221167e1da7f8cf97e999fc267aab552ee4620e048b87c9fcb2d445740a319d"
+    },
+    "python-final": {
+      "path": "/tmp/zippy-fixed-snapshot-python-final.log",
+      "bytes": 1002,
+      "sha256": "6b686085d23c4c4f7a736c1e6fad412864e180b8e6b42f40fdda2cfacb2d4884"
+    },
+    "client-coverage": {
+      "path": "/tmp/zippy-fixed-snapshot-client-coverage.log",
+      "bytes": 4315,
+      "sha256": "a1a14bfd5ba16741bca2016d3116f483b735dc12f5198ac317ae023da9bb407b"
+    },
+    "isolated-23": {
+      "path": "/tmp/zippy-fixed-snapshot-isolated-23.log",
+      "bytes": 16720,
+      "sha256": "ee3a151abee11725b863fd9ba89e5b3f6cc4478a725166c29dc4e9e907c1737d"
+    },
+    "isolated-25": {
+      "path": "/tmp/zippy-fixed-snapshot-isolated-25.log",
+      "bytes": 16721,
+      "sha256": "230e1b3d665fe8b7ae430450bc2e1d855dfe7fcf81d9b1b97c7b756c1d027b05"
+    },
+    "acceptance-final": {
+      "path": "/tmp/zippy-fixed-snapshot-acceptance-final.log",
+      "bytes": 23362,
+      "sha256": "74ace8e3db50202d5d1eb7ac79710fb8bd8e5595b67cf10f67eb7e7552fb1e53"
+    },
+    "codegen-check": {
+      "path": "/tmp/zippy-fixed-snapshot-codegen-check.log",
+      "bytes": 314,
+      "sha256": "a9440a7b0dd5b3a7dacdb334b7daaf5ab1c040b5a165f522e9842a21f451276d"
+    },
+    "mypy-root": {
+      "path": "/tmp/zippy-fixed-snapshot-mypy-root.log",
+      "bytes": 44,
+      "sha256": "fc409d91e6c781eb25a1ec1310b7fcb0086b74ed3aa2c415bcd73f884f23f07a"
+    },
+    "mypy": {
+      "path": "/tmp/zippy-fixed-snapshot-mypy.log",
+      "bytes": 44,
+      "sha256": "b1e54a4dabc8d720118d6074a4c299c7b40c262f2e4f5d8f801e29a5cdfe35a5"
+    },
+    "mypy-full": {
+      "path": "/tmp/zippy-fixed-snapshot-mypy-full.log",
+      "bytes": 161267,
+      "sha256": "a8dbc12c0224dab0ec6a73ae5c97190b9f89f718d42b558643b2ddfd3e60f714"
+    },
+    "black": {
+      "path": "/tmp/zippy-fixed-snapshot-black.log",
+      "bytes": 57,
+      "sha256": "16def83113193cc4f7b56015bcfdf4714d0466034144b3cafab20dbffbb06a69"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-fixed-snapshot-ruff.log",
+      "bytes": 19,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-fixed-snapshot-rustfmt.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff": {
+      "path": "/tmp/zippy-fixed-snapshot-diff.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}

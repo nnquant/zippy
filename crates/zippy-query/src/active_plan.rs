@@ -98,6 +98,7 @@ pub struct ActiveSegmentDescription {
     schema_version: NonZeroU64,
     offsets: OffsetRange,
     row_count: NonZeroU64,
+    max_utf8_value_bytes: Option<u64>,
 }
 
 impl ActiveSegmentDescription {
@@ -125,7 +126,21 @@ impl ActiveSegmentDescription {
             schema_version,
             offsets,
             row_count,
+            max_utf8_value_bytes: None,
         })
+    }
+
+    /// Attaches a UTF-8 cell-size bound measured before decoding the pinned prefix.
+    #[must_use]
+    pub fn with_utf8_value_bound(mut self, maximum: u64) -> Self {
+        self.max_utf8_value_bytes = Some(maximum);
+        self
+    }
+
+    /// Returns a value-buffer bound measured from the pinned prefix's immutable offsets.
+    #[must_use]
+    pub const fn max_utf8_value_bytes(self) -> Option<u64> {
+        self.max_utf8_value_bytes
     }
 
     /// Returns the complete stable key.
@@ -478,7 +493,10 @@ impl ExecutionPlan for PersistedAndActiveExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true, true]
+        // Concatenating sorted children does not preserve global ordering: a live row may
+        // precede every persisted row. Prevent the optimizer from pushing the sole sort
+        // below this node, which breaks latest-key window plans over mixed storage.
+        vec![false, false]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {

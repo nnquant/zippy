@@ -45,9 +45,7 @@ use zippy_protocol::wire::{
     CapabilitiesResponse, MetadataInfo, PutBatchResult, PutCommand, PutDurability, PutMutation,
     SessionOpenRequest, SessionOpenResponse, SessionRole,
 };
-use zippy_protocol::{
-    AUTHORIZATION_METADATA_KEY, CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY,
-};
+use zippy_protocol::{AUTHORIZATION_METADATA_KEY, CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION};
 use zippy_types::query::{
     QueryInput, QueryInstanceId, QueryPlanInfo, QueryPriority, QueryRequest, QueryResultBatch,
     RecordBatchStream, SendableRecordBatchStream,
@@ -355,13 +353,91 @@ impl RecordBatchStream for FakeResultStream {
     }
 }
 
+#[test]
+fn local_read_mode_is_explicit_and_cannot_bind_public_listener() {
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::new(AtomicUsize::new(0)),
+        Duration::from_secs(5),
+        false,
+    ));
+    let unset =
+        FlightServiceConfig::try_new("test", TEST_MESSAGE_BYTES, 4, TEST_TRANSPORT_BYTES).unwrap();
+    assert!(ZippyFlightService::try_new(unset, frontend.clone()).is_err());
+    let service = ZippyFlightService::try_new(service_config(4), frontend).unwrap();
+    let error = match FlightServerRuntime::start(
+        "0.0.0.0:0".parse().unwrap(),
+        service,
+        Duration::from_secs(1),
+    ) {
+        Ok(_) => panic!("local sessions must never bind a public listener"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_handshake_rejects_legacy_header_and_forged_command_identity() {
+    let (service, mut runtime) = start_service(
+        Arc::new(AtomicUsize::new(0)),
+        Duration::from_secs(5),
+        false,
+        4,
+    );
+    let (mut client, session, _) = local_client(&runtime).await;
+    let forged = SessionId::from_u128(999999).unwrap();
+    assert_ne!(forged, session);
+    let error = client
+        .get_flight_info(descriptor(forged, QueryId::from_u128(900).unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(flight_error_code(error), ErrorCode::PermissionDenied);
+    let mut legacy = raw_client(&runtime).await;
+    legacy
+        .add_header("x-zippy-session-id", &session.to_string())
+        .unwrap();
+    let error = legacy
+        .get_flight_info(descriptor(session, QueryId::from_u128(901).unwrap()))
+        .await
+        .unwrap_err();
+    assert_eq!(flight_error_code(error), ErrorCode::Unauthenticated);
+    assert_eq!(service.status().active_sessions, 1);
+    assert_eq!(service.status().pending_tickets, 0);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+    assert_eq!(service.status().active_sessions, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_fixed_snapshot_is_rejected_before_query_preparation() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let (service, mut runtime) =
+        start_service(Arc::clone(&lease_drops), Duration::from_secs(5), false, 4);
+    let (mut client, session, _) = local_client(&runtime).await;
+    let descriptor = descriptor(session, QueryId::from_u128(902).unwrap());
+    let mut command = zippy_protocol::wire::QueryCommand::decode(descriptor.cmd).unwrap();
+    command.fixed_snapshot_id = Some(
+        QueryId::from_u128(903)
+            .unwrap()
+            .into_bytes()
+            .to_vec()
+            .into(),
+    );
+    let error = client
+        .get_flight_info(encode_query_descriptor(&command))
+        .await
+        .unwrap_err();
+    assert_eq!(flight_error_code(error), ErrorCode::UnsupportedPlan);
+    assert_eq!(service.status().pending_tickets, 0);
+    assert_eq!(service.status().active_fixed_snapshots, 0);
+    assert_eq!(lease_drops.load(Ordering::SeqCst), 0);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flight_round_trip_is_snapshot_fixed_and_ticket_is_single_use() {
     let lease_drops = Arc::new(AtomicUsize::new(0));
     let (service, mut runtime) =
         start_service(Arc::clone(&lease_drops), Duration::from_secs(5), false, 4);
-    let session = SessionId::from_u128(11).unwrap();
-    let mut client = client(&runtime, session).await;
+    let (mut client, session, _session_token) = local_client(&runtime).await;
 
     let info = client
         .get_flight_info(descriptor(session, QueryId::from_u128(12).unwrap()))
@@ -624,6 +700,8 @@ async fn writer_session_streams_bounded_memory_puts_and_read_session_is_rejected
     ];
     let put_id = RequestId::from_u128(700).unwrap();
     let descriptor = encode_put_descriptor(&PutCommand {
+        expected_table_id: None,
+        namespace: "default".to_owned(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         session_id: session_id.into_bytes().to_vec().into(),
         put_id: put_id.into_bytes().to_vec().into(),
@@ -631,8 +709,8 @@ async fn writer_session_streams_bounded_memory_puts_and_read_session_is_rejected
         first_batch_sequence: 11,
         mutation: PutMutation::Append as i32,
         durability: PutDurability::Memory as i32,
-        producer_id: bytes::Bytes::new(),
-        connection_id: bytes::Bytes::new(),
+        producer_id: bytes::Bytes::from_static(&[3; 16]),
+        connection_id: bytes::Bytes::from_static(&[4; 16]),
         expected_writer_epoch: None,
     });
     let input = FlightDataEncoderBuilder::new()
@@ -678,6 +756,8 @@ async fn writer_session_streams_bounded_memory_puts_and_read_session_is_rejected
     let (mut reader, reader_session, _) =
         authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
     let denied_descriptor = encode_put_descriptor(&PutCommand {
+        expected_table_id: None,
+        namespace: "default".to_owned(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         session_id: reader_session.into_bytes().to_vec().into(),
         put_id: RequestId::from_u128(701)
@@ -689,8 +769,8 @@ async fn writer_session_streams_bounded_memory_puts_and_read_session_is_rejected
         first_batch_sequence: 0,
         mutation: PutMutation::Append as i32,
         durability: PutDurability::Memory as i32,
-        producer_id: bytes::Bytes::new(),
-        connection_id: bytes::Bytes::new(),
+        producer_id: bytes::Bytes::from_static(&[3; 16]),
+        connection_id: bytes::Bytes::from_static(&[4; 16]),
         expected_writer_epoch: None,
     });
     let denied_batch = RecordBatch::try_new(
@@ -741,6 +821,8 @@ async fn put_row_limit_rejects_batch_before_frontend_write() {
     )
     .unwrap();
     let descriptor = encode_put_descriptor(&PutCommand {
+        expected_table_id: None,
+        namespace: "default".to_owned(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         session_id: session_id.into_bytes().to_vec().into(),
         put_id: RequestId::from_u128(702)
@@ -752,8 +834,8 @@ async fn put_row_limit_rejects_batch_before_frontend_write() {
         first_batch_sequence: 0,
         mutation: PutMutation::Append as i32,
         durability: PutDurability::Memory as i32,
-        producer_id: bytes::Bytes::new(),
-        connection_id: bytes::Bytes::new(),
+        producer_id: bytes::Bytes::from_static(&[3; 16]),
+        connection_id: bytes::Bytes::from_static(&[4; 16]),
         expected_writer_epoch: None,
     });
     let input = FlightDataEncoderBuilder::new()
@@ -933,14 +1015,13 @@ async fn wrong_session_does_not_consume_ticket() {
     let lease_drops = Arc::new(AtomicUsize::new(0));
     let (_service, mut runtime) =
         start_service(Arc::clone(&lease_drops), Duration::from_secs(5), false, 4);
-    let owner = SessionId::from_u128(21).unwrap();
-    let mut owner_client = client(&runtime, owner).await;
+    let (mut owner_client, owner, _session_token) = local_client(&runtime).await;
     let info = owner_client
         .get_flight_info(descriptor(owner, QueryId::from_u128(22).unwrap()))
         .await
         .unwrap();
     let ticket = info.endpoint[0].ticket.clone().unwrap();
-    let mut foreign_client = client(&runtime, SessionId::from_u128(23).unwrap()).await;
+    let (mut foreign_client, _, _) = local_client(&runtime).await;
 
     let error = foreign_client
         .do_get(ticket.clone())
@@ -968,8 +1049,7 @@ async fn unconsumed_ticket_expires_and_releases_prepared_query() {
         false,
         4,
     );
-    let session = SessionId::from_u128(31).unwrap();
-    let mut client = client(&runtime, session).await;
+    let (mut client, session, _session_token) = local_client(&runtime).await;
     let info = client
         .get_flight_info(descriptor(session, QueryId::from_u128(32).unwrap()))
         .await
@@ -991,8 +1071,7 @@ async fn capabilities_and_pending_ticket_capacity_are_enforced() {
     let lease_drops = Arc::new(AtomicUsize::new(0));
     let (service, mut runtime) =
         start_service(Arc::clone(&lease_drops), Duration::from_secs(5), false, 1);
-    let session = SessionId::from_u128(35).unwrap();
-    let mut client = client(&runtime, session).await;
+    let (mut client, session, _session_token) = local_client(&runtime).await;
 
     let actions = client
         .list_actions()
@@ -1001,7 +1080,7 @@ async fn capabilities_and_pending_ticket_capacity_are_enforced() {
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
-    assert_eq!(actions.len(), 1);
+    assert_eq!(actions.len(), 2);
     assert_eq!(actions[0].r#type, CAPABILITIES_ACTION);
     let bodies = client
         .do_action(Action::new(CAPABILITIES_ACTION, Vec::<u8>::new()))
@@ -1059,14 +1138,13 @@ async fn standard_cancel_is_owner_bound_and_fenced_by_exact_ticket_identity() {
     ));
     let config = service_config(4).with_query_control();
     let (service, mut runtime) = start_frontend_with_config(frontend, config);
-    let owner = SessionId::from_u128(61).unwrap();
-    let mut owner_client = client(&runtime, owner).await;
+    let (mut owner_client, owner, _session_token) = local_client(&runtime).await;
     let info = owner_client
         .get_flight_info(descriptor(owner, QueryId::from_u128(62).unwrap()))
         .await
         .unwrap();
 
-    let mut foreign_client = client(&runtime, SessionId::from_u128(63).unwrap()).await;
+    let (mut foreign_client, _, _) = local_client(&runtime).await;
     let error = foreign_client
         .cancel_flight_info(CancelFlightInfoRequest::new(info.clone()))
         .await
@@ -1183,8 +1261,7 @@ async fn standard_flight_sql_client_reads_all_supported_metadata_commands() {
         .with_query_control()
         .with_sql_metadata(limits);
     let (service, mut runtime) = start_frontend_with_config(frontend, config);
-    let session = SessionId::from_u128(81).unwrap();
-    let mut capability_client = client(&runtime, session).await;
+    let (mut capability_client, _session, session_token) = local_client(&runtime).await;
     let bodies = capability_client
         .do_action(Action::new(CAPABILITIES_ACTION, Vec::<u8>::new()))
         .await
@@ -1208,13 +1285,22 @@ async fn standard_flight_sql_client_reads_all_supported_metadata_commands() {
     );
     assert!(!capabilities.administrator_authentication_enabled);
     let mut sql_client = FlightSqlServiceClient::new(channel(&runtime).await);
-    sql_client.set_header(SESSION_METADATA_KEY, session.to_string());
+    sql_client.set_header(
+        AUTHORIZATION_METADATA_KEY,
+        format!("Bearer {session_token}"),
+    );
 
     let catalogs = sql_client.get_catalogs().await.unwrap();
     let metadata = MetadataInfo::decode(catalogs.app_metadata.clone()).unwrap();
     assert_eq!(metadata.catalog_revision, 7);
     assert!(metadata.expires_at_ns > unix_time_ns());
-    let mut cancel_client = client(&runtime, session).await;
+    let mut cancel_client = raw_client(&runtime).await;
+    cancel_client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {session_token}"),
+        )
+        .unwrap();
     let result = cancel_client
         .cancel_flight_info(CancelFlightInfoRequest::new(catalogs.clone()))
         .await
@@ -1275,10 +1361,11 @@ async fn pending_metadata_tickets_share_the_transport_byte_budget() {
     let config =
         FlightServiceConfig::try_new("test-0.5.0", TEST_MESSAGE_BYTES, 4, TEST_MESSAGE_BYTES)
             .unwrap()
+            .with_local_read_sessions(Duration::from_secs(60), 128)
+            .unwrap()
             .with_sql_metadata(limits);
     let (service, mut runtime) = start_frontend_with_config(frontend, config);
-    let session = SessionId::from_u128(91).unwrap();
-    let mut client = client(&runtime, session).await;
+    let (mut client, _session, _session_token) = local_client(&runtime).await;
     let descriptor =
         arrow_flight::FlightDescriptor::new_cmd(CommandGetTableTypes {}.as_any().encode_to_vec());
     let first = client.get_flight_info(descriptor.clone()).await.unwrap();
@@ -1315,8 +1402,7 @@ async fn dropping_client_stream_releases_hanging_query() {
     let lease_drops = Arc::new(AtomicUsize::new(0));
     let (_service, mut runtime) =
         start_service(Arc::clone(&lease_drops), Duration::from_secs(5), true, 4);
-    let session = SessionId::from_u128(41).unwrap();
-    let mut client = client(&runtime, session).await;
+    let (mut client, session, _session_token) = local_client(&runtime).await;
     let info = client
         .get_flight_info(descriptor(session, QueryId::from_u128(42).unwrap()))
         .await
@@ -1348,8 +1434,7 @@ async fn shutdown_timeout_and_drop_do_not_wait_for_a_blocked_stream_poll() {
             .with_poll_block(Arc::clone(&poll_started), Arc::clone(&poll_release)),
     );
     let (service, mut runtime) = start_frontend(frontend, 4);
-    let session = SessionId::from_u128(51).unwrap();
-    let mut client = client(&runtime, session).await;
+    let (mut client, session, _session_token) = local_client(&runtime).await;
     let info = client
         .get_flight_info(descriptor(session, QueryId::from_u128(52).unwrap()))
         .await
@@ -1425,6 +1510,8 @@ fn service_config(max_pending_tickets: usize) -> FlightServiceConfig {
         max_pending_tickets,
         TEST_TRANSPORT_BYTES,
     )
+    .unwrap()
+    .with_local_read_sessions(Duration::from_secs(60), 128)
     .unwrap()
 }
 
@@ -1610,12 +1697,27 @@ async fn channel(runtime: &FlightServerRuntime) -> tonic::transport::Channel {
         .unwrap()
 }
 
-async fn client(runtime: &FlightServerRuntime, session: SessionId) -> FlightClient {
+async fn local_client(runtime: &FlightServerRuntime) -> (FlightClient, SessionId, String) {
     let mut client = raw_client(runtime).await;
-    client
-        .add_header(SESSION_METADATA_KEY, &session.to_string())
+    let payload = client
+        .handshake(
+            SessionOpenRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec(),
+        )
+        .await
         .unwrap();
+    let opened = SessionOpenResponse::decode(payload).unwrap();
+    let session = SessionId::from_bytes(opened.session_id.as_ref().try_into().unwrap()).unwrap();
+    assert_eq!(opened.role, SessionRole::Read as i32);
     client
+        .add_header(
+            AUTHORIZATION_METADATA_KEY,
+            &format!("Bearer {}", opened.bearer_token),
+        )
+        .unwrap();
+    (client, session, opened.bearer_token)
 }
 
 fn descriptor(session: SessionId, query_id: QueryId) -> arrow_flight::FlightDescriptor {
@@ -1624,6 +1726,8 @@ fn descriptor(session: SessionId, query_id: QueryId) -> arrow_flight::FlightDesc
         table: CatalogName::new("ticks").unwrap(),
     };
     let request = FlightQueryRequest {
+        fixed_snapshot_id: None,
+        key_value_snapshot: false,
         request: QueryRequest {
             query_id,
             session_id: session,
@@ -1678,4 +1782,64 @@ fn unix_time_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_session_close_reclaims_capacity_and_pending_ticket() {
+    let lease_drops = Arc::new(AtomicUsize::new(0));
+    let frontend = Arc::new(FakeFrontend::new(
+        Arc::clone(&lease_drops),
+        Duration::from_secs(5),
+        false,
+    ));
+    let (service, mut runtime) =
+        start_authenticated_frontend(frontend, 4, Duration::from_secs(60), 1);
+    let (mut client, session, _) = authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
+    let info = client
+        .get_flight_info(descriptor(session, QueryId::from_u128(7891).unwrap()))
+        .await
+        .unwrap();
+    let invalid = client
+        .do_action(Action::new(
+            zippy_protocol::CLOSE_SESSION_ACTION,
+            zippy_protocol::wire::SessionCloseRequest {
+                protocol_version: 99,
+            }
+            .encode_to_vec(),
+        ))
+        .await;
+    assert_eq!(
+        flight_error_code(invalid.err().expect("invalid version rejected")),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(service.status().active_sessions, 1);
+    assert_eq!(service.status().pending_tickets, 1);
+    let bodies = client
+        .do_action(Action::new(
+            zippy_protocol::CLOSE_SESSION_ACTION,
+            zippy_protocol::wire::SessionCloseRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+            }
+            .encode_to_vec(),
+        ))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let response = zippy_protocol::wire::SessionCloseResponse::decode(bodies[0].clone()).unwrap();
+    assert!(response.closed);
+    assert_eq!(response.protocol_version, CURRENT_PROTOCOL_VERSION);
+    wait_for_count(&lease_drops, 1).await;
+    assert_eq!(service.status().active_sessions, 0);
+    assert_eq!(service.status().pending_tickets, 0);
+    assert_eq!(service.status().session_revoked_tickets, 1);
+    let rejected = client
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .expect_err("closed token rejected");
+    assert_eq!(flight_error_code(rejected), ErrorCode::Unauthenticated);
+    let (_replacement, _, _) = authenticated_client(&runtime, TEST_BOOTSTRAP_TOKEN).await;
+    assert_eq!(service.status().active_sessions, 1);
+    runtime.shutdown(Duration::from_secs(5)).unwrap();
 }

@@ -1,0 +1,290 @@
+{
+  "batch": 52,
+  "date": "2026-09-22",
+  "overall_complete": false,
+  "audit_closed_total": 32,
+  "closed_this_batch": [],
+  "audit_remaining": [
+    "F08",
+    "F28"
+  ],
+  "net_removed_rust_lines": -5,
+  "server_ready_schema_version": 11,
+  "catalog_layout_version": 11,
+  "rust_affected_crates": {
+    "crates": [
+      "zippy-core",
+      "zippy-segment-store",
+      "zippy-ingest",
+      "zippy-server"
+    ],
+    "passed_records": 476,
+    "ignored": 5
+  },
+  "clippy": "workspace all-targets all-features -D warnings",
+  "pytest_passed": 543,
+  "mypy_source_files": 91,
+  "client_mypy_files": 27,
+  "native_recovery": {
+    "catalog_v11_native_files_watermarks_and_request_versions": true,
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+    "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+    "sdk_only_flight_examples_write_query_callbacks_and_restart": true,
+    "flight_short_session_snapshot_cleanup_capacity_reuse": true,
+    "public_examples_three_kinds_compute_and_restart_without_legacy_api": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "flight_only_buffered_writer_lazy_plan_and_restart": true,
+    "independent_client_native_child_without_main_import": true,
+    "server_launch": "repository_binary",
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "default_native_storage_query_and_flight_without_feature_switches": true,
+    "native_restart_never_creates_legacy_registry": true,
+    "native_recovery_without_old_table_configuration_or_external_persist_root": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_changes_since_batch_51": [
+    {
+      "path": "ROADMAP.md",
+      "before_sha256": "e83ab6138ef561c1b0ec1876e203bf3f9882d117d77817c5f0d7f21b13df2d85",
+      "after_sha256": "d67d5b04d9a4c4431f77f46a0a982eb27ca3c0b08b335a4b9143ab9d08176306",
+      "before_lines": 18,
+      "after_lines": 18
+    },
+    {
+      "path": "crates/zippy-core/src/config.rs",
+      "before_sha256": "2d1f89c5a23187c33d059e5d87426e7506666c5f30fd9adde00c6a3bc552b200",
+      "after_sha256": "613e48b7c7329dc460f395f310cc365edb937b1deda20f0e2b1fb64abaa49be5",
+      "before_lines": 1962,
+      "after_lines": 1958
+    },
+    {
+      "path": "crates/zippy-core/src/lib.rs",
+      "before_sha256": "9e8a6b488786224166eed59bad8ff98388816091ed9b707860dbec932beed993",
+      "after_sha256": "350a19ae6e8ddce6450df6bf3255cad927d0312e38c0388405583a2516a41896",
+      "before_lines": 70,
+      "after_lines": 69
+    },
+    {
+      "path": "crates/zippy-segment-store/src/active_reader.rs",
+      "before_sha256": "a265fb06e13469071bc67d8b215e6644c3e66f1abe2c9983bc9f9bfa17052b16",
+      "after_sha256": "ace561f078b39892ab8bbc585e55724517aa481ac877c5b2c7bc56a215e52ec2",
+      "before_lines": 351,
+      "after_lines": 347
+    },
+    {
+      "path": "crates/zippy-segment-store/src/builder.rs",
+      "before_sha256": "271435b8fcc5194a0d9183b61495c1936262e6df70fa80f99d294992af7e2b83",
+      "after_sha256": "ff75a58fc3512d1bfe7d8b7beeff0b8edf3afbc3943863a0c58a3951b4b8f1b0",
+      "before_lines": 1932,
+      "after_lines": 1932
+    },
+    {
+      "path": "crates/zippy-segment-store/src/descriptor.rs",
+      "before_sha256": "64fcb67ab0be7407390acede64105aefc838b5e53e9400cb5b5cda1a413c77f6",
+      "after_sha256": "a2b7770fe271ae2ae564847b6887160f8a9dd4ee6de2fab03d6d0e0072e2f769",
+      "before_lines": 98,
+      "after_lines": 95
+    },
+    {
+      "path": "crates/zippy-segment-store/src/segment.rs",
+      "before_sha256": "cdf9f8ba5b0371592845cc8352bcdf03757479c9a7e3581b74769aa6c7f7c2b1",
+      "after_sha256": "5ccd784985b5fa3c695cfaab12a07ad66817bfe1c4a4709ef9ec1212fc547955",
+      "before_lines": 207,
+      "after_lines": 207
+    },
+    {
+      "path": "crates/zippy-segment-store/src/view.rs",
+      "before_sha256": "7c3862432369afb9a48fc0ca0b7fd84d7dcfe5f1034f37c8045597937170ca30",
+      "after_sha256": "87e54225319f6c78a495a516d0582d2a999e886f99db72893c96cc29b52d59ae",
+      "before_lines": 811,
+      "after_lines": 805
+    },
+    {
+      "path": "crates/zippy-segment-store/tests/active_segment_reader.rs",
+      "before_sha256": "f28f7ef5d2decc5a439fb35db79ede48ed8c5e969f96e2e975bb8e60eef7970e",
+      "after_sha256": "04d71c1ce0d626be95996e65eecb158ef7972f482db5098a2ea8ffa5197add77",
+      "before_lines": 493,
+      "after_lines": 493
+    },
+    {
+      "path": "crates/zippy-segment-store/tests/arrow_bridge.rs",
+      "before_sha256": "9e5062a933cd62a4ff180074a55268106beb610a8db7d72fa084b2831a32a275",
+      "after_sha256": "32e53af48251e8776aa4b205de7f72a7dc557e52642bde6da0616908f1518b9b",
+      "before_lines": 838,
+      "after_lines": 861
+    },
+    {
+      "path": "docs/architecture-convergence-audit-2026-09-18.md",
+      "before_sha256": "633bfe625114d48326f7cd9c5bfa03b50ead2d523f2c852699fe09be2e9c68d9",
+      "after_sha256": "a7ed55fe16890f3338bcadbfb0183ea42ec6b0b0edab9082817a8e5694f894f2",
+      "before_lines": 223,
+      "after_lines": 223
+    },
+    {
+      "path": "docs/current-capabilities-2026-09-21.md",
+      "before_sha256": "58acfcb5e1679bf34c170f8c84882f869fc0d348accc37b141c9b75016655c96",
+      "after_sha256": "f8fb4e6dbe50daec700d39ad9da0b52289f222658b5e11597f4b677598dd973d",
+      "before_lines": 60,
+      "after_lines": 60
+    }
+  ],
+  "migrated_tests": [
+    {
+      "file": "crates/zippy-segment-store/tests/active_segment_reader.rs",
+      "test": "active_segment_reader_rejects_v4_header_without_payload_version_capability",
+      "action": "migrated",
+      "replacement": "active_segment_reader_rejects_descriptor_without_payload_version_offset",
+      "reason": "reject missing descriptor version at parsing rather than accepting then failing at read time"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/arrow_bridge.rs",
+      "test": "active_descriptor_envelope_accepts_legacy_payload_version_absence",
+      "action": "migrated",
+      "replacement": "active_descriptor_envelope_rejects_missing_or_invalid_payload_version_offset",
+      "reason": "reject missing descriptor version at parsing rather than accepting then failing at read time"
+    }
+  ],
+  "new_test_names": [
+    {
+      "file": "crates/zippy-segment-store/tests/active_segment_reader.rs",
+      "test": "active_segment_reader_rejects_descriptor_without_payload_version_offset"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/arrow_bridge.rs",
+      "test": "active_descriptor_envelope_rejects_missing_or_invalid_payload_version_offset"
+    }
+  ],
+  "report_sha256": "349a8b547ee64fa24acf34e90d54cb8a6926b2d7bc12120606e9dc1415c1a863",
+  "logs": {
+    "tests": {
+      "path": "/tmp/zippy-descriptor-contract-tests.log",
+      "sha256": "b69226424de3e026a3005a6c1b205533fdce89d012676f773128b425f5827614",
+      "bytes": 47637
+    },
+    "clippy": {
+      "path": "/tmp/zippy-descriptor-contract-clippy.log",
+      "sha256": "76fc73b1bfd32d152546047b71b7381fe9dddf82fdc0ae4141961acfdc5ccb2a",
+      "bytes": 1161
+    },
+    "build": {
+      "path": "/tmp/zippy-descriptor-contract-build.log",
+      "sha256": "a5d2492a08953d2f312577f7bf3afeb1231de11a58ccb74eaebed4c2fe9bf283",
+      "bytes": 2696
+    },
+    "pytest": {
+      "path": "/tmp/zippy-descriptor-contract-pytest.log",
+      "sha256": "96fe9875004f47adedce2a29012d236b042a007d97180818681b35a34a1d7a72",
+      "bytes": 2662
+    },
+    "native-matrix": {
+      "path": "/tmp/zippy-descriptor-contract-native-matrix.log",
+      "sha256": "52db98162fe35045fc2f064e3fa2df55d4cebe551326e62710ff73080e27fab7",
+      "bytes": 30283
+    },
+    "mypy": {
+      "path": "/tmp/zippy-descriptor-contract-mypy.log",
+      "sha256": "6e48d2986ce0d91c8cd60bff9ed577f4baf14c949620883ab530992e6c52e53a",
+      "bytes": 934
+    },
+    "mypy-client": {
+      "path": "/tmp/zippy-descriptor-contract-mypy-client.log",
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f",
+      "bytes": 44
+    },
+    "ruff": {
+      "path": "/tmp/zippy-descriptor-contract-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "bytes": 19
+    },
+    "black": {
+      "path": "/tmp/zippy-descriptor-contract-black.log",
+      "sha256": "161579e1a9a654d62a83f487d90f72be3d8e9379f20fa777ad6cc1d93115ac60",
+      "bytes": 57
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-descriptor-contract-rustfmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "diff": {
+      "path": "/tmp/zippy-descriptor-contract-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "extension-links": {
+      "path": "/tmp/zippy-descriptor-contract-extension-links.log",
+      "sha256": "e42e1563d416daa585e5560670ba4e67987cb7c65af229c0ae7472a289127e84",
+      "bytes": 445
+    }
+  },
+  "current_binary_evidence": {
+    "target/debug/zippy-server": "81c398b14def3f2ac38d2ddd30713d55ae4bbfc91cc2e2a86dd19665cf7e2e1b",
+    "python/zippy/_internal.cpython-311-x86_64-linux-gnu.so": "47479148cae979df6872abc6e7dae7af1b83bfaaca49b5d8b029cbb5b8e57ae3"
+  },
+  "limitations": [
+    "Old segment-store persistence worker, read-only actor and verifier wrapper remain.",
+    "Master process token still has a non-secure fallback after /dev/urandom failure; cross-platform fix pending.",
+    "Native matrix uses repository binary on Linux CPython 3.11 Arrow 23.0.1.",
+    "No new distribution archive build or Windows/macOS execution.",
+    "No commit, push, deployment or user data migration."
+  ]
+}

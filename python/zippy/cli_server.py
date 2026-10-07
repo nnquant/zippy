@@ -17,7 +17,7 @@ import zippy
 
 from .cli_common import DEFAULT_CONTROL_ENDPOINT, cli_error, ensure_control_parent_dir
 from .cli_common import resolve_control_endpoint
-from .cli_master import _endpoint_host_port
+from .cli_common import _endpoint_host_port
 from .server_process import (
     _ServerProcessError,
     _cleanup_child_state_from_environment,

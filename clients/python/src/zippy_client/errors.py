@@ -52,9 +52,23 @@ class AmbiguousWriteError(QueryError):
         self.receipts = [dict(receipt) for receipt in receipts]
 
 
+class AmbiguousAcknowledgementError(ZippyConnectionError):
+    """Report an ACK whose durable outcome was not received.
+
+    Reconnect using the same consumer identity; Catalog decides whether to replay the unit.
+
+    :param message: Description of the missing or invalid acknowledgement receipt.
+    :param request_id: Stable request ID sent for this confirmation.
+    """
+
+    def __init__(self, message: str, *, request_id: str) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+
+
 class ServerError(QueryError):
     """
-    Represent one structured error returned by Zippy Flight.
+    Represent one structured error returned by a Zippy service.
 
     :param code: Stable server error code such as ``RESOURCE_EXHAUSTED``.
     :type code: str
@@ -70,6 +84,8 @@ class ServerError(QueryError):
     :type table_id: str | None
     :param details: Optional code-specific structured details.
     :type details: dict[str, Any] | None
+    :param receipts: Write receipts acknowledged before this explicit rejection, if any.
+    :type receipts: list[dict[str, object]] | None
     """
 
     def __init__(
@@ -82,6 +98,7 @@ class ServerError(QueryError):
         query_id: str | None = None,
         table_id: str | None = None,
         details: dict[str, Any] | None = None,
+        receipts: list[dict[str, object]] | None = None,
     ) -> None:
         super().__init__(f"{code}: {message}")
         self.code = str(code)
@@ -91,3 +108,4 @@ class ServerError(QueryError):
         self.query_id = query_id
         self.table_id = table_id
         self.details = dict(details or {})
+        self.receipts = [dict(receipt) for receipt in receipts or []]

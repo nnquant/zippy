@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 arrow.workspace = true
+flatbuffers = "24.12.23"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -76,7 +76,6 @@ pub(crate) struct ActiveRowsSnapshot {
 pub struct ActiveSegmentWriter {
     header: SegmentHeader,
     schema: CompiledSchema,
-    persistence_key: String,
     layout: LayoutPlan,
     row_cursor: usize,
     current_row_open: bool,
@@ -102,7 +101,6 @@ impl ActiveSegmentWriter {
             generation,
             0,
             generation.saturating_add(1),
-            format!("segment-{segment_id}-generation-{generation}"),
         )
     }
 
@@ -122,7 +120,6 @@ impl ActiveSegmentWriter {
             generation,
             writer_epoch,
             descriptor_generation,
-            format!("segment-{segment_id}-generation-{generation}-epoch-{writer_epoch}"),
         )
     }
 
@@ -143,7 +140,6 @@ impl ActiveSegmentWriter {
         generation: u64,
         writer_epoch: u64,
         descriptor_generation: u64,
-        persistence_key: String,
     ) -> Result<Self, &'static str> {
         let mut i64_columns = HashMap::new();
         let mut f64_columns = HashMap::new();
@@ -238,7 +234,6 @@ impl ActiveSegmentWriter {
                 sealed: false,
             },
             schema,
-            persistence_key,
             layout,
             row_cursor: 0,
             current_row_open: false,
@@ -842,7 +837,7 @@ impl ActiveSegmentWriter {
             shm_os_id: self.shm_region.os_id().to_string(),
             payload_offset: SHM_PAYLOAD_OFFSET,
             committed_row_count_offset: SHM_COMMITTED_ROW_COUNT_OFFSET,
-            payload_version_offset: Some(SHM_PAYLOAD_VERSION_OFFSET),
+            payload_version_offset: SHM_PAYLOAD_VERSION_OFFSET,
             segment_id: self.header.segment_id,
             generation: self.header.generation,
             writer_epoch: self.header.writer_epoch,
@@ -1659,7 +1654,6 @@ impl ActiveSegmentWriter {
 
         SealedSegmentHandle::new(SealedSegmentData {
             schema: self.schema.clone(),
-            persistence_key: self.persistence_key.clone(),
             segment_id: self.header.segment_id,
             _generation: self.header.generation,
             row_count,

@@ -1,0 +1,85 @@
+{
+  "retired": [
+    {
+      "file": "crates/zippy-catalog/tests/sqlite_catalog.rs",
+      "test": "legacy_discovery_order_is_scoped_to_each_table",
+      "reason": "removed import summary, discovery-order or constructible LegacyUnknown contract",
+      "replacement": "removed legacy input is rejected; native lineage, snapshot visibility, budgets and checksum validation remain"
+    },
+    {
+      "file": "crates/zippy-catalog/tests/sqlite_catalog.rs",
+      "test": "raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discovery_order",
+      "reason": "replaced mixed legacy/native fixture with four native files",
+      "replacement": "raw_and_pinned_native_snapshots_share_file_id_order retains deterministic order and checksum corruption assertions"
+    },
+    {
+      "file": "crates/zippy-catalog/tests/sqlite_catalog.rs",
+      "test": "snapshot_rejects_invalid_legacy_discovery_order_and_incomplete_import_manifest",
+      "reason": "removed import summary, discovery-order or constructible LegacyUnknown contract",
+      "replacement": "removed legacy input is rejected; native lineage, snapshot visibility, budgets and checksum validation remain"
+    },
+    {
+      "file": "crates/zippy-ingest/src/registry.rs",
+      "test": "bootstrap_rejects_unknown_legacy_offset",
+      "reason": "removed import summary, discovery-order or constructible LegacyUnknown contract",
+      "replacement": "removed legacy input is rejected; native lineage, snapshot visibility, budgets and checksum validation remain"
+    },
+    {
+      "file": "crates/zippy-storage/src/catalog_verify.rs",
+      "test": "import_summary_requires_exact_keys_types_and_nonzero_revision",
+      "reason": "removed import summary, discovery-order or constructible LegacyUnknown contract",
+      "replacement": "removed legacy input is rejected; native lineage, snapshot visibility, budgets and checksum validation remain"
+    },
+    {
+      "file": "crates/zippy-storage/src/catalog_verify.rs",
+      "test": "import_summary_requires_exact_manifest_aggregates",
+      "reason": "removed import summary, discovery-order or constructible LegacyUnknown contract",
+      "replacement": "removed legacy input is rejected; native lineage, snapshot visibility, budgets and checksum validation remain"
+    },
+    {
+      "file": "crates/zippy-storage/src/catalog_verify.rs",
+      "test": "reconcile_import_summary_accepts_exact_target_manifest",
+      "reason": "removed import summary, discovery-order or constructible LegacyUnknown contract",
+      "replacement": "removed legacy input is rejected; native lineage, snapshot visibility, budgets and checksum validation remain"
+    },
+    {
+      "file": "crates/zippy-storage/src/catalog_verify.rs",
+      "test": "reconcile_import_summary_rejects_target_manifest_mismatch",
+      "reason": "removed import summary, discovery-order or constructible LegacyUnknown contract",
+      "replacement": "removed legacy input is rejected; native lineage, snapshot visibility, budgets and checksum validation remain"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-catalog/tests/sqlite_catalog.rs",
+      "test": "raw_and_pinned_native_snapshots_share_file_id_order"
+    },
+    {
+      "file": "crates/zippy-ingest/src/wal.rs",
+      "test": "wal_watermark_rejects_removed_legacy_tag"
+    },
+    {
+      "file": "crates/zippy-protocol/src/error.rs",
+      "test": "wire_watermarks_reject_removed_state_and_preserve_empty_vs_zero"
+    }
+  ],
+  "retained_assertions": [
+    "native lineage nonempty/exact/gap/overlap",
+    "snapshot identity/visibility/file budgets/checksum",
+    "u64 extremes and Empty versus Known(0)",
+    "old physical layouts rejected without modifying directory",
+    "native manifest, WAL, catalog replay and three-table-kind restart recovery"
+  ],
+  "golden_fixture_changes": [
+    {
+      "fixture": "nested command fingerprint",
+      "index": 2,
+      "reason": "legacy file replaced with native file; other three command goldens unchanged"
+    },
+    {
+      "fixture": "all response outcomes",
+      "index": 3,
+      "reason": "LegacyUnknown producer watermark replaced with Known(4); other nine response goldens unchanged"
+    }
+  ]
+}

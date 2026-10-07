@@ -1,0 +1,265 @@
+{
+  "date": "2026-09-22",
+  "batch": 18,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [
+    "F09"
+  ],
+  "additional_fixed": [
+    "F48",
+    "F49"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "catalog_directory_version": 9,
+  "validation": {
+    "rust_workspace": {
+      "passed": 1754,
+      "failed": 0,
+      "ignored": 10,
+      "result_blocks": 114
+    },
+    "clippy": "workspace all-targets all-features -D warnings; passed",
+    "python": {
+      "passed": 730,
+      "skipped": 1,
+      "extension_rebuilt": true
+    },
+    "client": {
+      "passed": 120,
+      "coverage_percent": 81.67,
+      "coverage_gate_percent": 80
+    },
+    "black": "86 files unchanged; passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "protocol_codegen": "--check; passed",
+    "mypy_configured": "root 14, client 26, acceptance script 1; passed",
+    "mypy_full": "Found 991 errors in 12 files (checked 85 source files); FAILED; F29 remains open",
+    "platform": "Linux x86_64 CPython 3.11; Arrow 23.0.1 and 25.0.1 real-service acceptance passed",
+    "packaging": "editable extension rebuilt; no new clean sdist-to-wheel acceptance; optional patchelf warning",
+    "windows_macos_real_machine_acceptance": false
+  },
+  "acceptance": {
+    "public_schema_action_and_capability": true,
+    "three_kinds_add_nullable_field_and_metadata_change": true,
+    "explicit_unchanged_key_value_keys_and_logical_schema_only": true,
+    "wrong_cas_unsupported_type_and_unauthorized_read_session_rejected": true,
+    "old_writer_and_continuous_log_schema_mismatch": true,
+    "old_cursor_rejected_without_silent_schema_adoption": true,
+    "historical_new_columns_null_and_versions_recover": true,
+    "exact_replay_does_not_roll_back_or_resurrect": true,
+    "schema_fingerprint_ignores_ipc_encoding_not_logical_content": true,
+    "bounded_decoder_shared_by_fingerprint_and_storage": true,
+    "malformed_ipc_and_trailing_data_rejected_before_hash": true,
+    "old_directory_versions_rejected_without_rewrite": true,
+    "doput_eof_terminal_schema_rejection_preserved": true,
+    "confirmed_receipt_prefix_preserved_on_rejection": true,
+    "unknown_write_outcomes_remain_ambiguous": true,
+    "every_cancellation_crash_point_injected": false,
+    "legacy_adapters_removed": false,
+    "native_local_compute_output": false,
+    "durable_subscription_ack": false
+  },
+  "new_findings": {
+    "F48": "Arrow schema metadata hash-map iteration changed server-generated IPC bytes and produced false Catalog idempotency conflicts; create/alter fingerprints now use validated canonical logical schema hashes; directory v9 rejects older fingerprint contracts.",
+    "F49": "PyArrow DoPut can return receipt EOF before exposing structured schema rejection on close; preserve confirmed schema rejection and acknowledged prefix while retaining ambiguous outcomes for unknown failures."
+  },
+  "real_service_results": {
+    "23.0.1": {
+      "empty_directory_create": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_six_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "25.0.1": {
+      "empty_directory_create": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_six_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "25.0.1"
+    }
+  },
+  "evidence": {
+    "workspace": {
+      "path": "/tmp/zippy-schema-api-workspace.log",
+      "sha256": "3f7636c2e6d8bfbd47421cf6bd89dadeb1dc1fdd32073cd06502266e8bf794be"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-schema-api-clippy.log",
+      "sha256": "6db279189acfc224ada880d675b56c640f2fb9642f01bdbcaa50ce218f7fd4fc"
+    },
+    "maturin": {
+      "path": "/tmp/zippy-schema-api-maturin.log",
+      "sha256": "3dff85984c2a8674a231c92be9389dd3b71921b1a9b49b11caa24c0156c70961"
+    },
+    "python": {
+      "path": "/tmp/zippy-schema-api-python.log",
+      "sha256": "93cc6a77c93fdad1d057c75f2088e6c75c0570d6481c88deed4dc91530568d53"
+    },
+    "client-full": {
+      "path": "/tmp/zippy-schema-api-client-full.log",
+      "sha256": "f222d4990dc985e90c0b74e5c1d84fbd46dea1328940d0cfa50353de79d5ae85"
+    },
+    "acceptance": {
+      "path": "/tmp/zippy-schema-api-acceptance.log",
+      "sha256": "bcb74419b0f0b9cdf85338193549de37d367168016f3b5f423c654a9cbdb8110"
+    },
+    "acceptance-arrow25": {
+      "path": "/tmp/zippy-schema-api-acceptance-arrow25.log",
+      "sha256": "c7e2ba3c3194e17113a929fa4c9a63c5c05a3bb932d161997d998b5158f011c4"
+    },
+    "black": {
+      "path": "/tmp/zippy-schema-api-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-schema-api-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "mypy-configured": {
+      "path": "/tmp/zippy-schema-api-mypy-configured.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "client-mypy": {
+      "path": "/tmp/zippy-schema-api-client-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "script-mypy": {
+      "path": "/tmp/zippy-schema-api-script-mypy.log",
+      "sha256": "5d4b6d285b77932e3d08212c3b4974d0a803f98ec60408ac6ccf6a063fa6c19e"
+    },
+    "mypy-full": {
+      "path": "/tmp/zippy-schema-api-mypy-full.log",
+      "sha256": "1d3e5769834805091073bbe58632471e3b5ece6ed936e6332a627b4c9b1a1012"
+    },
+    "fmt": {
+      "path": "/tmp/zippy-schema-api-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff": {
+      "path": "/tmp/zippy-schema-api-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "codegen-check": {
+      "path": "/tmp/zippy-schema-api-codegen-check.log",
+      "sha256": "82ac3d37ab3f2568702d1d6e38d0ac911adfb73efc5beaa269407372f168fa57"
+    }
+  },
+  "source_sha256": {
+    "Cargo.lock": "6778dfe1978f67fcc0fd368ec0b870d77d097be12c48fe249fc457d41acf8c8e",
+    "crates/zippy-types/Cargo.toml": "a2affd794900a11715fda3e2dbe70608792010fbeb51cd3e039776d18be4848d",
+    "crates/zippy-types/src/lib.rs": "78b6590db7f899504ebe00da8e8f041c956319b457924a63825dd4cff31c2eea",
+    "crates/zippy-types/src/schema_ipc.rs": "aa8da4c0f2e89827e01b26b1199a190ec06e4536817667b53a56dc3bb0335d93",
+    "crates/zippy-types/src/catalog.rs": "e54ad84d8de91032337e45c9da8409e5b9d94d580d796807c0f746832ab022e2",
+    "crates/zippy-types/src/catalog/wire_v1.rs": "6ef6544023acc1fb06e172752dd0887c9bb205b948570d9b35e8ece6de51081d",
+    "crates/zippy-types/src/table.rs": "1c3d0094c1cafda71648dd29a2232cf6be0981074c80452b9e33137c6aafd3a8",
+    "crates/zippy-catalog/src/lib.rs": "358f5c70aecb13dbc673a4f7413117bb817ba94e026867fa9b2235c0a6275ca0",
+    "crates/zippy-catalog/src/storage_codec.rs": "a1460d2c8d928bbfa3aa0c4484ce2b1a5dddc31dd292488e2c04d7225781396f",
+    "crates/zippy-catalog/src/domain.rs": "f4a1e5e6616a4d0547b11efd085d225ba342ae5ba8fc860b8f3942f45f981a60",
+    "crates/zippy-catalog/tests/sqlite_catalog.rs": "39c4a81f32bebeb2cabaf39bac966eb7b2140794a5ebf316ae96dca17b82e6f5",
+    "crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto": "aa11f88fcd328cec6c22b624dab478edecc31d47f9e3a31be314458fa507a5d8",
+    "crates/zippy-protocol/src/wire.rs": "3caa6ded24b1c2493579d5c31ff01ab12609fc6b8297b2161f2dfb3ee4525460",
+    "crates/zippy-protocol/src/admin.rs": "d530f27604d9b70d6f05dabbbbc5c443e87626e3ba7bf3269b318484bd90edda",
+    "crates/zippy-protocol/src/server.rs": "28cddb2cfd617de0f74a7343275616af1c63d65e71ea420b4ee1e7176849a2b8",
+    "crates/zippy-server/src/flight_query.rs": "02742373081c0b048efc32cf0ce700bad78dcbc2a2b8ed91740f2d9f74545401",
+    "crates/zippy-server/src/table_admin.rs": "d4c17c09bf2c92a7c7073f513dd152e2a15515604deae104a4fc783be534cdc0",
+    "crates/zippy-server/src/legacy_catalog_migration.rs": "59dec982a06f7d7215265ec5767f4c77941228a4644420e882cf340debee9b71",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "76301bffd696469900379f74a7a8d1431f13b362d327a6152f44f5b606e8827b",
+    "crates/zippy-ingest/src/actor.rs": "7bcb59e191a2d99ec1423b733fcfb7f80330099c78cbbd7b2d57f505c23e3c2b",
+    "crates/zippy-ingest/src/native.rs": "7d18ae4910c90bd5572a6e877c226bf83c37409b17aa06aa6c238e52311512ba",
+    "clients/python/src/zippy_client/client.py": "89a42609d52f2fc9c464f5eee63b6f49a8bc450a71ead66349dac703f24a1a63",
+    "clients/python/src/zippy_client/errors.py": "ed52b7341db090507cd157a94cfecd2a8090a60e01c7136e094256c88998c08b",
+    "clients/python/src/zippy_client/writer.py": "5c147453f2763952ae1c849004f0b47ab19086de36e2d4ab61e5b9c91a627d6d",
+    "clients/python/src/zippy_client/transports/flight.py": "6a667bb6027d8f2fbce3596d938066bc9a6000bb8168b60e49dae1bc9ac4c7bf",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.py": "9b59dbc475e4c206f0e01a0165d38f9bd0f7621671b0eada884137679576d792",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.pyi": "26354de58d37062f2d2fbe67f6e3419f292ad248797e749c88f09d3a76e06855",
+    "clients/python/tests/test_flight_transport.py": "aa46a408a7d7250595eed48750041a38f20e87a2dfef372b02fc1639a688dae4",
+    "scripts/check_native_client.py": "93be753128535097e4196c6f2326cc8f697c73fcbbd2aef18677890608d455f0",
+    "clients/python/README.md": "4220d63c09d43a35eab4abef502c820e02c654fcc15f273bf242013195e23168",
+    "crates/zippy-catalog/README.md": "055c508562f8264e6425db90397230d235c3b17835bedff1f279d10b4d74b6fa",
+    "docs/flight-query-service.md": "96acb00acc5f9e31676ab7a746b582745b94429fcbac703d3fd26a7f54a08763",
+    "docs/current-capabilities-2026-09-21.md": "b77f4292961779f7f84e48c9f55e3263eb232647fde80295ea8394ac13cf69cb",
+    "docs/convergence-schema-api-2026-09-22.md": "05b129a07259a02e81fe1991d5655e74b36f8629264edab8c5b59902fb25a842"
+  }
+}

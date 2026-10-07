@@ -1,0 +1,337 @@
+{
+  "date": "2026-09-22",
+  "batch": 39,
+  "overall_complete": false,
+  "audit_closed_total": 27,
+  "closed_this_batch": [],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F28"
+  ],
+  "removed_modules_lines_including_unit_tests": 7781,
+  "rust": {
+    "passed": 534,
+    "ignored": 5,
+    "scope": [
+      "zippy-core",
+      "zippy-server",
+      "zippy-gateway"
+    ]
+  },
+  "clippy": "workspace all-targets -D warnings",
+  "pytest_passed": 595,
+  "mypy_source_files": 91,
+  "strict_client_mypy_files": 27,
+  "native_recovery": {
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+    "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+    "sdk_only_flight_examples_write_query_callbacks_and_restart": true,
+    "flight_short_session_snapshot_cleanup_capacity_reuse": true,
+    "public_examples_three_kinds_compute_and_restart_without_legacy_api": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "flight_only_buffered_writer_lazy_plan_and_restart": true,
+    "independent_client_native_child_without_main_import": true,
+    "server_launch": "repository_binary",
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "current_binary_evidence": {
+    "target/debug/zippy-server": "8c582e60301cde39ac7e86fe11b85355953f6b9dbe1f19b21c3efe35d2ce1463",
+    "python/zippy/_internal.cpython-311-x86_64-linux-gnu.so": "1add871d78da72e9fcf4c68ec361a6da261f27fa9ca0e1b9828d464c5adc1b56"
+  },
+  "source_changes_since_batch_38": [
+    {
+      "path": "ROADMAP.md",
+      "before_sha256": "da841152be845fc5d4073863f44ea604e2c866553d2d47bbad88730ab2d8281a",
+      "after_sha256": "b47a4178419c2162502fad8fb5b2b51a91d971f1ee53af67469f04953a0a2bba",
+      "before_lines": 18,
+      "after_lines": 18
+    },
+    {
+      "path": "crates/zippy-core/src/config.rs",
+      "before_sha256": "d3b432bf3610bd4a060490b4d7a8f86042dd4f4b3000d8827aff406fcc35029b",
+      "after_sha256": "fd8b342be659b2faf8335efc15dd9c4cb927075e56b2c9b43b33dba93aef9e67",
+      "before_lines": 2666,
+      "after_lines": 2523
+    },
+    {
+      "path": "crates/zippy-core/src/lib.rs",
+      "before_sha256": "25f9835e8cda4f40ccb9e22b778301fd900efc3f0c12c211d24e601d6c8d39ec",
+      "after_sha256": "47595035cb5262add0f79a86d439564b8c71784e448ee876ed7cac7e299b6bf4",
+      "before_lines": 94,
+      "after_lines": 90
+    },
+    {
+      "path": "crates/zippy-core/tests/config.rs",
+      "before_sha256": "b3a850d99260e934a534064e5b9a3d3306c72afb3ee651a49b9acc79e608ac9f",
+      "after_sha256": "ea73c63125c149ca91a22d814fbe10b7a042c117ee1e6c54f35ad0ec389a67e3",
+      "before_lines": 2061,
+      "after_lines": 1906
+    },
+    {
+      "path": "crates/zippy-gateway/src/lib.rs",
+      "before_sha256": "2d2dac44f688aa3ea28088cd4cf2538ff1cf3eaf76c8ec529d361888ae37e559",
+      "after_sha256": "67b847e44ffbcfff13bae265ced760b485afd187d7c0bf6b6e1f96daddf9ec05",
+      "before_lines": 11250,
+      "after_lines": 11227
+    },
+    {
+      "path": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "before_sha256": "9081a7abeeea2a0502ca8101753d87454cb6500a83fc63a4af015088fbb4b5d6",
+      "after_sha256": null,
+      "before_lines": 1911,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-server/src/catalog_command_shadow.rs",
+      "before_sha256": "62b20af58d7f427d6ff3934b6cae93aa2c4bddd6cf46dc1309f373bcb2cc60b7",
+      "after_sha256": null,
+      "before_lines": 2539,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-server/src/catalog_shadow.rs",
+      "before_sha256": "8b41a1e005db75d58780e3c27f6f54c11a9e83d23a9419891dc2435a81d044e5",
+      "after_sha256": null,
+      "before_lines": 302,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-server/src/gateway_query.rs",
+      "before_sha256": "014d762292662fcb27d51a22c6b56d6f2bf830b2e658b208886e554e3c671d10",
+      "after_sha256": null,
+      "before_lines": 94,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "before_sha256": "59dec982a06f7d7215265ec5767f4c77941228a4644420e882cf340debee9b71",
+      "after_sha256": null,
+      "before_lines": 2935,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-server/src/lib.rs",
+      "before_sha256": "1d29b08655353d7ca112c9a85631caed00c835675eae6c672b0fbd1d7bacbeeb",
+      "after_sha256": "295282f835c5f20d6ce9b29427492fb09f06a86d0398caad37d1c1578b16bdcd",
+      "before_lines": 77,
+      "after_lines": 57
+    },
+    {
+      "path": "crates/zippy-server/src/native_storage.rs",
+      "before_sha256": "4fb11d9493e08f9a04e9a4c0eedf42410a36c263a16e8b19d8f70c56f88fb6ff",
+      "after_sha256": "dc0d8c77c7d4e4e63074ed8f285754262b87e5778c3c18f0b9d66e40d7c766dc",
+      "before_lines": 1889,
+      "after_lines": 1720
+    },
+    {
+      "path": "crates/zippy-server/src/query_execution.rs",
+      "before_sha256": "7ad9fa3dda6cbd9f172c40c7f5d6c264202af28b8668d64d410d4c96f727023b",
+      "after_sha256": "3b04e463e0d0ecaaa69f9e81ab105e8a43afb54a2c2d59b37a62cd7782142be5",
+      "before_lines": 2777,
+      "after_lines": 2769
+    },
+    {
+      "path": "crates/zippy-server/src/query_snapshot.rs",
+      "before_sha256": "a91fc5f3bd6297058aeccafb4b9965ca053ce9de28676b1f976b026997275a33",
+      "after_sha256": "f9aba181307c70c77d90aee070c79f511c77994704b7b0f5ed816f1f9f60292c",
+      "before_lines": 3698,
+      "after_lines": 3637
+    },
+    {
+      "path": "crates/zippy-server/src/runtime.rs",
+      "before_sha256": "498fe3b4cab3a4ab3a9102f2fa28ff6ad4bf82ea7f4a0e30493f3148b8bd7886",
+      "after_sha256": "bd82c8833c8f03af623a93c6909fd281542726e7b1924340d28c8c392a91fb5a",
+      "before_lines": 4046,
+      "after_lines": 3356
+    },
+    {
+      "path": "crates/zippy-server/tests/server_runtime/transport_performance.rs",
+      "before_sha256": "640fb73946df9ad62e65f1e8ce2f735508dd4bf489c67b512f5a1d37d931789e",
+      "after_sha256": "8157f54fa347026497fa6054b47cd2fc52a4495edab1e80b760874cd57b3a18c",
+      "before_lines": 1449,
+      "after_lines": 935
+    },
+    {
+      "path": "crates/zippy-server/tests/server_runtime.rs",
+      "before_sha256": "4e46de63f392684b5b6fafab18fd4ed93a2596ad35264db4075aedbe771569d5",
+      "after_sha256": "981a5e4474325e945446ede5637e606fd5705dfac1f4aac03c1ab8c611cbf389",
+      "before_lines": 2954,
+      "after_lines": 1575
+    },
+    {
+      "path": "docs/architecture-convergence-audit-2026-09-18.md",
+      "before_sha256": "bf379c679ee34146ee3e5e9ba5ec34e1d0a4dc5b1e79c3f85e98920aa2cf11f6",
+      "after_sha256": "97a9adbc94b6c811ff27873db1cef2e0060ef609ee2c79f014ba041c2f1d54a1",
+      "before_lines": 223,
+      "after_lines": 223
+    },
+    {
+      "path": "docs/current-capabilities-2026-09-21.md",
+      "before_sha256": "72bc567e0788421e7af768372a87c2c73a83956539da6f7a9e01f8eb15b8cdee",
+      "after_sha256": "a6640fc41eb51cb07b74ca5afc5ece3c6ea6f694e9ae9bb303106a912394e918",
+      "before_lines": 60,
+      "after_lines": 60
+    },
+    {
+      "path": "docs/flight-query-service.md",
+      "before_sha256": "1881b634d0de45a5e4072f92e8eb28052c0248604376140cc898e86535468fd5",
+      "after_sha256": "930460f9461d78d320ff7b63ab3a4338a92564aab6a22eef900f371965e4b004",
+      "before_lines": 383,
+      "after_lines": 383
+    },
+    {
+      "path": "docs/single-node-server-runtime.md",
+      "before_sha256": "41aa12faa6c5b823c690df7898dd3b51bc497a1814d85736186934f54a70eeab",
+      "after_sha256": "d20f6a07023430e2cd49e7316a6f271bf31ac2417d256d803273ea1e4fa8f78f",
+      "before_lines": 421,
+      "after_lines": 68
+    }
+  ],
+  "test_retirement_sha256": "6809f702c15a70350f085b08fab85f778747d0add5f776a206be0a33c18c0974",
+  "report_sha256": "97a1d8f8adf43c74e9729529cd9ad81edd60a25c2c417e8064bc9da68414407e",
+  "logs": {
+    "tests-initial": {
+      "path": "/tmp/zippy-shadow-tests-initial.log",
+      "sha256": "fa4c5350184be1d6ca3c1ef0537e606e1f922d8c180dffe8ace61f023ec0715a",
+      "bytes": 6480
+    },
+    "tests": {
+      "path": "/tmp/zippy-shadow-tests.log",
+      "sha256": "2dceaa125bdafd612c6aa51bb328b1e416fb70682d1cf38c282455071b374773",
+      "bytes": 43913
+    },
+    "tests-final": {
+      "path": "/tmp/zippy-shadow-tests-final.log",
+      "sha256": "fbfa7986970ebc0f35516b6d1fc0afecdfb3e9a6cf5b0b19208a61804e0e6ba2",
+      "bytes": 49065
+    },
+    "clippy": {
+      "path": "/tmp/zippy-shadow-clippy.log",
+      "sha256": "4dbd9520cb404904810992b27198b9dedaa8fd6c91e13994fd15d67c266a8d41",
+      "bytes": 1121
+    },
+    "native-build": {
+      "path": "/tmp/zippy-shadow-native-build.log",
+      "sha256": "c7756150197b80a0a617e0e94c53db9c0dd9f618e579c347bd8ab35585300cb1",
+      "bytes": 1677
+    },
+    "native-matrix": {
+      "path": "/tmp/zippy-shadow-native-matrix.log",
+      "sha256": "e1c123047df3f4184e277d912c13b3e97d45b04b10d22288377a0cbcb7f0d2c4",
+      "bytes": 30010
+    },
+    "pytest": {
+      "path": "/tmp/zippy-shadow-pytest.log",
+      "sha256": "fb5157984595c6a325a1893378b9ee0a92d883e016a0a10e2cdc4f7d0fa3302e",
+      "bytes": 741
+    },
+    "mypy": {
+      "path": "/tmp/zippy-shadow-mypy.log",
+      "sha256": "6e48d2986ce0d91c8cd60bff9ed577f4baf14c949620883ab530992e6c52e53a",
+      "bytes": 934
+    },
+    "mypy-client": {
+      "path": "/tmp/zippy-shadow-mypy-client.log",
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f",
+      "bytes": 44
+    },
+    "ruff": {
+      "path": "/tmp/zippy-shadow-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "bytes": 19
+    },
+    "black": {
+      "path": "/tmp/zippy-shadow-black.log",
+      "sha256": "161579e1a9a654d62a83f487d90f72be3d8e9379f20fa777ad6cc1d93115ac60",
+      "bytes": 57
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-shadow-rustfmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "diff": {
+      "path": "/tmp/zippy-shadow-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "extension-links": {
+      "path": "/tmp/zippy-shadow-extension-links.log",
+      "sha256": "28808ee69738640aeea56130b1610c2cbc22014d3b8b22ec61c1511f9416532e",
+      "bytes": 522
+    }
+  },
+  "limitations": [
+    "Legacy default, Master persistent registry, Gateway and memory ingest remain.",
+    "Master endpoint snapshot import and Catalog/Storage projection types remain; F15 is open.",
+    "No new Arrow 25 distribution or Windows/macOS acceptance claim.",
+    "Five existing manual or platform-specific Rust tests remain ignored.",
+    "Maturin emitted missing-patchelf warning; ldd resolved all current Linux extension dependencies.",
+    "No commit, push, deployment or user data migration performed."
+  ]
+}

@@ -5,13 +5,18 @@ from __future__ import annotations
 import math
 import threading
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+from loguru import logger
+
+if TYPE_CHECKING:
+    from zippy_client import Client, FlightLogReader
 
 
 class KeyValueState:
     """Maintain state from an atomic snapshot and unfiltered, ordered delta batches.
 
-    :param snapshot: Producer snapshot from ``Session.snapshot_state`` with cursor metadata.
+    :param snapshot: Atomic snapshot from ``Client.snapshot_state`` or local Session with metadata.
     :param max_pending_bytes: Maximum retained Arrow bytes for one incomplete version.
     :raises ValueError: Snapshot metadata or configured budget is invalid.
     :example:
@@ -98,164 +103,297 @@ class KeyValueState:
 
 
 class StateSubscription:
-    """Bootstrap a lossless delta subscription before loading the producer snapshot.
+    """Maintain native KV state from an identity-bound Flight snapshot and continuous log.
 
-    :param source: Published KeyValue table name.
-    :param snapshot_loader: Callable returning an atomic producer snapshot, locally or by RPC.
-    :param master: Optional Zippy master client.
-    :param timeout: Maximum subscription-readiness wait in seconds.
-    :param max_pending_bytes: Bootstrap and incomplete-version Arrow memory budget.
-    :raises RuntimeError: Continuity fails; discard this handle and bootstrap a new one.
+    :param source: Native key-value table name.
+    :param client: Explicitly owned zippy-client connection; this handle does not close it.
+    :param namespace: Catalog namespace.
+    :param timeout: Per-bootstrap deadline and maximum stop join time, in seconds.
+    :param max_pending_bytes: Native delta and Flight atomic-assembly byte limit.
+    :param reconnect: Rebuild state after transport/continuity loss, keeping the same table ID/schema.
+    :param max_reconnect_attempts: Maximum consecutive recovery failures before a terminal error.
+    :param reconnect_interval_sec: Initial cancellable exponential-backoff delay, capped at five seconds.
+    :raises RuntimeError: Bootstrap or state continuity cannot be proved.
     :example:
 
-        subscription = StateSubscription("quotes", lambda: producer.snapshot_state("quotes"))
-        subscription.start()
-        latest = subscription.snapshot()
-        subscription.stop()
+        with StateSubscription("quotes", client=client, namespace="market") as state:
+            selected = state.select([["a"]])
+
+    Recovery discards the old state and obtains a fresh snapshot; intermediate event delivery is
+    not guaranteed. Reads fail while recovering instead of returning stale state as current.
     """
 
     def __init__(
         self,
         source: str,
-        snapshot_loader: Callable[[], Any],
         *,
-        master=None,
+        client: Client,
+        namespace: str = "default",
         timeout: float = 5.0,
         max_pending_bytes: int = 64 * 1024 * 1024,
+        reconnect: bool = True,
+        max_reconnect_attempts: int = 5,
+        reconnect_interval_sec: float = 0.1,
     ) -> None:
-        if not math.isfinite(timeout) or timeout <= 0 or max_pending_bytes <= 0:
-            raise ValueError("readiness timeout and pending byte budget must be positive")
-        self._source = source
-        self._snapshot_loader = snapshot_loader
-        self._master = master
-        self._timeout = timeout
-        self._maximum = max_pending_bytes
-        self._lock = threading.Lock()
-        self._pending: list[Any] = []
-        self._pending_bytes = 0
+        if not source or not namespace:
+            raise ValueError("state table and namespace must be nonempty")
+        if not math.isfinite(timeout) or timeout <= 0 or max_pending_bytes <= 512:
+            raise ValueError("bootstrap timeout and pending byte budget must be positive")
+        if (
+            type(max_reconnect_attempts) is not int
+            or max_reconnect_attempts < 0
+            or not math.isfinite(reconnect_interval_sec)
+            or reconnect_interval_sec <= 0
+        ):
+            raise ValueError("reconnect attempts and interval are invalid")
+        self._source, self._namespace, self._client = source, namespace, client
+        self._timeout, self._maximum = timeout, max_pending_bytes
+        self._reconnect, self._max_attempts = reconnect, max_reconnect_attempts
+        self._interval = reconnect_interval_sec
+        self._condition = threading.Condition(threading.RLock())
+        self._stop_event = threading.Event()
         self._state: KeyValueState | None = None
-        self._subscriber: Any = None
+        self._reader: FlightLogReader | None = None
         self._error: Exception | None = None
-        self._started = False
+        self._phase = "created"
+        self._thread: threading.Thread | None = None
+        self._table_id: Any = None
+        self._schema: Any = None
+        self._generation = 0
+        self._attempts = 0
 
-    def _apply(self, delta) -> None:
-        with self._lock:
-            try:
-                if self._error is not None:
-                    raise RuntimeError("state subscription invalidated") from self._error
-                if delta.num_rows == 0:
-                    return
-                if self._state is None:
-                    size = delta.get_total_buffer_size()
-                    if size > self._maximum - self._pending_bytes:
-                        raise RuntimeError("state bootstrap exceeded its byte budget")
-                    self._pending.append(delta)
-                    self._pending_bytes += size
-                else:
-                    self._state.apply(delta)
-            except Exception as error:
-                self._error = error
-                self._pending.clear()
-                raise
+    def _bootstrap(self) -> None:
+        from zippy_client import ContinuityError
+
+        deadline = time.time_ns() + int(self._timeout * 1_000_000_000)
+        options: dict[str, Any] = {"max_pending_bytes": self._maximum}
+        if self._table_id is None:
+            options.update(source=self._source, namespace=self._namespace)
+        else:
+            self._client.flight.refresh_read_session(timeout_sec=self._timeout)
+            options["table_id"] = self._table_id
+        remaining = (deadline - time.time_ns()) / 1_000_000_000
+        if remaining <= 0:
+            raise TimeoutError("state bootstrap timed out during authentication")
+        options["open_timeout_sec"] = remaining
+        reader = self._client.open_log(**options)
+        try:
+            if reader.kind != "key_value":
+                raise ValueError("state subscription requires a native key-value table")
+            if self._table_id is not None and (
+                reader.table_id != self._table_id
+                or not reader.schema.equals(self._schema, check_metadata=True)
+            ):
+                raise ContinuityError("state recovery changed table identity or schema")
+            with self._condition:
+                if self._stop_event.is_set():
+                    raise RuntimeError("state subscription stopped during bootstrap")
+                self._reader = reader
+            snapshot = self._client.snapshot_state(table_id=reader.table_id, deadline_ns=deadline)
+            metadata = snapshot.schema.metadata or {}
+            if metadata.get(b"zippy_kv_stream_id") != reader.table_id.hex.encode("ascii"):
+                raise ContinuityError("state snapshot belongs to a different log identity")
+            state = KeyValueState(snapshot, max_pending_bytes=self._maximum)
+            if state.sequence < reader.cursor.next_offset:
+                raise ContinuityError("state snapshot cursor precedes its attached log")
+            with self._condition:
+                if self._stop_event.is_set():
+                    raise RuntimeError("state subscription stopped during bootstrap")
+                self._table_id, self._schema = reader.table_id, reader.schema
+                self._state = state
+                self._generation += 1
+                self._phase = "running"
+                self._condition.notify_all()
+        except BaseException:
+            reader.close()
+            with self._condition:
+                if self._reader is reader:
+                    self._reader = None
+            raise
 
     def start(self) -> StateSubscription:
-        """Start delivery, await attachment, then atomically install snapshot plus buffered deltas.
+        """Attach latest first, load the same table's snapshot, then consume its ordered log.
 
-        :returns: This handle.
-        :raises RuntimeError: The stream fails or does not implement the delta protocol.
-        :raises TimeoutError: Reader attachment does not complete before the deadline.
+        :returns: This handle, with a complete initial state already installed.
+        :raises RuntimeError: Already started, stopped, or initial bootstrap failed.
         """
-        from . import subscribe_table
-
-        if self._started:
-            raise RuntimeError("state subscription cannot be restarted; create a new handle")
-        self._started = True
-        self._subscriber = subscribe_table(
-            self._source, self._apply, master=self._master, wait=True, timeout=self._timeout
-        )
+        with self._condition:
+            if self._phase != "created":
+                raise RuntimeError("state subscription cannot be restarted; create a new handle")
+            self._phase = "starting"
         try:
-            deadline = time.monotonic() + self._timeout
-            while not self._subscriber.metrics().get("ready"):
-                self._require_healthy()
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("state delta reader did not become ready")
-                time.sleep(0.001)
-            snapshot = self._snapshot_loader()
-            with self._lock:
-                self._require_healthy()
-                state = KeyValueState(snapshot, max_pending_bytes=self._maximum)
-                for delta in self._pending:
-                    state.apply(delta)
-                self._state = state
-                self._pending.clear()
-                self._pending_bytes = 0
+            self._bootstrap()
+            with self._condition:
+                if self._stop_event.is_set():
+                    raise RuntimeError("state subscription stopped during startup")
+                self._thread = threading.Thread(
+                    target=self._run, name=f"zippy-state-{self._table_id}", daemon=True
+                )
+                self._thread.start()
         except Exception as error:
-            self._error = error
-            # Preserve the bootstrap failure if the transport also reports its callback error.
-            try:
-                self._subscriber.stop()
-            except Exception as stop_error:
-                error.add_note(f"subscriber stop failed error=[{stop_error}]")
+            with self._condition:
+                self._error = error
+                self._state = None
+                self._phase = "stopped" if self._stop_event.is_set() else "failed"
+                self._condition.notify_all()
+            reader = self._reader
+            if reader is not None:
+                reader.close()
             raise
         return self
 
-    def _require_healthy(self) -> None:
-        if self._error is not None:
-            raise RuntimeError("state subscription requires a fresh bootstrap") from self._error
-        if self._subscriber is None:
-            raise RuntimeError("state subscription is not started")
-        metrics = self._subscriber.metrics()
-        if metrics.get("last_error") or metrics.get("reconnects_total", 0):
-            raise RuntimeError("state subscription lost continuity; bootstrap again")
-        if metrics.get("running") is False or metrics.get("state") in {"stopped", "failed"}:
-            raise RuntimeError("state subscription is no longer live")
+    def _run(self) -> None:
+        from zippy_client import ContinuityError, ServerError, ZippyConnectionError
+
+        while not self._stop_event.is_set():
+            try:
+                if self._reader is None:
+                    self._bootstrap()
+                reader = self._reader
+                if reader is None:
+                    raise RuntimeError("state log reader is missing")
+                event = next(reader)
+                with self._condition:
+                    if self._stop_event.is_set():
+                        return
+                    if self._state is None:
+                        raise RuntimeError("state snapshot is missing")
+                    try:
+                        self._state.apply(event.table)
+                    except RuntimeError as error:
+                        raise ContinuityError("native state delta application failed") from error
+                    self._attempts = 0
+                    self._condition.notify_all()
+            except Exception as error:
+                reader = self._reader
+                with self._condition:
+                    self._reader = None
+                    self._state = None
+                    self._error = error
+                    self._attempts += 1
+                    retryable = isinstance(
+                        error, (ContinuityError, ZippyConnectionError, TimeoutError)
+                    )
+                    if isinstance(error, ServerError):
+                        retryable = error.retryable
+                    recover = self._reconnect and retryable and self._attempts <= self._max_attempts
+                    self._phase = "recovering" if recover else "failed"
+                    if self._stop_event.is_set():
+                        self._phase = "stopped"
+                    self._condition.notify_all()
+                if reader is not None:
+                    try:
+                        reader.close()
+                    except Exception as close_error:
+                        error.add_note(f"state reader close failed error=[{close_error}]")
+                if self._stop_event.is_set():
+                    return
+                if not recover:
+                    logger.error(
+                        "state subscription failed table_id=[{}] error=[{}]", self._table_id, error
+                    )
+                    return
+                logger.warning(
+                    "state subscription recovering table_id=[{}] attempt=[{}] error=[{}]",
+                    self._table_id,
+                    self._attempts,
+                    error,
+                )
+                delay = min(5.0, self._interval * 2 ** min(self._attempts - 1, 10))
+                if self._stop_event.wait(delay):
+                    return
+
+    def _healthy_state(self) -> KeyValueState:
+        if self._phase != "running" or self._state is None:
+            raise RuntimeError(f"state subscription is [{self._phase}]") from self._error
+        return self._state
 
     def snapshot(self):
-        """Request the latest complete state while verifying transport continuity.
+        """Return complete current state; fail while recovering, stopped or invalid.
 
-        :returns: Arrow Table with its committed cursor.
-        :raises RuntimeError: Bootstrap is incomplete or transport/state continuity was lost.
+        :returns: Arrow Table with its exact committed cursor metadata.
+        :raises RuntimeError: No healthy live state is available.
         """
-        with self._lock:
-            self._require_healthy()
-            if self._state is None:
-                raise RuntimeError("state bootstrap is not complete")
-            return self._state.snapshot()
+        with self._condition:
+            return self._healthy_state().snapshot()
 
     @property
     def sequence(self) -> int:
-        """Read the healthy committed cursor without allocating a full snapshot.
-
-        :returns: Last completely applied delta sequence.
-        :raises RuntimeError: Bootstrap is incomplete or continuity was lost.
-        """
-        with self._lock:
-            self._require_healthy()
-            if self._state is None:
-                raise RuntimeError("state bootstrap is not complete")
-            return self._state.sequence
+        """Return the healthy applied sequence without materializing a full snapshot."""
+        with self._condition:
+            return self._healthy_state().sequence
 
     def select(self, keys: list[list[str]]):
-        """Read only selected keys from a healthy live state.
+        """Read selected keys from healthy state without materializing the full table.
 
-        :param keys: Composite keys in configured key-column order.
-        :returns: Arrow Table containing the requested keys.
-        :raises RuntimeError: Bootstrap, key lookup, or continuity validation fails.
+        :param keys: Composite keys in the table's declared key order.
+        :returns: Arrow Table for the requested keys.
+        :raises RuntimeError: State is unavailable or a key does not exist.
         """
-        with self._lock:
-            self._require_healthy()
-            if self._state is None:
-                raise RuntimeError("state bootstrap is not complete")
-            return self._state.select(keys)
+        with self._condition:
+            return self._healthy_state().select(keys)
+
+    def wait_for_sequence(self, sequence: int, *, timeout: float = 5.0) -> bool:
+        """Wait for a complete applied cursor, including any explicit state recovery.
+
+        :param sequence: Minimum one-based applied sequence, or zero for the empty state.
+        :param timeout: Maximum monotonic wait in seconds.
+        :returns: True when ready at the requested sequence, False on timeout.
+        :raises RuntimeError: The subscription has failed or stopped.
+        """
+        if sequence < 0 or not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("sequence and wait timeout must be nonnegative")
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while True:
+                if self._phase in {"failed", "stopped", "created"}:
+                    self._healthy_state()
+                if (
+                    self._phase == "running"
+                    and self._state is not None
+                    and self._state.sequence >= sequence
+                ):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+
+    def metrics(self) -> dict[str, Any]:
+        """Report state phase, bootstrap generation, retries and the last observed failure."""
+        with self._condition:
+            return {
+                "state": self._phase,
+                "ready": self._phase == "running",
+                "bootstrap_generation": self._generation,
+                "reconnects_total": max(0, self._generation - 1),
+                "consecutive_failures": self._attempts,
+                "table_id": str(self._table_id) if self._table_id is not None else None,
+                "last_error": str(self._error) if self._error is not None else None,
+            }
 
     def stop(self) -> None:
-        """Stop the transport and release buffered bootstrap data.
+        """Cancel reading/backoff and wait for the worker, leaving the caller's Client open.
 
-        :returns: None.
-        :raises RuntimeError: The transport reports an earlier terminal error.
+        :raises TimeoutError: An in-flight bootstrap RPC did not finish within the join deadline.
         """
-        if self._subscriber is not None:
-            self._subscriber.stop()
-        with self._lock:
-            self._pending.clear()
+        self._stop_event.set()
+        with self._condition:
+            reader, worker = self._reader, self._thread
+            self._phase = "stopped"
             self._state = None
+            self._condition.notify_all()
+        if reader is not None:
+            reader.close()
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(self._timeout)
+            if worker.is_alive():
+                raise TimeoutError("state subscription worker did not stop before deadline")
+
+    def __enter__(self) -> StateSubscription:
+        """Start and return this explicitly owned state subscription."""
+        return self.start()
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Cancel the subscription when its context exits."""
+        self.stop()

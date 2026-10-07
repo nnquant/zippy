@@ -3,8 +3,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use zippy_types::catalog::{AcquireProducerCommand, ProducerDescriptor};
 use zippy_types::{
-    ErrorCode, OffsetWatermark, ProducerId, Result, SequenceWatermark, ServerError,
-    ServerErrorDetails, TableId,
+    ErrorCode, ProducerId, Result, SequenceWatermark, ServerError, ServerErrorDetails, TableId,
 };
 
 use crate::encoding::{
@@ -94,14 +93,6 @@ pub(crate) fn acquire_producer(
         }
     }
     let last_committed_log_offset = decode_offset_watermark(&current.2)?;
-    if last_committed_log_offset == OffsetWatermark::LegacyUnknown {
-        return Err(ServerError::new(
-            ErrorCode::UnsupportedPlan,
-            "durable producer acquisition requires a known native log watermark",
-        )
-        .with_table_id(prepared.table_id)
-        .with_retryable(false));
-    }
     let next_epoch = current_epoch.checked_add(1).ok_or_else(|| {
         ServerError::new(
             ErrorCode::ResourceExhausted,

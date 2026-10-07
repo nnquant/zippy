@@ -105,6 +105,72 @@ impl FingerprintInputV1 {
 }
 
 #[derive(Serialize)]
+pub(super) struct SchemaFingerprintInputV1<'a> {
+    format_version: u32,
+    expected_revision: Option<u64>,
+    actor: ActorRefV1<'a>,
+    command: SchemaFingerprintCommandV1<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "command", rename_all = "snake_case")]
+enum SchemaFingerprintCommandV1<'a> {
+    CreateTable {
+        table_id: String,
+        namespace_id: String,
+        name: &'a str,
+        definition: TableDefinitionV1,
+        canonical_schema_hash: String,
+        config: &'a BTreeMap<String, String>,
+    },
+    AlterTableSchema {
+        table_id: String,
+        expected_schema_version: u64,
+        canonical_schema_hash: String,
+    },
+}
+
+impl<'a> SchemaFingerprintInputV1<'a> {
+    pub(super) fn from_parts(
+        format_version: CatalogCommandFormatVersion,
+        expected_revision: Option<u64>,
+        actor: &'a CatalogActor,
+        command: &'a CatalogCommandV1,
+    ) -> Result<Option<Self>, CatalogFingerprintError> {
+        let hash = |payload: &SchemaIpcPayload| -> Result<String, CatalogFingerprintError> {
+            let schema = crate::schema_ipc::decode_schema_ipc_stream(payload.as_bytes())?;
+            Ok(crate::schema_hash::canonical_catalog_schema_hash_v1(
+                &schema,
+            ))
+        };
+        let command = match command {
+            CatalogCommandV1::CreateTable(command) => SchemaFingerprintCommandV1::CreateTable {
+                table_id: command.table_id.to_string(),
+                namespace_id: command.namespace_id.to_string(),
+                name: command.name.as_str(),
+                definition: (&command.definition).into(),
+                canonical_schema_hash: hash(&command.schema_ipc)?,
+                config: &command.config,
+            },
+            CatalogCommandV1::AlterTableSchema(command) => {
+                SchemaFingerprintCommandV1::AlterTableSchema {
+                    table_id: command.table_id.to_string(),
+                    expected_schema_version: command.expected_schema_version,
+                    canonical_schema_hash: hash(&command.schema_ipc)?,
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Self {
+            format_version: format_version.get(),
+            expected_revision,
+            actor: ActorRefV1::from(actor),
+            command,
+        }))
+    }
+}
+
+#[derive(Serialize)]
 pub(super) struct ManifestFingerprintInputRefV1<'a> {
     format_version: u32,
     expected_revision: Option<u64>,
@@ -150,7 +216,6 @@ impl<'a> From<&'a CatalogActor> for ActorRefV1<'a> {
                 CatalogActorKind::User => "user",
                 CatalogActorKind::Server => "server",
                 CatalogActorKind::Maintenance => "maintenance",
-                CatalogActorKind::Migration => "migration",
             },
             principal: actor.principal.as_str(),
         }
@@ -290,14 +355,12 @@ impl<'a> From<&'a PendingDataFile> for PendingDataFileRefV1<'a> {
 #[serde(tag = "type", content = "path", rename_all = "snake_case")]
 enum DataFileLocationRefV1<'a> {
     Managed(&'a str),
-    ExternalLegacy(&'a str),
 }
 
 impl<'a> From<&'a DataFileLocation> for DataFileLocationRefV1<'a> {
     fn from(location: &'a DataFileLocation) -> Self {
         match location {
             DataFileLocation::Managed(path) => Self::Managed(path.as_str()),
-            DataFileLocation::ExternalLegacy(path) => Self::ExternalLegacy(path.as_str()),
         }
     }
 }
@@ -306,10 +369,6 @@ impl<'a> From<&'a DataFileLocation> for DataFileLocationRefV1<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DataFileProvenanceRefV1<'a> {
     Native(NativeDataFileProvenanceRefV1<'a>),
-    Legacy {
-        offsets: Option<OffsetRangeRefV1>,
-        preserve_discovery_order: bool,
-    },
 }
 
 impl<'a> From<&'a DataFileProvenance> for DataFileProvenanceRefV1<'a> {
@@ -319,13 +378,6 @@ impl<'a> From<&'a DataFileProvenance> for DataFileProvenanceRefV1<'a> {
                 offsets: native.offsets().into(),
                 source_lineage: SourceLineagesRefV1(native.source_lineage().as_slice()),
             }),
-            DataFileProvenance::Legacy {
-                offsets,
-                preserve_discovery_order,
-            } => Self::Legacy {
-                offsets: offsets.map(Into::into),
-                preserve_discovery_order: *preserve_discovery_order,
-            },
         }
     }
 }
@@ -403,7 +455,6 @@ impl From<OffsetRange> for OffsetRangeRefV1 {
 enum OffsetWatermarkRefV1 {
     Empty,
     Known(u64),
-    LegacyUnknown,
 }
 
 impl From<OffsetWatermark> for OffsetWatermarkRefV1 {
@@ -411,7 +462,6 @@ impl From<OffsetWatermark> for OffsetWatermarkRefV1 {
         match offset {
             OffsetWatermark::Empty => Self::Empty,
             OffsetWatermark::Known(offset) => Self::Known(offset.get()),
-            OffsetWatermark::LegacyUnknown => Self::LegacyUnknown,
         }
     }
 }
@@ -473,7 +523,6 @@ impl From<&CatalogActor> for ActorV1 {
                 CatalogActorKind::User => "user",
                 CatalogActorKind::Server => "server",
                 CatalogActorKind::Maintenance => "maintenance",
-                CatalogActorKind::Migration => "migration",
             }
             .to_owned(),
             principal: principal.clone(),
@@ -487,7 +536,6 @@ impl ActorV1 {
             "user" => CatalogActorKind::User,
             "server" => CatalogActorKind::Server,
             "maintenance" => CatalogActorKind::Maintenance,
-            "migration" => CatalogActorKind::Migration,
             value => return Err(format!("invalid V1 actor kind value=[{value}]")),
         };
         Ok(CatalogActor {
@@ -820,6 +868,8 @@ struct CommitConsumerOffsetV1 {
     consumer_id: String,
     table_id: String,
     offset_authority: ConsumerOffsetAuthorityV1,
+    expected_schema_version: u64,
+    expected_committed_log_offset: CommittedOffsetV1,
     committed_log_offset: CommittedOffsetV1,
 }
 
@@ -829,12 +879,16 @@ impl From<&CommitConsumerOffsetCommand> for CommitConsumerOffsetV1 {
             consumer_id,
             table_id,
             offset_authority,
+            expected_schema_version,
+            expected_committed_log_offset,
             committed_log_offset,
         } = command;
         Self {
             consumer_id: consumer_id.to_string(),
             table_id: table_id.to_string(),
             offset_authority: (*offset_authority).into(),
+            expected_schema_version: *expected_schema_version,
+            expected_committed_log_offset: (*expected_committed_log_offset).into(),
             committed_log_offset: (*committed_log_offset).into(),
         }
     }
@@ -846,6 +900,8 @@ impl CommitConsumerOffsetV1 {
             consumer_id: parse(self.consumer_id, "consumer_id")?,
             table_id: parse(self.table_id, "table_id")?,
             offset_authority: self.offset_authority.into_domain()?,
+            expected_schema_version: self.expected_schema_version,
+            expected_committed_log_offset: self.expected_committed_log_offset.into_domain(),
             committed_log_offset: self.committed_log_offset.into_domain(),
         })
     }
@@ -1727,16 +1783,12 @@ impl PendingDataFileV1 {
 )]
 enum DataFileLocationV1 {
     Managed(String),
-    ExternalLegacy(String),
 }
 
 impl From<&DataFileLocation> for DataFileLocationV1 {
     fn from(location: &DataFileLocation) -> Self {
         match location {
             DataFileLocation::Managed(path) => Self::Managed(path.as_str().to_owned()),
-            DataFileLocation::ExternalLegacy(path) => {
-                Self::ExternalLegacy(path.as_str().to_owned())
-            }
         }
     }
 }
@@ -1747,9 +1799,6 @@ impl DataFileLocationV1 {
             Self::Managed(path) => Ok(DataFileLocation::Managed(
                 crate::table::ManagedDataPath::new(path).map_err(invalid)?,
             )),
-            Self::ExternalLegacy(path) => Ok(DataFileLocation::ExternalLegacy(
-                crate::table::ExternalDataPath::new(path).map_err(invalid)?,
-            )),
         }
     }
 }
@@ -1758,10 +1807,6 @@ impl DataFileLocationV1 {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum DataFileProvenanceV1 {
     Native(NativeDataFileProvenanceV1),
-    Legacy {
-        offsets: Option<OffsetRangeV1>,
-        preserve_discovery_order: bool,
-    },
 }
 
 impl From<&DataFileProvenance> for DataFileProvenanceV1 {
@@ -1776,13 +1821,6 @@ impl From<&DataFileProvenance> for DataFileProvenanceV1 {
                     .map(Into::into)
                     .collect(),
             }),
-            DataFileProvenance::Legacy {
-                offsets,
-                preserve_discovery_order,
-            } => Self::Legacy {
-                offsets: offsets.map(Into::into),
-                preserve_discovery_order: *preserve_discovery_order,
-            },
         }
     }
 }
@@ -1804,13 +1842,6 @@ impl DataFileProvenanceV1 {
                     .map_err(invalid)?,
                 ))
             }
-            Self::Legacy {
-                offsets,
-                preserve_discovery_order,
-            } => Ok(DataFileProvenance::Legacy {
-                offsets: offsets.map(OffsetRangeV1::into_domain).transpose()?,
-                preserve_discovery_order,
-            }),
         }
     }
 }
@@ -2011,7 +2042,6 @@ impl OffsetRangeV1 {
 enum OffsetWatermarkV1 {
     Empty,
     Known(u64),
-    LegacyUnknown,
 }
 
 impl From<OffsetWatermark> for OffsetWatermarkV1 {
@@ -2019,7 +2049,6 @@ impl From<OffsetWatermark> for OffsetWatermarkV1 {
         match offset {
             OffsetWatermark::Empty => Self::Empty,
             OffsetWatermark::Known(offset) => Self::Known(offset.get()),
-            OffsetWatermark::LegacyUnknown => Self::LegacyUnknown,
         }
     }
 }
@@ -2029,7 +2058,6 @@ impl OffsetWatermarkV1 {
         match self {
             Self::Empty => OffsetWatermark::Empty,
             Self::Known(offset) => OffsetWatermark::Known(crate::LogOffset::new(offset)),
-            Self::LegacyUnknown => OffsetWatermark::LegacyUnknown,
         }
     }
 }
@@ -2142,7 +2170,6 @@ fn snapshot_operation(operation: SnapshotOperation) -> &'static str {
         SnapshotOperation::Create => "create",
         SnapshotOperation::Persist => "persist",
         SnapshotOperation::Compaction => "compaction",
-        SnapshotOperation::Import => "import",
         SnapshotOperation::Retention => "retention",
     }
 }
@@ -2152,7 +2179,6 @@ fn parse_snapshot_operation(value: &str) -> Result<SnapshotOperation, String> {
         "create" => Ok(SnapshotOperation::Create),
         "persist" => Ok(SnapshotOperation::Persist),
         "compaction" => Ok(SnapshotOperation::Compaction),
-        "import" => Ok(SnapshotOperation::Import),
         "retention" => Ok(SnapshotOperation::Retention),
         _ => Err(format!("invalid V1 snapshot operation value=[{value}]")),
     }
@@ -2165,7 +2191,6 @@ fn maintenance_kind(kind: MaintenanceJobKind) -> &'static str {
         MaintenanceJobKind::GarbageCollection => "garbage_collection",
         MaintenanceJobKind::Verify => "verify",
         MaintenanceJobKind::Backup => "backup",
-        MaintenanceJobKind::Import => "import",
     }
 }
 
@@ -2176,7 +2201,6 @@ fn parse_maintenance_kind(value: &str) -> Result<MaintenanceJobKind, String> {
         "garbage_collection" => Ok(MaintenanceJobKind::GarbageCollection),
         "verify" => Ok(MaintenanceJobKind::Verify),
         "backup" => Ok(MaintenanceJobKind::Backup),
-        "import" => Ok(MaintenanceJobKind::Import),
         _ => Err(format!("invalid V1 maintenance kind value=[{value}]")),
     }
 }

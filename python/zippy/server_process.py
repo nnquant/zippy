@@ -17,7 +17,6 @@ import shlex
 import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
 import time
@@ -31,8 +30,7 @@ if os.name == "posix":
 
 
 _STATE_SCHEMA_VERSION = 1
-_READY_SCHEMA_VERSION = 7
-_SUPPORTED_READY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5, 6, _READY_SCHEMA_VERSION})
+_READY_SCHEMA_VERSION = 11
 _SERVER_ERROR_CODES = frozenset(
     {
         "INVALID_ARGUMENT",
@@ -436,7 +434,7 @@ def _wait_for_ready(
 
 
 def _validate_ready_record(record: dict[str, object]) -> None:
-    if record.get("schema_version") not in _SUPPORTED_READY_SCHEMA_VERSIONS:
+    if record.get("schema_version") != _READY_SCHEMA_VERSION:
         raise _ServerProcessError("native server returned an unsupported ready schema")
     health = record.get("health")
     if not isinstance(health, dict):
@@ -445,32 +443,12 @@ def _validate_ready_record(record: dict[str, object]) -> None:
     services = health.get("services")
     if not isinstance(facts, dict) or not isinstance(services, dict):
         raise _ServerProcessError("native server ready record is missing readiness facts")
-    gateway_configured = facts.get("gateway_configured")
-    if not isinstance(gateway_configured, bool):
-        raise _ServerProcessError(
-            "native server ready record has invalid gateway configuration fact"
-        )
-    schema_version = record.get("schema_version")
-    memory_ingest_configured = facts.get("memory_ingest_configured")
-    if schema_version in {2, 3, 4, 5, 6} and memory_ingest_configured is None:
-        memory_ingest_configured = False
-    if not isinstance(memory_ingest_configured, bool):
-        raise _ServerProcessError(
-            "native server ready record has invalid memory ingest configuration fact"
-        )
     flight_configured = facts.get("flight_configured")
-    if schema_version == 2 and flight_configured is None:
-        flight_configured = False
     if not isinstance(flight_configured, bool):
         raise _ServerProcessError(
             "native server ready record has invalid Flight configuration fact"
         )
-    native_storage_configured = facts.get("native_storage_configured")
-    if not isinstance(native_storage_configured, bool):
-        raise _ServerProcessError(
-            "native server ready record has invalid native storage configuration fact"
-        )
-    native_storage_ready = not native_storage_configured or (
+    native_storage_ready = (
         facts.get("native_catalog_ready") is True
         and facts.get("native_current_snapshot_files_ready") is True
         and facts.get("storage_reconciliation_complete") is True
@@ -479,15 +457,7 @@ def _validate_ready_record(record: dict[str, object]) -> None:
     runtime_ready = (
         facts.get("admission_open") is True
         and facts.get("master_listener_ready") is True
-        and (not memory_ingest_configured or facts.get("memory_ingest_ready") is True)
         and native_storage_ready
-        and (
-            not gateway_configured
-            or (
-                facts.get("gateway_listener_ready") is True
-                and facts.get("gateway_master_reachable") is True
-            )
-        )
         and (
             not flight_configured
             or (
@@ -500,45 +470,12 @@ def _validate_ready_record(record: dict[str, object]) -> None:
         services.get("admission_open") is True
         and services.get("accepting_work") is True
         and services.get("master_lifecycle_running") is True
-        and (not gateway_configured or services.get("gateway_facade_available") is True)
         and services.get("end_to_end_liveness") is True
-        and services.get("catalog") != "unavailable"
-        and (not gateway_configured or services.get("query") != "unavailable")
+        and services.get("catalog") == "ready"
+        and (not flight_configured or services.get("query") == "ready")
     )
     if not runtime_ready or not services_ready:
         raise _ServerProcessError("native server ready record did not satisfy full readiness")
-
-
-def _ready_record_for_status_validation(record: dict[str, object]) -> dict[str, object]:
-    if record.get("schema_version") != 1:
-        return record
-    health = record.get("health")
-    if not isinstance(health, dict):
-        return record
-    facts = health.get("readiness")
-    if not isinstance(facts, dict):
-        return record
-    compatibility_facts = dict(facts)
-    compatibility_facts.update(
-        {
-            "native_storage_configured": False,
-            "native_catalog_ready": False,
-            "native_current_snapshot_files_ready": False,
-            "storage_reconciliation_complete": False,
-            "commit_recovery_complete": False,
-            "memory_ingest_configured": False,
-            "memory_ingest_ready": False,
-            "flight_configured": False,
-            "flight_listener_ready": False,
-            "flight_protocol_ready": False,
-        }
-    )
-    compatibility_health = dict(health)
-    compatibility_health["readiness"] = compatibility_facts
-    compatibility_record = dict(record)
-    compatibility_record["schema_version"] = _READY_SCHEMA_VERSION
-    compatibility_record["health"] = compatibility_health
-    return compatibility_record
 
 
 def _tcp_address(endpoint: str) -> tuple[str, int]:
@@ -610,121 +547,6 @@ def _remaining_io_time(deadline: float, stage: str) -> float:
     return remaining
 
 
-def _probe_gateway(
-    gateway: dict[str, object],
-    effective_config: dict[str, object],
-    timeout_sec: float,
-) -> dict[str, object]:
-    if not gateway.get("enabled"):
-        return {"enabled": False, "status": "disabled"}
-    endpoint = str(gateway.get("endpoint") or "")
-    probe_endpoint = _connectable_gateway_endpoint(endpoint)
-    config_gateway = effective_config.get("gateway", {})
-    token = config_gateway.get("token") if isinstance(config_gateway, dict) else None
-    started = time.monotonic()
-    try:
-        response = _gateway_metrics_request(
-            probe_endpoint,
-            token=str(token) if token else None,
-            timeout_sec=timeout_sec,
-        )
-        if response.get("status") != "ok":
-            raise RuntimeError("gateway metrics response was not successful")
-    except Exception as error:
-        return {
-            "enabled": True,
-            "status": "unhealthy",
-            "endpoint": endpoint,
-            "error": str(error),
-        }
-    return {
-        "enabled": True,
-        "status": "healthy",
-        "endpoint": endpoint,
-        "protocol_version": gateway.get("protocol_version"),
-        "probe_ms": round((time.monotonic() - started) * 1000.0, 3),
-    }
-
-
-def _connectable_gateway_endpoint(endpoint: str) -> str:
-    value = endpoint.removeprefix("tcp://")
-    try:
-        host, port = value.rsplit(":", 1)
-    except ValueError:
-        return value
-    if host == "0.0.0.0":
-        return f"127.0.0.1:{port}"
-    if host in {"::", "[::]"}:
-        return f"[::1]:{port}"
-    return value
-
-
-def _gateway_metrics_request(
-    endpoint: str,
-    *,
-    token: str | None,
-    timeout_sec: float,
-) -> dict[str, object]:
-    deadline = time.monotonic() + timeout_sec
-    host, port = _tcp_address(f"tcp://{endpoint}")
-    header: dict[str, object] = {"kind": "metrics"}
-    if token is not None:
-        header["token"] = token
-    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    prefix = struct.Struct("!IQ")
-    with socket.create_connection(
-        (host, port),
-        timeout=_remaining_io_time(deadline, "connect gateway"),
-    ) as stream:
-        stream.settimeout(_remaining_io_time(deadline, "write gateway request"))
-        stream.sendall(prefix.pack(len(header_bytes), 0))
-        stream.sendall(header_bytes)
-        response_prefix = _recv_exact_with_deadline(
-            stream,
-            prefix.size,
-            deadline,
-            "read gateway response prefix",
-        )
-        header_size, payload_size = prefix.unpack(response_prefix)
-        if header_size > 1024 * 1024 or payload_size > _MAX_CONTROL_RESPONSE_BYTES:
-            raise _ServerProcessError("gateway health response exceeded size limit")
-        response_bytes = _recv_exact_with_deadline(
-            stream,
-            header_size,
-            deadline,
-            "read gateway response header",
-        )
-        if payload_size:
-            _recv_exact_with_deadline(
-                stream,
-                payload_size,
-                deadline,
-                "read gateway response payload",
-            )
-    response = json.loads(response_bytes.decode("utf-8"))
-    if not isinstance(response, dict):
-        raise _ServerProcessError("gateway health response must be an object")
-    return dict(response)
-
-
-def _recv_exact_with_deadline(
-    stream: socket.socket,
-    size: int,
-    deadline: float,
-    stage: str,
-) -> bytes:
-    chunks: list[bytes] = []
-    remaining_bytes = size
-    while remaining_bytes:
-        stream.settimeout(_remaining_io_time(deadline, stage))
-        chunk = stream.recv(remaining_bytes)
-        if not chunk:
-            raise _ServerProcessError(f"gateway closed connection stage=[{stage}]")
-        chunks.append(chunk)
-        remaining_bytes -= len(chunk)
-    return b"".join(chunks)
-
-
 def _probe_webui(url: str, timeout_sec: float) -> dict[str, object]:
     request = Request(url, method="GET", headers={"User-Agent": "zippy-server-health/1"})
     started = time.monotonic()
@@ -750,7 +572,7 @@ def _live_health(
     *,
     webui_url: str,
     timeout_sec: float,
-) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+) -> tuple[dict[str, object], dict[str, object]]:
     deadline = time.monotonic() + timeout_sec
 
     def remaining() -> float:
@@ -760,23 +582,17 @@ def _live_health(
         return value
 
     control_endpoint = str(ready_record["control_endpoint"])
-    effective_config, master_probe_ms = _master_get_config(control_endpoint, remaining())
+    _effective_config, master_probe_ms = _master_get_config(control_endpoint, remaining())
     master = {
         "status": "healthy",
         "endpoint": control_endpoint,
         "probe_ms": round(master_probe_ms, 3),
     }
-    ready_gateway = ready_record.get("gateway", {})
-    gateway = _probe_gateway(
-        dict(ready_gateway) if isinstance(ready_gateway, dict) else {},
-        effective_config,
-        remaining(),
-    )
     if time.monotonic() >= deadline:
         webui = {"managed": False, "status": "not_checked", "url": webui_url}
     else:
         webui = _probe_webui(webui_url, min(remaining(), 1.0))
-    return master, gateway, webui
+    return master, webui
 
 
 def _required_process_identity(pid: int) -> dict[str, object]:
@@ -830,14 +646,12 @@ def _compose_live_payload(
     ready: dict[str, object],
     *,
     master: dict[str, object],
-    gateway: dict[str, object],
     webui: dict[str, object],
     startup_elapsed_ms: float | None,
 ) -> dict[str, object]:
     launcher = _launcher_from_state(ready)
-    gateway_healthy = gateway.get("status") in {"healthy", "disabled"}
     payload: dict[str, object] = {
-        "status": "healthy" if gateway_healthy else "unhealthy",
+        "status": "healthy",
         "version": ready.get("version"),
         "pid": ready.get("pid"),
         "ready_at_unix_ns": ready.get("ready_at_unix_ns"),
@@ -847,7 +661,6 @@ def _compose_live_payload(
         "mode": ready.get("mode"),
         "runtime_health": ready.get("health"),
         "master": master,
-        "gateway": gateway,
         "flight": ready.get("flight"),
         "webui": webui,
         "bootstrap_log": launcher.get("bootstrap_log"),
@@ -989,16 +802,11 @@ def _launch_server(
             raise _ServerProcessError(
                 f"server health checks exceeded startup timeout timeout_sec=[{startup_timeout_sec}]"
             )
-        master, gateway, webui_health = _live_health(
+        master, webui_health = _live_health(
             ready,
             webui_url=webui,
             timeout_sec=min(remaining, 2.0),
         )
-        if gateway.get("status") not in {"healthy", "disabled"}:
-            raise _ServerProcessError(
-                f"gateway health probe failed endpoint=[{gateway.get('endpoint')}] "
-                f"error=[{gateway.get('error', 'unknown error')}]"
-            )
         if time.monotonic() - started > startup_timeout_sec:
             raise _ServerProcessError(
                 f"server health checks exceeded startup timeout timeout_sec=[{startup_timeout_sec}]"
@@ -1013,7 +821,6 @@ def _launch_server(
         return _compose_live_payload(
             ready,
             master=master,
-            gateway=gateway,
             webui=webui_health,
             startup_elapsed_ms=(time.monotonic() - started) * 1000.0,
         )
@@ -1048,7 +855,7 @@ def _state_for_endpoint(
         return paths, None
     schema_version = state.get("schema_version")
     schema_supported = (
-        schema_version in ({1} | _SUPPORTED_READY_SCHEMA_VERSIONS)
+        schema_version == _READY_SCHEMA_VERSION
         if state.get("status") == "ready"
         else schema_version == _STATE_SCHEMA_VERSION
     )
@@ -1111,7 +918,7 @@ def _generation_still_owned(
     expected_identity = _launcher_from_state(state).get("process_identity")
     if (
         latest.get("schema_version") != state.get("schema_version")
-        or latest.get("schema_version") not in ({1} | _SUPPORTED_READY_SCHEMA_VERSIONS)
+        or latest.get("schema_version") != _READY_SCHEMA_VERSION
         or latest.get("status") != "ready"
         or latest.get("pid") != pid
         or latest.get("launch_nonce") != state.get("launch_nonce")
@@ -1183,7 +990,7 @@ def _server_status(
         return result
 
     try:
-        _validate_ready_record(_ready_record_for_status_validation(state))
+        _validate_ready_record(state)
     except _ServerProcessError as error:
         result = _compose_starting_payload(state)
         result["status"] = "unhealthy"
@@ -1191,7 +998,7 @@ def _server_status(
         return result
 
     try:
-        master, gateway, webui = _live_health(
+        master, webui = _live_health(
             state,
             webui_url=_webui_url_from_state(state, webui_url),
             timeout_sec=probe_timeout_sec,
@@ -1208,7 +1015,6 @@ def _server_status(
     result = _compose_live_payload(
         state,
         master=master,
-        gateway=gateway,
         webui=webui,
         startup_elapsed_ms=None,
     )
@@ -1227,6 +1033,31 @@ def _wait_for_process_exit(pid: int, identity: object, timeout_sec: float) -> bo
             return True
         time.sleep(_PROCESS_POLL_INTERVAL_SEC)
     return not _process_matches(pid, identity)
+
+
+def _acquire_shutdown_cleanup_lock(
+    paths: _ServerPaths, *, pid: int, launch_nonce: str, timeout_sec: float
+) -> int:
+    """Wait for lock release without treating a concurrent ownership probe as replacement."""
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        fd = _try_acquire_launch_lock(paths.lock_file)
+        if fd is not None:
+            return fd
+        try:
+            latest = _read_json_file(paths.state_file)
+        except FileNotFoundError:
+            latest = None
+        if latest is not None and (
+            latest.get("pid") != pid or latest.get("launch_nonce") != launch_nonce
+        ):
+            raise _ServerProcessError(
+                "server generation changed during shutdown; active replacement was not stopped"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ServerProcessError("server ownership lock remained held after shutdown")
+        time.sleep(min(_PROCESS_POLL_INTERVAL_SEC, remaining))
 
 
 def _stop_server(
@@ -1288,11 +1119,11 @@ def _stop_server(
         forced = True
         if not _wait_for_process_exit(pid, identity, min(timeout_sec, 5.0)):
             raise _ServerProcessError(f"server process remained after SIGKILL pid=[{pid}]")
-    cleanup_lock_fd = _try_acquire_launch_lock(paths.lock_file)
-    if cleanup_lock_fd is None:
-        raise _ServerProcessError(
-            "server generation changed during shutdown; active replacement was not stopped"
-        )
+    # Status probes briefly take the same exclusive lock; allow at most one extra second
+    # after process exit, then validate the generation again while holding the lock.
+    cleanup_lock_fd = _acquire_shutdown_cleanup_lock(
+        paths, pid=pid, launch_nonce=launch_nonce, timeout_sec=min(timeout_sec, 1.0)
+    )
     try:
         try:
             current_state = _read_json_file(paths.state_file)
@@ -1352,11 +1183,9 @@ def _format_server_summary(payload: dict[str, object], *, action: str) -> str:
 
     heading = "zippy server started" if action == "run" else "zippy server status"
     master = payload.get("master", {})
-    gateway = payload.get("gateway", {})
     flight = payload.get("flight", {})
     webui = payload.get("webui", {})
     master = master if isinstance(master, dict) else {}
-    gateway = gateway if isinstance(gateway, dict) else {}
     flight = flight if isinstance(flight, dict) else {}
     webui = webui if isinstance(webui, dict) else {}
     lines = [
@@ -1375,12 +1204,6 @@ def _format_server_summary(payload: dict[str, object], *, action: str) -> str:
     if control_endpoint:
         master_line += f" endpoint=[{control_endpoint}]"
     lines.append(master_line)
-    if gateway.get("enabled") is False or gateway.get("status") == "disabled":
-        lines.append("gateway: disabled")
-    elif gateway:
-        lines.append(
-            f"gateway: {gateway.get('status', 'unknown')} endpoint=[{gateway.get('endpoint')}]"
-        )
     if flight.get("enabled") is False:
         lines.append("flight: disabled")
     elif flight:

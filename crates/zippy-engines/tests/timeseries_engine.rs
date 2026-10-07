@@ -3,9 +3,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{
-    spawn_engine, Engine, EngineConfig, LateDataPolicy, SegmentTableView, ZippyError,
-};
+use zippy_core::{Engine, LateDataPolicy, SegmentTableView, ZippyError};
 use zippy_engines::TimeSeriesEngine;
 use zippy_operators::{
     AggCountSpec, AggFirstSpec, AggLastSpec, AggMaxSpec, AggMinSpec, AggSumSpec, AggVwapSpec,
@@ -677,8 +675,8 @@ fn timeseries_engine_drop_with_metric_skips_late_rows_and_keeps_valid_rows() {
 }
 
 #[test]
-fn timeseries_runtime_records_late_rows_metric_for_drop_with_metric() {
-    let engine = TimeSeriesEngine::new(
+fn timeseries_kernel_records_late_rows_metric_for_drop_with_metric() {
+    let mut engine = TimeSeriesEngine::new(
         "bars",
         input_schema(),
         "id",
@@ -690,35 +688,24 @@ fn timeseries_runtime_records_late_rows_metric_for_drop_with_metric() {
         vec![],
     )
     .unwrap();
-    let mut handle = spawn_engine(
-        engine,
-        EngineConfig {
-            name: "timeseries-late-metric".to_string(),
-            buffer_capacity: 16,
-            overflow_policy: Default::default(),
-            late_data_policy: LateDataPolicy::DropWithMetric,
-            xfast: false,
-        },
-    )
-    .unwrap();
-
-    handle
-        .write(record_batch(
+    engine
+        .on_data(SegmentTableView::from_record_batch(record_batch(
             vec!["a", "a", "a"],
             vec![1_000_000_000, MINUTE_NS + 1_000_000_000, 30_000_000_000],
             vec![10.0, 12.0, 11.0],
             vec![1.0, 1.0, 1.0],
-        ))
+        )))
         .unwrap();
 
-    handle.stop().unwrap();
+    engine.on_flush().unwrap();
+    let metrics = engine.drain_metrics();
 
-    assert_eq!(handle.metrics().late_rows_total, 1);
+    assert_eq!(metrics.late_rows_total, 1);
 }
 
 #[test]
-fn timeseries_runtime_records_filtered_rows_metric() {
-    let engine = TimeSeriesEngine::new_with_id_filter(
+fn timeseries_kernel_records_filtered_rows_metric() {
+    let mut engine = TimeSeriesEngine::new_with_id_filter(
         "bars",
         input_schema(),
         "id",
@@ -731,31 +718,20 @@ fn timeseries_runtime_records_filtered_rows_metric() {
         Some(vec!["a".to_string()]),
     )
     .unwrap();
-    let mut handle = spawn_engine(
-        engine,
-        EngineConfig {
-            name: "timeseries-filtered-metric".to_string(),
-            buffer_capacity: 16,
-            overflow_policy: Default::default(),
-            late_data_policy: LateDataPolicy::Reject,
-            xfast: false,
-        },
-    )
-    .unwrap();
-
-    handle
-        .write(record_batch(
+    engine
+        .on_data(SegmentTableView::from_record_batch(record_batch(
             vec!["a", "b"],
             vec![1_000_000_000, 2_000_000_000],
             vec![10.0, 99.0],
             vec![1.0, 1.0],
-        ))
+        )))
         .unwrap();
 
-    handle.stop().unwrap();
+    engine.on_flush().unwrap();
+    let metrics = engine.drain_metrics();
 
-    assert_eq!(handle.metrics().filtered_rows_total, 1);
-    assert_eq!(handle.metrics().late_rows_total, 0);
+    assert_eq!(metrics.filtered_rows_total, 1);
+    assert_eq!(metrics.late_rows_total, 0);
 }
 
 #[test]

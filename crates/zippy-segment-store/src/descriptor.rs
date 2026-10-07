@@ -20,8 +20,7 @@ struct ActiveSegmentDescriptorEnvelope {
     shm_os_id: String,
     payload_offset: usize,
     committed_row_count_offset: usize,
-    #[serde(default)]
-    payload_version_offset: Option<usize>,
+    payload_version_offset: usize,
     segment_id: u64,
     generation: u64,
     writer_epoch: u64,
@@ -76,10 +75,8 @@ impl ActiveSegmentDescriptor {
         if envelope.committed_row_count_offset != SHM_COMMITTED_ROW_COUNT_OFFSET {
             return Err("active segment descriptor committed row count offset mismatch");
         }
-        if let Some(offset) = envelope.payload_version_offset {
-            if offset != SHM_PAYLOAD_VERSION_OFFSET {
-                return Err("active segment descriptor payload version offset mismatch");
-            }
+        if envelope.payload_version_offset != SHM_PAYLOAD_VERSION_OFFSET {
+            return Err("active segment descriptor payload version offset mismatch");
         }
 
         Ok(Self {

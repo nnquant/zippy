@@ -401,10 +401,14 @@ pub struct PersistRequest {
 
 impl PersistRequest {
     /// Creates a fully prevalidated persist request and freezes candidate order.
+    ///
+    /// `writer_epoch` fences the submitting authority. Historical source lineage keeps
+    /// its original epochs, each of which must be no greater than this authority epoch.
     pub fn new(
         request_id: RequestId,
         table_id: TableId,
         expected_snapshot_version: u64,
+        writer_epoch: u64,
         mut candidates: Vec<PersistCandidateInput>,
         committed_log_offset: OffsetWatermark,
     ) -> Result<Self> {
@@ -448,9 +452,6 @@ impl PersistRequest {
         }
         let schema_version = candidates[0].spec().schema_version;
         let schema = Arc::clone(&candidates[0].spec().schema);
-        let writer_epoch = candidates[0].spec().provenance.source_lineage().as_slice()[0]
-            .source
-            .writer_epoch;
         for candidate in &candidates {
             if candidate.spec().schema_version != schema_version {
                 return Err(ServerError::new(
@@ -476,10 +477,10 @@ impl PersistRequest {
                 .source_lineage()
                 .as_slice()
                 .iter()
-                .any(|lineage| lineage.source.writer_epoch != writer_epoch)
+                .any(|lineage| lineage.source.writer_epoch > writer_epoch)
             {
                 return Err(terminal_invalid(
-                    "persist request candidates must use one writer epoch",
+                    "persist source lineage exceeds the submitting writer epoch",
                 )
                 .with_request_id(request_id)
                 .with_table_id(table_id));
@@ -611,7 +612,7 @@ impl PersistRequest {
         &self.schema
     }
 
-    /// Returns the one producer fencing epoch shared by every source lineage.
+    /// Returns the submitting authority epoch, which may cover older source epochs.
     #[must_use]
     pub const fn writer_epoch(&self) -> u64 {
         self.writer_epoch
@@ -921,14 +922,6 @@ impl PersistController {
         writer: ParquetCandidateWriter,
         coordinator: CatalogCommitCoordinator,
     ) -> Result<Self> {
-        if !coordinator.supports_staged_persistence() {
-            let error = ServerError::new(
-                ErrorCode::UnsupportedPlan,
-                "persist controller requires Catalog publication control",
-            )
-            .with_retryable(false);
-            return Err(drain_after_startup_failure(coordinator, error).await);
-        }
         if let Err(error) = config.validate() {
             return Err(drain_after_startup_failure(coordinator, error).await);
         }

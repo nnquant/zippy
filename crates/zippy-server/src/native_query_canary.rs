@@ -83,7 +83,7 @@ impl NativeQueryCanaryBinding {
     }
 }
 
-/// Expected primary result used for one legacy-versus-native golden comparison.
+/// Expected Arrow result used for a deterministic native query comparison.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NativeQueryCanaryExpected {
     row_count: u64,
@@ -111,7 +111,7 @@ impl NativeQueryCanaryExpected {
     }
 }
 
-/// Incremental fixed-memory digest builder for legacy or other primary Arrow results.
+/// Incremental fixed-memory digest builder for expected Arrow results.
 pub struct NativeQueryCanaryDigestBuilder {
     canonical: CanonicalResultDigest,
     max_canonical_bytes: u64,
@@ -2045,6 +2045,7 @@ mod tests {
             request_id(request),
             table_id(table),
             1,
+            0,
             vec![candidate],
             OffsetWatermark::Known(last),
         )

@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from decimal import Decimal
 import math
+from typing import Any
 
-from .expressions import Expr, _TemporalInstant, normalize_temporal_filter
+from .expressions import (
+    Expr,
+    _datetime_to_epoch_ns,
+    _TemporalInstant,
+    normalize_temporal_filter,
+)
 
 
 @dataclass(frozen=True)
@@ -25,10 +32,44 @@ class _Relation:
     ordering: list[tuple[str, bool]]
 
 
-class FlightSqlCompiler:
-    """Compile one or more joined :class:`Table` objects into exact server SQL."""
+@dataclass(frozen=True)
+class SqlSource:
+    """Resolved input to the shared SQL compiler.
 
-    def __init__(self) -> None:
+    :param sources: Ordered namespace and table pairs, combined with UNION ALL.
+    :param columns: Input column order from the authoritative schema.
+    :param operations: Lazy operations with schema-normalized expressions.
+    """
+
+    sources: list[tuple[str, str]]
+    columns: list[str]
+    operations: list[tuple[str, object]]
+
+
+def _client_sql_source(table: Any) -> SqlSource:
+    schema = table.schema()
+    operations = [
+        (kind, normalize_temporal_filter(value, schema) if kind == "filter" else value)
+        for kind, value in table._plan
+    ]
+    return SqlSource(
+        sources=[(table.namespace, table.source)],
+        columns=list(schema.names),
+        operations=operations,
+    )
+
+
+class FlightSqlCompiler:
+    """Compile joined tables through one set of SQL and expression rules.
+
+    :param source_resolver: Resolve a table into schema columns, physical source names
+        and normalized operations without generating SQL.
+    :raises ValueError: If a plan contains cycles or unsupported operations.
+    :example: FlightSqlCompiler().compile(table)
+    """
+
+    def __init__(self, source_resolver: Callable[[object], SqlSource] = _client_sql_source) -> None:
+        self._source_resolver = source_resolver
         self.bindings: list[dict[str, object]] = []
         self._source_aliases: dict[tuple[str, str], str] = {}
         self._active_tables: set[int] = set()
@@ -45,24 +86,22 @@ class FlightSqlCompiler:
         identity = id(table)
         if identity in self._active_tables:
             raise ValueError("Flight query plan contains a cyclic table join")
-        source = str(getattr(table, "source"))
-        namespace = str(getattr(table, "namespace", "default"))
-        schema = table.schema()  # type: ignore[attr-defined]
-        columns = [str(name) for name in getattr(schema, "names", [])]
-        if not columns:
-            raise ValueError(f"Flight query source has no columns source=[{source}]")
         self._active_tables.add(identity)
         try:
-            alias = self._bind_source(source, namespace)
+            source = self._source_resolver(table)
+            if not source.columns or not source.sources:
+                raise ValueError("Flight query source requires columns and table bindings")
+            scans = [
+                f"SELECT * FROM {quote_identifier(self._bind_source(name, namespace))}"
+                for namespace, name in source.sources
+            ]
             relation = _Relation(
-                sql=f"SELECT * FROM {quote_identifier(alias)}",
-                columns=columns,
+                sql=" UNION ALL ".join(scans),
+                columns=list(source.columns),
                 ordering=[],
             )
-            for kind, value in list(getattr(table, "_plan", [])):
-                if kind == "filter":
-                    value = normalize_temporal_filter(value, schema)
-                relation = self._apply(relation, str(kind), value)
+            for kind, value in source.operations:
+                relation = self._apply(relation, kind, value)
             return relation
         finally:
             self._active_tables.remove(identity)
@@ -194,20 +233,19 @@ class FlightSqlCompiler:
             return relation
         if kind == "head":
             count = _non_negative_count("head", value)
-            relation.sql = f"SELECT * FROM ({relation.sql}) AS _zippy_q LIMIT {count}"
+            relation.sql = self._row_range_input(relation) + f" LIMIT {count}"
             return relation
         if kind == "slice":
             if not isinstance(value, dict):
                 raise TypeError("Flight slice plan must be a mapping")
             offset = _non_negative_count("slice offset", value.get("offset", 0))
             length = value.get("length")
+            ordered_input = self._row_range_input(relation)
             if length is None:
-                relation.sql = f"SELECT * FROM ({relation.sql}) AS _zippy_q OFFSET {offset}"
+                relation.sql = f"{ordered_input} OFFSET {offset}"
             else:
                 count = _non_negative_count("slice length", length)
-                relation.sql = (
-                    f"SELECT * FROM ({relation.sql}) AS _zippy_q LIMIT {count} OFFSET {offset}"
-                )
+                relation.sql = f"{ordered_input} LIMIT {count} OFFSET {offset}"
             return relation
         if kind == "tail":
             count = _non_negative_count("tail", value)
@@ -215,7 +253,7 @@ class FlightSqlCompiler:
                 raise ValueError("Flight tail requires an explicit preceding sort")
             reversed_order = [(name, not descending) for name, descending in relation.ordering]
             limited = self._ordered_sql(relation.sql, reversed_order)
-            relation.sql = f"SELECT * FROM ({limited}) AS _zippy_tail LIMIT {count}"
+            relation.sql = f"{limited} LIMIT {count}"
             relation.sql = self._ordered_sql(relation.sql, relation.ordering)
             return relation
         if kind == "join":
@@ -281,6 +319,14 @@ class FlightSqlCompiler:
         )
         return _Relation(sql=sql, columns=output_columns, ordering=[])
 
+    @classmethod
+    def _row_range_input(cls, relation: _Relation) -> str:
+        # SQL only binds row selection to ordering in the same query block. An
+        # ORDER BY inside a subquery can disappear during projection/repartition.
+        if relation.ordering:
+            return cls._ordered_sql(relation.sql, relation.ordering)
+        return f"SELECT * FROM ({relation.sql}) AS _zippy_q"
+
     @staticmethod
     def _ordered_sql(sql: str, ordering: list[tuple[str, bool]]) -> str:
         order = ", ".join(
@@ -329,11 +375,10 @@ def expression_to_sql(expression: object, *, include_alias: bool = False) -> str
     if expression.kind == "is_not_null":
         return f"({expression_to_sql(expression.args[0])} IS NOT NULL)"
     if expression.kind == "is_between":
-        return (
-            f"({expression_to_sql(expression.args[0])} BETWEEN "
-            f"{expression_to_sql(expression.args[1])} AND "
-            f"{expression_to_sql(expression.args[2])})"
-        )
+        target_sql = expression_to_sql(expression.args[0])
+        lower = expression_to_sql(expression.args[1])
+        upper = expression_to_sql(expression.args[2])
+        return f"(({target_sql} >= {lower}) AND ({target_sql} <= {upper}))"
     if expression.kind == "unary":
         value = expression_to_sql(expression.args[0])
         if expression.value == "not":
@@ -402,16 +447,6 @@ def _literal_to_sql(value: object) -> str:
     if isinstance(value, str):
         return "'" + value.replace("'", "''") + "'"
     raise ValueError(f"unsupported Flight SQL literal type=[{type(value).__name__}]")
-
-
-def _datetime_to_epoch_ns(value: datetime) -> int:
-    normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    utc = normalized.astimezone(timezone.utc)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    delta = utc - epoch
-    return (
-        delta.days * 86_400_000_000_000 + delta.seconds * 1_000_000_000 + delta.microseconds * 1_000
-    )
 
 
 def _membership_values(value: object) -> list[object]:

@@ -58,7 +58,8 @@ pub struct TableRuntime {
 }
 
 impl TableRuntime {
-    fn from_bootstrap(bootstrap: TableRuntimeBootstrap) -> Self {
+    /// Creates runtime state from a validated Catalog bootstrap.
+    pub fn from_bootstrap(bootstrap: TableRuntimeBootstrap) -> Self {
         Self {
             table: bootstrap.table,
             schema_descriptor: bootstrap.schema_descriptor,
@@ -223,17 +224,6 @@ fn validate_bootstrap(
         ))
         .with_table_id(table.table_id));
     }
-    if matches!(
-        snapshot.committed_log_offset,
-        OffsetWatermark::LegacyUnknown
-    ) {
-        return Err(ServerError::new(
-            ErrorCode::UnsupportedPlan,
-            "native table runtime cannot recover a legacy-unknown committed log offset",
-        )
-        .with_table_id(table.table_id)
-        .with_retryable(false));
-    }
     Ok(())
 }
 
@@ -336,21 +326,6 @@ mod tests {
             let error = TableRuntimeRegistry::from_bootstraps(9, bootstraps).unwrap_err();
             assert_eq!(error.code(), ErrorCode::DataCorruption);
         }
-    }
-
-    #[test]
-    fn bootstrap_rejects_unknown_legacy_offset() {
-        let mut value = bootstrap(10);
-        value.snapshot.committed_log_offset = OffsetWatermark::LegacyUnknown;
-
-        let error = TableRuntimeBootstrap::new(
-            value.table,
-            value.schema_descriptor,
-            value.schema,
-            value.snapshot,
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::UnsupportedPlan);
     }
 
     #[test]

@@ -1,5 +1,8 @@
 # Zippy Audit Closure 2026-05-10
 
+> 历史记录：以下结论和测量属于文中日期，不作为当前实现状态。当前事实见
+> [能力表](current-capabilities-2026-09-21.md)，后续工作见[收敛方案](single-trunk-convergence-plan.md)。
+
 ## Summary
 
 This document closes the `2026-05-08` audit findings by status. It separates

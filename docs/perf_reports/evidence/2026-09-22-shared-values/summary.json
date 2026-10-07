@@ -1,0 +1,252 @@
+{
+  "date": "2026-09-22",
+  "batch": 29,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F14",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "shared_contracts": {
+    "row_class": "zippy_client.row.Row",
+    "expression_factories_arguments_serializer_and_temporal_normalization": "zippy_client.expressions",
+    "main_duplicate_classes_and_functions_removed": 14,
+    "main_duplicate_regex_removed": true,
+    "timestamp_row_representation": "integer in source schema unit, null preserved",
+    "datetime_roundtrip_for_timestamp_rows": false,
+    "malformed_calendar_grammar_and_offset_rejected": true,
+    "nanosecond_subclass_precision_and_naive_schema_timezone_tested": true,
+    "actual_pandas_version_matrix_tested": false,
+    "calendar_dst_day_lengths_tested": [
+      23,
+      25
+    ],
+    "legacy_main_subscriptions_and_producers_removed": false
+  },
+  "validation": {
+    "python_full_initial": {
+      "path": "/tmp/zippy-shared-time-full.log",
+      "exit_code": 1,
+      "sha256": "93b966a3ea809b2996edb999a3eb68b6bedf26d1aa8161ce228f93fc7b7cce7a",
+      "tail": [
+        "python/zippy/__init__.py:3660: RuntimeError",
+        "=========================== short test summary info ============================",
+        "FAILED pytests/test_python_api.py::test_remote_read_table_collect_sends_plan_to_gateway",
+        "1 failed, 843 passed, 1 skipped in 68.89s (0:01:08)"
+      ]
+    },
+    "python_full_final": {
+      "path": "/tmp/zippy-shared-time-full-final.log",
+      "exit_code": 0,
+      "sha256": "32fe417f46dd221715adb162b43923bed3f94049425cf1727bfafcbc58054af4",
+      "tail": [
+        "........................................................................ [ 85%]",
+        "........................................................................ [ 93%]",
+        ".....................................................                    [100%]",
+        "844 passed, 1 skipped in 68.35s (0:01:08)"
+      ]
+    },
+    "final_main_integration": {
+      "path": "/tmp/zippy-shared-time-integration-final.log",
+      "exit_code": 0,
+      "sha256": "044b45f716b976e3214fa8a8886c1d04c34d0a3e7a4e1be0b906470ff410e5f3",
+      "tail": [
+        "...............................................................s........ [ 59%]",
+        ".................................................                        [100%]",
+        "120 passed, 1 skipped, 339 deselected in 22.03s"
+      ]
+    },
+    "shared_value_contracts": {
+      "path": "/tmp/zippy-shared-time-new-tests.log",
+      "exit_code": 0,
+      "sha256": "8b53f7feb4513a9e1520bc9e57b09ea8199f6c5f1d9701c1142277462a675837",
+      "tail": [
+        "........................                                                 [100%]",
+        "24 passed in 0.15s"
+      ]
+    },
+    "client_coverage": {
+      "path": "/tmp/zippy-shared-time-client.log",
+      "exit_code": 0,
+      "sha256": "baedae4e49112538f46eca654ec5e699c596bbd3b6791fedaa1b18e72f1faf58",
+      "tail": [
+        "------------------------------------------------------------------------------------------",
+        "TOTAL                                                         3706    560    85%",
+        "Required test coverage of 80% reached. Total coverage: 84.89%",
+        "211 passed in 2.76s"
+      ]
+    },
+    "isolated_arrow_23": {
+      "path": "/tmp/zippy-shared-time-isolated-23.0.1.log",
+      "exit_code": 0,
+      "sha256": "1be87c864110c0494c51499ea74df6b04943942bcacce2e9a4becb265d3b77b3",
+      "tail": [
+        "----------------------------------------------------------------------------------------------------------------",
+        "TOTAL                                                                               3706    678    82%",
+        "Required test coverage of 80% reached. Total coverage: 81.71%",
+        "206 passed, 1 skipped in 2.55s"
+      ]
+    },
+    "isolated_arrow_25": {
+      "path": "/tmp/zippy-shared-time-isolated-25.0.1.log",
+      "exit_code": 0,
+      "sha256": "d51c8019bb11e0f3206ca03ee926ec7f30574db7538cdeae24f368dceab2b489",
+      "tail": [
+        "----------------------------------------------------------------------------------------------------------------",
+        "TOTAL                                                                               3706    678    82%",
+        "Required test coverage of 80% reached. Total coverage: 81.71%",
+        "206 passed, 1 skipped in 2.61s"
+      ]
+    },
+    "native_matrix": {
+      "path": "/tmp/zippy-shared-time-native.log",
+      "exit_code": 0,
+      "sha256": "e7bbfb9375de059297d13dc0981beaf96093374693c4c90be04db22327e9b49a",
+      "tail": [
+        "2026-09-22 14:16:18.034 | ERROR    | zippy.compute:_fail:255 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:16:18.076 | ERROR    | zippy.compute:_fail:255 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:16:18.119 | ERROR    | zippy.compute:_fail:255 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-shared-time-black-all.log",
+      "exit_code": 0,
+      "sha256": "7eb8ed3009e2023293a82e675344275f0066cec028dfd7346394f42a0b8cd1a2",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "95 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-shared-time-ruff.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-shared-time-mypy-root.log",
+      "exit_code": 0,
+      "sha256": "fc409d91e6c781eb25a1ec1310b7fcb0086b74ed3aa2c415bcd73f884f23f07a",
+      "tail": [
+        "Success: no issues found in 15 source files"
+      ]
+    },
+    "mypy_changed": {
+      "path": "/tmp/zippy-shared-time-mypy-changed.log",
+      "exit_code": 0,
+      "sha256": "fa935e779fe5886f2480e415c7e46616bdedad407f9da1cca28e7d341d95f4d7",
+      "tail": [
+        "Success: no issues found in 24 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-shared-time-mypy-full.log",
+      "exit_code": 1,
+      "sha256": "ed914984d3fd410ad3c69155d68552f071fc0d603ee75acc370ad4c080db6b58",
+      "tail": [
+        "pytests/test_python_cli.py:956: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:1043: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:1044: error: Value of type \"object\" is not indexable  [index]",
+        "Found 976 errors in 12 files (checked 94 source files)"
+      ]
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-shared-time-diff.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    }
+  },
+  "initial_full_test_failure": "Gateway fixture free-port reservation race: Address already in use; original test kept, standalone full rerun passed",
+  "native_matrix": {
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_sha256": {
+    "python/zippy/__init__.py": "4aee266b5a773996ba96633ff695b53b084f5bcd20caf34245a39da902f8bb88",
+    "clients/python/src/zippy_client/expressions.py": "6e1f9a56071490eee2cb60a0e819ea10d049d2ab6b176bf4745c3379eeabab12",
+    "clients/python/src/zippy_client/row.py": "123b30051a19e824331679b888dd066d72bb52d270e968f8f98f1aa0a244bebd",
+    "clients/python/tests/test_temporal_contract.py": "572a8e2500198b4b8e9c684a7aa59f3db19905e21b045e1a6251ece9a13b57e9",
+    "pytests/test_shared_client_values.py": "5800dec6bf4ebd0b580893b4da560a412571e25e005667198ea23fc36d876b41",
+    "pytests/test_python_api.py": "b783ed551f870db7a2ca15c74a0377cb1e702aa116a95610073ae81f20f7002b",
+    "scripts/check_native_client.py": "c2e222a83f862753cc8e83580b83245e1d0c29b0027d80c2af473e725bb12089",
+    "clients/python/README.md": "d4bc24657c2ea4e19a95c077aa91ab1ad26aa0d6103c22fc0e3d32fc2ca811b1",
+    "docs/convergence-shared-values-2026-09-22.md": "5a74e5924d8aa935da5dffc201527229048162a014f5ad15348b0ba5ba72d72e"
+  },
+  "server_sha256": "05572a341f970070fae99e8c41f7fa5052cfa3d192404cae14cade3ccef493d9",
+  "rust_changes_this_batch": false,
+  "rust_workspace_and_clippy_rerun_this_batch": false,
+  "environment": "Linux x86_64, CPython 3.11; Arrow 23.0.1 and 25.0.1 isolated client installs"
+}

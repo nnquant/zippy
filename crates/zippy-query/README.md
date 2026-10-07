@@ -124,3 +124,16 @@ the stream on peer disconnect. Quota-enforced spill/temp storage is not installe
 is disabled and over-budget complex operators return `RESOURCE_EXHAUSTED`. The footer and row-group
 envelopes cover valid Zippy-managed Parquet files; treating arbitrary hostile local files as input
 would additionally require a bounded Thrift/page decoder or process/allocator isolation.
+
+
+Derived SQL relations are pre-admitted by bounding recursive projection substitution and
+wildcard expansion before DataFusion planning. Lateral relations and column-list aliases
+remain rejected. Built-in `coalesce` and fixed-width `to_timestamp_nanos` are covered by the
+physical output envelope; COALESCE copies existing values and reserves temporary arrays and
+selection masks. Arbitrary scalar functions remain outside the allowlist.
+
+These are conservative reservations, not observed heap usage. The shared-client nested outer
+join regression requires about 2.51 GB of planning/task budget; the native acceptance harness
+explicitly configures 4 GiB and checks that a 1 GiB per-query override fails. The production
+512 MiB default is unchanged, so complex query admission still requires an explicit resource
+budget. See `docs/convergence-shared-query-2026-09-22.md` for the remaining boundary.

@@ -1,0 +1,578 @@
+{
+  "date": "2026-09-22",
+  "batch": 34,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F13",
+    "F14",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "removed": [
+    "client GatewayTransport",
+    "client GatewayWriter",
+    "client Gateway frame protocol",
+    "gateway_local and gateway_remote transports",
+    "Gateway token/config/capability parsing",
+    "Gateway lazy query interpreter",
+    "old registry readiness poll",
+    "Table collect/profile ignored stream argument"
+  ],
+  "native_query_fix": {
+    "input": [
+      3,
+      1,
+      2
+    ],
+    "operation": "sort(sequence).slice(1,1).rename(sequence=seq).drop(instrument_id)",
+    "before": {
+      "seq": [
+        3
+      ]
+    },
+    "after": {
+      "seq": [
+        2
+      ]
+    },
+    "cause": "ORDER BY and LIMIT/OFFSET were in separate SQL query blocks",
+    "verified": "ascending and descending head, finite/open slice, tail and renamed range across real server restarts"
+  },
+  "validation": {
+    "client_coverage": {
+      "path": "/tmp/zippy-flight-only-client-final.log",
+      "exit_code": 0,
+      "sha256": "cbb174fc78e380c7206366fac75782c48ffd6d60a6d157c6234b93d2031542a4",
+      "tail": [
+        "------------------------------------------------------------------------------------------",
+        "TOTAL                                                         3245    482    85%",
+        "Required test coverage of 80% reached. Total coverage: 85.15%",
+        "203 passed in 3.46s"
+      ]
+    },
+    "pytest": {
+      "path": "/tmp/zippy-flight-only-pytest-final2.log",
+      "exit_code": 0,
+      "sha256": "e6d4362f21e0f6916f49400d6ceb685b96e30b3d4fbfa97f4dc0964ae9910474",
+      "tail": [
+        "........................................................................ [ 91%]",
+        "........................................................................ [ 99%]",
+        "....                                                                     [100%]",
+        "867 passed, 1 skipped in 65.43s (0:01:05)"
+      ]
+    },
+    "native_repository_binary": {
+      "path": "/tmp/zippy-flight-only-native-fixed.log",
+      "exit_code": 0,
+      "sha256": "b6fc8f65545d4203b1cd7c7128ebe29cde767b8a14d2d1f1bc5bba56981cb36d",
+      "tail": [
+        "2026-09-22 16:05:24.559 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:05:24.600 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:05:24.643 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"flight_only_buffered_writer_lazy_plan_and_restart\": true, \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_finite_replay_examples_presubscription_and_output_after_stop\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "native_installed_cli": {
+      "path": "/tmp/zippy-flight-only-installed-cli.log",
+      "exit_code": 0,
+      "sha256": "918c7706f53807270f3d2c0f07973a56c8fac1475d996b1639d9a1085c22b24f",
+      "tail": [
+        "2026-09-22 16:09:07.724 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:09:07.769 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:09:07.813 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"flight_only_buffered_writer_lazy_plan_and_restart\": true, \"independent_client_native_child_without_main_import\": true, \"server_launch\": \"installed_cli\", \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_finite_replay_examples_presubscription_and_output_after_stop\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "archive_release_arrow23": {
+      "path": "/tmp/zippy-flight-only-arrow23.log",
+      "exit_code": 0,
+      "sha256": "53c1290e3469133e168a7e57b797985a6fb22297655ba0f193a47bb86f513da5",
+      "tail": [
+        "2026-09-22 16:12:37.804 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:12:37.827 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:12:37.853 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"flight_only_buffered_writer_lazy_plan_and_restart\": true, \"independent_client_native_child_without_main_import\": true, \"server_launch\": \"installed_cli\", \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_finite_replay_examples_presubscription_and_output_after_stop\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "isolated_client_arrow25": {
+      "path": "/tmp/zippy-flight-only-arrow25.log",
+      "exit_code": 0,
+      "sha256": "4edb438d6f186069d4ee3238e07714ae036a05acf97365bd9701da242d591acd",
+      "tail": [
+        "----------------------------------------------------------------------------------------------------------------",
+        "TOTAL                                                                               3251    483    85%",
+        "Required test coverage of 80% reached. Total coverage: 85.14%",
+        "203 passed in 2.96s"
+      ]
+    },
+    "isolated_main_arrow25": {
+      "path": "/tmp/zippy-flight-only-main-arrow25.log",
+      "exit_code": 0,
+      "sha256": "d8a9435e9318606878be4f3a1449cff0409753a9cb317820c6b916a442e5a8c3",
+      "tail": [
+        "2026-09-22 16:13:58.831 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:13:58.857 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:13:58.882 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"flight_only_buffered_writer_lazy_plan_and_restart\": true, \"independent_client_native_child_without_main_import\": true, \"server_launch\": \"installed_cli\", \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_finite_replay_examples_presubscription_and_output_after_stop\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"25.0.1\"}"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-flight-only-black-final.log",
+      "exit_code": 0,
+      "sha256": "f87430cdd82bd19507f4e5943582f00c36c21d93e2cc293c01e87e65c0ab3dfa",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "100 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-flight-only-ruff-final.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-flight-only-mypy-root-final.log",
+      "exit_code": 0,
+      "sha256": "59cc4d21606d1f60735af82101c6094ef4d27a1054cb5061988711c9db04c37e",
+      "tail": [
+        "Success: no issues found in 17 source files"
+      ]
+    },
+    "mypy_changed": {
+      "path": "/tmp/zippy-flight-only-mypy-final.log",
+      "exit_code": 0,
+      "sha256": "d0c600371db0480c336f7f38c6394ca8923c62af2b00f235b1ab8a7841b7af23",
+      "tail": [
+        "clients/python/tests/test_flight_transport.py:2238: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]",
+        "clients/python/tests/test_flight_transport.py:2242: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]",
+        "clients/python/tests/test_flight_transport.py:2260: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]",
+        "Success: no issues found in 30 source files"
+      ]
+    },
+    "mypy_client_strict": {
+      "path": "/tmp/zippy-flight-only-mypy-client-strict.log",
+      "exit_code": 0,
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f",
+      "tail": [
+        "Success: no issues found in 27 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-flight-only-mypy-all-final.log",
+      "exit_code": 1,
+      "sha256": "9877a98d5299bf309212f5f580afd901a38bf992b4eeed28fd4babc75d90d8ea",
+      "tail": [
+        "pytests/test_python_cli.py:956: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:1043: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:1044: error: Value of type \"object\" is not indexable  [index]",
+        "Found 961 errors in 10 files (checked 99 source files)"
+      ]
+    },
+    "rust_format": {
+      "path": "/tmp/zippy-flight-only-fmt-final.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    },
+    "diff": {
+      "path": "/tmp/zippy-flight-only-diff-final.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    },
+    "initial_import_failure": {
+      "path": "/tmp/zippy-flight-only-client-initial.log",
+      "exit_code": 2,
+      "sha256": "615a774a6f0e2ef7f2f518d4c0b68f7e293898a7d7ebc2e3bf35d30ecaa745f7",
+      "tail": [
+        "=========================== short test summary info ============================",
+        "ERROR clients/python/tests/test_endpoints_router.py",
+        "!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!",
+        "1 error in 0.78s"
+      ]
+    },
+    "stale_router_tests": {
+      "path": "/tmp/zippy-flight-only-client-next.log",
+      "exit_code": 1,
+      "sha256": "67363a8b533210c91ea11178cbd43d19f9c232d7865756ccbc54608f1923c47e",
+      "tail": [
+        "=========================== short test summary info ============================",
+        "FAILED clients/python/tests/test_flight_subscriber.py::test_client_callbacks_never_consult_gateway_or_legacy_registry",
+        "FAILED clients/python/tests/test_flight_transport.py::test_flight_writer_buffers_rows_and_router_prefers_flight",
+        "2 failed, 187 passed in 3.07s"
+      ]
+    },
+    "native_sort_failure": {
+      "path": "/tmp/zippy-flight-only-native-debug.log",
+      "exit_code": 1,
+      "sha256": "e429a74fc02c161b407ee82824ea4046722ba1a38e4072f2a8e8ef6b57d90ec5",
+      "tail": [
+        "  File \"/home/jiangda/develop/zippy/scripts/check_native_client.py\", line 88, in verify_shared_sql",
+        "    assert result.to_pydict() == {\"seq\": [2]}, (result.to_pydict(), plan.explain())",
+        "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+        "AssertionError: ({'seq': [3]}, {'source': 'flight_buffered_plan', 'namespace': 'market', 'transport': 'flight_local', 'flight_endpoint': '127.0.0.1:46942', 'snapshot': 'per_query', 'sql': 'SELECT * FROM (SELECT \"seq\" FROM (SELECT \"sequence\" AS \"seq\", \"instrument_id\" FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM \"zippy_source_0\") AS _zippy_ordered ORDER BY \"sequence\" ASC) AS _zippy_q LIMIT 1 OFFSET 1) AS _zippy_q) AS _zippy_q) AS _zippy_ordered ORDER BY \"seq\" ASC', 'bindings': [{'sql_name': 'zippy_source_0', 'table': {'namespace': 'market', 'table': 'flight_buffered_plan'}}]})"
+      ]
+    },
+    "old_gateway_smoke_failure": {
+      "path": "/tmp/zippy-flight-only-pytest-final.log",
+      "exit_code": 1,
+      "sha256": "14d925d3b0a052e1f0d50cc667554c6c479b6095f9d5eb647ea40b4c0f87c02a",
+      "tail": [
+        "pytests/test_standalone_gateway_smoke_client.py:249: AssertionError",
+        "=========================== short test summary info ============================",
+        "FAILED pytests/test_standalone_gateway_smoke_client.py::test_independent_remote_zippy_client_smoke",
+        "1 failed, 867 passed, 1 skipped in 67.07s (0:01:07)"
+      ]
+    }
+  },
+  "native_matrices": {
+    "native-fixed": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "main_package_explicit_client_sql_aggregate_after_restart": true,
+      "flight_only_buffered_writer_lazy_plan_and_restart": true,
+      "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+      "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+      "native_fixed_snapshot_expiry_roles_and_capacity": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+      "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+      "native_compute_empty_source_schema_guard": true,
+      "native_compute_parquet_plugin_three_native_output_kinds": true,
+      "native_compute_chain_and_plain_producer_after_restart": true,
+      "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_repeated_server_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "installed-cli": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "main_package_explicit_client_sql_aggregate_after_restart": true,
+      "flight_only_buffered_writer_lazy_plan_and_restart": true,
+      "independent_client_native_child_without_main_import": true,
+      "server_launch": "installed_cli",
+      "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+      "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+      "native_fixed_snapshot_expiry_roles_and_capacity": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+      "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+      "native_compute_empty_source_schema_guard": true,
+      "native_compute_parquet_plugin_three_native_output_kinds": true,
+      "native_compute_chain_and_plain_producer_after_restart": true,
+      "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_repeated_server_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "arrow23": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "main_package_explicit_client_sql_aggregate_after_restart": true,
+      "flight_only_buffered_writer_lazy_plan_and_restart": true,
+      "independent_client_native_child_without_main_import": true,
+      "server_launch": "installed_cli",
+      "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+      "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+      "native_fixed_snapshot_expiry_roles_and_capacity": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+      "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+      "native_compute_empty_source_schema_guard": true,
+      "native_compute_parquet_plugin_three_native_output_kinds": true,
+      "native_compute_chain_and_plain_producer_after_restart": true,
+      "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_repeated_server_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "main-arrow25": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "main_package_explicit_client_sql_aggregate_after_restart": true,
+      "flight_only_buffered_writer_lazy_plan_and_restart": true,
+      "independent_client_native_child_without_main_import": true,
+      "server_launch": "installed_cli",
+      "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+      "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+      "native_fixed_snapshot_expiry_roles_and_capacity": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+      "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+      "native_compute_empty_source_schema_guard": true,
+      "native_compute_parquet_plugin_three_native_output_kinds": true,
+      "native_compute_chain_and_plain_producer_after_restart": true,
+      "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_repeated_server_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "25.0.1"
+    }
+  },
+  "coverage_percent": {
+    "client_before_sql_fix": 85.15,
+    "isolated_arrow23": 85.14,
+    "isolated_arrow25": 85.14
+  },
+  "source_sha256": {
+    "clients/python/src/zippy_client/query.py": "15f104e7320d86e456444d383e0f39ecbab60b42d2386e8b8fbb576c78454825",
+    "clients/python/src/zippy_client/log_reader.py": "afc4a87e4155e8ba31ef032bf00bf557a1e63274563268330b4d7ca72224cc47",
+    "clients/python/src/zippy_client/endpoints.py": "8b44b61f5b5a2636578d611a499da44014aed8c518315a1ec2cceb28b70d21db",
+    "clients/python/src/zippy_client/row.py": "123b30051a19e824331679b888dd066d72bb52d270e968f8f98f1aa0a244bebd",
+    "clients/python/src/zippy_client/arrow_values.py": "2341e236513093d27ef732bd55a6322a70e6db1b514c9cb90b8c4f857f17a7a6",
+    "clients/python/src/zippy_client/client.py": "9fd5f0b1278aa62e04c9ad457ea73f5770e1bf2a50ebe4b670c3c22ef7ebbb8b",
+    "clients/python/src/zippy_client/flight_subscriber.py": "d16e247d0acb879019a6b09f5643489e403cded0bab3eba075feecfe6143ecb3",
+    "clients/python/src/zippy_client/__init__.py": "40ebc9faddd205bf0bc7a5be1c1b95f26aed0b604858feb0dd440c865a14eadb",
+    "clients/python/src/zippy_client/control.py": "1274c9c7c7c944ea8a5d8c33a18ab320967517b3d4a320b87807ff2b31da0283",
+    "clients/python/src/zippy_client/expressions.py": "67293f424a31f8cd171aa0ece9d119d626464f4b621679bb887bb23380a0a82b",
+    "clients/python/src/zippy_client/sql.py": "39834957de1437e16ebe26d30a9a490dde9e823129ce7062d5ed264cd346d6ae",
+    "clients/python/src/zippy_client/writer.py": "73342660af9ac3d02de0b7c469a8f3d3382732e814d0dad7352660d42c01f693",
+    "clients/python/src/zippy_client/errors.py": "617a39351cb96dce2e4178febcab2e6564d9ec365f6462df3ed5fece2ac6f040",
+    "clients/python/src/zippy_client/models.py": "3433d236e10fc5d0e8526639673eee7f12376767377cffea2a6c4da7bf112f29",
+    "clients/python/src/zippy_client/router.py": "f369d76153330e5f5e366a777619adf9cfd03db50fa4336b67f9e34277b42b2a",
+    "clients/python/src/zippy_client/snapshot.py": "20a5c8f79e19e8de29183efe0ff0e01e71aaa5b6d481df4096a41e9253353430",
+    "clients/python/src/zippy_client/_generated/__init__.py": "5fbfcb0f75bf816bfde813629a33b76446dd8b0e4a2a0b7c7faa2a967bb051f0",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.py": "5d0e6e67208952e7f3a133f5760af2602d623d6eb86e685ae1cac4d8e817f15f",
+    "clients/python/src/zippy_client/transports/flight.py": "d61ab7e035def83743f402f709fe80f524c701af469e3b0e55769d1e45c5f122",
+    "clients/python/src/zippy_client/transports/__init__.py": "2dc0101cc438d77a9979dc5ae8027cc525b82206ffad4958fc164420190751bf",
+    "clients/python/tests/test_flight_transport.py": "d859db2c60d83d39c5ef2f4b6d6c1f08f76f69444f42e1681693cdaaa9b24473",
+    "clients/python/tests/test_expressions_protocol.py": "faca235ad970b21c3556bce50eb86a6b27f7e870c81334ff8bb30edefdc20569",
+    "clients/python/tests/test_unit_contracts.py": "2043acfccbc3ec610d44ca1bcc287f06bf067f592709c508d1b860ca12457f77",
+    "clients/python/tests/test_flight_subscriber.py": "d7adce059b5fce5d69cf01c45a684cdd1c5b1996d0946c7cdb5c5149c1af9a27",
+    "clients/python/tests/test_temporal_contract.py": "572a8e2500198b4b8e9c684a7aa59f3db19905e21b045e1a6251ece9a13b57e9",
+    "clients/python/tests/test_log_reader.py": "86d70eab94b710572e45dbebe2de6ee18f85fd27350e34d07fec5e5f591dd29b",
+    "clients/python/tests/test_endpoints_router.py": "8b18f682d48f15940bd4ce5669bb930a4e5e229dbb19c9db7fec2c1da416d7d4",
+    "clients/python/README.md": "3236913f820bc5e3cff4c79f78ed546179ed6c9828d82b7b80db9fa048f9c5de",
+    "scripts/check_distributions.py": "e139745d36a885dc2b389e2001feb3880ed043b21abfa97a4f3e7e0256eca03a",
+    "scripts/check_native_client.py": "01cd3fe2db20977b5bcba758a44cb3e184ab6d98bc8c1bf1c9b41e46199f8c99",
+    "scripts/check_replay_examples.py": "b2cd74cf8d64281de1cefa9fa49d72f20e12a70a739b5e36c4357382a7899f74",
+    "pytests/test_standalone_gateway_smoke_client.py": "8fa8a219d44d5605a64a5d941494800cdbaa5c4ff3fd527fd89c350a15cc1037",
+    "docs/convergence-flight-only-client-2026-09-22.md": "2e71a17ba6de2a0bac30a06615197d3f7928a324f5d240afaecf1b75458a647d",
+    "docs/current-capabilities-2026-09-21.md": "f0e2e0bfa65c431a4e88dd6605f77c884435e263d06c27066436f5acdac060c1",
+    "docs/native-query-service.md": "08aedef9878785bfc144acb7bb8d8f6f34a70099d7122189c365fcc5a131d65b",
+    "examples/examples_guide.md": "c95741fdbf035b9c634f07655ff458068105eebc6529d8cd6432ab390926ea2e"
+  },
+  "wheel_sha256": {
+    "/tmp/zippy-flight-only-release-arrow23/target/wheels/zippy-0.5.0-cp311-cp311-linux_x86_64.whl": "df5a841b59134858214123c6677a72b68d9e718dff4e9eb53503500d26a38416",
+    "/tmp/zippy-flight-only-release-arrow23/wheels/zippy-0.5.0-cp311-cp311-linux_x86_64.whl": "df5a841b59134858214123c6677a72b68d9e718dff4e9eb53503500d26a38416",
+    "/tmp/zippy-flight-only-release-arrow23/wheels/zippy_client-0.1.0-py3-none-any.whl": "c2ca2f81bcee0b9d8a4f679d1b15912f600ea3cd87860ad30fa70ee13c06fbab",
+    "/tmp/zippy-flight-only-release-arrow25/wheels/zippy_client-0.1.0-py3-none-any.whl": "59122840910682339a27f5d57b22e7ec267d22811415347498dc5f711204eeb3"
+  },
+  "main_release": {
+    "source": "archive extracted outside checkout",
+    "arrow_versions": [
+      "23.0.1",
+      "25.0.1"
+    ],
+    "python": "3.11",
+    "platform": "Linux x86_64",
+    "server": "installed zippy server run --foreground",
+    "repository_binary_used": false
+  },
+  "rust_modified": false,
+  "rust_workspace_clippy_rerun": false,
+  "cross_platform_rerun": false,
+  "retained_legacy": "main Table/Session/Pipeline, callbacks, Gateway/server adapters and Legacy/shadow authority",
+  "test_migration": "Gateway-only framing/codec tests retired; native writer/query/restart, fixed snapshot clones, real Flight independent clients and isolated child no-main-import smoke preserve effective behavior."
+}

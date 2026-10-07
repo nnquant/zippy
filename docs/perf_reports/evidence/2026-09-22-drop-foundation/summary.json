@@ -1,0 +1,85 @@
+{
+  "date": "2026-09-22",
+  "batch": 14,
+  "overall_complete": false,
+  "audit_closed_total": 23,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F09",
+    "F10"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "catalog": "full crate suite passed",
+    "rust_workspace": "passed; exit 0, including final ingest retirement and shutdown tests",
+    "clippy": "workspace all-targets all-features -D warnings; passed; exit 0",
+    "rustfmt": "passed; exit 0",
+    "diff_check": "passed; exit 0",
+    "python": "not rerun: this batch changes internal Rust lifecycle primitives, no Python API exposed",
+    "platform": "Linux x86_64; no new cross-platform results"
+  },
+  "acceptance": {
+    "catalog_drop_cas_atomic": true,
+    "catalog_drop_replays_after_restart": true,
+    "historical_snapshots_retained": true,
+    "new_producer_and_manifest_rejected_after_drop": true,
+    "query_pins_and_durable_leases_protect_retired_files": true,
+    "drop_fence_rejects_new_memory_and_durable_mutations": true,
+    "unresolved_wal_acks_prevent_drop_fence": true,
+    "dropping_uncommitted_guard_restores_writing": true,
+    "retirement_invalidates_old_writers": true,
+    "admitted_drop_guard_delays_shutdown": true,
+    "actor_materializer_retirement": false,
+    "same_name_recreation": false,
+    "public_flight_drop": false,
+    "alter_schema": false,
+    "physical_wal_retirement": false,
+    "gateway_removed": false
+  },
+  "evidence": {
+    "catalog_full": {
+      "path": "/tmp/zippy-drop-catalog-tests.log",
+      "sha256": "4294b649716f6aee3b573bb35b33310bd67e1572dd897979f3380df576a81c93"
+    },
+    "catalog_drop_scenario": {
+      "path": "/tmp/zippy-drop-tests.log",
+      "sha256": "fcac9e5f840dcb6f2390f2094aa8283655eabde65f421c8fc3fe26337e0922b2"
+    },
+    "rust_workspace": {
+      "path": "/tmp/zippy-drop-workspace.log",
+      "sha256": "50b921a3720d2e299636215f1224458c83474e59537940a0ac839eac4eb57b5f"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-drop-clippy.log",
+      "sha256": "3f3f763c6eee73ff60a9c6b8f628aae98e9a675d9efab07ccc5936d63b02d359"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-drop-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-drop-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-catalog/src/drop_domain.rs": "2ab6bba8319fefb8697e5c67e065b3c0c8390e96dd8e09522131b8231037ccff",
+    "crates/zippy-catalog/src/domain.rs": "155c0447c658425acfaf01345b3580354d0f60faee898db6072eadfcc2929d83",
+    "crates/zippy-catalog/src/lib.rs": "5fbd4d3c2fde26bd89f555b4f8950a41f367a17bff5667d69d3a8717e1e231a4",
+    "crates/zippy-catalog/src/service.rs": "939aac9bbf15d241791d450a474c5e30a159a92990270e98d749fea006998a5a",
+    "crates/zippy-ingest/src/native.rs": "41cfca06fdb2a5b939bf734fde03a0089f6c5a65c17e80bb36539a11287b6dc7",
+    "crates/zippy-ingest/src/lib.rs": "d274edbc07c363833b64e24a51afb873e935002efbad683f9e84a521158115d2"
+  }
+}

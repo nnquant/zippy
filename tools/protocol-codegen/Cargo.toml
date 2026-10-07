@@ -1,0 +1,13 @@
+[package]
+name = "zippy-protocol-codegen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Development tool only; normal package builds use the checked-in generated files.
+[workspace]
+
+[dependencies]
+prost = "=0.13.5"
+prost-types = "=0.13.5"
+prost-build = "=0.13.5"

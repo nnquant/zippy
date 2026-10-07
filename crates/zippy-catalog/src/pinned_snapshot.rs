@@ -1,13 +1,12 @@
 //! Lease-bound query manifests and controlled physical file readers.
 
 use std::fmt;
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::num::NonZeroU64;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 use zippy_core::OwnedDataDirectory;
 use zippy_types::catalog::{CatalogQuerySnapshot, CatalogSnapshotSelector};
 use zippy_types::storage::{
@@ -71,11 +70,13 @@ impl PinnedSnapshotProjectionProfile {
 struct PinnedSnapshotOwner {
     snapshot: CatalogQuerySnapshot,
     descriptor: CatalogSnapshotPinDescriptor,
-    scan_file_indices: Vec<Box<[usize]>>,
     retained_schema_charge_bytes: Vec<NonZeroU64>,
     projection_profile: PinnedSnapshotProjectionProfile,
+    retained_memory_bytes: NonZeroU64,
     _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
     _data_directory: Arc<OwnedDataDirectory>,
+    // Forks retain the original GC pins and accounting until their last reader completes.
+    _parent: Option<Arc<PinnedSnapshotOwner>>,
     // Keep this field last so owned snapshot data and sidecars drop before admission is released.
     _memory_lease: CatalogSnapshotMemoryLease,
 }
@@ -112,44 +113,19 @@ impl SqliteCatalogPinnedQuerySnapshot {
                 .map(|table| table.selector().clone())
                 .collect(),
         };
-        let scan_file_indices = snapshot
-            .tables()
-            .iter()
-            .map(|table| {
-                let files = table.files().as_slice();
-                let mut indices = (0..files.len()).collect::<Vec<_>>();
-                indices.sort_unstable_by(|left, right| {
-                    let left_file = &files[*left];
-                    let right_file = &files[*right];
-                    match (
-                        left_file.legacy_discovery_order(),
-                        right_file.legacy_discovery_order(),
-                    ) {
-                        (Some(left), Some(right)) => left
-                            .cmp(&right)
-                            .then_with(|| left_file.file_id().cmp(&right_file.file_id())),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => left_file.file_id().cmp(&right_file.file_id()),
-                    }
-                });
-                indices.into_boxed_slice()
-            })
-            .collect::<Vec<_>>();
-        let projection_profile = projection_profile(
-            snapshot.tables().len(),
-            scan_file_indices.as_slice(),
-            retained_schema_charge_bytes.as_slice(),
-        )?;
+        let projection_profile =
+            projection_profile(&snapshot, retained_schema_charge_bytes.as_slice())?;
+        let retained_memory_bytes = retained_snapshot_bytes(&snapshot, &projection_profile)?;
         Ok(Self {
             owner: Arc::new(PinnedSnapshotOwner {
                 snapshot,
                 descriptor,
-                scan_file_indices,
                 retained_schema_charge_bytes,
                 projection_profile,
+                retained_memory_bytes,
                 _pins: pins,
                 _data_directory: data_directory,
+                _parent: None,
                 _memory_lease: memory_lease,
             }),
         })
@@ -174,6 +150,107 @@ impl SqliteCatalogPinnedQuerySnapshot {
     #[must_use]
     pub fn memory_lease_descriptor(&self) -> CatalogSnapshotMemoryLeaseDescriptor {
         self.owner._memory_lease.descriptor()
+    }
+
+    /// Conservative post-decode ownership charge; excludes the completed schema decode peak.
+    pub fn retained_memory_bytes(&self) -> NonZeroU64 {
+        self.owner.retained_memory_bytes
+    }
+
+    /// Rebinds a unique snapshot to an already-admitted lease from the same issuer and query.
+    ///
+    /// All old accounting remains active until replacement succeeds. Once a table or file
+    /// capability has escaped, callers cannot change its authenticated ownership descriptor.
+    pub fn rebind_memory_lease(&mut self, lease: CatalogSnapshotMemoryLease) -> Result<()> {
+        if !self.owner._memory_lease.has_same_issuer(&lease)
+            || self.owner._memory_lease.query_instance_id() != lease.query_instance_id()
+            || lease.reserved_bytes() < self.owner.retained_memory_bytes
+        {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "replacement snapshot memory lease has invalid authority, query, or size",
+            ));
+        }
+        let owner = Arc::get_mut(&mut self.owner).ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Conflict,
+                "shared snapshot cannot change its memory lease",
+            )
+        })?;
+        owner._memory_lease = lease;
+        Ok(())
+    }
+
+    /// Forks selected immutable manifests under a newly admitted query reservation.
+    ///
+    /// The original GC pins remain retained by the child, including after the fixed snapshot
+    /// lease is released. No Catalog lookup occurs, so later schema changes or table replacement
+    /// cannot change the child's identity, schema, file order, or visibility boundary.
+    ///
+    /// :param indices: Nonempty, strictly increasing canonical table ordinals.
+    /// :param lease: Same-issuer reservation attributed to the destination query, covering at
+    ///     least the source snapshot's retained charge before metadata is cloned.
+    /// :returns: Independently accounted child whose physical readers retain both owners.
+    /// :raises ServerError: If authority, attribution, size, or table selection is invalid.
+    pub fn fork_for_query(
+        &self,
+        indices: &[usize],
+        lease: CatalogSnapshotMemoryLease,
+    ) -> Result<Self> {
+        if !self.owner._memory_lease.has_same_issuer(&lease)
+            || lease.query_instance_id().is_none()
+            || lease.reserved_bytes() < self.owner.retained_memory_bytes
+            || indices.is_empty()
+            || indices.windows(2).any(|pair| pair[0] >= pair[1])
+            || indices
+                .last()
+                .is_some_and(|index| *index >= self.table_count())
+        {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "snapshot fork requires valid table ordinals and admitted query authority",
+            ));
+        }
+        let snapshot = CatalogQuerySnapshot::new(
+            self.catalog_revision(),
+            indices
+                .iter()
+                .map(|index| self.owner.snapshot.tables()[*index].clone())
+                .collect(),
+        )
+        .map_err(|error| ServerError::new(ErrorCode::DataCorruption, error.to_string()))?;
+        let retained_schema_charge_bytes = indices
+            .iter()
+            .map(|index| self.owner.retained_schema_charge_bytes[*index])
+            .collect::<Vec<_>>();
+        let projection_profile = projection_profile(&snapshot, &retained_schema_charge_bytes)?;
+        let retained_memory_bytes = retained_snapshot_bytes(&snapshot, &projection_profile)?;
+        if retained_memory_bytes > lease.reserved_bytes() {
+            return Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "snapshot fork exceeds its admitted retained metadata charge",
+            ));
+        }
+        Ok(Self {
+            owner: Arc::new(PinnedSnapshotOwner {
+                descriptor: CatalogSnapshotPinDescriptor {
+                    catalog_revision: snapshot.catalog_revision(),
+                    selectors: snapshot
+                        .tables()
+                        .iter()
+                        .map(|table| table.selector().clone())
+                        .collect(),
+                },
+                snapshot,
+                retained_schema_charge_bytes,
+                projection_profile,
+                retained_memory_bytes,
+                _pins: Vec::new(),
+                _data_directory: Arc::clone(&self.owner._data_directory),
+                _parent: Some(Arc::clone(&self.owner)),
+                _memory_lease: lease,
+            }),
+        })
     }
 
     /// Returns the number of exact table manifests retained by this owner.
@@ -212,29 +289,20 @@ impl SqliteCatalogPinnedQuerySnapshot {
     }
 }
 
+/// Both callers build `retained_schema_charge_bytes` one-to-one with `snapshot.tables()`.
 fn projection_profile(
-    expected_table_count: usize,
-    scan_file_indices: &[Box<[usize]>],
+    snapshot: &CatalogQuerySnapshot,
     retained_schema_charge_bytes: &[NonZeroU64],
 ) -> Result<PinnedSnapshotProjectionProfile> {
-    if scan_file_indices.len() != expected_table_count
-        || retained_schema_charge_bytes.len() != expected_table_count
-    {
-        return Err(ServerError::new(
-            ErrorCode::Internal,
-            "pinned projection sidecar table counts differ",
-        )
-        .with_retryable(false));
-    }
-    let table_count = u64::try_from(scan_file_indices.len()).map_err(|_| {
+    let table_count = u64::try_from(snapshot.tables().len()).map_err(|_| {
         ServerError::new(
             ErrorCode::ResourceExhausted,
             "pinned projection table count exceeds u64",
         )
         .with_retryable(false)
     })?;
-    let file_count = scan_file_indices.iter().try_fold(0_u64, |total, files| {
-        let count = u64::try_from(files.len()).map_err(|_| {
+    let file_count = snapshot.tables().iter().try_fold(0_u64, |total, table| {
+        let count = u64::try_from(table.files().len()).map_err(|_| {
             ServerError::new(
                 ErrorCode::ResourceExhausted,
                 "pinned projection file count exceeds u64",
@@ -266,6 +334,50 @@ fn projection_profile(
         file_count,
         retained_schema_bytes,
     })
+}
+
+/// The worker constructs tightly sized table/file/lineage containers. Count the complete
+/// serialized metadata without allocating a copy, then apply the same 32x expansion used by
+/// snapshot read admission. Explicit sidecar and decoded-schema charges cover nonserialized
+/// ownership. This is a logical allocator envelope, not an RSS measurement.
+fn retained_snapshot_bytes(
+    snapshot: &CatalogQuerySnapshot,
+    profile: &PinnedSnapshotProjectionProfile,
+) -> Result<NonZeroU64> {
+    struct Counter(u64);
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| io::Error::other("snapshot metadata length overflowed"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, snapshot).map_err(|error| {
+        ServerError::new(
+            ErrorCode::DataCorruption,
+            format!("cannot measure retained snapshot metadata error=[{error}]"),
+        )
+    })?;
+    counter
+        .0
+        .checked_mul(32)
+        .and_then(|bytes| bytes.checked_add(profile.table_count.checked_mul(4096)?))
+        .and_then(|bytes| bytes.checked_add(profile.file_count.checked_mul(512)?))
+        .and_then(|bytes| bytes.checked_add(profile.retained_schema_bytes))
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "retained snapshot memory charge overflowed",
+            )
+        })
 }
 
 impl CatalogSnapshotPinGuard for SqliteCatalogPinnedQuerySnapshot {
@@ -341,7 +453,7 @@ impl PinnedTableManifest {
     /// Returns the number of visible physical files in this exact snapshot.
     #[must_use]
     pub fn file_count(&self) -> usize {
-        self.scan_file_indices().len()
+        self.raw_table().files().len()
     }
 
     /// Returns true when the exact snapshot contains no persisted files.
@@ -352,31 +464,21 @@ impl PinnedTableManifest {
 
     /// Creates lease-bound file tasks in the exact deterministic Catalog manifest order.
     pub fn files(&self) -> impl ExactSizeIterator<Item = PinnedDataFile> + '_ {
-        self.scan_file_indices()
-            .iter()
-            .copied()
-            .map(|file_index| PinnedDataFile {
-                owner: Arc::clone(&self.owner),
-                table_index: self.table_index,
-                file_index,
-            })
+        (0..self.file_count()).map(|file_index| PinnedDataFile {
+            owner: Arc::clone(&self.owner),
+            table_index: self.table_index,
+            file_index,
+        })
     }
 
     /// Creates one lease-bound file task by deterministic manifest index.
     #[must_use]
     pub fn file(&self, file_index: usize) -> Option<PinnedDataFile> {
-        self.scan_file_indices()
-            .get(file_index)
-            .copied()
-            .map(|file_index| PinnedDataFile {
-                owner: Arc::clone(&self.owner),
-                table_index: self.table_index,
-                file_index,
-            })
-    }
-
-    fn scan_file_indices(&self) -> &[usize] {
-        &self.owner.scan_file_indices[self.table_index]
+        (file_index < self.file_count()).then(|| PinnedDataFile {
+            owner: Arc::clone(&self.owner),
+            table_index: self.table_index,
+            file_index,
+        })
     }
 
     fn raw_table(&self) -> &zippy_types::catalog::CatalogTableSnapshot {
@@ -399,8 +501,6 @@ impl fmt::Debug for PinnedTableManifest {
 pub enum PinnedDataFileLocationKind {
     /// A server-managed file below the exclusively owned data root.
     Managed,
-    /// An explicitly mounted read-only legacy file outside the managed root.
-    ExternalLegacy,
 }
 
 /// One physical scan task that retains the complete query snapshot owner.
@@ -451,12 +551,11 @@ impl PinnedDataFile {
         self.raw_file().file.row_count
     }
 
-    /// Returns whether the file is managed or an external read-only legacy file.
+    /// Returns the managed file ownership class.
     #[must_use]
     pub fn location_kind(&self) -> PinnedDataFileLocationKind {
         match &self.raw_file().file.location {
             DataFileLocation::Managed(_) => PinnedDataFileLocationKind::Managed,
-            DataFileLocation::ExternalLegacy(_) => PinnedDataFileLocationKind::ExternalLegacy,
         }
     }
 
@@ -517,14 +616,8 @@ impl PinnedDataFile {
     /// Opens the physical file without exposing its Catalog path.
     ///
     /// Managed paths are traversed descriptor-relative with `NOFOLLOW`. The opened object must be
-    /// a secure regular file of the Catalog-recorded size. External legacy files are additionally
-    /// hashed through the same opened descriptor and compared with the Catalog checksum before the
-    /// cursor is rewound to zero. The returned reader retains the same opaque snapshot owner.
-    ///
-    /// This is synchronous physical I/O and must run on a bounded blocking scan worker, never on an
-    /// async runtime worker. External legacy opens perform a full-file checksum pass, so an
-    /// executor must open one reader per physical file scan rather than one reader per parallel
-    /// worker for the same file.
+    /// a secure regular file of the Catalog-recorded size. Opening may perform blocking
+    /// filesystem operations and must run on a blocking scan worker.
     pub fn open_reader(&self) -> Result<PinnedDataFileReader> {
         let file = open_pinned_file(&self.owner._data_directory, self.raw_file())?;
         Ok(PinnedDataFileReader {
@@ -698,35 +791,14 @@ fn open_pinned_file(
     data_directory: &OwnedDataDirectory,
     descriptor: &DataFileDescriptor,
 ) -> Result<File> {
-    let managed;
-    let (root, path) = match &descriptor.file.location {
-        DataFileLocation::Managed(path) => {
-            managed = true;
-            let root = data_directory.try_clone_root_directory().map_err(|_| {
-                file_io_error(
-                    descriptor,
-                    "clone owned data-root descriptor for pinned read",
-                )
-            })?;
-            (root, Path::new(path.as_str()))
-        }
-        DataFileLocation::ExternalLegacy(path) => {
-            managed = false;
-            let root = rustix::fs::open(
-                Path::new("/"),
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map(File::from)
-            .map_err(|error| map_open_error(descriptor, "open external root", error))?;
-            (root, Path::new(path.as_str()))
-        }
-    };
-
-    let components = normal_path_components(path, managed, descriptor)?;
+    let DataFileLocation::Managed(path) = &descriptor.file.location;
+    let root = data_directory.try_clone_root_directory().map_err(|_| {
+        file_io_error(
+            descriptor,
+            "clone owned data-root descriptor for pinned read",
+        )
+    })?;
+    let components = normal_path_components(Path::new(path.as_str()), descriptor)?;
     let Some((file_name, directories)) = components.split_last() else {
         return Err(file_corruption(
             descriptor,
@@ -735,7 +807,7 @@ fn open_pinned_file(
     };
     let mut parent = root;
     for directory_name in directories {
-        parent = open_directory_at(&parent, directory_name, managed, descriptor)?;
+        parent = open_directory_at(&parent, directory_name, descriptor)?;
     }
     let file_descriptor = rustix::fs::openat(
         &parent,
@@ -747,11 +819,8 @@ fn open_pinned_file(
         rustix::fs::Mode::empty(),
     )
     .map_err(|error| map_open_error(descriptor, "open pinned data file", error))?;
-    let mut file = File::from(file_descriptor);
-    let opened_metadata = validate_open_file(&file, managed, descriptor)?;
-    if !managed {
-        validate_external_legacy_content(&mut file, &opened_metadata, descriptor)?;
-    }
+    let file = File::from(file_descriptor);
+    validate_open_file(&file, descriptor)?;
     Ok(file)
 }
 
@@ -770,13 +839,11 @@ fn open_pinned_file(
 #[cfg(unix)]
 fn normal_path_components<'a>(
     path: &'a Path,
-    managed: bool,
     descriptor: &DataFileDescriptor,
 ) -> Result<Vec<&'a std::ffi::OsStr>> {
     let mut components = Vec::new();
     for component in path.components() {
         match component {
-            Component::RootDir if !managed => {}
             Component::Normal(value) => components.push(value),
             _ => {
                 return Err(file_corruption(
@@ -793,7 +860,6 @@ fn normal_path_components<'a>(
 fn open_directory_at(
     parent: &File,
     name: &std::ffi::OsStr,
-    managed: bool,
     descriptor: &DataFileDescriptor,
 ) -> Result<File> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -818,24 +884,18 @@ fn open_directory_at(
             "pinned data-file parent is not a directory",
         ));
     }
-    if managed {
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.uid() != rustix::process::geteuid().as_raw() || mode & 0o077 != 0 {
-            return Err(file_corruption(
-                descriptor,
-                "managed data-file directory ownership or permissions are invalid",
-            ));
-        }
+    let mode = metadata.permissions().mode() & 0o777;
+    if metadata.uid() != rustix::process::geteuid().as_raw() || mode & 0o077 != 0 {
+        return Err(file_corruption(
+            descriptor,
+            "managed data-file directory ownership or permissions are invalid",
+        ));
     }
     Ok(directory)
 }
 
 #[cfg(unix)]
-fn validate_open_file(
-    file: &File,
-    managed: bool,
-    descriptor: &DataFileDescriptor,
-) -> Result<Metadata> {
+fn validate_open_file(file: &File, descriptor: &DataFileDescriptor) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = file
@@ -853,82 +913,16 @@ fn validate_open_file(
             "pinned data-file length does not match Catalog metadata",
         ));
     }
-    if managed {
-        let mode = metadata.permissions().mode() & 0o777;
-        if metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.nlink() != 1
-            || mode & 0o077 != 0
-        {
-            return Err(file_corruption(
-                descriptor,
-                "managed data-file ownership, links, or permissions are invalid",
-            ));
-        }
-    }
-    Ok(metadata)
-}
-
-#[cfg(unix)]
-fn validate_external_legacy_content(
-    file: &mut File,
-    opened_metadata: &Metadata,
-    descriptor: &DataFileDescriptor,
-) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    file.seek(SeekFrom::Start(0)).map_err(|_| {
-        file_io_error(
-            descriptor,
-            "rewind external legacy data file before checksum",
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => hasher.update(&buffer[..read]),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                return Err(file_io_error(
-                    descriptor,
-                    "checksum external legacy data file",
-                ));
-            }
-        }
-    }
-
-    let checked_metadata = file
-        .metadata()
-        .map_err(|_| file_io_error(descriptor, "reinspect external legacy data-file descriptor"))?;
-    if !checked_metadata.is_file()
-        || opened_metadata.dev() != checked_metadata.dev()
-        || opened_metadata.ino() != checked_metadata.ino()
-        || opened_metadata.len() != checked_metadata.len()
-        || opened_metadata.mtime() != checked_metadata.mtime()
-        || opened_metadata.mtime_nsec() != checked_metadata.mtime_nsec()
-        || opened_metadata.ctime() != checked_metadata.ctime()
-        || opened_metadata.ctime_nsec() != checked_metadata.ctime_nsec()
+    let mode = metadata.permissions().mode() & 0o777;
+    if metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+        || mode & 0o077 != 0
     {
         return Err(file_corruption(
             descriptor,
-            "external legacy data file changed during checksum validation",
+            "managed data-file ownership, links, or permissions are invalid",
         ));
     }
-
-    let actual_checksum = format!("sha256-v1:{:x}", hasher.finalize());
-    if actual_checksum != descriptor.file.checksum {
-        return Err(file_corruption(
-            descriptor,
-            "external legacy data-file checksum does not match Catalog metadata",
-        ));
-    }
-    file.seek(SeekFrom::Start(0)).map_err(|_| {
-        file_io_error(
-            descriptor,
-            "rewind external legacy data file after checksum",
-        )
-    })?;
     Ok(())
 }
 

@@ -21,7 +21,7 @@ pub(crate) struct AdmittedPinnedParquetFile {
 impl AdmittedPinnedParquetFile {
     /// Opens an already-admitted pinned file and preserves the original task reservation.
     ///
-    /// This performs synchronous descriptor and optional legacy checksum I/O. Callers must invoke
+    /// This performs synchronous descriptor and file metadata I/O. Callers must invoke
     /// it on a bounded blocking scan worker, not a Tokio runtime worker.
     pub(crate) fn open(
         task: QueryTaskPermit<PinnedDataFile>,

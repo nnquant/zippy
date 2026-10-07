@@ -173,7 +173,7 @@ fn active_segment_reader_exposes_control_snapshot_from_mmap_header() {
     assert_eq!(snapshot.capacity_rows, 32);
     assert_eq!(snapshot.row_count, 2);
     assert_eq!(snapshot.committed_row_count, 2);
-    assert_eq!(snapshot.payload_version, Some(0));
+    assert_eq!(snapshot.payload_version, 0);
     assert_eq!(snapshot.notify_seq, 2);
     assert_eq!(snapshot.waiter_count, 0);
     assert!(!snapshot.sealed);
@@ -199,7 +199,7 @@ fn control_snapshot_reports_payload_version() {
     let reader = ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout).unwrap();
     let snapshot = reader.control_snapshot().unwrap();
 
-    assert_eq!(snapshot.payload_version, Some(0));
+    assert_eq!(snapshot.payload_version, 0);
 }
 
 #[test]
@@ -247,7 +247,7 @@ fn active_segment_reader_rejects_descriptor_generation_mismatch() {
 }
 
 #[test]
-fn active_segment_reader_rejects_v4_header_without_payload_version_capability() {
+fn active_segment_reader_rejects_descriptor_without_payload_version_offset() {
     let schema = tick_schema();
     let layout = LayoutPlan::for_schema(&schema, 32).unwrap();
     let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
@@ -270,7 +270,7 @@ fn active_segment_reader_rejects_v4_header_without_payload_version_capability() 
     let err = ActiveSegmentReader::from_descriptor_envelope(&legacy, schema, layout).unwrap_err();
     assert!(err
         .to_string()
-        .contains("active segment payload version capability missing"));
+        .contains("failed to decode active segment descriptor"));
 }
 
 #[test]

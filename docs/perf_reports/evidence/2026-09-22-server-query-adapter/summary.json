@@ -1,0 +1,301 @@
+{
+  "batch": 44,
+  "date": "2026-09-22",
+  "overall_complete": false,
+  "audit_closed_total": 28,
+  "closed_this_batch": [],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F28"
+  ],
+  "net_removed_rust_lines": 4304,
+  "server_ready_schema_version": 8,
+  "catalog_layout_version": 11,
+  "rust_server_gateway": {
+    "passed": 282,
+    "ignored": 4
+  },
+  "clippy": "workspace all-targets -D warnings",
+  "pytest_passed": 552,
+  "mypy_source_files": 91,
+  "strict_client_mypy_files": 27,
+  "native_recovery": {
+    "catalog_v11_native_files_watermarks_and_request_versions": true,
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+    "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+    "sdk_only_flight_examples_write_query_callbacks_and_restart": true,
+    "flight_short_session_snapshot_cleanup_capacity_reuse": true,
+    "public_examples_three_kinds_compute_and_restart_without_legacy_api": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "flight_only_buffered_writer_lazy_plan_and_restart": true,
+    "independent_client_native_child_without_main_import": true,
+    "server_launch": "repository_binary",
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_changes_since_batch_43": [
+    {
+      "path": "ROADMAP.md",
+      "before_sha256": "107e9555c822f95a7be2095d849042c3b952d70378d4b38d7f95c19f5ab1103c",
+      "after_sha256": "b5b7f49b98913c90f96b4bd50ebb526d4fdbd4c43d553e7680df5866b0405c5f",
+      "before_lines": 18,
+      "after_lines": 18
+    },
+    {
+      "path": "crates/zippy-gateway/src/legacy_query.rs",
+      "before_sha256": "fd98bd80c37b31efaf95e895ec7b93ca8d0995168f0e10253dc3afa66c5d39bd",
+      "after_sha256": null,
+      "before_lines": 473,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-gateway/src/lib.rs",
+      "before_sha256": "67b847e44ffbcfff13bae265ced760b485afd187d7c0bf6b6e1f96daddf9ec05",
+      "after_sha256": "46ab5da554deb81f70bf2428fb842335f264f8454260b342c32bdad369a5cafa",
+      "before_lines": 11227,
+      "after_lines": 10891
+    },
+    {
+      "path": "crates/zippy-server/src/composition.rs",
+      "before_sha256": "4fa3e1bb4a9ed3318627d1ed9b210492a6b20606bc043aeb26ef8013045c3226",
+      "after_sha256": null,
+      "before_lines": 342,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-server/src/health.rs",
+      "before_sha256": "e4e4dfdc542af573f7c989ca88b4c7984ec559da6cf8fccee2c4b0d5f7d24f93",
+      "after_sha256": "2d54b03e2993c415fdacaaeb36ee638216b75dcfb7e5a1e043c3499d1c764ec9",
+      "before_lines": 178,
+      "after_lines": 177
+    },
+    {
+      "path": "crates/zippy-server/src/legacy_query.rs",
+      "before_sha256": "fbb531c3d20be3f0bf000f31adcbb08ae6d9d106dd5c755ca6290aa5e450af4a",
+      "after_sha256": null,
+      "before_lines": 3002,
+      "after_lines": 0
+    },
+    {
+      "path": "crates/zippy-server/src/lib.rs",
+      "before_sha256": "295282f835c5f20d6ce9b29427492fb09f06a86d0398caad37d1c1578b16bdcd",
+      "after_sha256": "62ce4b8a0eeff64abef18598007b4a28a87a0bdb357ca10f7bcf1a2ea0021a37",
+      "before_lines": 57,
+      "after_lines": 50
+    },
+    {
+      "path": "crates/zippy-server/src/runtime.rs",
+      "before_sha256": "bd82c8833c8f03af623a93c6909fd281542726e7b1924340d28c8c392a91fb5a",
+      "after_sha256": "deb471c854972a32b56ffecabaac8fcc318d9b502533e9df953bdb1b1b41dde1",
+      "before_lines": 3356,
+      "after_lines": 3266
+    },
+    {
+      "path": "crates/zippy-server/tests/legacy_runtime_baseline.rs",
+      "before_sha256": "1d2cb67b17ba489088f90df18b72fd3c127181135724fbf1cd64dd0e6613e5d1",
+      "after_sha256": "d03f343fd5649d62c0d899f21fd3543b63e3aa6624f5148fed64f2e8a84bec11",
+      "before_lines": 174,
+      "after_lines": 136
+    },
+    {
+      "path": "crates/zippy-server/tests/server_runtime.rs",
+      "before_sha256": "8e502e42c00f9d99e8c7051ea0dd55c6fef468adbc35d21db897c2ab57592e24",
+      "after_sha256": "82473a04200a20aaddd6e3e4b0de2c5f36760ad492e3cefea96093ebf256ee0e",
+      "before_lines": 1574,
+      "after_lines": 1569
+    },
+    {
+      "path": "crates/zippy-server/tests/support/mod.rs",
+      "before_sha256": "1dc739ada224d76b7ab90d5ef1bcde5320121c6247b9929d2753eb32d093ea79",
+      "after_sha256": "525f1175be337445668a8f42255ca1ffbaae56e44d9ce9648172f949986535a1",
+      "before_lines": 254,
+      "after_lines": 244
+    },
+    {
+      "path": "docs/adr/0007-single-trunk-new-contract.md",
+      "before_sha256": "cc67c2d20f008ebb413fe2aa2cf009fed8c28e66be42f7ff39dc936daf333565",
+      "after_sha256": "62812d706a1e0f9d49fb86416cb4d1861731104c73aa7fffb0a0211635366973",
+      "before_lines": 52,
+      "after_lines": 52
+    },
+    {
+      "path": "docs/architecture-convergence-audit-2026-09-18.md",
+      "before_sha256": "b166c29b78d66be0f6dcedca97a1ed11761b1c2210f07e18696819fe1cc0af64",
+      "after_sha256": "497ac42ba89ed790ef1b65ed6f87234ec4ac4d3ccfb6fcef817d06fa481660ec",
+      "before_lines": 223,
+      "after_lines": 223
+    },
+    {
+      "path": "docs/current-capabilities-2026-09-21.md",
+      "before_sha256": "810b53d805fa9ff69a118e04a3cf1f0f1bd6b24690d7eb3eaadd3a99eae041dd",
+      "after_sha256": "c334de27de3a205e9d50f7256caf969094624e5ef994fb766917ee1ae95e5a36",
+      "before_lines": 60,
+      "after_lines": 60
+    },
+    {
+      "path": "docs/flight-query-service.md",
+      "before_sha256": "abe9abe45d13904d3969863aaacd21a3c5833e4b2ad661fd7926957d3b41f99c",
+      "after_sha256": "674a976ecd34e9842d61880f30045bb6cdb455f7b9fcb7feeaef6ba9c7e423d1",
+      "before_lines": 383,
+      "after_lines": 383
+    },
+    {
+      "path": "docs/single-node-server-runtime.md",
+      "before_sha256": "a3c6edd094ae258eca801450da778d8c9271610aeedc86e7f2e9046a501f00df",
+      "after_sha256": "12dc727929de55b3f65d16e8733923f1ae83fbda4d1108f2b9dd88f1991c27cc",
+      "before_lines": 71,
+      "after_lines": 73
+    },
+    {
+      "path": "pytests/test_server_process.py",
+      "before_sha256": "78f55dd97ccc3262967394cd342c14275cdb468d7f3232fd704c7681ae95da05",
+      "after_sha256": "b151f66f041a5a47eeae568ff8b00e25762bd01703e79351ebfee9c3d4766600",
+      "before_lines": 1311,
+      "after_lines": 1323
+    },
+    {
+      "path": "python/zippy/server_process.py",
+      "before_sha256": "e231a71c185fb2a45deb4411008a6d4560aa3c9cc791a8d8a8ba03e07618c008",
+      "after_sha256": "c2236d53a9ad3b7693d957a6a6c439a45fbedfa12b315bccbcd11a2befb3b645",
+      "before_lines": 1434,
+      "after_lines": 1434
+    }
+  ],
+  "test_retirement_sha256": "ea2f7e3351a9ad8951ac3ec2e3597160dccbb1beb665990366d97e564864318e",
+  "report_sha256": "2f6d75cd6c113c428b72abfce993af80a196ddcbb6896b8e98d0489ae12049d5",
+  "logs": {
+    "clippy-final": {
+      "path": "/tmp/zippy-server-query-adapter-clippy-final.log",
+      "sha256": "d79f9f2fbc6f0407138e89f17485ca853ebfd5d702dc4d9146327abac482ad26",
+      "bytes": 317
+    },
+    "tests": {
+      "path": "/tmp/zippy-server-query-adapter-tests.log",
+      "sha256": "ca711547a4efaeed192fa629a175dfa2bce7517735dcc5fcff35611bb2eeb2e1",
+      "bytes": 26873
+    },
+    "build": {
+      "path": "/tmp/zippy-server-query-adapter-build.log",
+      "sha256": "3e17a5c145815d2f06ce56181d811c8a765c455bfc0b43cb57565f67bf013c7f",
+      "bytes": 782
+    },
+    "pytest": {
+      "path": "/tmp/zippy-server-query-adapter-pytest.log",
+      "sha256": "f3b897a0353d32673d6123705e06b48ca4d896bcfabf5dc680ff8cb631a9a602",
+      "bytes": 661
+    },
+    "native-matrix": {
+      "path": "/tmp/zippy-server-query-adapter-native-matrix.log",
+      "sha256": "b8ac89d07a68cda1c75c34154cc0680ead81408047089a69dcccc38b53549c63",
+      "bytes": 30079
+    },
+    "mypy": {
+      "path": "/tmp/zippy-server-query-adapter-mypy.log",
+      "sha256": "6e48d2986ce0d91c8cd60bff9ed577f4baf14c949620883ab530992e6c52e53a",
+      "bytes": 934
+    },
+    "mypy-client": {
+      "path": "/tmp/zippy-server-query-adapter-mypy-client.log",
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f",
+      "bytes": 44
+    },
+    "ruff": {
+      "path": "/tmp/zippy-server-query-adapter-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "bytes": 19
+    },
+    "black": {
+      "path": "/tmp/zippy-server-query-adapter-black.log",
+      "sha256": "161579e1a9a654d62a83f487d90f72be3d8e9379f20fa777ad6cc1d93115ac60",
+      "bytes": 57
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-server-query-adapter-rustfmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "diff": {
+      "path": "/tmp/zippy-server-query-adapter-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "extension-links": {
+      "path": "/tmp/zippy-server-query-adapter-extension-links.log",
+      "sha256": "a2a1112a1000c1c6fb3a89894f8c6a003a92263b700b9968fda340d70c23b1c5",
+      "bytes": 445
+    }
+  },
+  "current_binary_evidence": {
+    "target/debug/zippy-server": "6528194770f6c270461d6e608b275be7a0ac48834e0853c8fb4e1cb92059b77d",
+    "python/zippy/_internal.cpython-311-x86_64-linux-gnu.so": "ed5ed81fcca828554a4d6cf1612f0bcca232b1965f815e356a89348dd5d72ec8"
+  },
+  "limitations": [
+    "Legacy default, persistent registry, Gateway protocol interpreter and memory ingest remain.",
+    "Complete Rust workspace run belongs to batch 42; this batch runs affected Server/Gateway crates and checks all targets.",
+    "No new Arrow 25 wheel or Windows/macOS acceptance.",
+    "No commit, push, deployment or user data migration."
+  ]
+}

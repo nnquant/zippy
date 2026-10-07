@@ -21,6 +21,12 @@ pub const MAX_CATALOG_SCHEMA_IPC_BYTES: usize = 16 * 1024 * 1024;
 /// A structured failure returned by the shared Catalog table-schema contract.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum CatalogTableSchemaError {
+    /// Native event metadata is malformed or contradicts the Catalog table definition.
+    #[error("invalid native key-value schema envelope reason=[{reason}]")]
+    InvalidKeyValueEnvelope {
+        /// The violated event-schema invariant.
+        reason: String,
+    },
     /// The schema contains more fields than the Catalog resource budget permits.
     #[error("catalog schema field count exceeds maximum actual=[{actual}] maximum=[{maximum}]")]
     FieldCountExceeded {
@@ -171,6 +177,27 @@ pub fn validate_catalog_table_schema(
             for column in definition.keys().as_slice() {
                 require_field(schema, column.as_str(), Some(&DataType::Utf8))?;
             }
+        }
+    }
+    if let Some(decoded) = crate::key_value::decode_log_schema(schema).map_err(|error| {
+        CatalogTableSchemaError::InvalidKeyValueEnvelope {
+            reason: error.to_string(),
+        }
+    })? {
+        let TableDefinition::KeyValue(definition) = definition else {
+            return Err(CatalogTableSchemaError::InvalidKeyValueEnvelope {
+                reason: "event envelope requires a key-value table definition".to_owned(),
+            });
+        };
+        if decoded.keys.iter().map(String::as_str).ne(definition
+            .keys()
+            .as_slice()
+            .iter()
+            .map(|key| key.as_str()))
+        {
+            return Err(CatalogTableSchemaError::InvalidKeyValueEnvelope {
+                reason: "event keys differ from the table definition".to_owned(),
+            });
         }
     }
     Ok(())

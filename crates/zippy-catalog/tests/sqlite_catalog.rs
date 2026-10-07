@@ -236,57 +236,6 @@ fn empty_metadata_blob(kind: &str) -> Vec<u8> {
     encoded
 }
 
-fn insert_legacy_data_file(
-    connection: &Connection,
-    table: TableId,
-    file: FileId,
-    legacy_discovery_order: Option<u64>,
-) {
-    let table_id = table.into_bytes();
-    let file_id = file.into_bytes();
-    let schema_version = 1_u64.to_be_bytes();
-    let file_size_bytes = 1_024_u64.to_be_bytes();
-    let row_count = 10_u64.to_be_bytes();
-    let absent = encode_optional_u64(None);
-    let legacy_order = encode_optional_u64(legacy_discovery_order);
-    let added_snapshot_version = 2_u64.to_be_bytes();
-    let created_at_ns = 1_u64.to_be_bytes();
-    let partition_blob = empty_metadata_blob("data_file_partition");
-    let statistics_blob = empty_metadata_blob("data_file_statistics");
-    let metadata_blob = empty_metadata_blob("data_file_metadata");
-    connection
-        .execute(
-            "INSERT INTO data_files(\
-                 file_id, table_id, schema_version, location_kind, file_path, \
-                 file_size_bytes, row_count, provenance_kind, min_log_offset, \
-                 max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
-                 partition_blob, statistics_blob, metadata_blob, checksum, \
-                 added_snapshot_version, removed_snapshot_version, state, created_at_ns\
-             ) VALUES (\
-                 ?1, ?2, ?3, 'external_legacy', ?4, ?5, ?6, 'legacy', ?7, ?7, \
-                 ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?7, 'committed', ?15\
-             )",
-            rusqlite::params![
-                file_id.as_slice(),
-                table_id.as_slice(),
-                schema_version.as_slice(),
-                format!("/tmp/zippy-catalog-file-{}.parquet", file),
-                file_size_bytes.as_slice(),
-                row_count.as_slice(),
-                absent.as_slice(),
-                i64::from(legacy_discovery_order.is_some()),
-                legacy_order.as_slice(),
-                partition_blob,
-                statistics_blob,
-                metadata_blob,
-                format!("sha256-v1:{:032x}", u128::from_be_bytes(file_id)),
-                added_snapshot_version.as_slice(),
-                created_at_ns.as_slice(),
-            ],
-        )
-        .expect("insert raw legacy data file");
-}
-
 fn insert_native_data_file(connection: &Connection, table: TableId, file: FileId) {
     let table_id = table.into_bytes();
     let file_id = file.into_bytes();
@@ -306,12 +255,12 @@ fn insert_native_data_file(connection: &Connection, table: TableId, file: FileId
             "INSERT INTO data_files(\
                  file_id, table_id, schema_version, location_kind, file_path, \
                  file_size_bytes, row_count, provenance_kind, min_log_offset, \
-                 max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+                 max_log_offset, \
                  partition_blob, statistics_blob, metadata_blob, checksum, \
                  added_snapshot_version, removed_snapshot_version, state, created_at_ns\
              ) VALUES (\
                  ?1, ?2, ?3, 'managed', ?4, ?5, ?6, 'native', ?7, ?8, \
-                 0, ?9, ?10, ?11, ?12, ?13, ?14, ?9, 'committed', ?15\
+                 ?10, ?11, ?12, ?13, ?14, ?9, 'committed', ?15\
              )",
             rusqlite::params![
                 file_id.as_slice(),
@@ -1080,29 +1029,25 @@ async fn catalog_with_raw_second_snapshot(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discovery_order() {
+async fn raw_and_pinned_native_snapshots_share_file_id_order() {
     let directory = TempDir::new().expect("create temp directory");
     let (catalog, memory_lease_issuer, raw, selector) =
         catalog_with_raw_second_snapshot(&directory).await;
     let table = selector.table_id;
     insert_native_data_file(&raw, table, file_id(2));
-    insert_legacy_data_file(&raw, table, file_id(1), None);
-    insert_legacy_data_file(&raw, table, file_id(4), Some(0));
-    insert_legacy_data_file(&raw, table, file_id(3), Some(1));
+    insert_native_data_file(&raw, table, file_id(1));
+    insert_native_data_file(&raw, table, file_id(4));
+    insert_native_data_file(&raw, table, file_id(3));
 
     let snapshot = catalog
         .read_snapshot_at(std::slice::from_ref(&selector))
         .await
-        .expect("read raw mixed-provenance manifest");
+        .expect("read raw native manifest");
     let files = snapshot.tables()[0].files().as_slice();
     assert_eq!(
         files.iter().map(|file| file.file_id()).collect::<Vec<_>>(),
         [file_id(1), file_id(2), file_id(3), file_id(4)]
     );
-    assert_eq!(files[0].legacy_discovery_order(), None);
-    assert_eq!(files[1].legacy_discovery_order(), None);
-    assert_eq!(files[2].legacy_discovery_order(), Some(1));
-    assert_eq!(files[3].legacy_discovery_order(), Some(0));
 
     let pinned = catalog
         .read_handle()
@@ -1112,22 +1057,22 @@ async fn raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discover
             snapshot_memory_lease(&memory_lease_issuer, 1),
         )
         .await
-        .expect("read pinned mixed-provenance manifest");
+        .expect("read pinned native manifest");
     let manifest = pinned.table(0).expect("pinned table manifest");
     assert_eq!(
         manifest
             .files()
             .map(|file| file.file_id())
             .collect::<Vec<_>>(),
-        [file_id(4), file_id(3), file_id(1), file_id(2)]
+        [file_id(1), file_id(2), file_id(3), file_id(4)]
     );
     assert_eq!(
         manifest.file(0).expect("first pinned file").file_id(),
-        file_id(4)
+        file_id(1)
     );
     assert_eq!(
         manifest.file(3).expect("last pinned file").file_id(),
-        file_id(2)
+        file_id(4)
     );
     drop((manifest, pinned));
 
@@ -1148,157 +1093,6 @@ async fn raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discover
             .code(),
         ErrorCode::DataCorruption
     );
-
-    drop(raw);
-    catalog.close().expect("close sqlite catalog");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_rejects_invalid_legacy_discovery_order_and_incomplete_import_manifest() {
-    let directory = TempDir::new().expect("create temp directory");
-    let (catalog, _memory_lease_issuer, raw, selector) =
-        catalog_with_raw_second_snapshot(&directory).await;
-    insert_legacy_data_file(&raw, selector.table_id, file_id(1), Some(0));
-    insert_legacy_data_file(&raw, selector.table_id, file_id(2), Some(0));
-
-    let error = catalog
-        .read_snapshot_at(std::slice::from_ref(&selector))
-        .await
-        .expect_err("duplicate legacy discovery positions must fail closed");
-    assert_eq!(error.code(), ErrorCode::DataCorruption);
-
-    raw.execute(
-        "DELETE FROM data_files WHERE file_id = ?1",
-        [file_id(2).into_bytes().as_slice()],
-    )
-    .expect("remove duplicate legacy file");
-    raw.execute(
-        "UPDATE data_files SET legacy_discovery_order = ?1 WHERE file_id = ?2",
-        rusqlite::params![
-            encode_optional_u64(Some(2)).as_slice(),
-            file_id(1).into_bytes().as_slice(),
-        ],
-    )
-    .expect("make imported legacy order noncontiguous");
-    raw.execute(
-        "UPDATE table_snapshots SET operation = 'import' \
-         WHERE table_id = ?1 AND snapshot_version = ?2",
-        rusqlite::params![
-            selector.table_id.into_bytes().as_slice(),
-            2_u64.to_be_bytes().as_slice(),
-        ],
-    )
-    .expect("mark raw snapshot as an import");
-    let error = catalog
-        .read_snapshot_at(std::slice::from_ref(&selector))
-        .await
-        .expect_err("an import snapshot must cover a contiguous discovery order");
-    assert_eq!(error.code(), ErrorCode::DataCorruption);
-
-    raw.execute(
-        "UPDATE data_files SET legacy_preserve_discovery_order = 0, \
-         legacy_discovery_order = ?1 WHERE file_id = ?2",
-        rusqlite::params![
-            encode_optional_u64(None).as_slice(),
-            file_id(1).into_bytes().as_slice(),
-        ],
-    )
-    .expect("remove imported legacy order");
-    let error = catalog
-        .read_snapshot_at(std::slice::from_ref(&selector))
-        .await
-        .expect_err("an import snapshot must preserve every external legacy order");
-    assert_eq!(error.code(), ErrorCode::DataCorruption);
-
-    let schema_two = Schema::new_with_metadata(
-        table_schema()
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>(),
-        HashMap::from([
-            ("source".to_owned(), "integration".to_owned()),
-            ("version".to_owned(), "2".to_owned()),
-        ]),
-    );
-    let schema_two_ipc = schema_ipc(&schema_two);
-    let schema_two_hash = zippy_catalog::canonical_schema_hash_from_ipc(&schema_two_ipc)
-        .expect("hash valid second schema");
-    raw.execute(
-        "INSERT INTO table_schemas(\
-             table_id, schema_version, schema_ipc, schema_hash, compatibility, created_at_ns\
-         ) VALUES (?1, ?2, ?3, ?4, 'full', ?5)",
-        rusqlite::params![
-            selector.table_id.into_bytes().as_slice(),
-            2_u64.to_be_bytes().as_slice(),
-            schema_two_ipc.as_bytes(),
-            schema_two_hash,
-            2_u64.to_be_bytes().as_slice(),
-        ],
-    )
-    .expect("insert a valid second schema for import corruption");
-    raw.execute(
-        "UPDATE tables SET current_schema_version = ?1 WHERE table_id = ?2",
-        rusqlite::params![
-            2_u64.to_be_bytes().as_slice(),
-            selector.table_id.into_bytes().as_slice(),
-        ],
-    )
-    .expect("advance raw table schema version");
-    raw.execute(
-        "UPDATE data_files SET schema_version = ?1, legacy_preserve_discovery_order = 1, \
-         legacy_discovery_order = ?2 WHERE file_id = ?3",
-        rusqlite::params![
-            2_u64.to_be_bytes().as_slice(),
-            encode_optional_u64(Some(0)).as_slice(),
-            file_id(1).into_bytes().as_slice(),
-        ],
-    )
-    .expect("corrupt imported legacy file schema version");
-    let schema_two_selector = CatalogSnapshotSelector {
-        schema_version: 2,
-        ..selector.clone()
-    };
-    let error = catalog
-        .read_snapshot_at(std::slice::from_ref(&schema_two_selector))
-        .await
-        .expect_err("an import snapshot must use the frozen initial file schema");
-    assert_eq!(error.code(), ErrorCode::DataCorruption);
-
-    drop(raw);
-    catalog.close().expect("close sqlite catalog");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_discovery_order_is_scoped_to_each_table() {
-    let directory = TempDir::new().expect("create temp directory");
-    let (catalog, _memory_lease_issuer, raw, first_selector) =
-        catalog_with_raw_second_snapshot(&directory).await;
-    catalog
-        .command(create_table(
-            3,
-            2,
-            1,
-            "quotes",
-            Some(2),
-            append_definition(),
-            schema_ipc(&table_schema()),
-        ))
-        .await
-        .expect("create second table");
-    let second_selector = insert_raw_second_snapshot(&raw, table_id(2));
-    insert_legacy_data_file(&raw, first_selector.table_id, file_id(1), Some(0));
-    insert_legacy_data_file(&raw, second_selector.table_id, file_id(2), Some(0));
-
-    let snapshot = catalog
-        .read_snapshot_at(&[first_selector, second_selector])
-        .await
-        .expect("the same discovery position in different tables must be valid");
-    assert_eq!(snapshot.tables().len(), 2);
-    assert!(snapshot
-        .tables()
-        .iter()
-        .all(|table| { table.files().as_slice()[0].legacy_discovery_order() == Some(0) }));
 
     drop(raw);
     catalog.close().expect("close sqlite catalog");
@@ -1347,15 +1141,20 @@ async fn validation_conflicts_and_injected_failure_leave_no_partial_table() {
     let raw = Connection::open(catalog_path(&data_directory)).expect("open raw catalog");
     raw.execute_batch("BEGIN IMMEDIATE")
         .expect("hold writer lock");
-    let malformed = create_table(
+    let mut malformed = create_table(
         2,
         1,
         1,
         "bad_ipc",
         Some(1),
         append_definition(),
-        SchemaIpcPayload::new(vec![1]).expect("nonempty malformed payload"),
+        schema_ipc(&table_schema()),
     );
+    let VersionedCatalogCommand::V1(envelope) = &mut malformed;
+    let CatalogCommandV1::CreateTable(command) = &mut envelope.command else {
+        panic!("expected create table");
+    };
+    command.schema_ipc = SchemaIpcPayload::new(vec![1]).expect("nonempty malformed payload");
     assert_eq!(
         catalog
             .command(malformed)
@@ -2251,4 +2050,79 @@ fn catalog_workers_hold_ownership_until_they_are_closed() {
     read_view
         .acquire_process_ownership()
         .expect("worker shutdown must release its final ownership capability");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_snapshot_forks_keep_gc_pins_and_independent_query_accounting() {
+    use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zippy_types::query::QueryInstanceId;
+    use zippy_types::QueryId;
+
+    struct LeaseOwner(Arc<AtomicUsize>);
+    impl Drop for LeaseOwner {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let (catalog, issuer, raw, selector) = catalog_with_raw_second_snapshot(&temp).await;
+    insert_native_data_file(&raw, selector.table_id, file_id(2));
+    let live_leases = Arc::new(AtomicUsize::new(0));
+    let issue = |issuer: &CatalogSnapshotMemoryLeaseIssuer, query, bytes| {
+        issuer
+            .issue_with_owner(bytes, query, |_| {
+                live_leases.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(LeaseOwner(Arc::clone(&live_leases))))
+            })
+            .unwrap()
+    };
+    let bytes = SqliteCatalogSnapshotReadLimits::default()
+        .conservative_owned_peak_bytes(1)
+        .unwrap();
+    let instance =
+        |id| QueryInstanceId::new(QueryId::from_u128(id).unwrap(), NonZeroU64::new(1).unwrap());
+    let pinned = catalog
+        .read_handle()
+        .unwrap()
+        .read_pinned_snapshot_at(std::slice::from_ref(&selector), issue(&issuer, None, bytes))
+        .await
+        .unwrap();
+    assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 1);
+    let (foreign, _) = CatalogSnapshotMemoryLeaseIssuer::new_authority().unwrap();
+    for (indices, lease) in [
+        (vec![0], issue(&foreign, Some(instance(11)), bytes)),
+        (vec![0], issue(&issuer, None, bytes)),
+        (
+            vec![0],
+            issue(&issuer, Some(instance(11)), NonZeroU64::new(1).unwrap()),
+        ),
+        (vec![], issue(&issuer, Some(instance(11)), bytes)),
+        (vec![0, 0], issue(&issuer, Some(instance(11)), bytes)),
+        (vec![1], issue(&issuer, Some(instance(11)), bytes)),
+    ] {
+        assert_eq!(
+            pinned.fork_for_query(&indices, lease).err().unwrap().code(),
+            ErrorCode::InvalidArgument
+        );
+    }
+    assert_eq!(live_leases.load(Ordering::SeqCst), 1);
+    let fork = pinned
+        .fork_for_query(&[0], issue(&issuer, Some(instance(11)), bytes))
+        .unwrap();
+    assert_eq!(
+        fork.memory_lease_descriptor().query_instance_id(),
+        Some(instance(11))
+    );
+    assert_eq!(fork.descriptor(), pinned.descriptor());
+    let file = fork.table(0).unwrap().file(0).unwrap();
+    drop((pinned, fork));
+    assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 1);
+    assert_eq!(live_leases.load(Ordering::SeqCst), 2);
+    assert_eq!(file.file_id(), file_id(2));
+    drop(file);
+    assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 0);
+    assert_eq!(live_leases.load(Ordering::SeqCst), 0);
+    drop(raw);
+    catalog.close().unwrap();
 }

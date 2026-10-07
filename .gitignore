@@ -29,3 +29,7 @@ crates/zippy-master/--no-console-log/
 /app/zippy-console/node_modules/
 /app/zippy-console/dist/
 /app/zippy-console/tsconfig.tsbuildinfo
+
+# Local artifact left by the removed vendored crate.
+/vendor/shared_memory-0.12.4/Cargo.lock
+*.egg-info/

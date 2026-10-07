@@ -1,0 +1,337 @@
+   Compiling zippy-core v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-core)
+   Compiling zippy-master v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-master)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.68s
+     Running unittests src/lib.rs (target/debug/deps/zippy_core-c1e91ba22b937f1a)
+
+running 8 tests
+test control_transport::tests::parse_error_prefers_cancelled_and_deadline_terminal_states ... ok
+test control_transport::tests::response_line_limit_rejects_growth_without_allocating_the_limit ... ok
+test endpoint::tests::resolves_bare_logical_name_and_explicit_paths ... ok
+test endpoint::tests::resolves_logical_default_endpoint ... ok
+test endpoint::tests::treats_bare_names_as_logical_endpoints ... ok
+test data_directory::tests::format_publish_never_overwrites_a_competing_version ... ok
+test durable_file::tests::directory_sync_failure_retains_published_entry_state ... ok
+test data_directory_ownership::tests::owner_drop_unlocks_a_fork_inherited_file_description ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/config.rs (target/debug/deps/config-e8ec24fe99669c2d)
+
+running 56 tests
+test zippy_config_defaults_query_parallelism_to_four ... ok
+test zippy_config_json_overlay_accepts_null_for_nullable_fields ... ok
+test zippy_config_json_overlay_rejects_null_for_non_nullable_fields ... ok
+test zippy_config_json_overlay_preserves_explicit_query_resources ... ok
+test zippy_config_json_overlay_rejects_removed_cpu_alias ... ok
+test zippy_config_json_overlay_rejects_invalid_cpu_query_and_task_limits ... ok
+test zippy_config_json_overlay_resolves_relative_data_dir_from_explicit_base ... ok
+test zippy_config_derives_tasks_from_tighter_query_parallelism ... ok
+test zippy_config_accepts_non_loopback_flight_with_tls_and_file_authentication ... ok
+test zippy_config_native_defaults_enable_one_explicit_flight_endpoint ... ok
+test zippy_config_query_parallelism_inherits_runtime_limit ... ok
+test zippy_config_json_overlay_ignores_environment_and_derives_active_tasks ... ok
+test zippy_config_environment_explicit_task_limit_overrides_toml_value ... ok
+test zippy_config_rejects_query_parallelism_above_runtime_limit ... ok
+test zippy_config_keeps_environment_flight_token_out_of_debug_and_json ... ok
+test zippy_config_rejects_native_task_budget_below_effective_query_parallelism ... ok
+test zippy_config_loads_default_home_config_path ... ok
+test zippy_config_loads_distinct_admin_auth_and_metadata_environment_limits ... ok
+test zippy_config_loads_loopback_flight_frontend_and_environment_limits ... ok
+test zippy_config_loads_native_query_canary_toml_and_env_overrides ... ok
+test zippy_config_loads_toml_and_env_overrides ... ok
+test zippy_config_derives_tasks_for_high_runtime_cpu_limit ... ok
+test zippy_config_loads_native_query_operator_budget ... ok
+test zippy_config_expands_explicit_server_data_dir ... ok
+test zippy_config_serializes_native_defaults_without_feature_switches ... ok
+test zippy_runtime_config_accepts_only_canonical_cpu_config ... ok
+test zippy_config_rejects_canary_operator_memory_above_query_budget ... ok
+test zippy_config_rejects_flight_ingest_without_distinct_writer_credential ... ok
+test zippy_config_rejects_flight_session_shorter_than_query_plan ... ok
+test zippy_config_rejects_identical_read_and_admin_credentials ... ok
+test zippy_config_rejects_non_loopback_flight_without_tls_and_authentication ... ok
+test zippy_config_rejects_metadata_result_larger_than_shared_transport_budget ... ok
+test zippy_config_rejects_plaintext_flight_token_in_toml ... ok
+test zippy_config_rejects_relative_server_data_dir_from_environment ... ok
+test zippy_config_rejects_query_buffer_budget_above_runtime_limit ... ok
+test zippy_config_keeps_flight_endpoint_independent_from_master ... ok
+test zippy_config_rejects_local_read_session_shorter_than_query_plan ... ok
+test zippy_config_rejects_native_query_concurrency_above_registry_capacity ... ok
+test zippy_config_rejects_query_plan_ttl_above_one_day ... ok
+test zippy_config_loads_and_validates_runtime_snapshot_pin_limits ... ok
+test zippy_config_rejects_removed_cpu_environment_even_with_canonical_value ... ok
+test zippy_config_loads_explicit_flight_ingest_and_redacts_writer_token ... ok
+test zippy_config_rejects_zero_query_plan_ttl ... ok
+test zippy_config_resolves_relative_server_data_dir_from_config_parent ... ok
+test zippy_config_rejects_invalid_native_query_operator_memory ... ok
+test zippy_config_rejects_invalid_runtime_max_cpu_cores ... ok
+test zippy_config_rejects_removed_compaction_configuration ... ok
+test zippy_config_rejects_removed_endpoint_snapshot_import ... ok
+test zippy_config_rejects_removed_runtime_cpu_name_in_toml ... ok
+test zippy_config_rejects_invalid_query_canary_limits ... ok
+test zippy_config_rejects_zero_native_query_resource_limits ... ok
+test zippy_config_rejects_removed_catalog_shadow_configuration ... ok
+test zippy_config_rejects_removed_compaction_environment ... ok
+test zippy_config_rejects_removed_gateway_configuration ... ok
+test zippy_config_rejects_removed_table_and_master_token_configuration ... ok
+test zippy_config_rejects_removed_backend_and_native_switches ... ok
+
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/control_endpoint.rs (target/debug/deps/control_endpoint-fa57e38c935bf98f)
+
+running 8 tests
+test rejects_legacy_remote_gateway_uri ... ok
+test resolves_explicit_tcp_endpoint ... ok
+test rejects_tcp_endpoint_without_port ... ok
+test resolves_logical_default_to_unix_socket_on_unix ... ok
+test resolves_remote_zippy_uri_to_tcp_endpoint ... ok
+test unix_endpoint_state_directories_include_the_socket_name ... ok
+test resolves_localhost_remote_zippy_uri_to_tcp_endpoint ... ok
+test tcp_endpoint_state_directories_include_the_full_address ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/control_transport.rs (target/debug/deps/control_transport-e19d323bea8cdae1)
+
+running 8 tests
+test control_transport_preserves_structured_terminal_codes ... ok
+test control_transport_preserves_unmapped_code_and_explicit_retry_policy ... ok
+test tcp_control_transport_timeout_api_roundtrips_json_line ... ok
+test tcp_control_transport_cancellation_interrupts_stalled_response ... ok
+test tcp_control_transport_roundtrips_json_line ... ok
+test tcp_control_transport_rejects_uncoded_error ... ok
+test tcp_control_transport_preserves_structured_not_found ... ok
+test tcp_control_transport_trickle_response_cannot_extend_deadline ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/core_contract.rs (target/debug/deps/core_contract-ade88babf7fa7f09)
+
+running 2 tests
+test compute_kernel_contract_retains_name_and_explicit_late_policy ... ok
+test control_protocol_rejects_removed_legacy_wait_requests ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/data_directory.rs (target/debug/deps/data_directory-de4c05578caa331c)
+
+running 12 tests
+test initialize_rejects_non_empty_unversioned_directory ... ok
+test rejected_unversioned_directory_keeps_existing_permissions ... ok
+test initialize_recovers_from_stale_version_temporary_file ... ok
+test initialize_recovers_from_an_inactive_bootstrap_lock ... ok
+test initialize_enforces_owner_only_permissions ... ok
+test initialize_creates_versioned_managed_layout ... ok
+test read_only_open_does_not_recreate_a_missing_managed_directory ... ok
+test open_rejects_symbolic_link_data_root ... ok
+test initialized_data_directory_can_be_reopened ... ok
+test open_rejects_symbolic_link_format_marker ... ok
+test open_rejects_symbolic_link_managed_directory ... ok
+test open_rejects_unknown_or_malformed_format_versions ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/data_directory_ownership.rs (target/debug/deps/data_directory_ownership-31cd06f24e249bb4)
+
+running 7 tests
+test ownership_child_exits_without_drop ... ok
+test ownership_rejects_a_hard_linked_lock_file ... ok
+
+running 1 test
+test ownership_rejects_symbolic_link_lock_file ... ok
+test ownership_record_is_owner_only_and_diagnostic ... ok
+test ownership_is_exclusive_but_does_not_block_read_only_open ... ok
+test ownership_reuses_the_stable_lock_inode ... ok
+test abrupt_process_exit_releases_kernel_ownership ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/durable_file.rs (target/debug/deps/durable_file-f349c22c2bf74fa1)
+
+running 8 tests
+test durable_file_rejects_a_symbolic_link_parent ... ok
+test durable_remove_of_a_missing_parent_is_idempotent ... ok
+test durable_file_rejects_a_regular_file_parent_component ... ok
+test dropping_an_unpublished_file_removes_its_temporary_inode ... ok
+test durable_remove_rejects_symbolic_links_and_hard_links ... ok
+test durable_remove_is_idempotent_and_syncs_a_published_file ... ok
+test durable_file_publishes_nested_contents_and_metadata ... ok
+test durable_file_never_overwrites_an_existing_target ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/errors.rs (target/debug/deps/errors-85fe8686324dd2c3)
+
+running 1 test
+test structured_error_code_does_not_depend_on_message_words ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/logging.rs (target/debug/deps/logging-6fe241c13b7cfcd8)
+
+running 7 tests
+test logging_case_dispatch ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+2026-09-23T02:29:47.485900014Z  INFO created logging snapshot component=[logging_test] event=[create_snapshot]
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+running 1 test
+test setup_log_rejects_different_config_without_creating_extra_files ... ok
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+2026-09-23T02:29:47.486401175Z  INFO reused logging snapshot component=[logging_test] event=[reuse_snapshot]
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test setup_log_creates_jsonl_file_and_returns_snapshot ... ok
+test setup_log_formats_console_logs_with_tracing_style_prefix ... ok
+test setup_log_restricts_existing_file_to_owner_only ... ok
+test setup_log_refuses_to_follow_existing_symlink ... ok
+test setup_log_reuses_existing_snapshot_without_creating_extra_files ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/master_client.rs (target/debug/deps/master_client-6a70f38caee59527)
+
+running 8 tests
+test master_client_request_timeout_rejects_zero_and_can_be_restored ... ok
+test master_client_register_process_over_tcp ... ok
+test master_client_gets_config ... ok
+test master_client_unregisters_registered_process ... ok
+test master_client_wait_shutdown_times_out_without_shutdown_request ... ok
+test master_client_sends_heartbeat_for_registered_process ... ok
+test master_client_accepts_canonical_and_rejects_removed_cpu_wire_config ... ok
+test watch_uses_its_long_poll_budget_when_ordinary_requests_have_a_short_timeout ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/table_view.rs (target/debug/deps/table_view-759d5ec055e1c620)
+
+running 2 tests
+test memory_table_view_has_no_segment_row_span ... ok
+test segment_table_view_exposes_row_span_for_engine_fast_paths ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/versioning.rs (target/debug/deps/versioning-5e47d082975dbc4b)
+
+running 2 tests
+test base_version_is_current_release_baseline ... ok
+test build_revision_is_separate_from_release_version ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workspace_smoke.rs (target/debug/deps/workspace_smoke-65d0c77274074368)
+
+running 1 test
+test workspace_builds_core_crate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_master-b189e2c2173a925d)
+
+running 13 tests
+test process_runtime::tests::adapter_boot_id_survives_clone_without_snapshot_persistence ... ok
+test process_runtime::tests::heartbeat_advances_one_revision_without_rebuilding_the_registry ... ok
+test registry::tests::process_record_requires_current_token_and_revision_fields ... ok
+test registry::tests::random_failure_does_not_register_process_or_advance_control_revision ... ok
+test daemon::tests::removed_import_configuration_fails_before_creating_data_directory ... ok
+test server::tests::accept_loop_idle_sleep_stays_below_control_plane_latency_budget ... ok
+test process_runtime::tests::stable_contract_enforces_boot_revision_state_and_aba ... ok
+test process_runtime::tests::process_expiry_does_not_mutate_generic_records_with_spoofed_attributes ... ok
+test server::tests::control_connection_limit_is_shared_and_released ... ok
+test daemon::tests::endpoint_scoped_legacy_snapshot_is_never_read_or_copied ... ok
+test daemon::tests::managed_legacy_registry_is_rejected_without_reading_or_rewriting_it ... ok
+test server::tests::control_request_size_and_newline_are_required ... ok
+test server::tests::partial_control_input_cannot_extend_absolute_deadline ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+
+     Running tests/control_transport_roundtrip.rs (target/debug/deps/control_transport_roundtrip-ac361164d041fa49)
+
+running 1 test
+test master_server_accepts_tcp_control_requests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/master_client_roundtrip.rs (target/debug/deps/master_client_roundtrip-0b92b757303a5fb7)
+
+running 1 test
+test master_client_fetches_master_runtime_config ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/master_server.rs (target/debug/deps/master_server-91e45fe3b70bd14e)
+
+running 23 tests
+
+running 1 test
+
+running 1 test
+test master_server_logging_case_dispatch ... ok
+test master_server_rejects_regular_file_at_socket_path ... ok
+test protocol_types_roundtrip_debug_repr ... ok
+test registry_rejects_heartbeat_for_expired_process ... ok
+test registry_stores_only_process_lease_records ... ok
+test registry_updates_process_lease_timestamp_on_heartbeat ... ok
+test removed_control_envelopes_are_rejected ... ok
+test master_server_graceful_shutdown_times_out_with_alive_processes ... ok
+test master_server_logs_cleanup_failure_without_stopped_log ... ok
+test lease_reaper_revokes_process_and_preserves_configuration_discovery ... ok
+test retired_data_control_requests_are_rejected_without_mutation ... ok
+test master_server_rejects_unbounded_watch_before_waiting ... ok
+test master_server_watch_process_wakes_on_heartbeat ... ok
+test master_server_watch_shutdown_wakes_without_heartbeat_polling ... ok
+test master_server_returns_structured_error_for_unknown_process_heartbeat ... ok
+test master_server_rejects_raw_heartbeat_without_process_capability ... ok
+test master_server_registers_process_over_unix_socket ... ok
+test master_server_logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.14s
+
+test master_server_emits_structured_control_plane_logs ... ok
+test master_server_graceful_shutdown_notifies_process_and_waits_for_unregister ... ok
+test master_server_accepts_process_heartbeat_over_unix_socket ... ok
+test master_server_survives_bad_request_and_serves_next_request ... ok
+test master_server_logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.22s
+
+test master_server_ignores_empty_control_probe_logs ... ok
+test master_server_handles_slow_client_without_blocking_accept_loop ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+   Doc-tests zippy_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_master
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

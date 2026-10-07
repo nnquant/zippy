@@ -1,5 +1,8 @@
 # ADR-0004：Arrow Flight 作为远端数据协议
 
+> 本 ADR 保留接受时的设计与阶段结论；当前实现状态以[能力表](../current-capabilities-2026-09-21.md)为准。
+> 新版本兼容边界由 [ADR-0007](0007-single-trunk-new-contract.md)补充。
+
 - 日期：2026-07-13
 - 状态：已接受，Stage 7.3 原生 WAL 写入已实施
 - 决策所有者：Zippy core maintainers

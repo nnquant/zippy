@@ -7,6 +7,29 @@ on:
   pull_request:
 
 jobs:
+  client-distribution:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        dependency-set:
+          - python: "3.11"
+            arrow: "23.0.1"
+          - python: "3.14"
+            arrow: "25.0.1"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.dependency-set.python }}
+      - uses: astral-sh/setup-uv@v4
+      - name: verify client archive without Rust or server
+        run: >-
+          python scripts/check_distributions.py --client-only
+          --arrow-version ${{ matrix.dependency-set.arrow }}
+          --work-dir "${{ runner.temp }}/zippy-client-distribution"
+
   windows-check:
     runs-on: windows-latest
 
@@ -14,13 +37,13 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: setup rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: setup python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: setup pinned rust
+        run: python scripts/setup_rust_toolchain.py
 
       - name: setup uv
         uses: astral-sh/setup-uv@v4
@@ -28,9 +51,9 @@ jobs:
       - name: run windows cargo check
         run: cargo check --workspace
 
-      - name: install windows lightweight client extension
+      - name: install windows lightweight client
         working-directory: clients/python
-        run: uv run --extra dev maturin develop
+        run: uv sync --locked --package zippy-client --extra dev
 
       - name: run windows lightweight client contracts
         working-directory: clients/python
@@ -50,36 +73,47 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: checkout rspm python dependency
-        uses: actions/checkout@v4
-        with:
-          repository: nnquant/rspm
-          ref: 520d3d6c497afd05b8e3d965ef6d04f7422c023e
-          path: .ci-deps/rspm
-          persist-credentials: false
-
-      - name: expose rspm sibling source
-        run: ln -s "$GITHUB_WORKSPACE/.ci-deps/rspm" "$GITHUB_WORKSPACE/../rspm"
-
-      - name: setup rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: setup python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: setup pinned rust
+        run: python scripts/setup_rust_toolchain.py
+
       - name: setup uv
         uses: astral-sh/setup-uv@v4
 
       - name: sync python dependencies
-        run: uv sync --locked --extra dev --no-install-project
+        run: uv sync --locked --extra dev --group protocol --no-install-project
+
+      - name: verify generated protocol
+        run: uv run --locked --group protocol scripts/generate_protocol.py --check
+
+      - name: check protocol generator
+        run: |
+          cargo fmt --manifest-path tools/protocol-codegen/Cargo.toml --check
+          cargo clippy --locked --manifest-path tools/protocol-codegen/Cargo.toml --all-targets -- -D warnings
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/zippy-console/package-lock.json
+
+      - name: build console
+        working-directory: app/zippy-console
+        run: |
+          npm ci
+          npm run build
+
+      - name: verify packaged console
+        run: uv run --locked scripts/check_frontend_bundle.py
 
       - name: run rust tests
         run: cargo test --workspace
 
-      - name: run zmq feature tests
-        run: cargo test -p zippy-io --features zmq-publisher
 
       - name: run rust clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -90,15 +124,15 @@ jobs:
       - name: install python extension
         run: uv run maturin develop --manifest-path crates/zippy-python/Cargo.toml
 
-      - name: install lightweight client extension
+      - name: install lightweight client
         working-directory: clients/python
-        run: uv run --extra dev maturin develop
+        run: uv sync --locked --package zippy-client --extra dev --inexact --no-install-package zippy
 
       - name: check python formatting
-        run: uv run --extra dev black --check python pytests
+        run: uv run --extra dev black --check --line-length 100 .
 
       - name: run python ruff
-        run: uv run --extra dev ruff check python pytests
+        run: uv run --extra dev ruff check .
 
       - name: run python mypy
         run: uv run --extra dev mypy
@@ -117,3 +151,9 @@ jobs:
 
       - name: run lightweight client tests
         run: uv run --project clients/python --extra dev pytest clients/python/tests -v
+
+      - name: verify native Python client and Rust server recovery
+        run: uv run --no-sync scripts/check_native_client.py
+
+      - name: verify archive distributions in isolation
+        run: uv run --no-sync scripts/check_distributions.py --work-dir /tmp/zippy-distributions

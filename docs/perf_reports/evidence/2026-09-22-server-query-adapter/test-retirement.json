@@ -1,0 +1,300 @@
+{
+  "retired_or_renamed": [
+    {
+      "file": "crates/zippy-gateway/src/legacy_query.rs",
+      "test": "facade_cancellation_interrupts_stalled_master_lookup",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/legacy_query.rs",
+      "test": "facade_pre_cancel_returns_typed_cancelled",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/legacy_query.rs",
+      "test": "facade_rejects_work_after_gateway_shutdown",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/legacy_query.rs",
+      "test": "request_accepts_streamable_filter_and_projection",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/legacy_query.rs",
+      "test": "request_explicitly_rejects_snapshots",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/legacy_query.rs",
+      "test": "request_rejects_invalid_or_residual_plans",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "legacy_cursor_cancel_after_open_returns_typed_cancelled",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "legacy_facade_defers_scan_and_drop_cancels_it",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "legacy_facade_enforces_global_buffer_reservation",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "legacy_facade_preserves_master_not_found",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-gateway/src/lib.rs",
+      "test": "legacy_facade_streams_persisted_batches_and_reports_metrics",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/composition.rs",
+      "test": "composition_applies_server_plan_ttl_to_legacy_queries",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/composition.rs",
+      "test": "composition_publishes_readiness_only_after_explicit_activation",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/composition.rs",
+      "test": "gateway_shutdown_only_removes_query_readiness",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/composition.rs",
+      "test": "master_shutdown_removes_readiness_and_rejects_catalog_and_query_work",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "active_only_registry_capacity_still_rejects_new_plans",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "cancellation_releases_admission_but_retains_stalled_worker_slot",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "compatibility_plan_rejects_blank_source",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "compatibility_plan_uses_a_distinct_format_version",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "concurrent_query_permits_are_strictly_bounded",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "delivery_attach_after_cancellation_observes_first_terminal_error",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "delivery_waker_runs_without_holding_delivery_lock",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "dropping_unexecuted_token_cancels_query_synchronously",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "dropping_unpolled_execution_future_cancels_query",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "early_eviction_tombstone_blocks_query_id_reuse",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "execution_streams_bounded_batches_without_materializing_the_table",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "explicit_deadline_times_out_a_stalled_opener",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "gateway_operational_timeout_before_query_deadline_sets_failed",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "gateway_operational_timeout_without_query_deadline_sets_failed",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "gateway_runtime_failures_map_without_message_parsing",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "logical_admission_failure_sets_matching_failed_status",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "owner_capability_is_bound_to_one_engine_instance",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "owner_capability_nonce_isolates_query_instances_in_one_session",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "retired_token_cannot_affect_reused_query_id",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "shutdown_gate_rejects_new_plans_and_cancels_registered_work",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "sql_is_rejected_without_registering_a_query",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "structured_gateway_deadline_sets_timed_out_status_and_wins_terminal_race",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "sweeper_enforces_deadline_after_query_starts",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "sweeper_prunes_expired_terminal_before_duplicate_reuse",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "sweeper_times_out_an_unexecuted_plan",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "terminal_eviction_uses_query_id_as_a_stable_tie_break",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "terminal_query_flood_does_not_block_new_plans",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "terminal_registry_churn_keeps_heap_and_map_bounded",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_query.rs",
+      "test": "tombstone_capacity_exhaustion_fails_closed",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "query_engines_use_the_server_plan_ttl",
+      "reason": "renamed to native_query_registry_uses_the_server_plan_ttl",
+      "replacement": "native plan TTL assertion retained, removed legacy adapter assertion"
+    },
+    {
+      "file": "crates/zippy-server/tests/legacy_runtime_baseline.rs",
+      "test": "legacy_composition_baseline_preserves_both_listener_wires",
+      "reason": "deleted legacy QueryEngine adapter, collect facade or composition contract",
+      "replacement": "native QueryEngine/QueryService streaming, snapshot, budget and cancellation tests; native Flight recovery matrix"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "native_query_registry_uses_the_server_plan_ttl"
+    },
+    {
+      "file": "pytests/test_server_process.py",
+      "test": "test_server_ready_record_rejects_removed_gateway_facade_fact"
+    }
+  ],
+  "retired_total": 45,
+  "renamed_total": 1,
+  "retained_assertions": [
+    "native plan TTL",
+    "real listener termination and ownership",
+    "Server startup rollback and ordered shutdown",
+    "native query snapshot/resource/cancellation",
+    "three-kind native recovery"
+  ],
+  "ready_contract": "v8 rejects v7 and rejects a missing listener fact even if the former facade fact is true"
+}

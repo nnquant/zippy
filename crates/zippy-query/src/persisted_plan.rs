@@ -17,9 +17,11 @@ use datafusion::common::{DFSchema, DataFusionError, Result, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{ParquetExec, ParquetFileReaderFactory};
 use datafusion::datasource::physical_plan::{FileMeta, FileScanConfig};
+use datafusion::datasource::provider_as_source;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{col, lit, ExprFunctionExt, LogicalPlanBuilder};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -39,7 +41,7 @@ const PLANNING_ONLY_READER_ERROR: &str =
     "planning-only Zippy Parquet scan has no snapshot-bound reader factory";
 const EXPIRED_EXECUTION_LEASE_ERROR: &str =
     "snapshot-bound Zippy Parquet scan execution lease has expired";
-const PERSISTED_SNAPSHOT_DIGEST_VERSION: u32 = 2;
+const PERSISTED_SNAPSHOT_DIGEST_VERSION: u32 = 3;
 
 static PLANNING_READER_FACTORY: LazyLock<Arc<dyn ParquetFileReaderFactory>> =
     LazyLock::new(|| Arc::new(PlanningOnlyParquetReaderFactory));
@@ -476,6 +478,8 @@ fn persisted_snapshot_digest(tables: &[PersistedTableDescription]) -> Result<[u8
             digest.update(segment.offsets().first().get().to_le_bytes());
             digest.update(segment.offsets().last().get().to_le_bytes());
             digest.update(segment.row_count().get().to_le_bytes());
+            digest.update([u8::from(segment.max_utf8_value_bytes().is_some())]);
+            digest.update(segment.max_utf8_value_bytes().unwrap_or(0).to_le_bytes());
         }
     }
     Ok(digest.finalize().into())
@@ -513,12 +517,10 @@ impl PersistedTableDescription {
         files: Vec<PersistedFileDescription>,
         active_segments: Vec<ActiveSegmentDescription>,
     ) -> Result<Self> {
+        zippy_types::key_value::decode_log_schema(schema.as_ref())
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let retained_schema_bytes = conservative_arrow_schema_retained_bytes(schema.as_ref())
-            .map_err(|error| {
-                DataFusionError::ResourcesExhausted(format!(
-                    "persisted schema retained-memory charge failed error=[{error}]"
-                ))
-            })?;
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let schema_digest = canonical_catalog_schema_digest_v1(schema.as_ref());
         let mut file_ids = HashSet::with_capacity(files.len());
         let mut total_file_size_bytes = 0_usize;
@@ -1295,13 +1297,17 @@ impl ParquetFileReaderFactory for BoundParquetReaderFactory {
 #[derive(Debug)]
 pub struct ZippyTableProvider {
     table: PersistedTableDescription,
+    /// Present only for the logical latest-state view; the inner raw-event scan has none.
+    key_value: Option<zippy_types::key_value::KeyValueLogSchema>,
 }
 
 impl ZippyTableProvider {
     /// Creates a provider that can plan, but cannot execute, the persisted manifest.
     #[must_use]
     pub fn new(table: PersistedTableDescription) -> Self {
-        Self { table }
+        let key_value = zippy_types::key_value::decode_log_schema(&table.schema)
+            .expect("persisted description validates the native event schema");
+        Self { table, key_value }
     }
 
     /// Returns the capability-free persisted manifest.
@@ -1317,7 +1323,10 @@ impl TableProvider for ZippyTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.table.schema)
+        match &self.key_value {
+            Some(key_value) => Arc::clone(&key_value.logical),
+            None => Arc::clone(&self.table.schema),
+        }
     }
 
     fn table_type(&self) -> TableType {
@@ -1339,6 +1348,62 @@ impl TableProvider for ZippyTableProvider {
         Self: 'async_trait,
     {
         Box::pin(async move {
+            if let Some(key_value) = &self.key_value {
+                use zippy_types::key_value::{OPERATION, SEQUENCE};
+                const RANK: &str = "_zippy_kv_latest_rank";
+                let raw = Self {
+                    table: self.table.clone(),
+                    key_value: None,
+                };
+                let rank = datafusion::functions_window::expr_fn::row_number()
+                    .partition_by(key_value.keys.iter().map(col).collect())
+                    .order_by(vec![col(SEQUENCE).sort(false, false)])
+                    .build()?
+                    .alias(RANK);
+                let mut plan = LogicalPlanBuilder::scan(
+                    "__zippy_key_value_events",
+                    provider_as_source(Arc::new(raw)),
+                    None,
+                )?
+                .window(vec![rank])?
+                .filter(
+                    col(RANK)
+                        .eq(lit(1_u64))
+                        .and(col(OPERATION).eq(lit("upsert"))),
+                )?;
+                // Predicates and limits only apply after latest-event selection, including
+                // tombstones. Pushing them into the raw log can resurrect overwritten rows.
+                if let Some(predicate) = conjunction(filters.iter().cloned()) {
+                    plan = plan.filter(predicate)?;
+                }
+                let indices = projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..key_value.logical.fields().len()).collect());
+                let fields = indices
+                    .iter()
+                    .map(|&index| {
+                        key_value
+                            .logical
+                            .fields()
+                            .get(index)
+                            .map(|field| col(field.name()))
+                            .ok_or_else(|| {
+                                DataFusionError::Plan(format!(
+                                    "key-value projection index is out of bounds index=[{index}]"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                plan = plan.project(fields)?;
+                if let Some(limit) = limit {
+                    plan = plan.limit(0, Some(limit))?;
+                }
+                let physical = state.create_physical_plan(&plan.build()?).await?;
+                let schema = Arc::new(key_value.logical.project(&indices)?);
+                return Ok(Arc::new(crate::logical_schema::LogicalSchemaExec::try_new(
+                    physical, schema,
+                )?) as Arc<dyn ExecutionPlan>);
+            }
             if let Some(projection) = projection {
                 for &index in projection {
                     if index >= self.table.schema.fields().len() {
@@ -1437,7 +1502,12 @@ impl TableProvider for ZippyTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        let support = if self.key_value.is_some() {
+            TableProviderFilterPushDown::Unsupported
+        } else {
+            TableProviderFilterPushDown::Inexact
+        };
+        Ok(vec![support; filters.len()])
     }
 }
 
@@ -2334,13 +2404,10 @@ mod tests {
             &variable_opener,
         )
         .expect("binding remains independent from output admission");
-        let error = variable_bound
-            .streaming_output_admission(NonZeroUsize::new(4096).expect("nonzero test batch size"))
-            .expect_err("variable-width scan must fail closed before reader creation");
-        assert!(matches!(
-            error,
-            datafusion::common::DataFusionError::NotImplemented(_)
-        ));
+        let admission = variable_bound
+            .streaming_output_admission(NonZeroUsize::new(4096).unwrap())
+            .expect("UTF-8 decoding is charged from the verified file footer before reading");
+        assert_eq!(admission.format_version(), 3);
 
         let union_plan: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(vec![
             marked_plan(planning_config(&fixed)),

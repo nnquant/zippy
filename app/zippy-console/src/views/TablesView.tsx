@@ -18,6 +18,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   fetchTableData,
   fetchTableDetail,
+  tableKey,
+  tableLabel,
   type DashboardPayload,
   type SchemaField,
   type StatusValue,
@@ -25,7 +27,7 @@ import {
   type TableDetailPayload,
   type TableSummary,
 } from "../api/client";
-import { displayNumber, displayValue, StatusBadge, statusTone } from "../components/status";
+import { displayNumber, displayValue } from "../components/status";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader } from "../components/ui/card";
 import { DataTable } from "../components/ui/table";
@@ -50,82 +52,65 @@ export function TablesView({
   const [tab, setTab] = useState<TableTab>("summary");
   const [detail, setDetail] = useState<TableDetailPayload | null>(null);
   const [tableData, setTableData] = useState<TableDataPayload | null>(null);
-  const [dataMode, setDataMode] = useState<DataMode>("tail");
+  const [dataMode, setDataMode] = useState<DataMode>("head");
   const [dataLimit, setDataLimit] = useState(100);
   const [autoRefresh, setAutoRefresh] = useState(false);
 
+  const [orderBy, setOrderBy] = useState<string[]>([]);
+  const [descending, setDescending] = useState(false);
+  const [refreshVersion, setRefreshVersion] = useState(0);
   const selectedSummary = useMemo(
-    () => data.tables.find((table) => table.stream_name === selectedTable) || null,
+    () => data.tables.find((table) => tableKey(table) === selectedTable) || null,
     [data.tables, selectedTable],
   );
+  const namespace = selectedSummary?.namespace;
+  const name = selectedSummary?.name;
 
   useEffect(() => {
-    if (!selectedTable) {
-      setDetail(null);
-      setTableData(null);
-      return;
-    }
     setDetail(null);
     setTableData(null);
-    void loadDetail(selectedTable);
-    if (tab === "data") {
-      void loadData(selectedTable);
-    }
-  }, [selectedTable]);
+    setOrderBy([]);
+    setDataMode("head");
+    if (!selectedSummary) return;
+    const controller = new AbortController();
+    void fetchTableDetail(selectedSummary, controller.signal).then((payload) => {
+      if (!controller.signal.aborted) setDetail(payload);
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setDetail({ ok: false, error: String(error) });
+    });
+    return () => controller.abort();
+  }, [namespace, name]);
 
   useEffect(() => {
-    if (!selectedTable || tab !== "data" || !autoRefresh) {
-      return undefined;
-    }
-    const timer = window.setInterval(() => {
-      void loadData(selectedTable);
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, [autoRefresh, dataLimit, dataMode, selectedTable, tab]);
+    setTableData(null);
+    if (!selectedSummary || tab !== "data") return;
+    const controller = new AbortController();
+    void fetchTableData(
+      selectedSummary, dataMode, dataLimit, orderBy, descending, controller.signal,
+    ).then((payload) => {
+      if (!controller.signal.aborted) setTableData(payload);
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setTableData({
+        ok: false, table_name: selectedSummary.name, namespace: selectedSummary.namespace,
+        mode: dataMode, limit: dataLimit, columns: [], rows: [], row_count: 0,
+        truncated: false, error: String(error),
+      });
+    });
+    return () => controller.abort();
+  }, [namespace, name, tab, dataMode, dataLimit, orderBy, descending, refreshVersion]);
 
-  async function loadDetail(tableName = selectedTable): Promise<void> {
-    if (!tableName) {
-      return;
-    }
-    const payload = await fetchTableDetail(tableName);
-    if (tableName === selectedTable) {
-      setDetail(payload);
-    }
-  }
-
-  async function loadData(tableName = selectedTable): Promise<void> {
-    if (!tableName) {
-      return;
-    }
-    const payload = await fetchTableData(tableName, dataMode, dataLimit);
-    if (tableName === selectedTable) {
-      setTableData(payload);
-    }
-  }
+  useEffect(() => {
+    if (!selectedTable || tab !== "data" || !autoRefresh || !tableData) return;
+    const timer = window.setTimeout(() => setRefreshVersion((current) => current + 1), 5000);
+    return () => window.clearTimeout(timer);
+  }, [autoRefresh, selectedTable, tab, tableData]);
 
   function handleTabChange(value: string): void {
-    const nextTab = value === "data" ? "data" : "summary";
-    setTab(nextTab);
-    if (nextTab === "data" && selectedTable && !tableData) {
-      void loadData(selectedTable);
-    }
-  }
-
-  function handleModeChange(mode: DataMode): void {
-    setDataMode(mode);
-    setTableData(null);
-    if (selectedTable) {
-      void fetchTableData(selectedTable, mode, dataLimit).then(setTableData);
-    }
+    setTab(value === "data" ? "data" : "summary");
   }
 
   function handleLimitChange(value: string): void {
-    const nextLimit = Math.min(Math.max(Number(value) || 100, 1), 1000);
-    setDataLimit(nextLimit);
-    setTableData(null);
-    if (selectedTable) {
-      void fetchTableData(selectedTable, dataMode, nextLimit).then(setTableData);
-    }
+    setDataLimit(Math.min(Math.max(Number(value) || 100, 1), 1000));
   }
 
   return (
@@ -138,8 +123,8 @@ export function TablesView({
           <ul className="table-name-list">
             {data.tables.map((table) => (
               <TableNameItem
-                key={table.stream_name}
-                selected={table.stream_name === selectedTable}
+                key={tableKey(table)}
+                selected={tableKey(table) === selectedTable}
                 table={table}
                 onSelect={onSelectedTableChange}
               />
@@ -150,7 +135,7 @@ export function TablesView({
 
       <Card className="table-inspector">
         <CardHeader>
-          <div className="inspector-name">{selectedSummary?.stream_name || "Select a table"}</div>
+          <div className="inspector-name">{selectedSummary ? tableLabel(selectedSummary) : "Select a table"}</div>
         </CardHeader>
         <Tabs onValueChange={handleTabChange} value={tab}>
           <TabsList>
@@ -174,8 +159,12 @@ export function TablesView({
             disabled={!selectedTable}
             onAutoRefreshChange={setAutoRefresh}
             onLimitChange={handleLimitChange}
-            onModeChange={handleModeChange}
-            onRefresh={() => void loadData()}
+            onModeChange={setDataMode}
+            orderBy={orderBy}
+            onOrderByChange={(columns) => { setOrderBy(columns); if (!columns.length) setDataMode("head"); }}
+            descending={descending}
+            onDescendingChange={setDescending}
+            onRefresh={() => setRefreshVersion((current) => current + 1)}
           />
         )}
       </Card>
@@ -196,12 +185,11 @@ function TableNameItem({
     <li>
       <button
         className={cn("table-name-item", selected && "selected")}
-        onClick={() => onSelect(table.stream_name)}
-        title={table.stream_name}
+        onClick={() => onSelect(tableKey(table))}
+        title={tableLabel(table)}
         type="button"
       >
-        <span className={cn("dot", statusTone(table.health_status || table.status))} />
-        <span className="table-name">{table.stream_name}</span>
+        <span className="table-name">{tableLabel(table)}</span>
       </button>
     </li>
   );
@@ -237,20 +225,11 @@ function SummaryPanel({
   }
 
   const table = detail.table || summary;
-  const fields = table.schema?.fields || table.fields || [];
+  const fields = table.schema?.fields || [];
   const items: Array<[string, unknown]> = [
-    ["Status", table.status],
-    ["Health", detail.health?.status],
-    ["Schema Hash", table.schema_hash],
-    ["Writer", table.writer_process_id],
-    ["Writer Epoch", table.writer_epoch],
-    ["Descriptor", table.descriptor_generation],
-    ["Rows", table.row_count],
-    ["Active Rows", table.active_rows],
-    ["Readers", table.reader_count],
-    ["Sealed", table.sealed_count],
-    ["Persisted", table.persisted_count],
-    ["Persist Events", table.persist_event_count],
+    ["Namespace", table.namespace], ["Name", table.name], ["Catalog", table.catalog],
+    ["Object type", table.table_type],
+    ...Object.entries(table.snapshots?.[0] || {}).map(([key, value]): [string, unknown] => [key, value]),
   ];
 
   return (
@@ -260,11 +239,7 @@ function SummaryPanel({
           <div className="info-item" key={label}>
             <div className="info-label">{label}</div>
             <div className="info-value" title={displayValue(value)}>
-              {label === "Status" || label === "Health" ? (
-                <StatusBadge value={value} />
-              ) : (
-                displayValue(value)
-              )}
+              {displayValue(value)}
             </div>
           </div>
         ))}
@@ -276,7 +251,6 @@ function SummaryPanel({
             <th>Name</th>
             <th>Type</th>
             <th>Nullable</th>
-            <th>Timezone</th>
           </tr>
         </thead>
         <tbody>
@@ -286,12 +260,11 @@ function SummaryPanel({
                 <td className="strong">{displayValue(field.name)}</td>
                 <td title={displayValue(field.data_type)}>{displayValue(field.data_type)}</td>
                 <td>{displayValue(field.nullable)}</td>
-                <td>{displayValue(field.timezone)}</td>
               </tr>
             ))
           ) : (
             <tr>
-              <td colSpan={4}>
+              <td colSpan={3}>
                 <EmptyState title="No schema fields" />
               </td>
             </tr>
@@ -313,6 +286,7 @@ function DataPanel({
   onLimitChange,
   onModeChange,
   onRefresh,
+  orderBy, onOrderByChange, descending, onDescendingChange,
 }: {
   autoRefresh: boolean;
   data: TableDataPayload | null;
@@ -324,9 +298,13 @@ function DataPanel({
   onLimitChange: (value: string) => void;
   onModeChange: (mode: DataMode) => void;
   onRefresh: () => void;
+  orderBy: string[];
+  onOrderByChange: (columns: string[]) => void;
+  descending: boolean;
+  onDescendingChange: (value: boolean) => void;
 }): JSX.Element {
   const columns = data?.columns || [];
-  const columnTypes = useMemo(() => dataTypeByColumn(detail), [detail]);
+  const columnTypes = useMemo(() => dataTypeByColumn(data), [data]);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -346,7 +324,7 @@ function DataPanel({
     setHiddenColumns(new Set());
     setSearchQuery("");
     setSearchOpen(false);
-  }, [data?.table_name]);
+  }, [data?.namespace, data?.table_name]);
 
   function toggleColumn(column: string): void {
     setHiddenColumns((current) => {
@@ -367,10 +345,10 @@ function DataPanel({
           <Button
             aria-label="Load tail rows"
             className={cn("toolbar-icon-button", dataMode === "tail" && "active")}
-            disabled={disabled}
+            disabled={disabled || !orderBy.length}
             onClick={() => onModeChange("tail")}
             size="icon"
-            title="Tail"
+            title="Tail requires explicit sort columns"
             variant="outline"
           >
             <ArrowDownToLine size={16} />
@@ -396,6 +374,26 @@ function DataPanel({
             <option value="100">100 rows</option>
             <option value="500">500 rows</option>
             <option value="1000">1000 rows</option>
+          </select>
+        </div>
+
+        <div className="data-toolbar-group" aria-label="Sort controls">
+          <details className="toolbar-menu">
+            <summary className="ui-button ui-button-outline ui-button-size-default" aria-label="Sort columns">Sort columns</summary>
+            <div className="toolbar-menu-panel">
+              {(detail?.table?.schema?.fields || []).map((field) => (
+                <label className="toolbar-menu-item" key={field.name}>
+                  <input type="checkbox" checked={orderBy.includes(field.name || "")}
+                    onChange={(event) => onOrderByChange(event.target.checked
+                      ? [...orderBy, field.name || ""] : orderBy.filter((name) => name !== field.name))} />
+                  <span>{field.name}</span>
+                </label>
+              ))}
+            </div>
+          </details>
+          <select className="select-box" aria-label="Sort direction" value={String(descending)}
+            disabled={!orderBy.length} onChange={(event) => onDescendingChange(event.target.value === "true")}>
+            <option value="false">Ascending</option><option value="true">Descending</option>
           </select>
         </div>
 
@@ -539,6 +537,11 @@ function DataPanel({
           </details>
         </div>
       </div>
+      <div className="data-preview-note">
+        {orderBy.length ? `Sort: ${orderBy.join(", ")} (${descending ? "descending" : "ascending"})`
+          : "Unsorted preview. Choose sort columns for ordered head or tail rows."}
+        {data?.ok && ` · ${data.row_count} rows${data.truncated ? " (preview limited)" : ""}`}
+      </div>
       <div className="data-scroll">
         <DataTable className={cn("data-table", wrapCells && "wrap-cells")}>
           <thead>
@@ -560,8 +563,8 @@ function DataPanel({
   );
 }
 
-function dataTypeByColumn(detail: TableDetailPayload | null): Map<string, string> {
-  const fields = detail?.table?.schema?.fields || detail?.table?.fields || [];
+function dataTypeByColumn(data: TableDataPayload | null): Map<string, string> {
+  const fields = data?.schema?.fields || [];
   return new Map(
     fields
       .filter((field): field is SchemaField & { name: string } => Boolean(field.name))
@@ -617,7 +620,7 @@ function exportRows(
   columns: string[],
   format: "csv" | "json",
 ): void {
-  const tableName = data?.table_name || "table";
+  const tableName = data ? `${data.namespace}-${data.table_name}` : "table";
   if (format === "csv") {
     downloadTextFile(`${tableName}.csv`, toCsv(rows, columns), "text/csv;charset=utf-8");
     return;

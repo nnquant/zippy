@@ -18,7 +18,7 @@ from .webui import DashboardService, WebuiConfig, run_webui, webui_url
     "uri",
     default=DEFAULT_CONTROL_ENDPOINT,
     show_default=True,
-    help="zippy-master URI",
+    help="Server control endpoint used for Flight discovery",
 )
 @click.option("--host", default="127.0.0.1", show_default=True, help="Web UI bind host")
 @click.option("--port", type=int, default=17688, show_default=True, help="Web UI bind port")
@@ -63,7 +63,7 @@ def _startup_message(config: WebuiConfig) -> str:
         [
             "zippy webui starting",
             f"url: {url}",
-            f"master: {config.uri}",
+            f"server: {config.uri}",
             f"log dir: {config.log_dir}",
             f"dashboard api: {url}api/dashboard",
             "access logs: enabled",

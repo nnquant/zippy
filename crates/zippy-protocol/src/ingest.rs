@@ -13,13 +13,14 @@ use zippy_types::{
     Result, ServerError, SessionId,
 };
 
+use crate::error::watermark_to_wire;
 use crate::query::STABLE_ID_BYTES;
 use crate::wire::{PutBatchResult, PutCommand, PutDurability, PutMutation};
 use crate::CURRENT_PROTOCOL_VERSION;
 
 /// Maximum serialized `PutCommand` accepted by protocol version 1.
 pub const MAX_PUT_COMMAND_BYTES: usize = 64 * 1024;
-/// Maximum legacy stream-name size accepted at the transport boundary.
+/// Maximum table-name size accepted by the Flight write descriptor.
 pub const MAX_PUT_STREAM_NAME_BYTES: usize = 512;
 /// Maximum configurable concurrent `DoPut` streams.
 pub const MAX_CONCURRENT_PUTS: usize = 1_024;
@@ -30,15 +31,19 @@ pub const MAX_ROWS_PER_PUT: u64 = 1_000_000_000;
 /// Maximum configurable decoded bytes in one batch or complete `DoPut` stream.
 pub const MAX_BYTES_PER_PUT: usize = 4 * 1024 * 1024 * 1024;
 
-/// Validated append-only command for one `DoPut` stream.
+/// Validated typed mutation command for one `DoPut` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightPutCommand {
     /// Server-issued writer session bound to the request metadata.
     pub session_id: SessionId,
     /// Client-stable identity for this stream attempt and its batch receipts.
     pub put_id: RequestId,
-    /// Legacy stream name used by the Stage 6.4 compatibility backend.
+    /// Logical table name resolved by the authoritative Catalog.
     pub stream_name: String,
+    /// Optional immutable identity guarding every stream open against name reuse.
+    pub expected_table_id: Option<zippy_types::TableId>,
+    /// Explicit Catalog namespace; empty names are rejected.
+    pub namespace: String,
     /// Sequence assigned to the first decoded record batch.
     pub first_batch_sequence: u64,
     /// Durable producer identity shared by reconnecting writer attempts.
@@ -49,6 +54,8 @@ pub struct FlightPutCommand {
     pub expected_writer_epoch: Option<u64>,
     /// Durability boundary requested for every batch in this stream.
     pub durability: Durability,
+    /// Explicit table mutation; the backend rejects mismatched table definitions.
+    pub mutation: PutMutation,
 }
 
 /// One decoded batch admitted to the configured Flight ingest frontend.
@@ -198,54 +205,50 @@ pub fn decode_put_command(command: PutCommand) -> Result<FlightPutCommand> {
             invalid("Flight ingest stream name is empty or too large").with_request_id(put_id)
         );
     }
-    if PutMutation::try_from(command.mutation).ok() != Some(PutMutation::Append) {
-        return Err(
-            unsupported("Flight protocol version 1 only supports append mutation")
-                .with_request_id(put_id),
-        );
-    }
+    let mutation = match PutMutation::try_from(command.mutation).ok() {
+        Some(
+            mutation @ (PutMutation::Append
+            | PutMutation::Frame
+            | PutMutation::KeyValueUpsert
+            | PutMutation::KeyValueDelete),
+        ) => mutation,
+        _ => return Err(unsupported("unsupported Flight mutation").with_request_id(put_id)),
+    };
     let durability = match PutDurability::try_from(command.durability).ok() {
         Some(PutDurability::Memory) => Durability::Memory,
         Some(PutDurability::Wal) => Durability::Wal,
-        Some(PutDurability::Persisted) => {
+        Some(PutDurability::Persisted) => Durability::Persisted,
+        Some(PutDurability::Unspecified) | None => {
             return Err(unsupported(
-                "Flight persisted acknowledgement requires the future checkpoint pipeline",
+                "Flight ingest requires explicit memory, WAL or persisted durability",
             )
             .with_request_id(put_id));
         }
-        Some(PutDurability::Unspecified) | None => {
-            return Err(
-                unsupported("Flight ingest requires explicit memory or WAL durability")
-                    .with_request_id(put_id),
-            );
-        }
     };
-    let fallback_id = put_id.into_bytes();
-    let producer_id = if command.producer_id.is_empty() {
-        ProducerId::from_bytes(fallback_id)
-            .expect("a nonzero request identity is also a valid producer identity")
-    } else {
-        decode_id(&command.producer_id, ProducerId::from_bytes, "producer_id")?
-    };
-    let connection_id = if command.connection_id.is_empty() {
-        ConnectionId::from_bytes(fallback_id)
-            .expect("a nonzero request identity is also a valid connection identity")
-    } else {
-        decode_id(
-            &command.connection_id,
-            ConnectionId::from_bytes,
-            "connection_id",
-        )?
-    };
+    zippy_types::table::CatalogName::new(command.namespace.clone())
+        .map_err(|error| invalid(format!("invalid Flight ingest namespace error=[{error}]")))?;
+    let producer_id = decode_id(&command.producer_id, ProducerId::from_bytes, "producer_id")?;
+    let connection_id = decode_id(
+        &command.connection_id,
+        ConnectionId::from_bytes,
+        "connection_id",
+    )?;
     Ok(FlightPutCommand {
         session_id,
         put_id,
+        expected_table_id: command
+            .expected_table_id
+            .as_deref()
+            .map(|value| decode_id(value, zippy_types::TableId::from_bytes, "expected_table_id"))
+            .transpose()?,
         stream_name: command.stream_name,
+        namespace: command.namespace,
         first_batch_sequence: command.first_batch_sequence,
         producer_id,
         connection_id,
         expected_writer_epoch: command.expected_writer_epoch,
         durability,
+        mutation,
     })
 }
 
@@ -265,7 +268,7 @@ pub fn put_batch_request_id(put_id: RequestId, batch_index: u64) -> RequestId {
     RequestId::from_bytes(bytes).expect("SHA-256-derived request identity is nonzero")
 }
 
-/// Builds one stable memory-durability compatibility result.
+/// Builds a deterministic memory-durability result for protocol fixtures.
 #[must_use]
 pub fn put_batch_result(
     command: &FlightPutCommand,
@@ -392,10 +395,6 @@ fn decode_watermark(
     match State::try_from(value.state).ok() {
         Some(State::Empty) if value.offset == 0 => Ok(OffsetWatermark::Empty),
         Some(State::Known) => Ok(OffsetWatermark::Known(LogOffset::new(value.offset))),
-        Some(State::LegacyUnknown) => Err(internal_receipt(
-            command,
-            "frontend receipt contains a legacy-unknown watermark",
-        )),
         Some(State::Empty | State::Unspecified) | None => Err(internal_receipt(
             command,
             "frontend receipt watermark state is invalid",
@@ -447,20 +446,6 @@ fn durability_to_wire(durability: Durability) -> PutDurability {
     }
 }
 
-fn watermark_to_wire(value: OffsetWatermark) -> crate::wire::OffsetWatermark {
-    use crate::wire::offset_watermark::State;
-
-    let (state, offset) = match value {
-        OffsetWatermark::Empty => (State::Empty, 0),
-        OffsetWatermark::Known(offset) => (State::Known, offset.get()),
-        OffsetWatermark::LegacyUnknown => (State::LegacyUnknown, 0),
-    };
-    crate::wire::OffsetWatermark {
-        state: state as i32,
-        offset,
-    }
-}
-
 fn decode_id<T, E>(
     value: &[u8],
     decode: impl FnOnce([u8; STABLE_ID_BYTES]) -> std::result::Result<T, E>,
@@ -501,6 +486,8 @@ mod tests {
 
     fn command() -> PutCommand {
         PutCommand {
+            expected_table_id: None,
+            namespace: "default".to_owned(),
             protocol_version: CURRENT_PROTOCOL_VERSION,
             session_id: Bytes::copy_from_slice(&SessionId::from_u128(1).unwrap().into_bytes()),
             put_id: Bytes::copy_from_slice(&RequestId::from_u128(2).unwrap().into_bytes()),
@@ -508,14 +495,40 @@ mod tests {
             first_batch_sequence: 7,
             mutation: PutMutation::Append as i32,
             durability: PutDurability::Memory as i32,
-            producer_id: Bytes::new(),
-            connection_id: Bytes::new(),
+            producer_id: Bytes::from_static(&[3; 16]),
+            connection_id: Bytes::from_static(&[4; 16]),
             expected_writer_epoch: None,
         }
     }
 
     #[test]
-    fn command_requires_explicit_append_supported_durability_and_nonzero_ids() {
+    fn command_validates_optional_table_identity_guard() {
+        assert!(decode_put_command(command())
+            .unwrap()
+            .expected_table_id
+            .is_none());
+        let mut guarded = command();
+        guarded.expected_table_id = Some(Bytes::from_static(&[9; 16]));
+        assert_eq!(
+            decode_put_command(guarded)
+                .unwrap()
+                .expected_table_id
+                .unwrap()
+                .into_bytes(),
+            [9; 16]
+        );
+        for invalid in [vec![0; 16], vec![1; 15], vec![1; 17], vec![]] {
+            let mut guarded = command();
+            guarded.expected_table_id = Some(Bytes::from(invalid));
+            assert_eq!(
+                decode_put_command(guarded).unwrap_err().code(),
+                ErrorCode::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn command_requires_explicit_mutation_supported_durability_and_nonzero_ids() {
         let decoded = decode_put_command(command()).unwrap();
         assert_eq!(decoded.stream_name, "ticks");
         assert_eq!(decoded.first_batch_sequence, 7);
@@ -524,6 +537,19 @@ mod tests {
         durable.durability = PutDurability::Unspecified as i32;
         assert_eq!(
             decode_put_command(durable).unwrap_err().code(),
+            ErrorCode::UnsupportedPlan
+        );
+
+        let mut frame = command();
+        frame.mutation = PutMutation::Frame as i32;
+        assert_eq!(
+            decode_put_command(frame).unwrap().mutation,
+            PutMutation::Frame
+        );
+        let mut missing = command();
+        missing.mutation = PutMutation::Unspecified as i32;
+        assert_eq!(
+            decode_put_command(missing).unwrap_err().code(),
             ErrorCode::UnsupportedPlan
         );
 
@@ -536,7 +562,29 @@ mod tests {
     }
 
     #[test]
-    fn command_accepts_wal_with_explicit_fencing_ids_and_rejects_persisted() {
+    fn command_rejects_implicit_namespace_and_fencing_identities() {
+        let mut missing = command();
+        missing.namespace.clear();
+        assert_eq!(
+            decode_put_command(missing).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+        let mut missing = command();
+        missing.producer_id.clear();
+        assert_eq!(
+            decode_put_command(missing).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+        let mut missing = command();
+        missing.connection_id.clear();
+        assert_eq!(
+            decode_put_command(missing).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn command_accepts_wal_and_persisted_with_explicit_fencing_ids() {
         let producer_id = ProducerId::from_u128(3).unwrap();
         let connection_id = ConnectionId::from_u128(4).unwrap();
         let mut wal = command();
@@ -554,8 +602,8 @@ mod tests {
         let mut persisted = command();
         persisted.durability = PutDurability::Persisted as i32;
         assert_eq!(
-            decode_put_command(persisted).unwrap_err().code(),
-            ErrorCode::UnsupportedPlan
+            decode_put_command(persisted).unwrap().durability,
+            Durability::Persisted
         );
     }
 

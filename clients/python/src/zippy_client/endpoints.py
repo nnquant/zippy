@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from .errors import ProtocolError
 
-DEFAULT_MASTER_URI = "zippy://default"
+DEFAULT_CONTROL_URI = "zippy://default"
 DEFAULT_WINDOWS_CONTROL_ADDR = "127.0.0.1:17690"
 
 
@@ -43,37 +43,41 @@ def resolve_control_endpoint(uri: str | None = None) -> ControlEndpoint:
     :type uri: str | None
     :returns: Resolved control endpoint.
     :rtype: ControlEndpoint
+    :raises ValueError: If the URI is invalid or unsupported on this platform.
     """
-    raw_uri = (
-        uri
-        or os.environ.get("ZIPPY_MASTER_URI")
-        or os.environ.get("ZIPPY_MASTER_ENDPOINT")
-        or os.environ.get("ZIPPY_CONTROL_ENDPOINT")
-        or DEFAULT_MASTER_URI
-    )
+    for removed_name in ("ZIPPY_MASTER_URI", "ZIPPY_MASTER_ENDPOINT"):
+        if removed_name in os.environ:
+            raise ValueError(
+                f"removed control endpoint environment variable name=[{removed_name}]; "
+                "use [ZIPPY_CONTROL_ENDPOINT]"
+            )
+    raw_uri = uri or os.environ.get("ZIPPY_CONTROL_ENDPOINT") or DEFAULT_CONTROL_URI
     if raw_uri.startswith("zippy+tcp://"):
-        raise ValueError("zippy+tcp:// is no longer supported; use zippy://host:port/profile")
+        raise ValueError("zippy+tcp:// is no longer supported; use zippy://host:port/default")
     if raw_uri.startswith("tcp://"):
         return ControlEndpoint("tcp", normalize_tcp_address(raw_uri), raw_uri)
     if raw_uri.startswith("zippy://"):
         body = raw_uri.removeprefix("zippy://")
-        authority = body.split("/", 1)[0]
+        authority, separator, profile = body.partition("/")
         if ":" in authority:
+            if separator and profile != "default":
+                raise ValueError("remote zippy control URI supports only /default profile")
             return ControlEndpoint("tcp", normalize_tcp_address(authority), raw_uri)
         if os.name == "nt":
-            address = DEFAULT_WINDOWS_CONTROL_ADDR if authority in {"", "default"} else authority
-            return ControlEndpoint("tcp", normalize_tcp_address(address), raw_uri)
+            if body not in {"", "default"}:
+                raise ValueError("named control endpoint is not supported on this platform")
+            return ControlEndpoint("tcp", DEFAULT_WINDOWS_CONTROL_ADDR, raw_uri)
         return ControlEndpoint("unix", str(_logical_unix_path(body or "default")), raw_uri)
+    if os.name == "nt" and (
+        raw_uri.startswith(("unix://", "file://")) or _looks_like_path(raw_uri)
+    ):
+        raise ValueError("Unix control endpoint is not supported on this platform")
     if raw_uri.startswith("unix://"):
-        return ControlEndpoint(
-            "unix", str(Path(raw_uri.removeprefix("unix://")).expanduser()), raw_uri
-        )
+        return ControlEndpoint("unix", _expand_path(raw_uri.removeprefix("unix://")), raw_uri)
     if raw_uri.startswith("file://"):
-        return ControlEndpoint(
-            "unix", str(Path(raw_uri.removeprefix("file://")).expanduser()), raw_uri
-        )
+        return ControlEndpoint("unix", _expand_path(raw_uri.removeprefix("file://")), raw_uri)
     if _looks_like_path(raw_uri):
-        return ControlEndpoint("unix", str(Path(raw_uri).expanduser()), raw_uri)
+        return ControlEndpoint("unix", _expand_path(raw_uri), raw_uri)
     if os.name == "nt":
         address = DEFAULT_WINDOWS_CONTROL_ADDR if raw_uri in {"", "default"} else raw_uri
         return ControlEndpoint("tcp", normalize_tcp_address(address), raw_uri)
@@ -82,12 +86,25 @@ def resolve_control_endpoint(uri: str | None = None) -> ControlEndpoint:
 
 def normalize_tcp_address(value: str) -> str:
     """Normalize a TCP endpoint to ``host:port`` without a path."""
-    text = str(value).removeprefix("tcp://")
-    parsed = urlsplit(f"//{text}")
-    if parsed.hostname is None or parsed.port is None:
-        raise ValueError(f"TCP endpoint must include host and port endpoint=[{value}]")
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    return f"{host}:{parsed.port}"
+    endpoint = str(value).removeprefix("tcp://")
+    try:
+        parsed = urlsplit(f"//{endpoint}")
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("TCP endpoint must include host and port only") from error
+    if (
+        host is None
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or "?" in endpoint
+        or "#" in endpoint
+    ):
+        raise ValueError("TCP endpoint must include host and port only")
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{rendered_host}:{port}"
 
 
 def split_host_port(value: str) -> tuple[str, int]:
@@ -98,11 +115,6 @@ def split_host_port(value: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
-def connectable_gateway_endpoint(endpoint: str, control: ControlEndpoint) -> str:
-    """Replace wildcard Gateway hosts with a host reachable by this client."""
-    return connectable_data_endpoint(endpoint, control)
-
-
 def connectable_data_endpoint(endpoint: str, control: ControlEndpoint) -> str:
     """Replace wildcard data-plane hosts with a host reachable by this client."""
     host, port = split_host_port(endpoint)
@@ -111,11 +123,6 @@ def connectable_data_endpoint(endpoint: str, control: ControlEndpoint) -> str:
     replacement = control.host or "127.0.0.1"
     rendered = f"[{replacement}]" if ":" in replacement else replacement
     return f"{rendered}:{port}"
-
-
-def gateway_is_local(endpoint: str, control: ControlEndpoint) -> bool:
-    """Return whether a Gateway endpoint is local to the client host."""
-    return data_endpoint_is_local(endpoint, control)
 
 
 def data_endpoint_is_local(endpoint: str, control: ControlEndpoint) -> bool:
@@ -141,4 +148,18 @@ def _home_dir() -> Path:
 
 
 def _looks_like_path(value: str) -> bool:
-    return value.startswith(("/", "~/", "~\\", "./", "../"))
+    return (
+        value.startswith(("/", "~/", "~\\", "./", "../"))
+        or "/" in value
+        or "\\" in value
+        or (len(value) > 1 and value[1] == ":")
+        or value.endswith(".sock")
+    )
+
+
+def _expand_path(value: str) -> str:
+    if value.startswith("~/"):
+        return str(_home_dir() / value[2:])
+    if value.startswith("~\\"):
+        return str(_home_dir()) + "\\" + value[2:]
+    return str(Path(value).expanduser())

@@ -1,7 +1,7 @@
-//! Native append materialization and serialized TableActor publication.
+//! Native table materialization and serialized TableActor publication.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
 use zippy_core::{Engine, SegmentTableView, ZippyError};
@@ -9,7 +9,7 @@ use zippy_engines::{StreamTableLiveSegment, StreamTableMaterializer};
 use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
 use zippy_types::table::{
     MetadataMap, NativeDataFileProvenance, SourceSegmentIdentity, SourceSegmentLineage,
-    SourceSegmentLineages, TableDefinition,
+    SourceSegmentLineages, TableDefinition, TableKind,
 };
 use zippy_types::{
     BoxFuture, ErrorCode, FileId, LogOffset, OffsetRange, OffsetWatermark, RequestId, Result,
@@ -22,33 +22,33 @@ use crate::{
     TableActorLiveSegmentsPublication, TableActorRegistryHandle,
 };
 
-/// Default row capacity of one native append shared-memory segment.
-pub const DEFAULT_NATIVE_APPEND_ROW_CAPACITY: usize =
+/// Default row capacity of one native table shared-memory segment.
+pub const DEFAULT_NATIVE_TABLE_ROW_CAPACITY: usize =
     zippy_engines::DEFAULT_STREAM_TABLE_ROW_CAPACITY;
 /// Default maximum live shared-memory segments published for one append table.
-pub const DEFAULT_NATIVE_APPEND_MAX_LIVE_SEGMENTS: usize = 1_024;
-/// Hard ceiling for native append live-segment publication.
-pub const MAX_NATIVE_APPEND_LIVE_SEGMENTS: usize = 1_024;
+pub const DEFAULT_NATIVE_TABLE_MAX_LIVE_SEGMENTS: usize = 1_024;
+/// Hard ceiling for native table live-segment publication.
+pub const MAX_NATIVE_TABLE_LIVE_SEGMENTS: usize = 1_024;
 
-/// Bounded shared-memory policy for the native append sink.
+/// Bounded shared-memory policy for the native table sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeAppendMaterializerConfig {
+pub struct NativeTableMaterializerConfig {
     row_capacity: usize,
     max_live_segments: usize,
     max_buffered_bytes: usize,
 }
 
-impl Default for NativeAppendMaterializerConfig {
+impl Default for NativeTableMaterializerConfig {
     fn default() -> Self {
         Self {
-            row_capacity: DEFAULT_NATIVE_APPEND_ROW_CAPACITY,
-            max_live_segments: DEFAULT_NATIVE_APPEND_MAX_LIVE_SEGMENTS,
+            row_capacity: DEFAULT_NATIVE_TABLE_ROW_CAPACITY,
+            max_live_segments: DEFAULT_NATIVE_TABLE_MAX_LIVE_SEGMENTS,
             max_buffered_bytes: 64 * 1024 * 1024,
         }
     }
 }
 
-impl NativeAppendMaterializerConfig {
+impl NativeTableMaterializerConfig {
     /// Creates the default bounded append materializer policy.
     #[must_use]
     pub fn new() -> Self {
@@ -79,97 +79,150 @@ impl NativeAppendMaterializerConfig {
     pub fn validate(self) -> Result<()> {
         if self.max_buffered_bytes == 0 || self.max_buffered_bytes > 256 * 1024 * 1024 {
             return Err(invalid(
-                "native append buffered byte limit must be between 1 and 256 MiB",
+                "native table buffered byte limit must be between 1 and 256 MiB",
             ));
         }
         if self.row_capacity == 0 {
-            return Err(invalid("native append row capacity must be positive"));
+            return Err(invalid("native table row capacity must be positive"));
         }
-        if self.max_live_segments == 0 || self.max_live_segments > MAX_NATIVE_APPEND_LIVE_SEGMENTS {
+        if self.max_live_segments == 0 || self.max_live_segments > MAX_NATIVE_TABLE_LIVE_SEGMENTS {
             return Err(invalid(format!(
-                concat!("native append live segment limit must be between 1 and {} actual=[{}]"),
-                MAX_NATIVE_APPEND_LIVE_SEGMENTS, self.max_live_segments
+                concat!("native table live segment limit must be between 1 and {} actual=[{}]"),
+                MAX_NATIVE_TABLE_LIVE_SEGMENTS, self.max_live_segments
             )));
         }
         Ok(())
     }
 }
 
-/// Server-owned append materializer that publishes fixed logical prefixes through TableActor.
-pub struct NativeAppendMaterializerSink {
-    config: NativeAppendMaterializerConfig,
-    tables: BTreeMap<TableId, Arc<NativeAppendTable>>,
+/// Server-owned native table materializer that publishes fixed logical prefixes through TableActor.
+pub struct NativeTableMaterializerSink {
+    config: NativeTableMaterializerConfig,
+    tables: RwLock<BTreeMap<TableId, Arc<NativeMaterializedTable>>>,
 }
 
-impl NativeAppendMaterializerSink {
-    /// Builds one append sink from the same revision-consistent bootstraps as native ingest.
+impl NativeTableMaterializerSink {
+    /// Checks a physical schema against the actual writer layout before Catalog publication.
+    ///
+    /// Uses the materializer's single schema compiler without allocating a partition.
+    pub fn validate_schema(schema: &arrow::datatypes::SchemaRef) -> Result<()> {
+        StreamTableMaterializer::validate_schema(schema).map_err(|error| {
+            ServerError::new(
+                ErrorCode::SchemaMismatch,
+                format!("native writer cannot materialize the proposed schema error=[{error}]"),
+            )
+            .with_retryable(false)
+        })
+    }
+
+    /// Builds one native table sink from the same revision-consistent bootstraps as native ingest.
     pub fn start(
-        config: NativeAppendMaterializerConfig,
+        config: NativeTableMaterializerConfig,
         bootstraps: &[NativeIngestTableBootstrap],
         actors: &TableActorRegistryHandle,
     ) -> Result<Self> {
         config.validate()?;
-        let mut tables = BTreeMap::new();
+        let sink = Self {
+            config,
+            tables: RwLock::new(BTreeMap::new()),
+        };
         for bootstrap in bootstraps {
-            if !matches!(bootstrap.table_definition(), TableDefinition::Append(_)) {
-                continue;
-            }
-            let table_id = bootstrap.table_id();
-            let table = NativeAppendTable {
-                table_id,
-                schema_version: bootstrap.schema_version(),
-                schema: Arc::clone(bootstrap.schema()),
-                actor: actors.table(table_id)?,
-                state: Mutex::new(NativeAppendTableState {
-                    actor_writer_epoch: bootstrap.writer_epoch(),
-                    persisted_log_offset: bootstrap.persisted_log_offset(),
-                    last_applied_log_offset: bootstrap.persisted_log_offset(),
-                    live_rows: 0,
-                    retained_start: next_offset(table_id, bootstrap.persisted_log_offset())?,
-                    buffered_bytes: 0,
-                    batch_bytes: VecDeque::new(),
-                    epochs: Vec::new(),
-                }),
-            };
-            if tables.insert(table_id, Arc::new(table)).is_some() {
-                return Err(ServerError::new(
-                    ErrorCode::DataCorruption,
-                    "native append materializer contains a duplicate table",
-                )
-                .with_table_id(table_id)
-                .with_retryable(false));
-            }
+            sink.register_table(bootstrap, actors)?;
         }
-        Ok(Self { config, tables })
+        Ok(sink)
     }
 
-    /// Returns the number of append tables owned by this sink.
+    /// Installs a materializer after its Catalog row and table actor exist.
+    pub fn register_table(
+        &self,
+        bootstrap: &NativeIngestTableBootstrap,
+        actors: &TableActorRegistryHandle,
+    ) -> Result<()> {
+        let table_id = bootstrap.table_id();
+        let mut tables = self.tables.write().unwrap();
+        if tables.contains_key(&table_id) {
+            return Err(ServerError::new(
+                ErrorCode::AlreadyExists,
+                "native materializer already exists",
+            )
+            .with_table_id(table_id));
+        }
+        let schema = if let TableDefinition::KeyValue(definition) = bootstrap.table_definition() {
+            let keys = definition
+                .keys()
+                .as_slice()
+                .iter()
+                .map(|key| key.as_str().to_owned())
+                .collect::<Vec<_>>();
+            zippy_types::key_value::log_schema(bootstrap.schema().as_ref(), &keys)?
+        } else {
+            Arc::clone(bootstrap.schema())
+        };
+        Self::validate_schema(&schema)?;
+        let table = NativeMaterializedTable {
+            table_id,
+            kind: bootstrap.table_definition().kind(),
+            schema_version: bootstrap.schema_version(),
+            schema,
+            actor: actors.table(table_id)?,
+            state: Mutex::new(NativeMaterializedTableState {
+                actor_writer_epoch: bootstrap.writer_epoch(),
+                key_value_version: bootstrap.persisted_state_version(),
+                persisted_log_offset: bootstrap.persisted_log_offset(),
+                last_applied_log_offset: bootstrap.persisted_log_offset(),
+                live_rows: 0,
+                retained_start: next_offset(table_id, bootstrap.persisted_log_offset())?,
+                buffered_bytes: 0,
+                batch_bytes: VecDeque::new(),
+                epochs: Vec::new(),
+            }),
+        };
+        tables.insert(table_id, Arc::new(table));
+        Ok(())
+    }
+
+    /// Removes a retired table after Server fences ingest and quiesces its actor.
+    ///
+    /// Retained query spans own their mappings independently. This does not remove Catalog
+    /// files, WAL or data-root directories and is idempotent for interrupted cleanup retries.
+    pub fn retire_table(&self, table_id: TableId) {
+        self.tables.write().unwrap().remove(&table_id);
+    }
+
+    /// Returns the number of tables owned by this sink.
     #[must_use]
     pub fn table_count(&self) -> usize {
-        self.tables.len()
+        self.tables.read().unwrap().len()
     }
 
-    fn table(&self, table_id: TableId) -> Result<&NativeAppendTable> {
-        self.tables.get(&table_id).map(Arc::as_ref).ok_or_else(|| {
-            ServerError::new(
-                ErrorCode::UnsupportedPlan,
-                "native materializer currently supports append tables only",
-            )
-            .with_table_id(table_id)
-            .with_retryable(false)
-        })
+    fn table(&self, table_id: TableId) -> Result<Arc<NativeMaterializedTable>> {
+        self.tables
+            .read()
+            .unwrap()
+            .get(&table_id)
+            .cloned()
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::NotFound,
+                    "native table materializer was not found",
+                )
+                .with_table_id(table_id)
+                .with_retryable(false)
+            })
     }
 }
 
-struct NativeAppendTable {
+struct NativeMaterializedTable {
     table_id: TableId,
+    kind: TableKind,
     schema_version: u64,
     schema: arrow::datatypes::SchemaRef,
     actor: TableActorHandle,
-    state: Mutex<NativeAppendTableState>,
+    state: Mutex<NativeMaterializedTableState>,
 }
 
-struct NativeAppendTableState {
+struct NativeMaterializedTableState {
+    key_value_version: u64,
     actor_writer_epoch: u64,
     persisted_log_offset: OffsetWatermark,
     last_applied_log_offset: OffsetWatermark,
@@ -185,11 +238,13 @@ struct EpochMaterializer {
     materializer: StreamTableMaterializer,
 }
 
-impl NativeIngestSink for NativeAppendMaterializerSink {
+impl NativeIngestSink for NativeTableMaterializerSink {
+    fn frame_row_capacity(&self) -> Option<usize> {
+        Some(self.config.row_capacity)
+    }
+
     fn supports_checkpoint(&self) -> bool {
-        self.tables
-            .values()
-            .any(|table| table.actor.persistence_enabled())
+        true
     }
 
     fn prepare_checkpoint(
@@ -197,14 +252,7 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
         table_id: TableId,
         watermark: OffsetWatermark,
     ) -> Result<Option<BoxFuture<'static, Result<OffsetWatermark>>>> {
-        let table = Arc::clone(
-            self.tables
-                .get(&table_id)
-                .ok_or_else(|| invalid("checkpoint table missing"))?,
-        );
-        if !table.actor.persistence_enabled() {
-            return Ok(None);
-        }
+        let table = self.table(table_id)?;
         {
             let mut state = table.state.lock().unwrap();
             if state.last_applied_log_offset != watermark {
@@ -228,6 +276,19 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
         })))
     }
 
+    fn persisted_state(
+        &self,
+        table_id: TableId,
+    ) -> BoxFuture<'_, Result<crate::NativePersistedState>> {
+        Box::pin(async move {
+            let snapshot = self.table(table_id)?.actor.snapshot().await?;
+            Ok(crate::NativePersistedState {
+                snapshot_version: snapshot.persisted_snapshot_version,
+                committed_log_offset: snapshot.committed_log_offset,
+            })
+        })
+    }
+
     fn fence_writer(&self, table_id: TableId, writer_epoch: u64) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let table = self.table(table_id)?;
@@ -238,7 +299,7 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
                         ErrorCode::StaleProducerEpoch,
                         format!(
                             concat!(
-                                "native append writer epoch regressed expected=[{}] actual=[{}]"
+                                "native table writer epoch regressed expected=[{}] actual=[{}]"
                             ),
                             state.actor_writer_epoch, writer_epoch
                         ),
@@ -253,7 +314,7 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
                         .materializer
                         .seal_active_for_writer_handoff()
                         .map_err(|error| materializer_error("seal append writer handoff", error))?;
-                    Some(build_publication(table, &state, state.live_rows)?)
+                    Some(build_publication(&table, &state, state.live_rows)?)
                 } else {
                     None
                 }
@@ -276,30 +337,70 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
         let table = self
             .table(context.identity.table_id)
             .map_err(NativeIngestSinkError::Rejected)?;
-        let zippy_types::ingest::TableMutation::Append(batch) = mutation else {
-            return Err(NativeIngestSinkError::Rejected(
-                ServerError::new(
-                    ErrorCode::UnsupportedPlan,
-                    "native append materializer received a non-append mutation",
-                )
-                .with_table_id(table.table_id)
-                .with_retryable(false),
-            ));
+        let mut state = table.state.lock().unwrap();
+        let encoded;
+        let next_state_version = if table.kind == TableKind::KeyValue && mutation.row_count() != 0 {
+            state
+                .key_value_version
+                .checked_add(1)
+                .filter(|version| *version <= i64::MAX as u64)
+                .ok_or_else(|| {
+                    NativeIngestSinkError::Rejected(resource_exhausted(
+                        table.table_id,
+                        "native key-value mutation version is exhausted",
+                    ))
+                })?
+        } else {
+            state.key_value_version
         };
+        let batch = match (table.kind, mutation) {
+            (TableKind::Append, zippy_types::ingest::TableMutation::Append(batch))
+            | (TableKind::Frame, zippy_types::ingest::TableMutation::Frame(batch)) => batch,
+            (TableKind::KeyValue, zippy_types::ingest::TableMutation::KeyValue(mutation)) => {
+                let first_sequence = match context.receipt.previous_log_offset() {
+                    OffsetWatermark::Empty => 1,
+                    OffsetWatermark::Known(offset) => {
+                        offset.get().checked_add(2).ok_or_else(|| {
+                            NativeIngestSinkError::Rejected(invalid("key-value sequence exhausted"))
+                        })?
+                    }
+                };
+                encoded = zippy_types::key_value::change_batch(
+                    Arc::clone(&table.schema),
+                    mutation,
+                    table.table_id,
+                    next_state_version,
+                    first_sequence,
+                )
+                .map_err(NativeIngestSinkError::Rejected)?;
+                &encoded
+            }
+            _ => {
+                return Err(NativeIngestSinkError::Rejected(
+                    invalid("native mutation kind differs from its materialized table")
+                        .with_table_id(table.table_id),
+                ))
+            }
+        };
+        if table.kind == TableKind::Frame && batch.num_rows() > self.config.row_capacity {
+            return Err(NativeIngestSinkError::Rejected(
+                resource_exhausted(table.table_id, "native frame exceeds segment row capacity")
+                    .with_retryable(false),
+            ));
+        }
         if context.schema_version != table.schema_version
             || batch.schema().as_ref() != table.schema.as_ref()
         {
             return Err(NativeIngestSinkError::Rejected(
                 ServerError::new(
                     ErrorCode::SchemaMismatch,
-                    "native append materializer schema differs from its startup schema",
+                    "native table materializer schema differs from its startup schema",
                 )
                 .with_table_id(table.table_id)
                 .with_retryable(false),
             ));
         }
 
-        let mut state = table.state.lock().unwrap();
         validate_receipt_prefix(table.table_id, &state, &context)?;
         if batch.num_rows() == 0 {
             return Ok(());
@@ -314,7 +415,7 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
             return Err(NativeIngestSinkError::Rejected(
                 ServerError::new(
                     ErrorCode::ResourceExhausted,
-                    "native append persistence backlog exhausted its byte budget",
+                    "native table persistence backlog exhausted its byte budget",
                 )
                 .with_table_id(table.table_id)
                 .with_retryable(true),
@@ -324,17 +425,23 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
             return Err(NativeIngestSinkError::Rejected(
                 ServerError::new(
                     ErrorCode::StaleProducerEpoch,
-                    "native append mutation epoch is ahead of the TableActor fencing epoch",
+                    "native table mutation epoch is ahead of the TableActor fencing epoch",
                 )
                 .with_table_id(table.table_id)
                 .with_retryable(false),
             ));
         }
-        preflight_live_segment_budget(self.config, &state, context.identity.producer_epoch, batch)
-            .map_err(NativeIngestSinkError::Rejected)?;
+        preflight_live_segment_budget(
+            self.config,
+            &state,
+            context.identity.producer_epoch,
+            batch,
+            table.kind == TableKind::Frame,
+        )
+        .map_err(NativeIngestSinkError::Rejected)?;
         ensure_epoch_materializer(
             self.config,
-            table,
+            &table,
             &mut state,
             context.identity.producer_epoch,
         )?;
@@ -354,7 +461,7 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
             })?;
         current.materializer.on_flush().map_err(|error| {
             NativeIngestSinkError::Indeterminate(materializer_error(
-                "flush native append mutation",
+                "flush native table mutation",
                 error,
             ))
         })?;
@@ -365,10 +472,10 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
             .ok_or_else(|| {
                 NativeIngestSinkError::Indeterminate(resource_exhausted(
                     table.table_id,
-                    "native append live row counter overflow",
+                    "native table live row counter overflow",
                 ))
             })?;
-        let publication = build_publication(table, &state, new_live_rows)
+        let publication = build_publication(&table, &state, new_live_rows)
             .map_err(NativeIngestSinkError::Indeterminate)?;
         table
             .actor
@@ -377,6 +484,7 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
             .wait_blocking()
             .map_err(NativeIngestSinkError::Indeterminate)?;
         state.live_rows = new_live_rows;
+        state.key_value_version = next_state_version;
         state.last_applied_log_offset = context.receipt.committed_log_offset();
         state.buffered_bytes += batch_bytes;
         if let OffsetWatermark::Known(last) = context.receipt.committed_log_offset() {
@@ -387,7 +495,7 @@ impl NativeIngestSink for NativeAppendMaterializerSink {
 }
 
 async fn persist_checkpoint_prefix(
-    table: Arc<NativeAppendTable>,
+    table: Arc<NativeMaterializedTable>,
     watermark: OffsetWatermark,
 ) -> Result<OffsetWatermark> {
     let snapshot = table.actor.snapshot().await?;
@@ -446,6 +554,22 @@ async fn persist_checkpoint_prefix(
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| invalid(error.to_string()))?
             .as_nanos();
+        let mut metadata = MetadataMap::new();
+        if table.kind == TableKind::KeyValue {
+            let batch = batches
+                .last()
+                .ok_or_else(|| invalid("key-value checkpoint has no events"))?;
+            let versions = batch
+                .column_by_name(zippy_types::key_value::VERSION)
+                .and_then(|column| column.as_any().downcast_ref::<arrow::array::Int64Array>())
+                .ok_or_else(|| invalid("key-value checkpoint version column is invalid"))?;
+            metadata.insert(
+                zippy_types::key_value::STATE_VERSION_METADATA.to_owned(),
+                zippy_types::table::MetadataScalar::UInt64(
+                    versions.value(versions.len() - 1) as u64
+                ),
+            );
+        }
         let candidate = PersistCandidateInput::new(
             ParquetCandidateSpec {
                 file_id,
@@ -454,7 +578,7 @@ async fn persist_checkpoint_prefix(
                 schema: Arc::clone(&table.schema),
                 provenance,
                 partition: MetadataMap::new(),
-                metadata: MetadataMap::new(),
+                metadata,
                 created_at_ns: u64::try_from(created_at_ns)
                     .map_err(|_| invalid("checkpoint timestamp exceeds u64 nanoseconds"))?,
             },
@@ -464,6 +588,7 @@ async fn persist_checkpoint_prefix(
             request_id,
             table.table_id,
             snapshot.persisted_snapshot_version,
+            snapshot.writer_epoch,
             vec![candidate],
             watermark,
         )?;
@@ -486,8 +611,8 @@ async fn persist_checkpoint_prefix(
 }
 
 fn reclaim_materialized_prefix(
-    table: &NativeAppendTable,
-    state: &mut NativeAppendTableState,
+    table: &NativeMaterializedTable,
+    state: &mut NativeMaterializedTableState,
 ) -> Result<()> {
     let end = next_offset(table.table_id, state.persisted_log_offset)?;
     let mut budget = end.saturating_sub(state.retained_start);
@@ -495,14 +620,14 @@ fn reclaim_materialized_prefix(
     for epoch in &mut state.epochs {
         let rows = epoch
             .materializer
-            .retire_persisted_append_prefix(usize::try_from(budget).unwrap_or(usize::MAX))
+            .retire_persisted_prefix(usize::try_from(budget).unwrap_or(usize::MAX))
             .map_err(|error| materializer_error("retire persisted append prefix", error))?
             as u64;
         budget -= rows;
         reclaimed += rows;
         if epoch
             .materializer
-            .append_live_segment_count()
+            .live_segment_count()
             .map_err(|error| materializer_error("count retained checkpoint segments", error))?
             != 0
         {
@@ -521,7 +646,7 @@ fn reclaim_materialized_prefix(
     while state.epochs.len() > 1 {
         if state.epochs[0]
             .materializer
-            .append_live_segment_count()
+            .live_segment_count()
             .map_err(|error| materializer_error("count retired epoch segments", error))?
             != 0
         {
@@ -538,14 +663,14 @@ fn reclaim_materialized_prefix(
 
 fn validate_receipt_prefix(
     table_id: TableId,
-    state: &NativeAppendTableState,
+    state: &NativeMaterializedTableState,
     context: &NativeIngestApplyContext,
 ) -> std::result::Result<(), NativeIngestSinkError> {
     if context.receipt.previous_log_offset() != state.last_applied_log_offset {
         return Err(NativeIngestSinkError::Rejected(
             ServerError::new(
                 ErrorCode::SequenceGap,
-                "native append receipt does not continue the materialized logical prefix",
+                "native table receipt does not continue the materialized logical prefix",
             )
             .with_table_id(table_id)
             .with_retryable(false),
@@ -555,9 +680,9 @@ fn validate_receipt_prefix(
 }
 
 fn ensure_epoch_materializer(
-    config: NativeAppendMaterializerConfig,
-    table: &NativeAppendTable,
-    state: &mut NativeAppendTableState,
+    config: NativeTableMaterializerConfig,
+    table: &NativeMaterializedTable,
+    state: &mut NativeMaterializedTableState,
     writer_epoch: u64,
 ) -> std::result::Result<(), NativeIngestSinkError> {
     if let Some(current) = state.epochs.last_mut() {
@@ -565,7 +690,7 @@ fn ensure_epoch_materializer(
             return Err(NativeIngestSinkError::Rejected(
                 ServerError::new(
                     ErrorCode::DataCorruption,
-                    "native append mutation writer epochs regressed",
+                    "native table mutation writer epochs regressed",
                 )
                 .with_table_id(table.table_id)
                 .with_retryable(false),
@@ -576,18 +701,24 @@ fn ensure_epoch_materializer(
         }
     }
 
-    let materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+    // Each nonempty segment covers at least one logical row. Starting generation at the next
+    // offset keeps every new source identity beyond persisted generations, even when recovery
+    // resumes the same producer epoch. Empty batches never allocate or seal native segments.
+    let initial_generation = next_offset(table.table_id, state.last_applied_log_offset)
+        .map_err(NativeIngestSinkError::Rejected)?;
+    let materializer = StreamTableMaterializer::new_with_row_capacity_and_origin(
         format!("native-{}-{writer_epoch}", table.table_id),
         Arc::clone(&table.schema),
         config.row_capacity,
-        Some(writer_epoch),
+        Some((writer_epoch, initial_generation)),
     )
     .map_err(|error| {
         NativeIngestSinkError::Rejected(materializer_error(
-            "create native append materializer",
+            "create native table materializer",
             error,
         ))
-    })?;
+    })?
+    .with_frame_per_batch(table.kind == TableKind::Frame);
     if let Some(current) = state.epochs.last_mut() {
         current
             .materializer
@@ -607,28 +738,33 @@ fn ensure_epoch_materializer(
 }
 
 fn preflight_live_segment_budget(
-    config: NativeAppendMaterializerConfig,
-    state: &NativeAppendTableState,
+    config: NativeTableMaterializerConfig,
+    state: &NativeMaterializedTableState,
     writer_epoch: u64,
     batch: &arrow::record_batch::RecordBatch,
+    frame: bool,
 ) -> Result<()> {
     let rows = batch.num_rows();
+    let projected_segments = |rows| {
+        if frame {
+            usize::from(rows != 0)
+        } else {
+            ceil_segments(rows, config.row_capacity)
+        }
+    };
     let mut projected = 0_usize;
     for epoch in &state.epochs {
         let segment_count = epoch
             .materializer
-            .append_live_segment_count()
-            .map_err(|error| materializer_error("inspect native append segments", error))?;
+            .live_segment_count()
+            .map_err(|error| materializer_error("inspect native table segments", error))?;
         if epoch.writer_epoch == writer_epoch {
             let active_rows = epoch.materializer.active_committed_row_count();
             let sealed = segment_count - usize::from(active_rows != 0);
             projected = projected
                 .checked_add(sealed)
                 .and_then(|value| {
-                    value.checked_add(ceil_segments(
-                        active_rows.checked_add(rows)?,
-                        config.row_capacity,
-                    ))
+                    value.checked_add(projected_segments(active_rows.checked_add(rows)?))
                 })
                 .ok_or_else(|| resource_exhausted_no_table("live segment count overflow"))?;
         } else {
@@ -643,14 +779,14 @@ fn preflight_live_segment_budget(
         .is_none_or(|epoch| epoch.writer_epoch != writer_epoch)
     {
         projected = projected
-            .checked_add(ceil_segments(rows, config.row_capacity))
+            .checked_add(projected_segments(rows))
             .ok_or_else(|| resource_exhausted_no_table("live segment count overflow"))?;
     }
     if projected > config.max_live_segments {
         return Err(ServerError::new(
             ErrorCode::ResourceExhausted,
             format!(
-                "native append live segment limit exhausted projected=[{projected}] maximum=[{}]",
+                "native table live segment limit exhausted projected=[{projected}] maximum=[{}]",
                 config.max_live_segments
             ),
         )
@@ -664,8 +800,8 @@ fn ceil_segments(rows: usize, capacity: usize) -> usize {
 }
 
 fn build_publication(
-    table: &NativeAppendTable,
-    state: &NativeAppendTableState,
+    table: &NativeMaterializedTable,
+    state: &NativeMaterializedTableState,
     expected_live_rows: u64,
 ) -> Result<TableActorLiveSegmentsPublication> {
     let mut next = state.retained_start;
@@ -674,20 +810,20 @@ fn build_publication(
     for epoch in &state.epochs {
         for segment in epoch
             .materializer
-            .append_live_segments()
-            .map_err(|error| materializer_error("snapshot native append segments", error))?
+            .live_segments()
+            .map_err(|error| materializer_error("snapshot native table segments", error))?
         {
             let rows = u64::try_from(segment.row_count()).map_err(|_| {
-                resource_exhausted(table.table_id, "native append segment rows exceed u64")
+                resource_exhausted(table.table_id, "native table segment rows exceed u64")
             })?;
             let last = next.checked_add(rows.saturating_sub(1)).ok_or_else(|| {
-                resource_exhausted(table.table_id, "native append logical offsets exhausted")
+                resource_exhausted(table.table_id, "native table logical offsets exhausted")
             })?;
             let offsets =
                 OffsetRange::new(LogOffset::new(next), LogOffset::new(last)).map_err(|error| {
                     ServerError::new(
                         ErrorCode::Internal,
-                        format!("construct native append segment offsets error=[{error}]"),
+                        format!("construct native table segment offsets error=[{error}]"),
                     )
                     .with_table_id(table.table_id)
                     .with_retryable(false)
@@ -699,10 +835,10 @@ fn build_publication(
                 segment,
             ));
             row_count = row_count.checked_add(rows).ok_or_else(|| {
-                resource_exhausted(table.table_id, "native append live row count exhausted")
+                resource_exhausted(table.table_id, "native table live row count exhausted")
             })?;
             next = last.checked_add(1).ok_or_else(|| {
-                resource_exhausted(table.table_id, "native append next offset exhausted")
+                resource_exhausted(table.table_id, "native table next offset exhausted")
             })?;
         }
     }
@@ -710,7 +846,7 @@ fn build_publication(
         return Err(ServerError::new(
             ErrorCode::Internal,
             format!(
-                "native append materialized row count mismatch expected=[{}] actual=[{row_count}]",
+                "native table materialized row count mismatch expected=[{}] actual=[{row_count}]",
                 expected_live_rows
             ),
         )
@@ -754,15 +890,10 @@ fn segment_publication(
 fn next_offset(table_id: TableId, watermark: OffsetWatermark) -> Result<u64> {
     match watermark {
         OffsetWatermark::Empty => Ok(0),
-        OffsetWatermark::Known(offset) => offset.get().checked_add(1).ok_or_else(|| {
-            resource_exhausted(table_id, "native append persisted offset exhausted")
-        }),
-        OffsetWatermark::LegacyUnknown => Err(ServerError::new(
-            ErrorCode::DataCorruption,
-            "native append materializer cannot follow a legacy-unknown offset",
-        )
-        .with_table_id(table_id)
-        .with_retryable(false)),
+        OffsetWatermark::Known(offset) => offset
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| resource_exhausted(table_id, "native table persisted offset exhausted")),
     }
 }
 

@@ -1,0 +1,124 @@
+{
+  "date": "2026-09-22",
+  "batch": 11,
+  "overall_complete": false,
+  "audit_closed_total": 21,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11",
+    "F16"
+  ],
+  "additional_fixes": [
+    "F43: schema app_metadata is hidden by PyArrow; opening metadata is now a standalone FlightData before the schema"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "rust_workspace": "passed; exit 0",
+    "rust_test_count": "not aggregated: subprocess log interleaving",
+    "clippy": "workspace, all targets, all features, -D warnings; passed; exit 0",
+    "python_client": "112 passed; 81.58% coverage; exit 0",
+    "native_python_rust": "passed; authenticated API; empty directory plus three restarts; Arrow 23.0.1",
+    "black": "85 files unchanged; passed; one worker outside sandbox",
+    "ruff": "repository checks passed",
+    "mypy": "root configured 14 source files and client source/tests 26 files passed",
+    "full_repository_mypy": "F29 still open; configured gates do not cover all source/tests",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "platform": "Linux x86_64, Python 3.11.14; no new Windows/macOS or Arrow 25 run"
+  },
+  "acceptance": {
+    "pyarrow_sees_opening_identity_and_watermark": true,
+    "native_three_kinds_authenticated_python_reader": true,
+    "atomic_frames_across_network_chunks": true,
+    "atomic_key_value_versions_across_network_chunks": true,
+    "combined_wire_batch_split_into_atomic_mutations": true,
+    "incomplete_disconnect_preserves_complete_cursor": true,
+    "table_id_kind_and_schema_validated_on_resume": true,
+    "gap_invalid_control_and_memory_limit_fail_closed": true,
+    "concurrent_stop_interrupts_read_and_releases_pending": true,
+    "client_and_transport_close_all_active_logs": true,
+    "history_replayed_across_four_starts": true,
+    "durable_ack": false,
+    "automatic_state_recovery": false,
+    "legacy_callbacks_migrated": false,
+    "gateway_removed": false
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-client-log-workspace.log",
+      "sha256": "d6eb773f1ff9d918eb894efc610a0d6659e9a13dad1cd1e2de30ebc934c66063"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-client-log-clippy.log",
+      "sha256": "8be67d6a2fd14ad37592f333b8811f147ef1fcaeec5ce0becf96010cce315294"
+    },
+    "python_client": {
+      "path": "/tmp/zippy-client-log-tests-final.log",
+      "sha256": "a22d3860fa8d0e7aeb7eaa1896120b1586c03594ed2ed7f4026f973bac896871"
+    },
+    "native_python_rust": {
+      "path": "/tmp/zippy-client-log-native-final.log",
+      "sha256": "f4ecfd0a48e67fcc95d048b609aaf50dd515599de8ab6f46a4e9ca8851ce52f9"
+    },
+    "client_mypy": {
+      "path": "/tmp/zippy-client-log-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "configured_mypy": {
+      "path": "/tmp/zippy-client-log-root-mypy.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "black": {
+      "path": "/tmp/zippy-client-log-black.log",
+      "sha256": "1bfb67447a06a422bde3c8028fe40d77d9da5c7ba773571abb538b11c10144b4"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-client-log-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-client-log-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-client-log-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "server_build": {
+      "path": "/tmp/zippy-client-log-build.log",
+      "sha256": "400bf54127ef51541991d8978dd560d2770282b329cb322e176e59f11bf3c064"
+    },
+    "pyarrow_schema_metadata_probe": {
+      "path": "/tmp/zippy-log-pyarrow-probe-direct.log",
+      "sha256": "2223d5cdf962f64d6a5e2ec588faea248ab4d26d436610d8221218ae3c67beda"
+    },
+    "pyarrow_standalone_metadata_probe": {
+      "path": "/tmp/zippy-log-pyarrow-probe-fixed.log",
+      "sha256": "e9422e7ac5e5d8cf699a26addc9a616a534807adeb2d9aba2a9899b71bd9110d"
+    }
+  },
+  "source_sha256": {
+    "clients/python/src/zippy_client/__init__.py": "bffff3b7236046dcfb24301ce33c28bfc6bf312321f7bbaaa594b90bb989a828",
+    "clients/python/src/zippy_client/client.py": "1d5adb9f22ffa8549e0e738f1945a3d3e14b4e080697a2d52919c2871f953048",
+    "clients/python/src/zippy_client/log_reader.py": "65993a8d0a25087fd2af3ff37b9baa6d754cd15973d1368380547ff172aa95ad",
+    "clients/python/src/zippy_client/transports/flight.py": "124551fb4e39af2640851d3f99b2308d6c4af5cdb7bab79870b14cd6e8b783e5",
+    "clients/python/tests/test_log_reader.py": "0e23fdb05211a69cba759e6c62993adbb232dc5e0aed95a12f6fcbc5db670c4b",
+    "crates/zippy-protocol/src/log.rs": "5d3a73f2a852a14c075ed2ca2d52939098f5419e52f3c00ea4bd78b5216c609c",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "cbdc6c5d695943e54f19906d52bdf1c971ef3b7175960607ea552e026c68a107",
+    "scripts/check_native_client.py": "95ad71da5b7c67f2f6819d4a0bac3c3bcfc226cc217c0426e271a179f1c0d944"
+  }
+}

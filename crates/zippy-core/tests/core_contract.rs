@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use zippy_core::{
-    ControlRequest, Engine, EngineStatus, LateDataPolicy, OverflowPolicy, Result, SegmentTableView,
-};
+use zippy_core::{ControlRequest, Engine, LateDataPolicy, Result, SegmentTableView};
 
 struct NoopEngine {
     schema: Arc<Schema>,
@@ -28,7 +26,7 @@ impl Engine for NoopEngine {
 }
 
 #[test]
-fn core_types_match_v1_contract() {
+fn compute_kernel_contract_retains_name_and_explicit_late_policy() {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "price",
         DataType::Float64,
@@ -37,9 +35,7 @@ fn core_types_match_v1_contract() {
     let engine = NoopEngine { schema };
 
     assert_eq!(engine.name(), "noop");
-    assert_eq!(OverflowPolicy::default(), OverflowPolicy::Block);
     assert_eq!(LateDataPolicy::default(), LateDataPolicy::Reject);
-    assert_eq!(EngineStatus::Created.as_str(), "created");
 }
 
 #[test]

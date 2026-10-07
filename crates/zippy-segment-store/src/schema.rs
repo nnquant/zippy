@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 /// 列的数据类型定义。
 #[derive(Debug, Clone)]
@@ -80,10 +83,88 @@ impl ColumnSpec {
 #[derive(Debug, Clone)]
 pub struct CompiledSchema {
     schema_id: u64,
-    columns: Vec<ColumnSpec>,
+    columns: Arc<[ColumnSpec]>,
+    arrow_metadata: Arc<ArrowMetadata>,
+}
+
+#[derive(Debug)]
+struct ArrowMetadata {
+    physical_schema_id: u64,
+    root: HashMap<String, String>,
+    fields: Vec<HashMap<String, String>>,
 }
 
 impl CompiledSchema {
+    /// Retains Arrow metadata and includes it in the deterministic shared-memory identity.
+    pub fn with_arrow_metadata(
+        self,
+        schema: &arrow::datatypes::Schema,
+    ) -> Result<Self, &'static str> {
+        if self.columns.len() != schema.fields().len()
+            || self
+                .columns
+                .iter()
+                .zip(schema.fields())
+                .any(|(column, field)| column.name() != field.name())
+        {
+            return Err("metadata schema columns differ from compiled columns");
+        }
+        self.with_metadata(
+            schema.metadata().clone(),
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.metadata().clone())
+                .collect(),
+        )
+    }
+
+    /// Applies root and ordered field metadata without duplicating the physical type contract.
+    pub fn with_metadata(
+        mut self,
+        root: HashMap<String, String>,
+        fields: Vec<HashMap<String, String>>,
+    ) -> Result<Self, &'static str> {
+        if fields.len() != self.columns.len() {
+            return Err("field metadata count differs from compiled columns");
+        }
+        self.arrow_metadata = Arc::new(ArrowMetadata {
+            physical_schema_id: self.arrow_metadata.physical_schema_id,
+            root,
+            fields,
+        });
+        // Recompute from the column contract so repeated metadata application is idempotent.
+        self.schema_id = self.arrow_metadata.physical_schema_id;
+        for metadata in
+            std::iter::once(&self.arrow_metadata.root).chain(&self.arrow_metadata.fields)
+        {
+            let ordered = metadata
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(ordered.len() as u64).to_le_bytes());
+            for (key, value) in ordered {
+                bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(key.as_bytes());
+                bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            for byte in bytes {
+                self.schema_id ^= u64::from(byte);
+                self.schema_id = self.schema_id.wrapping_mul(0x100000001b3);
+            }
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn metadata(&self) -> &HashMap<String, String> {
+        &self.arrow_metadata.root
+    }
+
+    pub(crate) fn field_metadata(&self, index: usize) -> &HashMap<String, String> {
+        &self.arrow_metadata.fields[index]
+    }
+
     /// 返回 schema 标识。
     pub fn schema_id(&self) -> u64 {
         self.schema_id
@@ -149,8 +230,67 @@ pub fn compile_schema(columns: &[ColumnSpec]) -> Result<CompiledSchema, &'static
         }
     }
 
-    Ok(CompiledSchema {
-        schema_id: fingerprint_schema(columns),
-        columns: columns.to_vec(),
-    })
+    let physical_schema_id = fingerprint_schema(columns);
+    let fields = vec![HashMap::new(); columns.len()];
+    // Apply empty metadata so bare and metadata-carrying schemas share one identity domain.
+    CompiledSchema {
+        schema_id: physical_schema_id,
+        columns: columns.into(),
+        arrow_metadata: Arc::new(ArrowMetadata {
+            physical_schema_id,
+            root: HashMap::new(),
+            fields: fields.clone(),
+        }),
+    }
+    .with_metadata(HashMap::new(), fields)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn arrow_metadata_survives_compilation_and_changes_identity_deterministically() {
+        let columns = [ColumnSpec::new("key", ColumnType::Utf8)];
+        let bare = compile_schema(&columns).unwrap();
+        let plain = Schema::new(vec![Field::new("key", DataType::Utf8, false)]);
+        assert_eq!(
+            bare.clone()
+                .with_arrow_metadata(&plain)
+                .unwrap()
+                .schema_id(),
+            bare.schema_id()
+        );
+        let schema = Schema::new_with_metadata(
+            vec![Field::new("key", DataType::Utf8, false)
+                .with_metadata([("unit".to_owned(), "identifier".to_owned())].into())],
+            [
+                ("source".to_owned(), "fixture".to_owned()),
+                ("version".to_owned(), "1".to_owned()),
+            ]
+            .into(),
+        );
+        let compiled = bare.clone().with_arrow_metadata(&schema).unwrap();
+        assert_eq!(
+            crate::arrow_bridge::build_arrow_schema(&compiled).as_ref(),
+            &schema
+        );
+        assert_ne!(compiled.schema_id(), bare.schema_id());
+        assert_eq!(
+            compiled
+                .clone()
+                .with_arrow_metadata(&schema)
+                .unwrap()
+                .schema_id(),
+            compiled.schema_id()
+        );
+        let mut metadata = schema.metadata().clone();
+        metadata.insert("version".to_owned(), "2".to_owned());
+        let changed = schema.clone().with_metadata(metadata);
+        assert_ne!(
+            bare.with_arrow_metadata(&changed).unwrap().schema_id(),
+            compiled.schema_id()
+        );
+    }
 }

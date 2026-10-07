@@ -1,0 +1,5 @@
+   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)
+   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.10s

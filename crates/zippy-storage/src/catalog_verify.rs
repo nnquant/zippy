@@ -7,16 +7,15 @@ use std::sync::Arc;
 use serde::Serialize;
 use zippy_core::OwnedDataDirectory;
 use zippy_types::catalog::{
-    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, ListTablesRequest,
+    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogTableSnapshot,
+    ListTablesRequest,
 };
 use zippy_types::table::{
-    DataFileLocation, MetadataScalar, SchemaCompatibility, SchemaDescriptor, SnapshotOperation,
-    TableDescriptor, TableSnapshot, TableState,
+    SchemaCompatibility, SchemaDescriptor, TableDescriptor, TableSnapshot, TableState,
 };
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
 
 use crate::candidate::verify_catalog_visible_candidate;
-use crate::legacy_import::verify_catalog_visible_external_legacy_file;
 
 const DEFAULT_MAX_TABLES: usize = 65_536;
 const DEFAULT_TABLE_PAGE_SIZE: u32 = 512;
@@ -69,6 +68,12 @@ impl StartupCatalogFileVerifierConfig {
         self
     }
 
+    /// Returns the maximum active tables admitted at startup and online creation.
+    #[must_use]
+    pub const fn max_tables(&self) -> usize {
+        self.max_tables
+    }
+
     /// Sets the bounded Catalog table listing page size.
     #[must_use]
     pub const fn with_table_page_size(mut self, size: u32) -> Self {
@@ -86,16 +91,6 @@ impl StartupCatalogFileVerifierConfig {
     /// Sets the maximum current visible files admitted by one verification pass.
     #[must_use]
     pub const fn with_max_files(mut self, maximum: usize) -> Self {
-        self.max_files = maximum;
-        self
-    }
-
-    /// Sets the maximum current visible files admitted by one verification pass.
-    ///
-    /// This compatibility alias predates external-legacy startup verification. Its limit now
-    /// covers the aggregate of managed and external-legacy files.
-    #[must_use]
-    pub const fn with_max_managed_files(mut self, maximum: usize) -> Self {
         self.max_files = maximum;
         self
     }
@@ -134,11 +129,9 @@ pub struct StartupCatalogFileVerificationReport {
     pub table_count: usize,
     /// Number of current visible managed files fully verified.
     pub managed_file_count: usize,
-    /// Number of current visible external legacy files fully verified.
-    pub external_legacy_file_count: usize,
     /// Aggregate number of current visible files fully verified.
     pub file_count: usize,
-    /// Aggregate physical bytes checksummed and footer-validated across both location classes.
+    /// Aggregate physical bytes checksummed and footer-validated in managed storage.
     pub verified_bytes: u64,
 }
 
@@ -148,6 +141,8 @@ pub struct StartupCatalogFileVerificationReport {
 /// file verification owns them only for the duration of its bounded batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupActiveTableBootstrapDescriptor {
+    /// Exact encoded metadata charge, excluding the server's decoded Arrow schema charge.
+    pub retained_metadata_bytes: u64,
     /// The active persistent table descriptor.
     pub table: TableDescriptor,
     /// The exact current schema selected at the startup Catalog revision.
@@ -203,13 +198,6 @@ impl StartupCatalogFileVerifier {
         })
     }
 
-    /// Reads current snapshots and verifies every visible Parquet descriptor.
-    ///
-    /// This compatibility wrapper discards the bounded runtime bootstrap descriptors.
-    pub async fn verify(&self) -> Result<StartupCatalogFileVerificationReport> {
-        Ok(self.verify_with_bootstrap().await?.verification)
-    }
-
     /// Verifies visible files and atomically loads all active runtime table descriptors.
     ///
     /// The returned descriptors exclude visible files and are published only after
@@ -222,8 +210,6 @@ impl StartupCatalogFileVerifier {
         let mut after = None;
         let mut table_count = 0_usize;
         let mut file_count = 0_usize;
-        let mut managed_file_count = 0_usize;
-        let mut external_legacy_file_count = 0_usize;
         let mut verified_bytes = 0_u64;
         let mut runtime_metadata_bytes = 0_u64;
         let mut active_tables = Vec::new();
@@ -271,7 +257,19 @@ impl StartupCatalogFileVerifier {
                 let expected_tables = &page.tables[first_table..first_table + batch.len()];
                 validate_snapshot_response(batch, expected_tables, &snapshot)?;
                 let measured_files = measure_snapshot_files(&snapshot)?;
-                let batch_runtime_metadata_bytes = measure_runtime_metadata(&snapshot)?;
+                let table_metadata_bytes = snapshot
+                    .tables()
+                    .iter()
+                    .map(measure_runtime_table_metadata)
+                    .collect::<Result<Vec<_>>>()?;
+                let batch_runtime_metadata_bytes =
+                    table_metadata_bytes
+                        .iter()
+                        .try_fold(0_u64, |total, bytes| {
+                            total.checked_add(*bytes).ok_or_else(|| {
+                                resource("startup runtime metadata byte count overflow")
+                            })
+                        })?;
                 let next_files = file_count
                     .checked_add(measured_files.file_count)
                     .ok_or_else(|| resource("startup file count overflow"))?;
@@ -284,12 +282,6 @@ impl StartupCatalogFileVerifier {
                         next_files, self.config.max_files
                     )));
                 }
-                let next_managed_files = managed_file_count
-                    .checked_add(measured_files.managed_file_count)
-                    .ok_or_else(|| resource("startup managed file count overflow"))?;
-                let next_external_legacy_files = external_legacy_file_count
-                    .checked_add(measured_files.external_legacy_file_count)
-                    .ok_or_else(|| resource("startup external legacy file count overflow"))?;
                 let next_bytes = verified_bytes
                     .checked_add(measured_files.bytes)
                     .ok_or_else(|| resource("startup verification byte count overflow"))?;
@@ -318,11 +310,15 @@ impl StartupCatalogFileVerifier {
                 let batch_active_tables = snapshot
                     .tables()
                     .iter()
-                    .map(|table| StartupActiveTableBootstrapDescriptor {
-                        table: table.table().clone(),
-                        schema: table.schema().clone(),
-                        snapshot: table.snapshot().clone(),
-                    })
+                    .zip(table_metadata_bytes)
+                    .map(
+                        |(table, retained_metadata_bytes)| StartupActiveTableBootstrapDescriptor {
+                            retained_metadata_bytes,
+                            table: table.table().clone(),
+                            schema: table.schema().clone(),
+                            snapshot: table.snapshot().clone(),
+                        },
+                    )
                     .collect::<Vec<_>>();
 
                 let data_directory = Arc::clone(&self.data_directory);
@@ -332,8 +328,6 @@ impl StartupCatalogFileVerifier {
                 .await
                 .map_err(|error| join_error("verify Catalog-visible files", error))??;
                 file_count = next_files;
-                managed_file_count = next_managed_files;
-                external_legacy_file_count = next_external_legacy_files;
                 verified_bytes = next_bytes;
                 runtime_metadata_bytes = next_runtime_metadata_bytes;
                 active_tables.extend(batch_active_tables);
@@ -355,8 +349,8 @@ impl StartupCatalogFileVerifier {
             verification: StartupCatalogFileVerificationReport {
                 catalog_revision,
                 table_count,
-                managed_file_count,
-                external_legacy_file_count,
+                // Every Catalog-visible file is managed.
+                managed_file_count: file_count,
                 file_count,
                 verified_bytes,
             },
@@ -439,178 +433,24 @@ fn validate_snapshot_response(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MeasuredSnapshotFiles {
     file_count: usize,
-    managed_file_count: usize,
-    external_legacy_file_count: usize,
     bytes: u64,
 }
 
 fn measure_snapshot_files(snapshot: &CatalogQuerySnapshot) -> Result<MeasuredSnapshotFiles> {
     let mut measured = MeasuredSnapshotFiles::default();
     for table in snapshot.tables() {
-        let mut table_file_count = 0_u64;
-        let mut table_rows = 0_u64;
-        let mut table_bytes = 0_u64;
         for descriptor in table.files().as_slice() {
             measured.file_count = measured
                 .file_count
                 .checked_add(1)
                 .ok_or_else(|| resource("startup file count overflow"))?;
-            match descriptor.file.location {
-                DataFileLocation::Managed(_) => {
-                    measured.managed_file_count = measured
-                        .managed_file_count
-                        .checked_add(1)
-                        .ok_or_else(|| resource("startup managed file count overflow"))?;
-                }
-                DataFileLocation::ExternalLegacy(_) => {
-                    measured.external_legacy_file_count = measured
-                        .external_legacy_file_count
-                        .checked_add(1)
-                        .ok_or_else(|| resource("startup external legacy file count overflow"))?;
-                }
-            }
             measured.bytes = measured
                 .bytes
                 .checked_add(descriptor.file.file_size_bytes)
                 .ok_or_else(|| resource("startup verification byte count overflow"))?;
-            table_file_count = table_file_count
-                .checked_add(1)
-                .ok_or_else(|| resource("startup import file count overflow"))?;
-            table_rows = table_rows
-                .checked_add(descriptor.file.row_count.get())
-                .ok_or_else(|| resource("startup import row count overflow"))?;
-            table_bytes = table_bytes
-                .checked_add(descriptor.file.file_size_bytes)
-                .ok_or_else(|| resource("startup import byte count overflow"))?;
-        }
-        if table.snapshot().operation == SnapshotOperation::Import {
-            validate_import_summary(
-                table.table().table_id,
-                table.snapshot(),
-                table_file_count,
-                table_rows,
-                table_bytes,
-            )?;
         }
     }
     Ok(measured)
-}
-
-fn validate_import_summary(
-    table_id: TableId,
-    snapshot: &TableSnapshot,
-    file_count: u64,
-    rows: u64,
-    bytes: u64,
-) -> Result<()> {
-    match snapshot.snapshot_version {
-        2 => validate_initial_import_summary(table_id, snapshot, file_count, rows, bytes),
-        version if version > 2 => {
-            validate_reconcile_import_summary(table_id, snapshot, file_count, rows, bytes)
-        }
-        _ => Err(table_corruption(
-            table_id,
-            "catalog import snapshot has an invalid version",
-        )),
-    }
-}
-
-fn validate_initial_import_summary(
-    table_id: TableId,
-    snapshot: &TableSnapshot,
-    file_count: u64,
-    rows: u64,
-    bytes: u64,
-) -> Result<()> {
-    const ADDED_FILES: &str = "added_files";
-    const ADDED_ROWS: &str = "added_rows";
-    const ADDED_BYTES: &str = "added_bytes";
-    const LEGACY_FILES_REVISION: &str = "legacy_files_revision";
-
-    let summary = &snapshot.summary;
-    let legacy_files_revision = match summary.get(LEGACY_FILES_REVISION) {
-        Some(MetadataScalar::UInt64(value)) if *value != 0 => *value,
-        _ => {
-            return Err(table_corruption(
-                table_id,
-                "catalog import snapshot has an invalid legacy file revision",
-            ));
-        }
-    };
-    let expected = [
-        (ADDED_FILES, file_count),
-        (ADDED_ROWS, rows),
-        (ADDED_BYTES, bytes),
-        (LEGACY_FILES_REVISION, legacy_files_revision),
-    ];
-    if summary.len() != expected.len()
-        || expected.iter().any(|(key, expected_value)| {
-            summary.get(*key) != Some(&MetadataScalar::UInt64(*expected_value))
-        })
-    {
-        return Err(table_corruption(
-            table_id,
-            "catalog import snapshot summary does not match its visible manifest",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_reconcile_import_summary(
-    table_id: TableId,
-    snapshot: &TableSnapshot,
-    file_count: u64,
-    rows: u64,
-    bytes: u64,
-) -> Result<()> {
-    let value = |key: &str| match snapshot.summary.get(key) {
-        Some(MetadataScalar::UInt64(value)) => Some(*value),
-        _ => None,
-    };
-    let values = (
-        value("target_files"),
-        value("target_rows"),
-        value("target_bytes"),
-        value("retained_files"),
-        value("added_files"),
-        value("removed_files"),
-        value("previous_legacy_files_revision"),
-        value("legacy_files_revision"),
-        value("continuity_gap"),
-    );
-    let (
-        Some(target_files),
-        Some(target_rows),
-        Some(target_bytes),
-        Some(retained_files),
-        Some(added_files),
-        Some(removed_files),
-        Some(previous_revision),
-        Some(legacy_revision),
-        Some(continuity_gap),
-    ) = values
-    else {
-        return Err(table_corruption(
-            table_id,
-            "catalog reconcile snapshot has an invalid summary",
-        ));
-    };
-
-    if snapshot.summary.len() != 9
-        || target_files != file_count
-        || target_rows != rows
-        || target_bytes != bytes
-        || retained_files.checked_add(added_files) != Some(target_files)
-        || removed_files > u64::try_from(MAX_FILES).expect("file bound fits u64")
-        || legacy_revision <= previous_revision
-        || continuity_gap != u64::from(previous_revision.checked_add(1) != Some(legacy_revision))
-    {
-        return Err(table_corruption(
-            table_id,
-            "catalog reconcile snapshot summary does not match its visible manifest",
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Serialize)]
@@ -651,38 +491,32 @@ impl Write for SerializedByteCounter {
     }
 }
 
-fn measure_runtime_metadata(snapshot: &CatalogQuerySnapshot) -> Result<u64> {
-    let mut total = 0_u64;
-    for table in snapshot.tables() {
-        let schema = table.schema();
-        let metadata = RuntimeTableMetadata {
-            table: table.table(),
-            schema: RuntimeSchemaMetadata {
-                table_id: schema.table_id,
-                schema_version: schema.schema_version,
-                schema_hash: &schema.schema_hash,
-                compatibility: schema.compatibility,
-                created_at_ns: schema.created_at_ns,
-            },
-            snapshot: table.snapshot(),
-        };
-        let mut counter = SerializedByteCounter::default();
-        serde_json::to_writer(&mut counter, &metadata).map_err(|error| {
-            resource(format!(
-                "measure startup runtime metadata failed error=[{error}]"
-            ))
-        })?;
-        let schema_ipc_bytes = u64::try_from(schema.schema_ipc.as_bytes().len())
-            .map_err(|_| resource("startup schema IPC exceeds addressable bytes"))?;
-        let descriptor_bytes = counter
-            .bytes
-            .checked_add(schema_ipc_bytes)
-            .ok_or_else(|| resource("startup runtime metadata byte count overflow"))?;
-        total = total
-            .checked_add(descriptor_bytes)
-            .ok_or_else(|| resource("startup runtime metadata byte count overflow"))?;
-    }
-    Ok(total)
+fn measure_runtime_table_metadata(table: &CatalogTableSnapshot) -> Result<u64> {
+    let schema = table.schema();
+    let metadata = RuntimeTableMetadata {
+        table: table.table(),
+        schema: RuntimeSchemaMetadata {
+            table_id: schema.table_id,
+            schema_version: schema.schema_version,
+            schema_hash: &schema.schema_hash,
+            compatibility: schema.compatibility,
+            created_at_ns: schema.created_at_ns,
+        },
+        snapshot: table.snapshot(),
+    };
+    let mut counter = SerializedByteCounter::default();
+    serde_json::to_writer(&mut counter, &metadata).map_err(|error| {
+        resource(format!(
+            "measure startup runtime metadata failed error=[{error}]"
+        ))
+    })?;
+    let schema_ipc_bytes = u64::try_from(schema.schema_ipc.as_bytes().len())
+        .map_err(|_| resource("startup schema IPC exceeds addressable bytes"))?;
+    let descriptor_bytes = counter
+        .bytes
+        .checked_add(schema_ipc_bytes)
+        .ok_or_else(|| resource("startup runtime metadata byte count overflow"))?;
+    Ok(descriptor_bytes)
 }
 
 fn verify_snapshot_files(
@@ -690,33 +524,8 @@ fn verify_snapshot_files(
     snapshot: &CatalogQuerySnapshot,
 ) -> Result<()> {
     for table in snapshot.tables() {
-        let external_schema = table
-            .files()
-            .as_slice()
-            .iter()
-            .any(|descriptor| {
-                matches!(
-                    descriptor.file.location,
-                    DataFileLocation::ExternalLegacy(_)
-                )
-            })
-            .then(|| zippy_catalog::decode_persisted_schema(table.schema()))
-            .transpose()?;
         for descriptor in table.files().as_slice() {
-            match descriptor.file.location {
-                DataFileLocation::Managed(_) => {
-                    verify_catalog_visible_candidate(data_directory, &descriptor.file)?;
-                }
-                DataFileLocation::ExternalLegacy(_) => {
-                    verify_catalog_visible_external_legacy_file(
-                        &descriptor.file,
-                        external_schema
-                            .as_ref()
-                            .expect("external file requires a decoded Catalog schema")
-                            .as_ref(),
-                    )?;
-                }
-            }
+            verify_catalog_visible_candidate(data_directory, &descriptor.file)?;
         }
     }
     Ok(())
@@ -792,10 +601,6 @@ fn corruption(message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::DataCorruption, message).with_retryable(false)
 }
 
-fn table_corruption(table_id: TableId, message: impl Into<String>) -> ServerError {
-    corruption(message).with_table_id(table_id)
-}
-
 fn resource(message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::ResourceExhausted, message).with_retryable(false)
 }
@@ -810,140 +615,4 @@ fn join_error(operation: &str, error: tokio::task::JoinError) -> ServerError {
         format!("{operation} blocking task failed error=[{error}]"),
     )
     .with_retryable(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use zippy_types::table::{MetadataMap, MetadataScalar, SnapshotOperation, TableSnapshot};
-    use zippy_types::{ErrorCode, OffsetWatermark, TableId};
-
-    use super::validate_import_summary;
-
-    fn table_id() -> TableId {
-        TableId::from_u128(1).expect("nonzero table id")
-    }
-
-    fn import_snapshot(summary: MetadataMap) -> TableSnapshot {
-        TableSnapshot {
-            table_id: table_id(),
-            snapshot_version: 2,
-            parent_snapshot_version: Some(1),
-            operation: SnapshotOperation::Import,
-            commit_lsn: 2,
-            committed_log_offset: OffsetWatermark::LegacyUnknown,
-            created_at_ns: 1,
-            summary,
-        }
-    }
-
-    fn valid_summary() -> MetadataMap {
-        MetadataMap::from([
-            ("added_files".to_owned(), MetadataScalar::UInt64(2)),
-            ("added_rows".to_owned(), MetadataScalar::UInt64(5)),
-            ("added_bytes".to_owned(), MetadataScalar::UInt64(13)),
-            (
-                "legacy_files_revision".to_owned(),
-                MetadataScalar::UInt64(7),
-            ),
-        ])
-    }
-
-    fn reconcile_snapshot(summary: MetadataMap) -> TableSnapshot {
-        TableSnapshot {
-            table_id: table_id(),
-            snapshot_version: 3,
-            parent_snapshot_version: Some(2),
-            operation: SnapshotOperation::Import,
-            commit_lsn: 3,
-            committed_log_offset: OffsetWatermark::LegacyUnknown,
-            created_at_ns: 2,
-            summary,
-        }
-    }
-
-    fn valid_reconcile_summary() -> MetadataMap {
-        MetadataMap::from([
-            ("target_files".to_owned(), MetadataScalar::UInt64(2)),
-            ("target_rows".to_owned(), MetadataScalar::UInt64(5)),
-            ("target_bytes".to_owned(), MetadataScalar::UInt64(13)),
-            ("retained_files".to_owned(), MetadataScalar::UInt64(1)),
-            ("added_files".to_owned(), MetadataScalar::UInt64(1)),
-            ("removed_files".to_owned(), MetadataScalar::UInt64(0)),
-            (
-                "previous_legacy_files_revision".to_owned(),
-                MetadataScalar::UInt64(7),
-            ),
-            (
-                "legacy_files_revision".to_owned(),
-                MetadataScalar::UInt64(8),
-            ),
-            ("continuity_gap".to_owned(), MetadataScalar::UInt64(0)),
-        ])
-    }
-
-    #[test]
-    fn import_summary_requires_exact_manifest_aggregates() {
-        validate_import_summary(table_id(), &import_snapshot(valid_summary()), 2, 5, 13)
-            .expect("exact import summary");
-
-        for (files, rows, bytes) in [(3, 5, 13), (2, 6, 13), (2, 5, 14)] {
-            let error = validate_import_summary(
-                table_id(),
-                &import_snapshot(valid_summary()),
-                files,
-                rows,
-                bytes,
-            )
-            .expect_err("mismatched aggregate must fail closed");
-            assert_eq!(error.code(), ErrorCode::DataCorruption);
-        }
-    }
-
-    #[test]
-    fn import_summary_requires_exact_keys_types_and_nonzero_revision() {
-        let mut extra = valid_summary();
-        extra.insert("unexpected".to_owned(), MetadataScalar::UInt64(1));
-        let mut wrong_type = valid_summary();
-        wrong_type.insert("added_rows".to_owned(), MetadataScalar::Int64(5));
-        let mut zero_revision = valid_summary();
-        zero_revision.insert(
-            "legacy_files_revision".to_owned(),
-            MetadataScalar::UInt64(0),
-        );
-
-        for summary in [extra, wrong_type, zero_revision] {
-            let error = validate_import_summary(table_id(), &import_snapshot(summary), 2, 5, 13)
-                .expect_err("noncanonical import summary must fail closed");
-            assert_eq!(error.code(), ErrorCode::DataCorruption);
-            assert!(!error.retryable());
-        }
-    }
-
-    #[test]
-    fn reconcile_import_summary_accepts_exact_target_manifest() {
-        validate_import_summary(
-            table_id(),
-            &reconcile_snapshot(valid_reconcile_summary()),
-            2,
-            5,
-            13,
-        )
-        .expect("exact reconcile summary");
-    }
-
-    #[test]
-    fn reconcile_import_summary_rejects_target_manifest_mismatch() {
-        for (files, rows, bytes) in [(3, 5, 13), (2, 6, 13), (2, 5, 14)] {
-            let error = validate_import_summary(
-                table_id(),
-                &reconcile_snapshot(valid_reconcile_summary()),
-                files,
-                rows,
-                bytes,
-            )
-            .expect_err("mismatched reconcile aggregate must fail closed");
-            assert_eq!(error.code(), ErrorCode::DataCorruption);
-            assert!(!error.retryable());
-        }
-    }
 }

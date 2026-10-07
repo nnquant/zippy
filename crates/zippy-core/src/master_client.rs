@@ -1,28 +1,17 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::bus_protocol::{
-    AcquireSegmentReaderLeaseRequest, ControlEnvelopeRequest, ControlRequest, ControlResponse,
-    DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
-    GetStreamRequest, HeartbeatRequest, ListStreamsRequest, PublishPersistEventRequest,
-    PublishPersistedFileRequest, PublishSegmentDescriptorRequest, RegisterEngineRequest,
-    RegisterProcessRequest, RegisterSourceRequest, RegisterStreamRequest,
-    ReleaseSegmentReaderLeaseRequest, ReplacePersistedFilesRequest, StreamInfo,
-    UnregisterProcessRequest, UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
+    ControlRequest, ControlResponse, GetConfigRequest, HeartbeatRequest, RegisterProcessRequest,
+    UnregisterProcessRequest, WatchRequest, WatchResource, MAX_CONTROL_WATCH_TIMEOUT_MS,
 };
 use crate::{
-    canonical_schema_hash, resolve_control_endpoint, schema_metadata, send_control_line_request,
-    send_control_line_request_with_timeout, ControlEndpoint, Result, SchemaRef, ZippyConfig,
-    ZippyError,
+    resolve_control_endpoint, send_control_line_request_with_timeout, ControlEndpoint, Result,
+    ZippyConfig, ZippyError,
 };
 
-static CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_control_request_id() -> String {
-    let request_id = CONTROL_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    format!("req_{request_id}")
-}
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const WATCH_RESPONSE_GRACE: Duration = Duration::from_secs(5);
 
 /// Synchronous control-plane client for zippy-master.
 #[derive(Debug, Clone)]
@@ -31,14 +20,7 @@ pub struct MasterClient {
     process_id: Option<String>,
     process_token: Option<String>,
     process_app: Option<String>,
-    token: Option<String>,
-    request_timeout: Option<Duration>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SegmentDescriptorUpdate {
-    pub descriptor_generation: u64,
-    pub descriptor: serde_json::Value,
+    request_timeout: Duration,
 }
 
 impl MasterClient {
@@ -56,8 +38,7 @@ impl MasterClient {
             process_id: None,
             process_token: None,
             process_app: None,
-            token: None,
-            request_timeout: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -77,13 +58,9 @@ impl MasterClient {
         self.process_app.as_deref()
     }
 
-    pub fn set_token(&mut self, token: impl Into<String>) {
-        self.token = Some(token.into());
-    }
-
     /// Applies one positive timeout to all subsequent control requests.
-    pub fn set_request_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
-        if timeout.is_some_and(|value| value.is_zero()) {
+    pub fn set_request_timeout(&mut self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
             return Err(ZippyError::InvalidConfig {
                 reason: "master client request timeout must be positive".to_string(),
             });
@@ -92,9 +69,9 @@ impl MasterClient {
         Ok(())
     }
 
-    /// Returns the configured per-request timeout, or `None` for legacy unbounded behavior.
+    /// Returns the positive deadline budget for ordinary control requests.
     #[must_use]
-    pub const fn request_timeout(&self) -> Option<Duration> {
+    pub const fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
 
@@ -168,7 +145,7 @@ impl MasterClient {
         let process_token = Some(self.require_process_token()?);
         let response = self.send_request(ControlRequest::UnregisterProcess(
             UnregisterProcessRequest {
-                process_id: process_id.clone(),
+                process_id,
                 process_token,
             },
         ))?;
@@ -184,403 +161,12 @@ impl MasterClient {
         }
     }
 
-    pub fn register_stream(
-        &mut self,
-        stream_name: &str,
-        schema: SchemaRef,
-        buffer_size: usize,
-        frame_size: usize,
-    ) -> Result<()> {
-        let schema_hash = canonical_schema_hash(&schema);
-        let schema = schema_metadata(&schema);
-        let (process_id, process_token) = self.optional_process_capability_or_token()?;
-        let response =
-            self.send_request(ControlRequest::RegisterStream(RegisterStreamRequest {
-                process_id,
-                process_token,
-                token: self.token.clone(),
-                stream_name: stream_name.to_string(),
-                schema,
-                schema_hash,
-                buffer_size,
-                frame_size,
-            }))?;
-
-        match response {
-            ControlResponse::StreamRegistered { .. } => Ok(()),
-            other => Err(unexpected_response("StreamRegistered", other)),
-        }
-    }
-
-    pub fn register_source(
-        &mut self,
-        source_name: &str,
-        source_type: &str,
-        output_stream: &str,
-        config: serde_json::Value,
-    ) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let response =
-            self.send_request(ControlRequest::RegisterSource(RegisterSourceRequest {
-                source_name: source_name.to_string(),
-                source_type: source_type.to_string(),
-                process_id,
-                process_token,
-                output_stream: output_stream.to_string(),
-                config,
-            }))?;
-
-        match response {
-            ControlResponse::SourceRegistered { .. } => Ok(()),
-            other => Err(unexpected_response("SourceRegistered", other)),
-        }
-    }
-
-    pub fn unregister_source(&mut self, source_name: &str) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let response =
-            self.send_request(ControlRequest::UnregisterSource(UnregisterSourceRequest {
-                source_name: source_name.to_string(),
-                process_id,
-                process_token,
-            }))?;
-
-        match response {
-            ControlResponse::SourceUnregistered { .. } => Ok(()),
-            other => Err(unexpected_response("SourceUnregistered", other)),
-        }
-    }
-
-    pub fn register_engine(
-        &mut self,
-        engine_name: &str,
-        engine_type: &str,
-        input_stream: &str,
-        output_stream: &str,
-        config: serde_json::Value,
-    ) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let response =
-            self.send_request(ControlRequest::RegisterEngine(RegisterEngineRequest {
-                engine_name: engine_name.to_string(),
-                engine_type: engine_type.to_string(),
-                process_id,
-                process_token,
-                input_stream: input_stream.to_string(),
-                output_stream: output_stream.to_string(),
-                config,
-            }))?;
-
-        match response {
-            ControlResponse::EngineRegistered { .. } => Ok(()),
-            other => Err(unexpected_response("EngineRegistered", other)),
-        }
-    }
-
-    pub fn update_status(
-        &self,
-        kind: &str,
-        name: &str,
-        status: &str,
-        metrics: Option<serde_json::Value>,
-    ) -> Result<()> {
-        let (process_id, process_token) = self.optional_process_capability_or_token()?;
-        let response =
-            self.send_request(ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
-                process_id,
-                process_token,
-                token: self.token.clone(),
-                kind: kind.to_string(),
-                name: name.to_string(),
-                status: status.to_string(),
-                metrics,
-            }))?;
-
-        match response {
-            ControlResponse::StatusUpdated { .. } => Ok(()),
-            other => Err(unexpected_response("StatusUpdated", other)),
-        }
-    }
-
-    pub fn list_streams(&self) -> Result<Vec<StreamInfo>> {
-        let response = self.send_request(ControlRequest::ListStreams(ListStreamsRequest {}))?;
-
-        match response {
-            ControlResponse::StreamsListed(response) => Ok(response.streams),
-            other => Err(unexpected_response("StreamsListed", other)),
-        }
-    }
-
-    pub fn list_streams_status(&self) -> Result<Vec<StreamInfo>> {
-        let response =
-            self.send_request(ControlRequest::ListStreamStatuses(ListStreamsRequest {}))?;
-
-        match response {
-            ControlResponse::StreamsListed(response) => Ok(response.streams),
-            other => Err(unexpected_response("StreamsListed", other)),
-        }
-    }
-
-    pub fn get_stream(&self, stream_name: &str) -> Result<StreamInfo> {
-        let response = self.send_request(ControlRequest::GetStream(GetStreamRequest {
-            stream_name: stream_name.to_string(),
-        }))?;
-
-        match response {
-            ControlResponse::StreamFetched(response) => Ok(response.stream),
-            other => Err(unexpected_response("StreamFetched", other)),
-        }
-    }
-
-    pub fn get_stream_status(&self, stream_name: &str) -> Result<StreamInfo> {
-        let response = self.send_request(ControlRequest::GetStreamStatus(GetStreamRequest {
-            stream_name: stream_name.to_string(),
-        }))?;
-
-        match response {
-            ControlResponse::StreamFetched(response) => Ok(response.stream),
-            other => Err(unexpected_response("StreamFetched", other)),
-        }
-    }
-
     pub fn get_config(&self) -> Result<ZippyConfig> {
         let response = self.send_request(ControlRequest::GetConfig(GetConfigRequest {}))?;
 
         match response {
             ControlResponse::ConfigFetched { config } => ZippyConfig::from_wire_json(config),
             other => Err(unexpected_response("ConfigFetched", other)),
-        }
-    }
-
-    pub fn drop_table(&self, table_name: &str, drop_persisted: bool) -> Result<DropTableResult> {
-        let response = self.send_request(ControlRequest::DropTable(DropTableRequest {
-            process_id: self.process_id.clone(),
-            process_token: self.process_token.clone(),
-            token: self.token.clone(),
-            table_name: table_name.to_string(),
-            drop_persisted,
-        }))?;
-
-        match response {
-            ControlResponse::TableDropped(result) => Ok(result),
-            other => Err(unexpected_response("TableDropped", other)),
-        }
-    }
-
-    pub fn publish_segment_descriptor(
-        &self,
-        stream_name: &str,
-        descriptor: serde_json::Value,
-    ) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let descriptor = self.with_stream_writer_epoch_if_missing(stream_name, descriptor)?;
-        let response = self.send_request(ControlRequest::PublishSegmentDescriptor(
-            PublishSegmentDescriptorRequest {
-                stream_name: stream_name.to_string(),
-                process_id,
-                process_token,
-                descriptor,
-            },
-        ))?;
-
-        match response {
-            ControlResponse::SegmentDescriptorPublished { .. } => Ok(()),
-            other => Err(unexpected_response("SegmentDescriptorPublished", other)),
-        }
-    }
-
-    pub fn publish_segment_descriptor_bytes(
-        &self,
-        stream_name: &str,
-        descriptor_envelope: &[u8],
-    ) -> Result<()> {
-        let descriptor =
-            serde_json::from_slice::<serde_json::Value>(descriptor_envelope).map_err(json_error)?;
-        self.publish_segment_descriptor(stream_name, descriptor)
-    }
-
-    pub fn publish_persisted_file(
-        &self,
-        stream_name: &str,
-        persisted_file: serde_json::Value,
-    ) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let persisted_file =
-            self.with_stream_writer_epoch_if_missing(stream_name, persisted_file)?;
-        let response = self.send_request(ControlRequest::PublishPersistedFile(
-            PublishPersistedFileRequest {
-                stream_name: stream_name.to_string(),
-                process_id,
-                process_token,
-                persisted_file,
-            },
-        ))?;
-
-        match response {
-            ControlResponse::PersistedFilePublished { .. } => Ok(()),
-            other => Err(unexpected_response("PersistedFilePublished", other)),
-        }
-    }
-
-    pub fn replace_persisted_files(
-        &self,
-        stream_name: &str,
-        persisted_files: Vec<serde_json::Value>,
-    ) -> Result<()> {
-        let persisted_files = persisted_files
-            .into_iter()
-            .map(|persisted_file| {
-                self.with_stream_writer_epoch_if_missing(stream_name, persisted_file)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let response = self.send_request(ControlRequest::ReplacePersistedFiles(
-            ReplacePersistedFilesRequest {
-                stream_name: stream_name.to_string(),
-                process_id: self.process_id.clone(),
-                process_token: self.process_token.clone(),
-                token: self.token.clone(),
-                persisted_files,
-            },
-        ))?;
-
-        match response {
-            ControlResponse::PersistedFilesReplaced { .. } => Ok(()),
-            other => Err(unexpected_response("PersistedFilesReplaced", other)),
-        }
-    }
-
-    pub fn publish_persist_event(
-        &self,
-        stream_name: &str,
-        persist_event: serde_json::Value,
-    ) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let persist_event = self.with_stream_writer_epoch_if_missing(stream_name, persist_event)?;
-        let response = self.send_request(ControlRequest::PublishPersistEvent(
-            PublishPersistEventRequest {
-                stream_name: stream_name.to_string(),
-                process_id,
-                process_token,
-                persist_event,
-            },
-        ))?;
-
-        match response {
-            ControlResponse::PersistEventPublished { .. } => Ok(()),
-            other => Err(unexpected_response("PersistEventPublished", other)),
-        }
-    }
-
-    pub fn acquire_segment_reader_lease(
-        &self,
-        stream_name: &str,
-        source_segment_id: u64,
-        source_generation: u64,
-    ) -> Result<String> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let response = self.send_request(ControlRequest::AcquireSegmentReaderLease(
-            AcquireSegmentReaderLeaseRequest {
-                stream_name: stream_name.to_string(),
-                process_id,
-                process_token,
-                source_segment_id,
-                source_generation,
-            },
-        ))?;
-
-        match response {
-            ControlResponse::SegmentReaderLeaseAcquired { lease_id, .. } => Ok(lease_id),
-            other => Err(unexpected_response("SegmentReaderLeaseAcquired", other)),
-        }
-    }
-
-    pub fn release_segment_reader_lease(&self, stream_name: &str, lease_id: &str) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        self.release_segment_reader_lease_for_process(
-            stream_name,
-            lease_id,
-            &process_id,
-            process_token.as_deref(),
-        )
-    }
-
-    pub fn release_segment_reader_lease_for_process(
-        &self,
-        stream_name: &str,
-        lease_id: &str,
-        process_id: &str,
-        process_token: Option<&str>,
-    ) -> Result<()> {
-        let response = self.send_request(ControlRequest::ReleaseSegmentReaderLease(
-            ReleaseSegmentReaderLeaseRequest {
-                stream_name: stream_name.to_string(),
-                process_id: process_id.to_string(),
-                process_token: process_token.map(ToOwned::to_owned),
-                lease_id: lease_id.to_string(),
-            },
-        ))?;
-
-        match response {
-            ControlResponse::SegmentReaderLeaseReleased { .. } => Ok(()),
-            other => Err(unexpected_response("SegmentReaderLeaseReleased", other)),
-        }
-    }
-
-    pub fn get_segment_descriptor(&self, stream_name: &str) -> Result<Option<serde_json::Value>> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let response = self.send_request(ControlRequest::GetSegmentDescriptor(
-            GetSegmentDescriptorRequest {
-                stream_name: stream_name.to_string(),
-                process_id,
-                process_token,
-            },
-        ))?;
-
-        match response {
-            ControlResponse::SegmentDescriptorFetched { descriptor, .. } => Ok(descriptor),
-            other => Err(unexpected_response("SegmentDescriptorFetched", other)),
-        }
-    }
-
-    pub fn wait_segment_descriptor(
-        &self,
-        stream_name: &str,
-        after_descriptor_generation: u64,
-        timeout: Duration,
-    ) -> Result<Option<SegmentDescriptorUpdate>> {
-        let event = self.watch_resource(
-            WatchResource::SegmentDescriptor {
-                stream_name: stream_name.to_string(),
-            },
-            after_descriptor_generation,
-            timeout,
-        )?;
-
-        match event {
-            None => Ok(None),
-            Some(event) => match event.resource {
-                WatchResource::SegmentDescriptor { .. } => {
-                    let descriptor = event
-                        .payload
-                        .get("descriptor")
-                        .cloned()
-                        .filter(|value| !value.is_null());
-                    Ok(descriptor.map(|descriptor| SegmentDescriptorUpdate {
-                        descriptor_generation: event.revision,
-                        descriptor,
-                    }))
-                }
-                other => Err(unexpected_watch_resource("SegmentDescriptor", other)),
-            },
         }
     }
 
@@ -593,25 +179,27 @@ impl MasterClient {
         let process_id = self.require_process_id()?;
         let process_token = self.require_process_token()?;
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-        let response = self.send_request(ControlRequest::Envelope(ControlEnvelopeRequest {
-            version: crate::CONTROL_PROTOCOL_VERSION,
-            request_id: next_control_request_id(),
-            process_id: Some(process_id),
-            process_token: Some(process_token),
-            token: self.token.clone(),
-            verb: Some("watch".to_string()),
-            resource: Some(resource),
-            revision: Some(after_revision),
-            timeout_ms: Some(timeout_ms),
-            payload: None,
-            inner: None,
-        }))?;
-
+        if timeout_ms > MAX_CONTROL_WATCH_TIMEOUT_MS {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "master client watch timeout exceeds maximum requested_ms=[{timeout_ms}] maximum_ms=[{MAX_CONTROL_WATCH_TIMEOUT_MS}]"
+                ),
+            });
+        }
+        // Bounded by MAX_CONTROL_WATCH_TIMEOUT_MS above, so the grace addition cannot overflow.
+        let response_timeout = timeout + WATCH_RESPONSE_GRACE;
+        let response = send_control_line_request_with_timeout(
+            &self.endpoint,
+            ControlRequest::Watch(WatchRequest {
+                process_id,
+                process_token: Some(process_token),
+                resource,
+                after_revision,
+                timeout_ms,
+            }),
+            response_timeout.max(self.request_timeout),
+        )?;
         match response {
-            ControlResponse::Envelope(envelope) => match *envelope.inner {
-                ControlResponse::ResourceChanged { event } => Ok(event),
-                other => Err(unexpected_response("ResourceChanged", other)),
-            },
             ControlResponse::ResourceChanged { event } => Ok(event),
             other => Err(unexpected_response("ResourceChanged", other)),
         }
@@ -629,52 +217,8 @@ impl MasterClient {
         })
     }
 
-    fn optional_process_capability_or_token(&self) -> Result<(Option<String>, Option<String>)> {
-        match self.process_id.as_ref() {
-            Some(process_id) => Ok((
-                Some(process_id.clone()),
-                Some(self.require_process_token()?),
-            )),
-            None if self.token.is_some() => Ok((None, None)),
-            None => Err(ZippyError::InvalidState {
-                status: "master client process not registered",
-            }),
-        }
-    }
-
-    fn with_stream_writer_epoch_if_missing(
-        &self,
-        stream_name: &str,
-        mut metadata: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        if metadata.get("writer_epoch").is_some() {
-            return Ok(metadata);
-        }
-
-        let writer_epoch = self.get_stream_status(stream_name)?.writer_epoch;
-        if let Some(object) = metadata.as_object_mut() {
-            object.insert(
-                "writer_epoch".to_string(),
-                serde_json::Value::from(writer_epoch),
-            );
-        }
-
-        Ok(metadata)
-    }
-
     fn send_request(&self, request: ControlRequest) -> Result<ControlResponse> {
-        match self.request_timeout {
-            Some(timeout) => {
-                send_control_line_request_with_timeout(&self.endpoint, request, timeout)
-            }
-            None => send_control_line_request(&self.endpoint, request),
-        }
-    }
-}
-
-fn json_error(error: serde_json::Error) -> ZippyError {
-    ZippyError::Io {
-        reason: error.to_string(),
+        send_control_line_request_with_timeout(&self.endpoint, request, self.request_timeout)
     }
 }
 

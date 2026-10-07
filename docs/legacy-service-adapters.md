@@ -1,4 +1,8 @@
-# Legacy service adapters
+# Legacy service adapters（历史设计）
+
+2026-09-22：本文仅保留迁移阶段的设计记录。Catalog/query 适配器与旧数据控制路径已删除；
+运行时只保留进程租约的 ProcessRuntimeRegistry。当前操作方式见
+[单节点运行时](single-node-server-runtime.md)，不要按下文启用旧适配器。
 
 `LegacyCatalogAdapter`, `LegacyRuntimeRegistryAdapter`, and `LegacyQueryEngineAdapter` are Phase 1 migration components. They let
 the new single-node composition root depend on stable `zippy-types` service traits while the
@@ -213,14 +217,13 @@ an external readiness probe. `LegacyServerRuntime` owns the stronger boundary: i
 master listener bind barrier, starts the configured Gateway, performs a real Gateway-to-master
 control request, and only then calls `activate()`. Its health view publishes
 `end_to_end_liveness: true` after those checks and changes it to `false` before shutdown. The
-recommended product entry point is `zippy server run`; `zippy master run` is a compatibility alias
-to the same server-owned runtime.
+product entry point is `zippy server run`; the old `zippy master run` command has been removed.
 
 Catalog-only mode uses the same closed-then-activated `RuntimeRegistry` admission gate as full
 mode. Shutdown caches its first structured result and gives Gateway, master process draining, and
 the master listener one absolute deadline; repeated calls neither retry blocking cleanup nor turn a
-previous timeout into a clean result. The standalone Rust `zippy-master` binary remains a Phase 1
-rollback path and is not this composition root.
+previous timeout into a clean result. The Rust `zippy-server` binary uses this same composition root; the standalone master daemon
+and its separate Gateway startup/shutdown implementation have been deleted.
 
 The query adapter enforces the composition admission gate. Phase 1 still returns the raw catalog
 adapter for compatibility, so a previously cloned catalog handle remains callable after

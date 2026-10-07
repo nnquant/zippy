@@ -35,7 +35,10 @@ struct StoredIdempotentResponse {
 enum PreparedCommand {
     CreateNamespace(CreateNamespaceCommand),
     CreateTable(crate::table_domain::PreparedCreateTable),
+    AlterTableSchema(crate::schema_domain::PreparedAlterTableSchema),
+    DropTable(zippy_types::catalog::DropTableCommand),
     AcquireProducer(crate::producer_domain::PreparedAcquireProducer),
+    CommitConsumerOffset(zippy_types::catalog::CommitConsumerOffsetCommand),
     CommitDataFiles(crate::manifest_domain::PreparedCommitDataFiles),
     CommitCompaction(crate::manifest_domain::PreparedCommitCompaction),
     AcquireSnapshotLease(crate::lease_domain::PreparedAcquireSnapshotLease),
@@ -222,10 +225,13 @@ pub(crate) fn finalize_manifest_preparation(
 
 fn verify_envelope(envelope: &CatalogCommandEnvelopeV1) -> Result<()> {
     envelope.verify_fingerprint().map_err(|error| {
-        ServerError::new(
-            ErrorCode::InvalidArgument,
-            format!("invalid catalog command fingerprint error=[{error}]"),
-        )
+        match error {
+            zippy_types::catalog::CatalogFingerprintError::Schema(error) => error,
+            error => ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid catalog command fingerprint error=[{error}]"),
+            ),
+        }
         .with_request_id(envelope.request_id)
     })
 }
@@ -268,10 +274,20 @@ fn prepare_command(
             crate::table_domain::prepare_create_table(create)
                 .map_err(|error| error.with_request_id(request_id))?,
         )),
+        CatalogCommandV1::AlterTableSchema(command) => Ok(PreparedCommand::AlterTableSchema(
+            crate::schema_domain::prepare_alter_table_schema(actor_kind, command)
+                .map_err(|error| error.with_request_id(request_id))?,
+        )),
         CatalogCommandV1::AcquireProducer(acquire) => Ok(PreparedCommand::AcquireProducer(
             crate::producer_domain::prepare_acquire_producer(acquire)
                 .map_err(|error| error.with_request_id(request_id))?,
         )),
+        CatalogCommandV1::CommitConsumerOffset(command) => {
+            Ok(PreparedCommand::CommitConsumerOffset(
+                crate::consumer_domain::prepare_commit_consumer_offset(actor_kind, command)
+                    .map_err(|error| error.with_request_id(request_id))?,
+            ))
+        }
         CatalogCommandV1::CommitDataFiles(commit) => Ok(PreparedCommand::CommitDataFiles(
             crate::manifest_domain::prepare_commit_data_files(actor_kind, commit)
                 .map_err(|error| error.with_request_id(request_id))?,
@@ -292,6 +308,10 @@ fn prepare_command(
                     .map_err(|error| error.with_request_id(request_id))?,
             ))
         }
+        CatalogCommandV1::DropTable(command) => Ok(PreparedCommand::DropTable(
+            crate::drop_domain::prepare_drop_table(actor_kind, command)
+                .map_err(|error| error.with_request_id(request_id))?,
+        )),
         ref unsupported => Err(unsupported_command(unsupported).with_request_id(request_id)),
     }
 }
@@ -302,15 +322,6 @@ fn commit_prepared_command(
     prepared: PreparedCommand,
 ) -> Result<VersionedCatalogResponse> {
     let request_id = context.request_id;
-    let mutates_table_projection = matches!(
-        context.operation,
-        "create_table"
-            | "alter_table_schema"
-            | "acquire_producer"
-            | "commit_data_files"
-            | "commit_compaction"
-            | "drop_table"
-    );
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| {
@@ -363,10 +374,32 @@ fn commit_prepared_command(
             crate::table_domain::create_table(&transaction, create, next_revision, committed_at_ns)
                 .map_err(|error| error.with_request_id(request_id))?,
         ),
+        PreparedCommand::AlterTableSchema(command) => CatalogOutcomeV1::Schema(
+            crate::schema_domain::alter_table_schema(&transaction, command, committed_at_ns)
+                .map_err(|error| error.with_request_id(request_id))?,
+        ),
+        PreparedCommand::DropTable(command) => CatalogOutcomeV1::TableDropped {
+            table_id: crate::drop_domain::drop_table(
+                &transaction,
+                command,
+                next_revision,
+                committed_at_ns,
+            )
+            .map_err(|error| error.with_request_id(request_id))?,
+        },
         PreparedCommand::AcquireProducer(acquire) => CatalogOutcomeV1::Producer(
             crate::producer_domain::acquire_producer(&transaction, acquire, committed_at_ns)
                 .map_err(|error| error.with_request_id(request_id))?,
         ),
+        PreparedCommand::CommitConsumerOffset(command) => CatalogOutcomeV1::ConsumerOffset {
+            offset_authority: command.offset_authority,
+            committed_log_offset: crate::consumer_domain::commit_consumer_offset(
+                &transaction,
+                command,
+                committed_at_ns,
+            )
+            .map_err(|error| error.with_request_id(request_id))?,
+        },
         PreparedCommand::CommitDataFiles(commit) => CatalogOutcomeV1::Snapshot(
             crate::manifest_domain::commit_data_files(
                 &transaction,
@@ -400,13 +433,6 @@ fn commit_prepared_command(
         catalog_revision: next_revision,
         outcome,
     });
-    if mutates_table_projection {
-        crate::legacy_projection_domain::downgrade_ready_after_native_table_mutation(
-            &transaction,
-            committed_at_ns,
-        )
-        .map_err(|error| error.with_request_id(request_id))?;
-    }
     let response_blob = CatalogCodec::encode_response(&response).map_err(|error| {
         ServerError::new(
             ErrorCode::Internal,
@@ -494,7 +520,7 @@ fn create_namespace(
 
 /// Returns the current durable catalog revision.
 pub(crate) fn revision(connection: &Connection) -> Result<u64> {
-    crate::migration::catalog_revision(connection)
+    crate::layout::catalog_revision(connection)
 }
 
 /// Resolves one namespace by immutable identity or exact name.
@@ -880,8 +906,9 @@ mod tests {
     use rusqlite::Connection;
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1,
-        CatalogCommandReplayProbe, CatalogCommandV1, CreateNamespaceCommand, CreateTableCommand,
-        DropTableCommand, ListNamespacesRequest, NamespaceRef, VersionedCatalogCommand,
+        CatalogCommandReplayProbe, CatalogCommandV1, CreateMaintenanceJobCommand,
+        CreateNamespaceCommand, CreateTableCommand, ListNamespacesRequest, MaintenanceJobKind,
+        NamespaceRef, VersionedCatalogCommand,
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, SchemaIpcPayload, TableDefinition,
@@ -920,16 +947,7 @@ mod tests {
                      fingerprint BLOB NOT NULL,\
                      committed_at_ns BLOB NOT NULL\
                  );\
-                 CREATE TABLE legacy_import_requests (\
-                     request_id BLOB PRIMARY KEY,\
-                     format_version INTEGER NOT NULL,\
-                     fingerprint BLOB NOT NULL,\
-                     response_blob BLOB NOT NULL,\
-                     committed_at_ns BLOB NOT NULL\
-                 );\
-                 CREATE TABLE legacy_file_view_mappings (\
-                     request_id BLOB UNIQUE\
-                 );",
+                 ",
             )
             .unwrap();
         connection
@@ -976,6 +994,15 @@ mod tests {
     }
 
     fn create_table_command(request_id: RequestId) -> VersionedCatalogCommand {
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]);
+        let mut bytes = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &schema).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
         CatalogCommandEnvelopeV1::new(
             request_id,
             None,
@@ -985,7 +1012,7 @@ mod tests {
                 namespace_id: namespace_id(1),
                 name: CatalogName::new("ticks").unwrap(),
                 definition: TableDefinition::Append(AppendTableDefinition::default()),
-                schema_ipc: SchemaIpcPayload::new(vec![1]).unwrap(),
+                schema_ipc: SchemaIpcPayload::new(bytes).unwrap(),
                 config: BTreeMap::new(),
             }),
         )
@@ -998,9 +1025,12 @@ mod tests {
             request_id,
             None,
             actor(),
-            CatalogCommandV1::DropTable(DropTableCommand {
-                table_id: TableId::from_u128(1).unwrap(),
-                expected_snapshot_version: 1,
+            CatalogCommandV1::CreateMaintenanceJob(CreateMaintenanceJobCommand {
+                job_id: zippy_types::JobId::from_u128(1).unwrap(),
+                kind: MaintenanceJobKind::Verify,
+                table_id: None,
+                priority: 0,
+                input: BTreeMap::new(),
             }),
         )
         .unwrap()

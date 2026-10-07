@@ -1,0 +1,140 @@
+{
+  "date": "2026-09-22",
+  "batch": 20,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "catalog_directory_version": 9,
+  "validation": {
+    "rust_workspace": {
+      "passed": 1760,
+      "failed": 0,
+      "ignored": 10,
+      "result_blocks": 116
+    },
+    "new_runtime_test": "three table kinds; real Catalog, TableActor, Memory writes, checkpoint and restart",
+    "clippy": "workspace all-targets all-features -D warnings; passed",
+    "python": {
+      "passed": 730,
+      "skipped": 1,
+      "extension_rebuilt": true
+    },
+    "black": "86 files unchanged; passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "protocol_codegen": "--check; passed",
+    "mypy_configured": "root 14 and client 26 source files; passed",
+    "mypy_full": "Found 991 errors in 12 files (checked 85 source files); FAILED; F29 remains open",
+    "platform": "Linux x86_64 CPython 3.11; no new Windows/macOS or Arrow version matrix acceptance",
+    "packaging": "editable extension rebuilt; optional patchelf warning; no new clean sdist/wheel validation"
+  },
+  "acceptance": {
+    "runtime_shared_consumer_service": true,
+    "single_active_consumer_or_group_connection": true,
+    "committed_replay_uses_catalog_only": true,
+    "delivery_sequence_and_exact_processed_boundary": true,
+    "atomic_frame_and_key_value_delivery": true,
+    "partial_key_value_committed_position_rejected": true,
+    "noncloneable_result_ownership_preserves_query_charges": true,
+    "retained_delivery_charged_after_connection_close": true,
+    "ack_persists_memory_writes_before_committing_offset": true,
+    "checkpoint_targets_one_table_and_holds_schema_gate": true,
+    "checkpoint_guard_participates_in_shutdown_drain": true,
+    "cancelled_ack_wait_does_not_cancel_commit": true,
+    "inflight_ack_retains_group_membership_after_connection_drop": true,
+    "query_cancel_prevents_new_ack": true,
+    "reconnect_and_restart_replay_unacknowledged_progress": true,
+    "flight_ack_channel": false,
+    "all_subscription_service_views_filters_throttles": false,
+    "key_value_subscription_throughput_accepted": false,
+    "legacy_callback_migration": false,
+    "native_local_compute_output": false
+  },
+  "limitations": [
+    "internal runtime API only; public Flight/Python ACK still pending",
+    "single active member per group; no partition rebalance",
+    "key-value currently uses one accounted physical row per fragment",
+    "legacy paths remain until callbacks and local compute are migrated"
+  ],
+  "evidence": {
+    "tests": {
+      "path": "/tmp/zippy-consumer-service-tests.log",
+      "sha256": "b72e78f3ca50f28d1a5acd29d6e0c1035ef8812cbfce1507eb960ebfb3c5ff8d"
+    },
+    "workspace": {
+      "path": "/tmp/zippy-consumer-service-workspace.log",
+      "sha256": "72dd36006f627363a5eb869b0979d1805de3a45fd7aa0f4a90d4da0c01dab292"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-consumer-service-clippy.log",
+      "sha256": "0e59e2200d2eaf4b412f98b78401bb2c4674e56610ca3fc5ebbcbe9471f4f4e0"
+    },
+    "maturin": {
+      "path": "/tmp/zippy-consumer-service-maturin.log",
+      "sha256": "b04768d1617038e0d1347fb8ce835168bb0f8aafa17a756d3f4aadecb909a696"
+    },
+    "python": {
+      "path": "/tmp/zippy-consumer-service-python.log",
+      "sha256": "649f357163c2f1a08c4ba54eb7ccf6efe2bafc3d08670ba3e6c2e5dc01b0a4cb"
+    },
+    "black": {
+      "path": "/tmp/zippy-consumer-service-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-consumer-service-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "mypy-configured": {
+      "path": "/tmp/zippy-consumer-service-mypy-configured.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "client-mypy": {
+      "path": "/tmp/zippy-consumer-service-client-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "mypy-full": {
+      "path": "/tmp/zippy-consumer-service-mypy-full.log",
+      "sha256": "53e95f51c2318a499c2e60f932178a876addd3daa3f543e1619f82e770c277a0"
+    },
+    "fmt": {
+      "path": "/tmp/zippy-consumer-service-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff": {
+      "path": "/tmp/zippy-consumer-service-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "codegen-check": {
+      "path": "/tmp/zippy-consumer-service-codegen-check.log",
+      "sha256": "458e96d5a24969425d792cbdd67166fe8b814b6fe78ebb215d235efc7740d26b"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-ingest/src/native.rs": "e9dccd3ea6c56ace2337f4917cc1677dd6936dd1d954dc7d7076a4217f9c6339",
+    "crates/zippy-ingest/src/lib.rs": "e9092dc49104b41cdd4c007fccaa5ec04aac36d2cf224c402bde72a13091af8d",
+    "crates/zippy-server/src/consumer_log.rs": "9cd4da4798804800f1a6859e98b1c3f57460e12cb5a2ee580fcea86b61af8d3d",
+    "crates/zippy-server/src/native_log.rs": "1d70488520f00152decd001bffe180345d85d3b64247060d24141981a805f6dd",
+    "crates/zippy-server/src/native_storage.rs": "4fb11d9493e08f9a04e9a4c0eedf42410a36c263a16e8b19d8f70c56f88fb6ff",
+    "crates/zippy-server/src/lib.rs": "54f14a5afe824534ac43e6819b2d4a184aff5e09fe90875db2846bbe67e93cfb",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "daaed8f5249bd2d73e6b50f6fe256360ce6cfb1d12984f9bf184ef11d18fca37",
+    "docs/convergence-consumer-service-2026-09-22.md": "e348c4d506f9293d5e603c7298a559da54e7439484db0bd36ee7eed276407f64",
+    "docs/current-capabilities-2026-09-21.md": "8f77fc737eff1b18066a1f17254ef504cbdade025fbed7587f4c48d66c737a16",
+    "docs/architecture-convergence-audit-2026-09-18.md": "70346144ebb7a3f8942ce00b4a1227f229ab475fdfc73dcec9f75bfa598340cf"
+  }
+}

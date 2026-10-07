@@ -39,6 +39,7 @@ use tokio::task::JoinHandle;
 use zippy_types::{ErrorCode, ServerError};
 
 mod active_plan;
+mod logical_schema;
 mod output_admission;
 mod persisted_plan;
 mod prepared_plan;
@@ -1146,7 +1147,7 @@ mod tests {
         let charge = admission
             .file_decode_memory_bytes(&metadata)
             .expect("charge decoded row group");
-        assert_eq!(admission.format_version(), 1);
+        assert_eq!(admission.format_version(), 3);
         assert_eq!(admission.batch_size().get(), 1024);
         assert_eq!(admission.scan_column_count().get(), 1);
         assert!(charge > admission.batch_peak_memory_bytes());

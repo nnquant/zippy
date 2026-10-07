@@ -1,4 +1,4 @@
-"""Typed query expression AST and Gateway JSON serialization."""
+"""Shared query expressions, precise temporal ranges and transport serialization."""
 
 from __future__ import annotations
 
@@ -166,7 +166,7 @@ def normalize_expressions(
 
 
 def expression_to_json(expression: object) -> dict[str, Any]:
-    """Serialize one expression to Gateway protocol JSON."""
+    """Serialize one expression to the shared JSON expression representation."""
     if isinstance(expression, str):
         return {"kind": "col", "value": expression}
     if not isinstance(expression, Expr):
@@ -224,7 +224,14 @@ def expression_to_json(expression: object) -> dict[str, Any]:
 
 
 def normalize_temporal_filter(expression: object, schema: object | None) -> object:
-    """Normalize timestamp and date literals using the source Arrow schema."""
+    """Normalize timestamp/date comparisons to inclusive-start, exclusive-end ranges.
+
+    :param expression: Shared expression AST; non-temporal nodes are unchanged.
+    :param schema: Source Arrow schema, supplying the timestamp unit and timezone.
+    :returns: One normalized expression shared by both Python packages.
+    :raises ValueError: A temporal literal has an invalid date, precision or offset.
+    :example: normalize_temporal_filter(col("dt") == "2026-09", schema)
+    """
     if schema is None or not isinstance(expression, Expr) or expression.kind != "binary":
         return expression
     op = str(expression.value)
@@ -238,6 +245,8 @@ def normalize_temporal_filter(expression: object, schema: object | None) -> obje
                 normalize_temporal_filter(right, schema),
             ),
         )
+    if op not in {"eq", "ne", "gt", "ge", "lt", "le"}:
+        return expression
     pair = _column_literal_pair(left, right)
     reverse = False
     if pair is None:
@@ -267,34 +276,7 @@ def normalize_temporal_filter(expression: object, schema: object | None) -> obje
         return column_expression >= end
     if op == "lt":
         return column_expression < start
-    if op == "le":
-        return column_expression < end
-    return expression
-
-
-def expression_supported_by_gateway(expression: object) -> bool:
-    """Return whether Gateway can evaluate a filter expression exactly."""
-    if not isinstance(expression, Expr):
-        return False
-    if expression.kind == "is_in":
-        target, values = expression.args
-        return (
-            isinstance(target, Expr)
-            and target.kind == "col"
-            and isinstance(values, (list, tuple, set))
-        )
-    if expression.kind != "binary":
-        return False
-    op = str(expression.value)
-    left, right = expression.args
-    if op in {"and", "or"}:
-        return expression_supported_by_gateway(left) and expression_supported_by_gateway(right)
-    if op not in {"eq", "ne", "gt", "ge", "lt", "le"}:
-        return False
-    return (
-        _column_literal_pair(left, right) is not None
-        or _column_literal_pair(right, left) is not None
-    )
+    return column_expression < end  # le
 
 
 def _column_literal_pair(left: object, right: object) -> tuple[str, object] | None:
@@ -333,6 +315,14 @@ def _temporal_range(value: object, field_info: dict[str, object]) -> _TemporalRa
         elif target_timezone is not None:
             normalized = normalized.astimezone(target_timezone)
         start_ns = _datetime_to_epoch_ns(normalized)
+        # Timestamp datetime subclasses can carry a nanosecond remainder. Avoid
+        # their unit-dependent integer .value and retain schema-local naive times.
+        nanosecond = getattr(normalized, "nanosecond", None)
+        if nanosecond is not None:
+            if type(nanosecond) is not int or not 0 <= nanosecond < 1_000:
+                raise ValueError("invalid datetime nanosecond remainder")
+            start_ns += nanosecond
+            return _TemporalRange(start_ns, start_ns + 1, timezone_name, unit)
         return _TemporalRange(start_ns, start_ns + 1_000, timezone_name, unit)
     if isinstance(value, date):
         start = datetime(
@@ -353,10 +343,11 @@ def _temporal_range(value: object, field_info: dict[str, object]) -> _TemporalRa
 
 
 _TEMPORAL_RE = re.compile(
-    r"^(?P<date>\d{4}-?\d{2}(?:-?\d{2})?)"
+    r"(?P<year>\d{4})(?P<separator>-?)(?P<month>\d{2})"
+    r"(?:(?P=separator)(?P<day>\d{2})"
     r"(?:(?:[ T])(?P<hour>\d{2}):(?P<minute>\d{2})"
     r"(?::(?P<second>\d{2})(?:\.(?P<fraction>\d{1,9}))?)?"
-    r"(?P<tz>Z|[+-]\d{2}:?\d{2})?)?$"
+    r"(?P<tz>Z|[+-]\d{2}:?\d{2})?)?)?"
 )
 
 
@@ -365,16 +356,13 @@ def _parse_temporal_string(
     timezone_name: str | None,
     unit: str,
 ) -> _TemporalRange:
-    match = _TEMPORAL_RE.match(value)
+    match = _TEMPORAL_RE.fullmatch(value)
     if match is None:
         raise ValueError(f"invalid temporal literal value=[{value}]")
-    date_text = match.group("date").replace("-", "")
-    if len(date_text) not in {6, 8}:
-        raise ValueError(f"invalid temporal literal value=[{value}]")
-    year = int(date_text[:4])
-    month = int(date_text[4:6])
+    year = int(match.group("year"))
+    month = int(match.group("month"))
     target_timezone = _timezone(timezone_name) or timezone.utc
-    if len(date_text) == 6:
+    if match.group("day") is None:
         start = datetime(year, month, 1, tzinfo=target_timezone)
         end = (
             datetime(year + 1, 1, 1, tzinfo=target_timezone)
@@ -387,7 +375,7 @@ def _parse_temporal_string(
             timezone_name,
             unit,
         )
-    day = int(date_text[6:8])
+    day = int(match.group("day"))
     hour_text = match.group("hour")
     if hour_text is None:
         start = datetime(year, month, day, tzinfo=target_timezone)
@@ -404,9 +392,10 @@ def _parse_temporal_string(
     elif tz_text:
         compact = tz_text.replace(":", "")
         sign = 1 if compact[0] == "+" else -1
-        literal_timezone = timezone(
-            sign * timedelta(hours=int(compact[1:3]), minutes=int(compact[3:5]))
-        )
+        offset_hour, offset_minute = int(compact[1:3]), int(compact[3:5])
+        if offset_hour > 23 or offset_minute > 59:
+            raise ValueError(f"invalid temporal literal offset value=[{value}]")
+        literal_timezone = timezone(sign * timedelta(hours=offset_hour, minutes=offset_minute))
     minute = int(match.group("minute"))
     second_text = match.group("second")
     if second_text is None:

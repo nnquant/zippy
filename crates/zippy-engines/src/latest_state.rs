@@ -14,27 +14,19 @@ pub(crate) struct LatestColumnarState {
     key_fields: Vec<String>,
     key_indices: Vec<usize>,
     key_to_slot: BTreeMap<Vec<String>, usize>,
-    snapshot_rows_by_slot: Vec<usize>,
+    allocated_slots: usize,
     columns: Vec<LatestColumnStore>,
+    free_slots: Vec<usize>,
 }
 
 #[derive(Debug)]
 pub(crate) struct LatestUpdateSet {
     slots: Vec<usize>,
-    new_slots: Vec<usize>,
 }
 
 impl LatestUpdateSet {
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.is_empty()
-    }
-
-    pub(crate) fn slots(&self) -> &[usize] {
-        &self.slots
-    }
-
-    pub(crate) fn has_new_slots(&self) -> bool {
-        !self.new_slots.is_empty()
     }
 }
 
@@ -124,8 +116,9 @@ impl LatestColumnarState {
             key_fields,
             key_indices,
             key_to_slot: BTreeMap::new(),
-            snapshot_rows_by_slot: Vec::new(),
+            allocated_slots: 0,
             columns,
+            free_slots: Vec::new(),
         })
     }
 
@@ -152,6 +145,45 @@ impl LatestColumnarState {
         self.materialize_slots(&update.slots)
     }
 
+    /// Validates every key before removing any rows; missing or repeated keys are harmless.
+    pub(crate) fn delete_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let arrays = self
+            .key_fields
+            .iter()
+            .map(|name| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                    .ok_or_else(|| ZippyError::SchemaMismatch {
+                        reason: format!("missing utf8 delete key field=[{name}]"),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut keys = BTreeSet::new();
+        for row in 0..batch.num_rows() {
+            if arrays.iter().any(|array| array.is_null(row)) {
+                return Err(ZippyError::SchemaMismatch {
+                    reason: "delete key contains null".to_owned(),
+                });
+            }
+            keys.insert(
+                arrays
+                    .iter()
+                    .map(|array| array.value(row).to_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for key in keys {
+            if let Some(slot) = self.key_to_slot.remove(&key) {
+                for column in &mut self.columns {
+                    column.clear_slot(slot);
+                }
+                self.free_slots.push(slot);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn materialize_snapshot(&self) -> Result<RecordBatch> {
         let slots = self.key_to_slot.values().copied().collect::<Vec<_>>();
         self.materialize_slots(&slots)
@@ -170,13 +202,6 @@ impl LatestColumnarState {
             })
             .collect::<Result<Vec<_>>>()?;
         self.materialize_slots(&slots)
-    }
-
-    pub(crate) fn snapshot_rows_for_slots(&self, slots: &[usize]) -> Vec<usize> {
-        slots
-            .iter()
-            .filter_map(|slot| self.snapshot_rows_by_slot.get(*slot).copied())
-            .collect()
     }
 
     fn prepare_batch_update(&self, table: &SegmentTableView) -> Result<PreparedLatestUpdate> {
@@ -226,7 +251,6 @@ impl LatestColumnarState {
 
     fn commit_batch_update(&mut self, update: PreparedLatestUpdate) -> Result<LatestUpdateSet> {
         let mut updated_slots = Vec::with_capacity(update.rows.len());
-        let mut new_slots = Vec::new();
 
         for (key, cells) in update.rows {
             let slot = match self.key_to_slot.get(&key).copied() {
@@ -234,7 +258,6 @@ impl LatestColumnarState {
                 None => {
                     let slot = self.allocate_slot();
                     self.key_to_slot.insert(key, slot);
-                    new_slots.push(slot);
                     slot
                 }
             };
@@ -244,23 +267,17 @@ impl LatestColumnarState {
             updated_slots.push(slot);
         }
 
-        // Existing-key updates cannot change sorted snapshot positions. Rebuild only
-        // when new keys invalidate the index, once per batch rather than per key.
-        if !new_slots.is_empty() {
-            for (row, slot) in self.key_to_slot.values().copied().enumerate() {
-                self.snapshot_rows_by_slot[slot] = row;
-            }
-        }
-
         Ok(LatestUpdateSet {
             slots: updated_slots,
-            new_slots,
         })
     }
 
     fn allocate_slot(&mut self) -> usize {
-        let slot = self.snapshot_rows_by_slot.len();
-        self.snapshot_rows_by_slot.push(0);
+        if let Some(slot) = self.free_slots.pop() {
+            return slot;
+        }
+        let slot = self.allocated_slots;
+        self.allocated_slots += 1;
         for column in &mut self.columns {
             column.push_default();
         }
@@ -273,10 +290,7 @@ impl LatestColumnarState {
         }
         // Slots are append-only and every column grows with their allocation.
         // Validate once for the whole projection, not once per cell.
-        if slots
-            .iter()
-            .any(|slot| *slot >= self.snapshot_rows_by_slot.len())
-        {
+        if slots.iter().any(|slot| *slot >= self.allocated_slots) {
             return Err(ZippyError::InvalidState {
                 status: "latest state slot is out of bounds",
             });
@@ -293,6 +307,23 @@ impl LatestColumnarState {
 }
 
 impl LatestColumnStore {
+    fn clear_slot(&mut self, slot: usize) {
+        match self {
+            Self::Int64 { values, valid, .. } | Self::TimestampNanosecond { values, valid, .. } => {
+                values[slot] = 0;
+                valid[slot] = false;
+            }
+            Self::Float64 { values, valid, .. } => {
+                values[slot] = 0.0;
+                valid[slot] = false;
+            }
+            Self::Utf8 { values, valid, .. } => {
+                values[slot] = String::new();
+                valid[slot] = false;
+            }
+        }
+    }
+
     fn new(field: &Field) -> Result<Self> {
         let field_name = field.name().clone();
         let nullable = field.is_nullable();
@@ -665,10 +696,8 @@ mod tests {
         assert_eq!(delta_ids.value(1), "IH2606");
         assert_eq!(snapshot_ids.value(0), "IF2606");
         assert_eq!(snapshot_ids.value(1), "IH2606");
-        assert_eq!(state.snapshot_rows_for_slots(update.slots()), vec![0, 1]);
 
-        // Insert on both sides of existing keys: stable slots must now resolve
-        // to the new sorted snapshot positions, not their allocation order.
+        // Inserts on both sides retain deterministic key order in full snapshots and deltas.
         let inserted = state
             .apply_batch(&batch(
                 vec![Some("ZZ"), Some("AA")],
@@ -678,8 +707,23 @@ mod tests {
                 vec![104, 105],
             ))
             .unwrap();
-        assert_eq!(state.snapshot_rows_for_slots(update.slots()), vec![1, 2]);
-        assert_eq!(state.snapshot_rows_for_slots(inserted.slots()), vec![0, 3]);
+        let inserted_delta = state.materialize_update(&inserted).unwrap();
+        assert_eq!(
+            inserted_delta
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["AA", "ZZ"])
+        );
+        let full = state.materialize_snapshot().unwrap();
+        assert_eq!(
+            full.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["AA", "IF2606", "IH2606", "ZZ"])
+        );
 
         let existing = state
             .apply_batch(&batch(
@@ -690,8 +734,24 @@ mod tests {
                 vec![106, 107, 108],
             ))
             .unwrap();
-        assert!(!existing.has_new_slots());
-        assert_eq!(state.snapshot_rows_for_slots(existing.slots()), vec![0, 2]);
+        let updated_delta = state.materialize_update(&existing).unwrap();
+        assert_eq!(
+            updated_delta
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["AA", "IH2606"])
+        );
+        assert_eq!(
+            updated_delta
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap(),
+            &Float64Array::from(vec![4.0, 5.0])
+        );
+        assert_eq!(state.len(), 4);
         assert!(state.materialize_slots(&[usize::MAX]).is_err());
     }
 

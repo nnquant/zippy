@@ -1,0 +1,97 @@
+{
+  "date": "2026-09-22",
+  "batch": 9,
+  "overall_complete": false,
+  "audit_closed_total": 21,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11",
+    "F16"
+  ],
+  "additional_fixes": [
+    "bounded ZMQ test connection handshake and join timeout; production transport unchanged"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "rust_workspace": "passed before final follow-open error attribution patch; final targeted native stream and refresh tests passed after patch",
+    "rust_test_count": "not aggregated: logging subprocess output interleaves",
+    "clippy": "passed; workspace, all targets, all features, warnings denied; process exit 0",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "python": "unchanged in this batch; not rebuilt or rerun",
+    "full_repository_mypy": "unresolved debt remains",
+    "platform": "Linux x86_64"
+  },
+  "acceptance": {
+    "three_table_kinds_replay_and_latest": true,
+    "stable_query_identity_across_refreshes": true,
+    "checkpoint_offsets_without_duplicates": true,
+    "idle_deadline_cancel_and_shutdown": true,
+    "retained_result_accounting": true,
+    "snapshot_lease_authority_and_unique_owner": true,
+    "follow_open_failure_is_failed": true,
+    "flight_continuous_subscription": false,
+    "durable_subscription_ack": false,
+    "gateway_removed": false
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-tail-workspace-final.log",
+      "sha256": "71ee64adfdf95a67ad34b0c53aaf2ab0e6a97a7b44ec133eec2a5239dcf94310"
+    },
+    "initial_workspace_hang": {
+      "path": "/tmp/zippy-tail-workspace-initial.log",
+      "sha256": "64e165f6721a3b53073193bc091e5b46cf01aef18bc3d1284e5206d46f359ca9"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-tail-clippy-final.log",
+      "sha256": "50e84ed7a3b6cc983073d12adcff3c13f5d94546d62195bf78455882a5f40f9e"
+    },
+    "native_live_final": {
+      "path": "/tmp/zippy-tail-live-final.log",
+      "sha256": "1a2c582e055bdd31810cd51ac0060f11e1e9865bab3418a99cea7fbb68b38303"
+    },
+    "snapshot_refresh_final": {
+      "path": "/tmp/zippy-tail-refresh-final.log",
+      "sha256": "f3d06d16e2186307b3d5b873ee89716a7c5c83afad010deb05eace1f3531a874"
+    },
+    "zmq": {
+      "path": "/tmp/zippy-tail-zmq.log",
+      "sha256": "b7d377c196653ccf8eff167bca83f693789285f7ff3a1a43777d5b6d71e9745a"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-tail-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-tail-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-server/src/native_log.rs": "b6ae080726c0c54eccb4d69a57f9c885d8a9d3a87f47c637cd30c44996880502",
+    "crates/zippy-server/src/native_query.rs": "b769679dea13d3829c93602c7696b4ccfb943ecbd151237b04e6a82a156448f2",
+    "crates/zippy-server/src/query_service.rs": "0a15250310985bb9cd35ecd3ef28f9551980399a61191aef866b5893e066c879",
+    "crates/zippy-server/src/query_snapshot.rs": "9b8dcc71aa21ff0d01d4032f4f9eb3c698e752f4e56712720e3a66c883bf7d17",
+    "crates/zippy-server/src/lib.rs": "82b73b4de33300ac3f7bbd7ae5e3506d0f6478e5452940df48c4df316e3e97dd",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "bb34ca7bcbfc94eec9022357c1f8c2f6790aa395f37a6381717f5d84c926ef3e",
+    "crates/zippy-catalog/src/pinned_snapshot.rs": "97080f0ac7732ca88a70839324430b79f599dbbfaccfbb49ea28c92c283afb9e",
+    "crates/zippy-catalog/src/service.rs": "4a3c98e77fc1466e1e997cedd1f9d66d982ba01fe98648a2ec71cc4fce19024f",
+    "crates/zippy-types/src/storage.rs": "d9f1724fc5588c775924983b55fb00e54cade88df9f6a5cbd974628ca236dca3",
+    "crates/zippy-io/tests/zmq_source.rs": "8ea45441e48c60f2c8b8b1321a43299d855368b5a03766d087a4bd06c86b6719"
+  }
+}

@@ -23,7 +23,7 @@ use crate::encoding::{
     encode_optional_u64, encode_u64,
 };
 use crate::storage_codec::{
-    encode_data_file_metadata_blob, encode_data_file_partition_blob,
+    decode_snapshot_summary_blob, encode_data_file_metadata_blob, encode_data_file_partition_blob,
     encode_data_file_statistics_blob, encode_snapshot_summary_blob,
 };
 
@@ -74,6 +74,7 @@ struct PreparedFiles {
 }
 
 struct PreparedDataFile {
+    key_value_version: Option<u64>,
     file: PendingDataFile,
     partition_blob: Vec<u8>,
     statistics_blob: Vec<u8>,
@@ -101,6 +102,7 @@ struct RawInputFile {
 }
 
 struct ManifestTableState {
+    key_value: bool,
     current_schema_version: u64,
     current_snapshot_version: u64,
     writer_epoch: u64,
@@ -173,19 +175,6 @@ async fn estimate_manifest_queue_bytes_cooperative(
     estimate_pending_files_queue_bytes(files.len(), files.iter(), context, work_since_yield).await
 }
 
-pub(crate) async fn legacy_import_files_preflight_bytes(
-    files: &[zippy_types::catalog::LegacyCatalogImportFileV2],
-    work_since_yield: &mut usize,
-) -> Result<usize> {
-    estimate_pending_files_queue_bytes(
-        files.len(),
-        files.iter().map(|file| &file.file),
-        "legacy import",
-        work_since_yield,
-    )
-    .await
-}
-
 async fn estimate_pending_files_queue_bytes<'a>(
     file_count: usize,
     files: impl Iterator<Item = &'a PendingDataFile> + Send,
@@ -205,10 +194,8 @@ async fn estimate_pending_files_queue_bytes<'a>(
     let mut lineage_rows = 0_usize;
     for file in files {
         yield_after_preflight_work(work_since_yield).await;
-        let path = match &file.location {
-            DataFileLocation::Managed(path) => path.as_str(),
-            DataFileLocation::ExternalLegacy(path) => path.as_str(),
-        };
+        let DataFileLocation::Managed(path) = &file.location;
+        let path = path.as_str();
         if path.len() > MAX_FILE_PATH_BYTES {
             return Err(resource(format!(
                 "manifest file path exceeds byte limit file_id=[{}] actual=[{}] maximum=[{}]",
@@ -225,10 +212,8 @@ async fn estimate_pending_files_queue_bytes<'a>(
                 MAX_CHECKSUM_BYTES
             )));
         }
-        let file_lineage = match &file.provenance {
-            DataFileProvenance::Native(native) => native.source_lineage().as_slice().len(),
-            DataFileProvenance::Legacy { .. } => 0,
-        };
+        let DataFileProvenance::Native(native) = &file.provenance;
+        let file_lineage = native.source_lineage().as_slice().len();
         if file_lineage > MAX_LINEAGE_ROWS_PER_FILE {
             return Err(resource(format!(
                 concat!(
@@ -406,9 +391,6 @@ fn require_known_watermark(value: OffsetWatermark, operation: &str) -> Result<Lo
         OffsetWatermark::Empty => Err(invalid(format!(
             "native {operation} requires a nonempty committed log watermark"
         ))),
-        OffsetWatermark::LegacyUnknown => Err(unsupported(format!(
-            "catalog.{operation}.legacy_unknown_watermark"
-        ))),
     }
 }
 
@@ -457,12 +439,8 @@ fn validate_pending_files(
                 file.file_id
             )));
         }
-        let path = match &file.location {
-            DataFileLocation::Managed(path) => path.as_str(),
-            DataFileLocation::ExternalLegacy(_) => {
-                return Err(unsupported(format!("catalog.{context}.external_legacy")));
-            }
-        };
+        let DataFileLocation::Managed(path) = &file.location;
+        let path = path.as_str();
         validate_managed_path(path, file.file_id)?;
         if !paths.insert(path) {
             return Err(invalid(format!(
@@ -470,12 +448,7 @@ fn validate_pending_files(
             )));
         }
         validate_checksum(&file.checksum, file.file_id)?;
-        let native = match &file.provenance {
-            DataFileProvenance::Native(native) => native,
-            DataFileProvenance::Legacy { .. } => {
-                return Err(unsupported(format!("catalog.{context}.legacy")));
-            }
-        };
+        let DataFileProvenance::Native(native) = &file.provenance;
         if native.offsets().len() != u128::from(file.row_count.get()) {
             return Err(invalid(format!(
                 "{context} file row count does not equal offset span file_id=[{}] rows=[{}] offsets=[{}]",
@@ -651,9 +624,7 @@ fn prepare_files(files: Vec<PendingDataFile>) -> Result<PreparedFiles> {
     let mut max_writer_epoch = 0_u64;
     let mut encoded_metadata_bytes = 0_usize;
     for mut file in files {
-        let DataFileProvenance::Native(native) = &file.provenance else {
-            return Err(unsupported("catalog.manifest.legacy"));
-        };
+        let DataFileProvenance::Native(native) = &file.provenance;
         coverage.push(native.offsets());
         schema_coverage
             .entry(file.schema_version)
@@ -689,11 +660,25 @@ fn prepare_files(files: Vec<PendingDataFile>) -> Result<PreparedFiles> {
         encoded_metadata_bytes =
             charge_encoded_metadata(encoded_metadata_bytes, statistics_blob.len(), "statistics")?;
         let metadata = std::mem::take(&mut file.metadata);
+        let key_value_version = match metadata.get(zippy_types::key_value::STATE_VERSION_METADATA) {
+            Some(MetadataScalar::UInt64(version))
+                if *version > 0 && *version <= i64::MAX as u64 =>
+            {
+                Some(*version)
+            }
+            None => None,
+            _ => {
+                return Err(invalid(
+                    "key-value file version must be a positive signed-domain integer",
+                ))
+            }
+        };
         let metadata_blob = encode_data_file_metadata_blob(&metadata)?;
         drop(metadata);
         encoded_metadata_bytes =
             charge_encoded_metadata(encoded_metadata_bytes, metadata_blob.len(), "file metadata")?;
         prepared.push(PreparedDataFile {
+            key_value_version,
             file,
             partition_blob,
             statistics_blob,
@@ -826,35 +811,45 @@ fn canonicalize_schema_coverage(
 }
 
 fn manifest_summary(files: &PreparedFiles, removed_files: u64) -> Result<MetadataMap> {
-    Ok(MetadataMap::from([
-        (
-            "added_bytes".to_owned(),
-            MetadataScalar::UInt64(files.total_bytes),
-        ),
-        (
-            "added_files".to_owned(),
-            MetadataScalar::UInt64(
-                u64::try_from(files.files.len())
-                    .map_err(|_| resource("manifest file count is outside the supported domain"))?,
+    let mut summary =
+        MetadataMap::from([
+            (
+                "added_bytes".to_owned(),
+                MetadataScalar::UInt64(files.total_bytes),
             ),
-        ),
-        (
-            "added_rows".to_owned(),
-            MetadataScalar::UInt64(files.total_rows),
-        ),
-        (
-            "removed_files".to_owned(),
-            MetadataScalar::UInt64(removed_files),
-        ),
-        (
-            "source_lineage_rows".to_owned(),
-            MetadataScalar::UInt64(
-                u64::try_from(files.lineage_rows).map_err(|_| {
+            (
+                "added_files".to_owned(),
+                MetadataScalar::UInt64(u64::try_from(files.files.len()).map_err(|_| {
+                    resource("manifest file count is outside the supported domain")
+                })?),
+            ),
+            (
+                "added_rows".to_owned(),
+                MetadataScalar::UInt64(files.total_rows),
+            ),
+            (
+                "removed_files".to_owned(),
+                MetadataScalar::UInt64(removed_files),
+            ),
+            (
+                "source_lineage_rows".to_owned(),
+                MetadataScalar::UInt64(u64::try_from(files.lineage_rows).map_err(|_| {
                     resource("manifest lineage count is outside the supported domain")
-                })?,
+                })?),
             ),
-        ),
-    ]))
+        ]);
+    if let Some(version) = files
+        .files
+        .iter()
+        .filter_map(|file| file.key_value_version)
+        .max()
+    {
+        summary.insert(
+            zippy_types::key_value::STATE_VERSION_METADATA.to_owned(),
+            MetadataScalar::UInt64(version),
+        );
+    }
+    Ok(summary)
 }
 
 fn ensure_encoded_budget(metadata_bytes: usize, summary_bytes: usize) -> Result<()> {
@@ -884,11 +879,41 @@ pub(crate) fn commit_data_files(
     next_revision: u64,
     committed_at_ns: u64,
 ) -> Result<TableSnapshot> {
-    let table = read_append_table(connection, prepared.table_id, "commit_data_files")?;
+    let table = read_log_table(connection, prepared.table_id, "commit_data_files")?;
     validate_current_snapshot(
         prepared.expected_snapshot_version,
         table.current_snapshot_version,
     )?;
+    if table.key_value {
+        let table_id = prepared.table_id.into_bytes();
+        let version = encode_u64(prepared.expected_snapshot_version);
+        let summary: Vec<u8> = connection.query_row(
+            "SELECT summary_blob FROM table_snapshots WHERE table_id = ?1 AND snapshot_version = ?2",
+            params![table_id.as_slice(), version.as_slice()], |row| row.get(0),
+        ).map_err(|error| crate::map_sqlite_error("read key-value parent version", error))?;
+        let summary = decode_snapshot_summary_blob(&summary)?;
+        let key = zippy_types::key_value::STATE_VERSION_METADATA;
+        let parent = match summary.get(key) {
+            Some(MetadataScalar::UInt64(version)) => *version,
+            None if prepared.expected_snapshot_version == 1 => 0,
+            _ => {
+                return Err(corruption(
+                    "key-value parent mutation version is missing or invalid",
+                ))
+            }
+        };
+        for file in &prepared.files.files {
+            match file.key_value_version {
+                Some(version) if version > parent => {}
+                _ => {
+                    return Err(invalid(format!(
+                        "key-value file must advance the parent mutation version parent=[{parent}] file=[{:?}]",
+                        file.key_value_version,
+                    )))
+                }
+            }
+        }
+    }
     validate_writer_epoch(prepared.files.max_writer_epoch, table.writer_epoch)?;
     validate_schema_versions(
         connection,
@@ -956,7 +981,7 @@ pub(crate) fn commit_compaction(
     next_revision: u64,
     committed_at_ns: u64,
 ) -> Result<TableSnapshot> {
-    let table = read_append_table(connection, prepared.table_id, "commit_compaction")?;
+    let table = read_log_table(connection, prepared.table_id, "commit_compaction")?;
     validate_current_snapshot(
         prepared.expected_snapshot_version,
         table.current_snapshot_version,
@@ -1055,7 +1080,7 @@ pub(crate) fn commit_compaction(
     })
 }
 
-fn read_append_table(
+fn read_log_table(
     connection: &Connection,
     table_id: TableId,
     operation: &str,
@@ -1080,12 +1105,18 @@ fn read_append_table(
         .map_err(|error| crate::map_sqlite_error("read manifest table state", error))?
         .ok_or_else(|| not_found(format!("table was not found table_id=[{table_id}]")))?;
     let (table_kind, current_schema_version, current_snapshot_version, writer_epoch, state) = row;
+    if table_kind == "key_value_table" && operation == "commit_compaction" {
+        return Err(unsupported("catalog.commit_compaction.key_value_table"));
+    }
     if state != "active" {
         return Err(conflict(format!(
             "manifest table is not active table_id=[{table_id}] state=[{state}]"
         )));
     }
-    if table_kind != "append_table" {
+    if !matches!(
+        table_kind.as_str(),
+        "append_table" | "frame_table" | "key_value_table"
+    ) {
         return Err(unsupported(format!(
             "catalog.{operation}.table_kind.{}",
             table_kind
@@ -1100,6 +1131,7 @@ fn read_append_table(
         )));
     }
     Ok(ManifestTableState {
+        key_value: table_kind == "key_value_table",
         current_schema_version,
         current_snapshot_version,
         writer_epoch,
@@ -1154,11 +1186,6 @@ fn validate_persist_parent_watermark(parent: OffsetWatermark, first: LogOffset) 
         OffsetWatermark::Known(offset) => offset
             .checked_next()
             .ok_or_else(|| conflict("cannot persist after the maximum committed log offset"))?,
-        OffsetWatermark::LegacyUnknown => {
-            return Err(unsupported(
-                "catalog.commit_data_files.legacy_unknown_parent",
-            ));
-        }
     };
     if first != expected {
         return Err(conflict(format!(
@@ -1277,12 +1304,8 @@ fn ensure_output_identities_available(
 }
 
 fn prepared_managed_path(file: &PreparedDataFile) -> &str {
-    match &file.file.location {
-        DataFileLocation::Managed(path) => path.as_str(),
-        DataFileLocation::ExternalLegacy(_) => {
-            unreachable!("prepared native manifest files are managed")
-        }
-    }
+    let DataFileLocation::Managed(path) = &file.file.location;
+    path.as_str()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1303,7 +1326,7 @@ fn insert_snapshot(
     let operation = match operation {
         SnapshotOperation::Persist => "persist",
         SnapshotOperation::Compaction => "compaction",
-        SnapshotOperation::Create | SnapshotOperation::Import | SnapshotOperation::Retention => {
+        SnapshotOperation::Create | SnapshotOperation::Retention => {
             unreachable!("manifest writer only creates persist and compaction snapshots")
         }
     };
@@ -1342,20 +1365,18 @@ fn insert_output_files(
             "INSERT INTO data_files(\
                  file_id, table_id, schema_version, location_kind, file_path, \
                  file_size_bytes, row_count, provenance_kind, min_log_offset, \
-                 max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+                 max_log_offset, \
                  partition_blob, statistics_blob, metadata_blob, checksum, \
                  added_snapshot_version, removed_snapshot_version, state, created_at_ns\
              ) VALUES (\
-                 ?1, ?2, ?3, 'managed', ?4, ?5, ?6, 'native', ?7, ?8, 0, ?9, \
-                 ?10, ?11, ?12, ?13, ?14, ?15, 'committed', ?16\
+                 ?1, ?2, ?3, 'managed', ?4, ?5, ?6, 'native', ?7, ?8, \
+                 ?9, ?10, ?11, ?12, ?13, ?14, 'committed', ?15\
              )",
         )
         .map_err(|error| crate::map_sqlite_error("prepare manifest file insert", error))?;
     for prepared in files {
         let file = &prepared.file;
-        let DataFileProvenance::Native(native) = &file.provenance else {
-            unreachable!("prepared manifest files have native provenance");
-        };
+        let DataFileProvenance::Native(native) = &file.provenance;
         let file_id = file.file_id.into_bytes();
         let offsets = native.offsets();
         let minimum = encode_optional_u64(Some(offsets.first().get()));
@@ -1370,7 +1391,6 @@ fn insert_output_files(
                 encode_u64(file.row_count.get()).as_slice(),
                 minimum.as_slice(),
                 maximum.as_slice(),
-                absent.as_slice(),
                 prepared.partition_blob.as_slice(),
                 prepared.statistics_blob.as_slice(),
                 prepared.metadata_blob.as_slice(),
@@ -1393,9 +1413,7 @@ fn insert_output_files(
         .map_err(|error| crate::map_sqlite_error("prepare manifest lineage insert", error))?;
     for prepared in files {
         let file_id = prepared.file.file_id.into_bytes();
-        let DataFileProvenance::Native(native) = &prepared.file.provenance else {
-            unreachable!("prepared manifest files have native provenance");
-        };
+        let DataFileProvenance::Native(native) = &prepared.file.provenance;
         for lineage in native.source_lineage().as_slice() {
             insert_lineage
                 .execute(params![

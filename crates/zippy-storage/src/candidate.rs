@@ -52,6 +52,8 @@ pub struct ParquetCandidateSpec {
     /// Exact Arrow schema expected from every input batch.
     pub schema: SchemaRef,
     /// Exact native offset coverage and source-segment lineage.
+    /// Physical row `i` must represent `provenance.offsets().first() + i`.
+    /// Writers and compaction preserve event order, independently of lineage identity order.
     pub provenance: NativeDataFileProvenance,
     /// Stable partition values recorded in the Catalog manifest.
     pub partition: MetadataMap,
@@ -160,9 +162,7 @@ impl PublishedCandidateCleanup {
     }
 
     pub(crate) fn path(&self) -> &ManagedDataPath {
-        let DataFileLocation::Managed(path) = &self.pending.location else {
-            unreachable!("controller-published native candidate has a managed path")
-        };
+        let DataFileLocation::Managed(path) = &self.pending.location;
         path
     }
 
@@ -210,17 +210,6 @@ impl StagedParquetCandidate {
         let table_id = pending.table_id;
         let expected_size = pending.file_size_bytes;
         let expected_checksum = pending.checksum.clone();
-        let DataFileLocation::Managed(_) = &pending.location else {
-            return Err(CandidatePublicationFailure {
-                error: ServerError::new(
-                    ErrorCode::Internal,
-                    "staged native Parquet candidate has an external location",
-                )
-                .with_table_id(table_id)
-                .with_retryable(false),
-                cleanup: None,
-            });
-        };
 
         match transaction.publish_noclobber() {
             Ok(published) => {
@@ -310,12 +299,15 @@ impl ParquetCandidateWriter {
         Self { data_directory }
     }
 
-    /// Writes, checksums, and durably publishes one native Parquet candidate.
+    /// Writes, checksums, and durably publishes one native Parquet test fixture.
     ///
     /// The target path is deterministically
     /// `parquet/<table_id>/<file_id>.parquet`. Repeating the same file identity
     /// with byte-identical content returns the existing candidate. Different
     /// content under the same identity fails without replacing the file.
+    /// This low-level method does not create Catalog visibility or transfer
+    /// cleanup authority; production writes use [`crate::PersistController`].
+    #[doc(hidden)]
     pub fn write_candidate<I>(
         &self,
         spec: ParquetCandidateSpec,
@@ -950,20 +942,8 @@ pub(crate) fn verify_pending_candidate(
     data_directory: &OwnedDataDirectory,
     pending: &PendingDataFile,
 ) -> Result<()> {
-    let DataFileLocation::Managed(managed_path) = &pending.location else {
-        return Err(ServerError::new(
-            ErrorCode::InvalidArgument,
-            "native candidate verification requires a managed file location",
-        )
-        .with_table_id(pending.table_id));
-    };
-    let DataFileProvenance::Native(provenance) = &pending.provenance else {
-        return Err(ServerError::new(
-            ErrorCode::InvalidArgument,
-            "native candidate verification requires native provenance",
-        )
-        .with_table_id(pending.table_id));
-    };
+    let DataFileLocation::Managed(managed_path) = &pending.location;
+    let DataFileProvenance::Native(provenance) = &pending.provenance;
     let path = data_directory
         .directory()
         .root()
@@ -1092,27 +1072,8 @@ pub(crate) fn verify_catalog_visible_candidate(
     data_directory: &OwnedDataDirectory,
     pending: &PendingDataFile,
 ) -> Result<()> {
-    let DataFileLocation::Managed(managed_path) = &pending.location else {
-        return Err(corruption_error(
-            pending.table_id,
-            data_directory.directory().root(),
-            None,
-            None,
-            "catalog-visible native candidate is not managed by the data root",
-        ));
-    };
-    let DataFileProvenance::Native(provenance) = &pending.provenance else {
-        return Err(corruption_error(
-            pending.table_id,
-            &data_directory
-                .directory()
-                .root()
-                .join(managed_path.as_str()),
-            Some(pending.checksum.clone()),
-            None,
-            "catalog-visible managed candidate does not have native provenance",
-        ));
-    };
+    let DataFileLocation::Managed(managed_path) = &pending.location;
+    let DataFileProvenance::Native(provenance) = &pending.provenance;
     let expected = candidate_managed_path(pending.table_id, pending.file_id)?;
     if managed_path != &expected {
         return Err(corruption_error(

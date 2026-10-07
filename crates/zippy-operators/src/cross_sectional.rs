@@ -35,11 +35,6 @@ impl<'a> CrossSectionalFactorContext<'a> {
         }
     }
 
-    /// Return the underlying bucket batch for compatibility fallback paths.
-    pub fn batch(&self) -> &RecordBatch {
-        self.batch
-    }
-
     /// Return cached finite float64 values for a field.
     pub fn float64_values(&mut self, field: &str) -> Result<&[Option<f64>]> {
         if !self.float64_values_by_field.contains_key(field) {
@@ -88,16 +83,16 @@ pub trait CrossSectionalFactor: Send {
     /// Return the output field definition for this factor.
     fn output_field(&self) -> Field;
 
-    /// Evaluate the factor for each row in the batch.
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef>;
+    /// Evaluate one batch through the same context kernel used by bucket engines.
+    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
+        self.evaluate_with_context(&mut CrossSectionalFactorContext::new(batch))
+    }
 
-    /// Evaluate the factor with per-bucket shared context.
+    /// Evaluate the factor with its canonical per-bucket shared context.
     fn evaluate_with_context(
         &mut self,
         context: &mut CrossSectionalFactorContext<'_>,
-    ) -> Result<ArrayRef> {
-        self.evaluate(context.batch())
-    }
+    ) -> Result<ArrayRef>;
 }
 
 /// Builder for a cross-sectional rank factor.
@@ -182,11 +177,6 @@ impl CrossSectionalFactor for CSRankFactor {
         self.output_field.clone()
     }
 
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let values = float64_values(batch, &self.value_field)?;
-        Ok(float64_array_from_options(&compute_float64_ranks(&values)))
-    }
-
     fn evaluate_with_context(
         &mut self,
         context: &mut CrossSectionalFactorContext<'_>,
@@ -204,11 +194,6 @@ struct CSZscoreFactor {
 impl CrossSectionalFactor for CSZscoreFactor {
     fn output_field(&self) -> Field {
         self.output_field.clone()
-    }
-
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let values = float64_values(batch, &self.value_field)?;
-        Ok(zscore_array(&values, compute_float64_stats(&values)))
     }
 
     fn evaluate_with_context(
@@ -229,11 +214,6 @@ struct CSDemeanFactor {
 impl CrossSectionalFactor for CSDemeanFactor {
     fn output_field(&self) -> Field {
         self.output_field.clone()
-    }
-
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let values = float64_values(batch, &self.value_field)?;
-        Ok(demean_array(&values, compute_float64_stats(&values)))
     }
 
     fn evaluate_with_context(

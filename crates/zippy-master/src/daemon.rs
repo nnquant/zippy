@@ -1,31 +1,13 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use std::net::TcpStream;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-
-#[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
-use std::time::Instant;
-
-#[cfg(unix)]
-use signal_hook::consts::signal::{SIGINT, SIGTERM};
-#[cfg(unix)]
-use signal_hook::iterator::Signals;
 use zippy_core::{
     default_control_endpoint, resolve_control_endpoint, ControlEndpoint, LogConfig,
     ManagedDataDirectory, OwnedDataDirectory, ZippyConfig, ZippyError,
 };
-use zippy_gateway::{
-    GatewayNativeQueryFrontend, GatewayServer, GatewayServerConfig,
-    LegacyPersistedReadSnapshotSource, PersistedReadSnapshotSource,
-};
 
 use crate::server::MasterServer;
-use crate::snapshot::SnapshotStore;
 
 const LEGACY_MASTER_SNAPSHOT_FILE: &str = "legacy-master-registry.json";
 
@@ -40,7 +22,7 @@ pub struct MasterDaemonConfig {
     pub console_log: bool,
 }
 
-/// Validated legacy master components prepared without starting any listener.
+/// Validated control runtime components prepared without starting any listener.
 #[derive(Debug)]
 pub struct PreparedMasterRuntime {
     control_endpoint: ControlEndpoint,
@@ -133,87 +115,6 @@ impl MasterDaemonConfig {
     }
 }
 
-pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
-    let prepared = prepare_master_runtime(config)?;
-    let gateway = Arc::new(Mutex::new(start_legacy_gateway_if_enabled(
-        prepared.runtime_config(),
-        prepared.control_endpoint(),
-    )?));
-    let control_endpoint = prepared.control_endpoint().clone();
-    let control_endpoint_display = control_endpoint.display_string();
-    let server = prepared.server().clone();
-    install_shutdown_handlers(
-        &control_endpoint,
-        server.clone(),
-        Arc::clone(&gateway),
-        prepared.shutdown_timeout(),
-    )?;
-
-    if std::env::var_os("ZIPPY_MASTER_TEST_PAUSE_BEFORE_SERVE").is_some() {
-        std::thread::sleep(Duration::from_millis(150));
-    }
-
-    if !server.is_running() {
-        stop_legacy_gateway_after_master_exit(&gateway, prepared.shutdown_timeout())?;
-        tracing::info!(
-            component = "master",
-            event = "master_stopped",
-            status = "stopped",
-            control_endpoint = control_endpoint_display.as_str(),
-            "master stopped"
-        );
-        return Ok(());
-    }
-
-    let result = server.serve_endpoint_with_ready(&control_endpoint, None);
-    let gateway_result =
-        stop_legacy_gateway_after_master_exit(&gateway, prepared.shutdown_timeout());
-    match (result, gateway_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-    }
-}
-
-fn stop_legacy_gateway_after_master_exit(
-    gateway: &Arc<Mutex<Option<GatewayServer>>>,
-    timeout: Duration,
-) -> zippy_core::Result<()> {
-    let Some(gateway) = gateway
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-    else {
-        return Ok(());
-    };
-    match gateway.stop_gracefully_with_timeout(timeout) {
-        Ok(outcome) if outcome.is_clean() => Ok(()),
-        Ok(outcome) => {
-            tracing::error!(
-                component = "master",
-                event = "legacy_gateway_cleanup_after_master_incomplete",
-                status = "incomplete",
-                outcome = ?outcome,
-                "legacy Gateway cleanup after master exit was incomplete"
-            );
-            Err(ZippyError::Io {
-                reason: format!("legacy Gateway cleanup was incomplete outcome=[{outcome:?}]"),
-            })
-        }
-        Err(error) => {
-            tracing::error!(
-                component = "master",
-                event = "legacy_gateway_cleanup_after_master_error",
-                status = "error",
-                error = %error,
-                "legacy Gateway cleanup after master exit failed"
-            );
-            Err(error)
-        }
-    }
-}
-
-/// Loads configuration, logging, snapshot state, and master service without binding listeners.
 pub fn prepare_master_runtime(
     config: MasterDaemonConfig,
 ) -> zippy_core::Result<PreparedMasterRuntime> {
@@ -238,7 +139,6 @@ pub fn prepare_master_runtime(
 
     let snapshot_dir = control_endpoint.snapshot_dir();
     let consider_endpoint_snapshot = runtime_config.server.data_dir.is_none();
-    let import_endpoint_snapshot = runtime_config.server.import_legacy_endpoint_snapshot;
     if consider_endpoint_snapshot {
         std::fs::create_dir_all(&snapshot_dir).map_err(|error| ZippyError::Io {
             reason: format!(
@@ -263,6 +163,24 @@ pub fn prepare_master_runtime(
             }
         })?,
     );
+    let retired_registry = data_directory
+        .directory()
+        .path(ManagedDataDirectory::Catalog)
+        .join(LEGACY_MASTER_SNAPSHOT_FILE);
+    match std::fs::symlink_metadata(&retired_registry) {
+        Ok(_) => {
+            return Err(ZippyError::InvalidConfig {
+                reason: "removed legacy master registry; use an empty native data directory"
+                    .to_owned(),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ZippyError::Io {
+                reason: format!("inspect retired registry failed error=[{error}]"),
+            })
+        }
+    }
     if let Some(socket_path) = control_endpoint.unix_path() {
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
@@ -296,10 +214,6 @@ pub fn prepare_master_runtime(
         log_level = effective_log_level,
         server_data_dir = data_directory.directory().root().display().to_string(),
         server_data_owner_pid = data_directory.owner().pid(),
-        table_row_capacity = runtime_config.table.row_capacity,
-        table_persist_enabled = runtime_config.table.persist.enabled,
-        table_persist_method = runtime_config.table.persist.method.as_str(),
-        table_persist_data_dir = runtime_config.table.persist.data_dir.as_str(),
         max_cpu_cores = runtime_config.runtime.max_cpu_cores,
         query_parallelism = runtime_config.query_parallelism(),
         log_file = snapshot
@@ -310,68 +224,8 @@ pub fn prepare_master_runtime(
         "starting zippy master"
     );
 
-    let endpoint_snapshot_path = control_endpoint.legacy_snapshot_path();
-    if consider_endpoint_snapshot
-        && import_endpoint_snapshot
-        && endpoint_snapshot_path
-            .try_exists()
-            .map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "inspect endpoint legacy snapshot path=[{}] error=[{}]",
-                    endpoint_snapshot_path.display(),
-                    error
-                ),
-            })?
-    {
-        ensure_control_endpoint_offline(&control_endpoint)?;
-    }
-    let snapshot_path = prepare_legacy_snapshot_path(
-        data_directory.as_ref(),
-        &endpoint_snapshot_path,
-        consider_endpoint_snapshot,
-        import_endpoint_snapshot,
-    )?;
     let shutdown_timeout = Duration::from_millis(runtime_config.master.shutdown_timeout_ms);
-
-    let server = if snapshot_path.exists() {
-        tracing::info!(
-            component = "master",
-            event = "snapshot_load_start",
-            status = "starting",
-            snapshot_path = snapshot_path.display().to_string(),
-            "loading registry snapshot"
-        );
-        match MasterServer::from_snapshot_path(&snapshot_path) {
-            Ok(server) => {
-                tracing::info!(
-                    component = "master",
-                    event = "snapshot_load_success",
-                    status = "success",
-                    snapshot_path = snapshot_path.display().to_string(),
-                    "loaded registry snapshot"
-                );
-                server.with_runtime_config_values(runtime_config.clone())
-            }
-            Err(error) => {
-                tracing::error!(
-                    component = "master",
-                    event = "snapshot_load_failure",
-                    status = "error",
-                    snapshot_path = snapshot_path.display().to_string(),
-                    error = %error,
-                    "failed to load registry snapshot"
-                );
-                return Err(error);
-            }
-        }
-    } else {
-        MasterServer::with_runtime_config_and_config(
-            Some(snapshot_path),
-            Duration::from_secs(10),
-            Duration::from_secs(2),
-            runtime_config,
-        )
-    };
+    let server = MasterServer::with_config(runtime_config);
     Ok(PreparedMasterRuntime {
         control_endpoint,
         runtime_config: server.runtime_config().clone(),
@@ -381,248 +235,10 @@ pub fn prepare_master_runtime(
     })
 }
 
-fn prepare_legacy_snapshot_path(
-    data_directory: &OwnedDataDirectory,
-    endpoint_snapshot_path: &Path,
-    consider_endpoint_snapshot: bool,
-    import_endpoint_snapshot: bool,
-) -> zippy_core::Result<PathBuf> {
-    let managed_snapshot_path = data_directory
-        .directory()
-        .path(ManagedDataDirectory::Catalog)
-        .join(LEGACY_MASTER_SNAPSHOT_FILE);
-    if managed_snapshot_path
-        .try_exists()
-        .map_err(|error| ZippyError::Io {
-            reason: format!(
-                "inspect managed legacy snapshot path=[{}] error=[{}]",
-                managed_snapshot_path.display(),
-                error
-            ),
-        })?
-    {
-        return Ok(managed_snapshot_path);
-    }
-    if !consider_endpoint_snapshot {
-        return Ok(managed_snapshot_path);
-    }
-    if !endpoint_snapshot_path
-        .try_exists()
-        .map_err(|error| ZippyError::Io {
-            reason: format!(
-                "inspect endpoint legacy snapshot path=[{}] error=[{}]",
-                endpoint_snapshot_path.display(),
-                error
-            ),
-        })?
-    {
-        return Ok(managed_snapshot_path);
-    }
-    if !import_endpoint_snapshot {
-        return Err(ZippyError::InvalidConfig {
-            reason: format!(
-                "legacy endpoint snapshot requires an explicit offline import source_path=[{}] set=[ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT=1] after stopping the old server",
-                endpoint_snapshot_path.display()
-            ),
-        });
-    }
-    tracing::info!(
-        component = "master",
-        event = "legacy_snapshot_import_start",
-        status = "starting",
-        source_path = endpoint_snapshot_path.display().to_string(),
-        target_path = managed_snapshot_path.display().to_string(),
-        "importing endpoint-scoped legacy snapshot into managed data root"
-    );
-    let snapshot = SnapshotStore::load(endpoint_snapshot_path)?;
-    SnapshotStore::write(&managed_snapshot_path, &snapshot)?;
-    tracing::info!(
-        component = "master",
-        event = "legacy_snapshot_import_success",
-        status = "success",
-        source_path = endpoint_snapshot_path.display().to_string(),
-        target_path = managed_snapshot_path.display().to_string(),
-        "imported endpoint-scoped legacy snapshot into managed data root"
-    );
-    Ok(managed_snapshot_path)
-}
-
-fn ensure_control_endpoint_offline(endpoint: &ControlEndpoint) -> zippy_core::Result<()> {
-    let active = match endpoint {
-        #[cfg(unix)]
-        ControlEndpoint::Unix(path) => match UnixStream::connect(path) {
-            Ok(stream) => {
-                drop(stream);
-                true
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) =>
-            {
-                false
-            }
-            Err(error) => {
-                return Err(ZippyError::Io {
-                    reason: format!(
-                        "verify legacy control endpoint is offline endpoint=[{}] error=[{}]",
-                        endpoint.display_string(),
-                        error
-                    ),
-                });
-            }
-        },
-        #[cfg(not(unix))]
-        ControlEndpoint::Unix(path) => {
-            return Err(ZippyError::InvalidConfig {
-                reason: format!(
-                    "unix control endpoint is unsupported path=[{}]",
-                    path.display()
-                ),
-            });
-        }
-        ControlEndpoint::Tcp(address) => {
-            match TcpStream::connect_timeout(address, Duration::from_millis(200)) {
-                Ok(stream) => {
-                    drop(stream);
-                    true
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::NotFound
-                            | std::io::ErrorKind::AddrNotAvailable
-                    ) =>
-                {
-                    false
-                }
-                Err(error) => {
-                    return Err(ZippyError::Io {
-                        reason: format!(
-                            "verify legacy control endpoint is offline endpoint=[{}] error=[{}]",
-                            endpoint.display_string(),
-                            error
-                        ),
-                    });
-                }
-            }
-        }
-    };
-    if active {
-        return Err(ZippyError::Conflict {
-            reason: format!(
-                "legacy control endpoint is still active endpoint=[{}]",
-                endpoint.display_string()
-            ),
-        });
-    }
-    Ok(())
-}
-
 fn control_endpoint_host_port(endpoint: &ControlEndpoint) -> (String, String) {
     match endpoint {
         ControlEndpoint::Tcp(addr) => (addr.ip().to_string(), addr.port().to_string()),
         ControlEndpoint::Unix(path) => (path.display().to_string(), String::new()),
-    }
-}
-
-/// Starts the compatibility Gateway when enabled in the validated runtime configuration.
-pub fn start_legacy_gateway_if_enabled(
-    runtime_config: &ZippyConfig,
-    control_endpoint: &ControlEndpoint,
-) -> zippy_core::Result<Option<GatewayServer>> {
-    start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
-        runtime_config,
-        control_endpoint,
-        Arc::new(LegacyPersistedReadSnapshotSource),
-    )
-}
-
-/// Starts the compatibility Gateway with an explicit persisted-read authority when enabled.
-///
-/// The unified server uses this boundary to install migration shadow observation without changing
-/// the standalone legacy master or the primary query result.
-pub fn start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
-    runtime_config: &ZippyConfig,
-    control_endpoint: &ControlEndpoint,
-    persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
-) -> zippy_core::Result<Option<GatewayServer>> {
-    start_legacy_gateway_with_query_frontend_if_enabled(
-        runtime_config,
-        control_endpoint,
-        persisted_read_snapshot_source,
-        None,
-    )
-}
-
-/// Starts the compatibility Gateway with explicit persisted and native-query authorities.
-pub fn start_legacy_gateway_with_query_frontend_if_enabled(
-    runtime_config: &ZippyConfig,
-    control_endpoint: &ControlEndpoint,
-    persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
-    native_query_frontend: Option<Arc<dyn GatewayNativeQueryFrontend>>,
-) -> zippy_core::Result<Option<GatewayServer>> {
-    if !runtime_config.gateway.enabled {
-        return Ok(None);
-    }
-    if runtime_config.query.native_enabled && native_query_frontend.is_none() {
-        return Err(ZippyError::InvalidConfig {
-            reason: "native query is enabled but no server-owned frontend was installed"
-                .to_string(),
-        });
-    }
-    let endpoint =
-        runtime_config
-            .gateway
-            .endpoint
-            .clone()
-            .ok_or_else(|| ZippyError::InvalidConfig {
-                reason: "gateway endpoint is required when gateway is enabled".to_string(),
-            })?;
-    let mut gateway = GatewayServer::new_with_query_limits_and_persisted_read_snapshot_source(
-        GatewayServerConfig {
-            endpoint,
-            master_endpoint: control_endpoint.clone(),
-            token: runtime_config.gateway.token.clone(),
-            max_write_rows: None,
-            max_connections: None,
-            max_subscribers: None,
-            max_blocking_requests: None,
-            write_timeout_ms: None,
-        },
-        runtime_config.runtime.max_cpu_cores,
-        runtime_config.query_parallelism(),
-        runtime_config.runtime.max_query_buffer_bytes,
-        runtime_config.query_max_buffered_bytes(),
-        persisted_read_snapshot_source,
-    )?;
-    if let Some(frontend) = native_query_frontend {
-        gateway = gateway.with_native_query_frontend(frontend)?;
-    }
-    let gateway = gateway.start()?;
-    let (host, port) = gateway_endpoint_host_port(gateway.endpoint());
-    tracing::info!(
-        component = "gateway",
-        event = "gateway_start",
-        status = "ready",
-        endpoint = gateway.endpoint(),
-        host = host.as_str(),
-        port = port.as_str(),
-        max_cpu_cores = runtime_config.runtime.max_cpu_cores,
-        query_parallelism = runtime_config.query_parallelism(),
-        max_query_buffer_bytes = runtime_config.runtime.max_query_buffer_bytes,
-        query_max_buffered_bytes = runtime_config.query_max_buffered_bytes(),
-        "started zippy gateway"
-    );
-    Ok(Some(gateway))
-}
-
-fn gateway_endpoint_host_port(endpoint: &str) -> (String, String) {
-    match endpoint.rsplit_once(':') {
-        Some((host, port)) => (host.to_string(), port.to_string()),
-        None => (endpoint.to_string(), String::new()),
     }
 }
 
@@ -638,188 +254,77 @@ fn load_runtime_config(config_path: Option<&Path>) -> zippy_core::Result<ZippyCo
     ZippyConfig::load_default()
 }
 
-fn install_shutdown_handlers(
-    control_endpoint: &ControlEndpoint,
-    server: MasterServer,
-    gateway: Arc<Mutex<Option<GatewayServer>>>,
-    shutdown_timeout: Duration,
-) -> zippy_core::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| ZippyError::Io {
-            reason: format!("failed to install signal handler error=[{}]", error),
-        })?;
-        let shutdown_logged = Arc::new(AtomicBool::new(false));
-        let control_endpoint = control_endpoint.display_string();
-        let control_endpoint_for_thread = control_endpoint.clone();
-        let shutdown_logged_for_thread = Arc::clone(&shutdown_logged);
-
-        std::thread::spawn(move || {
-            for signal in signals.forever() {
-                if !shutdown_logged_for_thread.swap(true, Ordering::SeqCst) {
-                    tracing::info!(
-                        component = "master",
-                        event = "master_shutdown_requested",
-                        status = "stopping",
-                        control_endpoint = control_endpoint_for_thread.as_str(),
-                        signal = signal_name(signal),
-                        "received shutdown signal"
-                    );
-                }
-                let deadline = Instant::now()
-                    .checked_add(shutdown_timeout)
-                    .unwrap_or_else(Instant::now);
-                if let Some(gateway) = gateway
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    match gateway.stop_gracefully_with_timeout(
-                        deadline.saturating_duration_since(Instant::now()),
-                    ) {
-                        Ok(outcome) if outcome.is_clean() => {}
-                        Ok(outcome) => {
-                            tracing::error!(
-                                component = "master",
-                                event = "legacy_gateway_shutdown_incomplete",
-                                status = "incomplete",
-                                outcome = ?outcome,
-                                "legacy master Gateway cleanup was incomplete"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                component = "master",
-                                event = "legacy_gateway_shutdown_error",
-                                status = "error",
-                                error = %error,
-                                "legacy master failed to stop Gateway"
-                            );
-                        }
-                    }
-                }
-                let outcome = server
-                    .request_graceful_shutdown(deadline.saturating_duration_since(Instant::now()));
-                if !outcome.timed_out_processes.is_empty() {
-                    tracing::error!(
-                        component = "master",
-                        event = "master_shutdown_timeout",
-                        status = "timeout",
-                        timed_out_processes = ?outcome.timed_out_processes,
-                        "master shutdown timed out waiting for child processes"
-                    );
-                }
-            }
-        });
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = control_endpoint;
-        let _ = server;
-        let _ = gateway;
-        let _ = shutdown_timeout;
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn signal_name(signal: i32) -> &'static str {
-    match signal {
-        SIGINT => "SIGINT",
-        SIGTERM => "SIGTERM",
-        _ => "UNKNOWN",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{prepare_legacy_snapshot_path, LEGACY_MASTER_SNAPSHOT_FILE};
-    use crate::snapshot::{RegistrySnapshot, SnapshotStore};
-    use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
+    use super::{prepare_master_runtime, MasterDaemonConfig};
+    use zippy_core::ControlEndpoint;
 
-    fn snapshot(catalog_revision: u64) -> RegistrySnapshot {
-        RegistrySnapshot {
-            catalog_revision,
-            ..RegistrySnapshot::default()
-        }
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_scoped_legacy_snapshot_is_never_read_or_copied() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_path = temp.path().join("master-registry.json");
+        let old_bytes = b"not current registry data; leave untouched";
+        std::fs::write(&old_path, old_bytes).unwrap();
+        let endpoint = ControlEndpoint::Unix(temp.path().join("server.sock"));
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let config = MasterDaemonConfig::new(endpoint.clone())
+            .with_config_path(config_path)
+            .with_logging(temp.path().join("logs"), "error", false);
+        let prepared = prepare_master_runtime(config).unwrap();
+        assert!(!endpoint
+            .snapshot_dir()
+            .join("data/catalog/legacy-master-registry.json")
+            .exists());
+        assert_eq!(std::fs::read(old_path).unwrap(), old_bytes);
+        drop(prepared);
     }
 
     #[test]
-    fn default_data_root_imports_endpoint_snapshot_once() {
-        let endpoint = tempfile::tempdir().unwrap();
-        let root = endpoint.path().join("data");
-        let owner = OwnedDataDirectory::acquire_or_initialize(&root).unwrap();
-        let endpoint_snapshot = endpoint.path().join("master-registry.json");
-        SnapshotStore::write(&endpoint_snapshot, &snapshot(17)).unwrap();
-
-        let managed = prepare_legacy_snapshot_path(&owner, &endpoint_snapshot, true, true).unwrap();
-
-        assert_eq!(
-            managed,
-            owner
-                .directory()
-                .path(ManagedDataDirectory::Catalog)
-                .join(LEGACY_MASTER_SNAPSHOT_FILE)
-        );
-        assert_eq!(SnapshotStore::load(&managed).unwrap().catalog_revision, 17);
-        assert!(endpoint_snapshot.exists());
-    }
-
-    #[test]
-    fn managed_snapshot_remains_authoritative_when_endpoint_snapshot_exists() {
-        let endpoint = tempfile::tempdir().unwrap();
-        let root = endpoint.path().join("data");
-        let owner = OwnedDataDirectory::acquire_or_initialize(&root).unwrap();
-        let managed = owner
-            .directory()
-            .path(ManagedDataDirectory::Catalog)
-            .join(LEGACY_MASTER_SNAPSHOT_FILE);
-        SnapshotStore::write(&managed, &snapshot(23)).unwrap();
-        SnapshotStore::write(&endpoint.path().join("master-registry.json"), &snapshot(11)).unwrap();
-
-        let selected = prepare_legacy_snapshot_path(
-            &owner,
-            &endpoint.path().join("master-registry.json"),
-            true,
-            false,
+    fn removed_import_configuration_fails_before_creating_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("database");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\ndata_dir = {:?}\nimport_legacy_endpoint_snapshot = true\n",
+                data.to_str().unwrap(),
+            ),
         )
         .unwrap();
-
-        assert_eq!(selected, managed);
-        assert_eq!(SnapshotStore::load(&selected).unwrap().catalog_revision, 23);
+        let config =
+            MasterDaemonConfig::new(ControlEndpoint::Tcp("127.0.0.1:17690".parse().unwrap()))
+                .with_config_path(config_path)
+                .with_logging(temp.path().join("logs"), "error", false);
+        let error = prepare_master_runtime(config).err().unwrap();
+        assert!(error.to_string().contains("unknown field"));
+        assert!(!data.exists());
     }
-
     #[test]
-    fn explicit_data_root_does_not_import_endpoint_snapshot() {
-        let endpoint = tempfile::tempdir().unwrap();
-        let root_parent = tempfile::tempdir().unwrap();
-        let owner =
-            OwnedDataDirectory::acquire_or_initialize(root_parent.path().join("database")).unwrap();
-        SnapshotStore::write(&endpoint.path().join("master-registry.json"), &snapshot(31)).unwrap();
-
-        let managed = prepare_legacy_snapshot_path(
-            &owner,
-            &endpoint.path().join("master-registry.json"),
-            false,
-            false,
+    fn managed_legacy_registry_is_rejected_without_reading_or_rewriting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("database");
+        let owned = zippy_core::OwnedDataDirectory::acquire_or_initialize(&data).unwrap();
+        let old_path = data.join("catalog/legacy-master-registry.json");
+        let original = b"unparseable retired registry bytes";
+        std::fs::write(&old_path, original).unwrap();
+        drop(owned);
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[server]\ndata_dir = {:?}\n", data.to_str().unwrap()),
         )
         .unwrap();
-
-        assert!(!managed.exists());
-    }
-
-    #[test]
-    fn default_data_root_requires_explicit_offline_import() {
-        let endpoint = tempfile::tempdir().unwrap();
-        let owner =
-            OwnedDataDirectory::acquire_or_initialize(endpoint.path().join("data")).unwrap();
-        let endpoint_snapshot = endpoint.path().join("master-registry.json");
-        SnapshotStore::write(&endpoint_snapshot, &snapshot(37)).unwrap();
-        let error = prepare_legacy_snapshot_path(&owner, &endpoint_snapshot, true, false)
-            .expect_err("implicit endpoint snapshot import must fail closed");
-
-        assert!(error.to_string().contains("explicit offline import"));
+        let config =
+            MasterDaemonConfig::new(ControlEndpoint::Tcp("127.0.0.1:17690".parse().unwrap()))
+                .with_config_path(config_path)
+                .with_logging(temp.path().join("logs"), "error", false);
+        let error = prepare_master_runtime(config).err().unwrap();
+        assert!(error.to_string().contains("removed legacy master registry"));
+        assert_eq!(std::fs::read(&old_path).unwrap(), original);
+        assert!(!data.join("catalog/catalog.db").exists());
+        assert!(zippy_core::OwnedDataDirectory::acquire_or_initialize(&data).is_ok());
     }
 }

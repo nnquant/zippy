@@ -1,0 +1,40 @@
+   Compiling pyo3-build-config v0.22.6
+   Compiling zippy-perf v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-perf)
+   Compiling pyo3-ffi v0.22.6
+   Compiling pyo3-macros-backend v0.22.6
+   Compiling pyo3 v0.22.6
+   Compiling zippy-python v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-python)
+   Compiling pyo3-macros v0.22.6
+    Checking arrow v53.4.1
+    Checking zippy-segment-store v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-segment-store)
+    Checking zippy-types v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-types)
+    Checking datafusion-common v44.0.0
+    Checking zippy-operator-runtime v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operator-runtime)
+    Checking datafusion-expr-common v44.0.0
+    Checking datafusion-physical-expr-common v44.0.0
+    Checking datafusion-functions-aggregate-common v44.0.0
+    Checking datafusion-functions-window-common v44.0.0
+    Checking datafusion-expr v44.0.0
+    Checking zippy-core v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-core)
+    Checking zippy-protocol v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-protocol)
+    Checking datafusion-physical-expr v44.0.0
+    Checking datafusion-execution v44.0.0
+    Checking datafusion-sql v44.0.0
+    Checking zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)
+    Checking zippy-catalog v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-catalog)
+    Checking zippy-master v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-master)
+    Checking datafusion-functions v44.0.0
+    Checking zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)
+    Checking datafusion-physical-plan v44.0.0
+    Checking datafusion-functions-aggregate v44.0.0
+    Checking datafusion-optimizer v44.0.0
+    Checking datafusion-functions-window v44.0.0
+    Checking zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+    Checking zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+    Checking datafusion-catalog v44.0.0
+    Checking datafusion-physical-optimizer v44.0.0
+    Checking datafusion-functions-table v44.0.0
+    Checking datafusion v44.0.0
+    Checking zippy-query v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-query)
+    Checking zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.27s

@@ -1,0 +1,135 @@
+{
+  "date": "2026-09-22",
+  "batch": 19,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "catalog_directory_version": 9,
+  "validation": {
+    "rust_workspace": {
+      "passed": 1759,
+      "failed": 0,
+      "ignored": 10,
+      "result_blocks": 116
+    },
+    "consumer_integration_tests": 4,
+    "clippy": "workspace all-targets all-features -D warnings; passed",
+    "python": {
+      "passed": 730,
+      "skipped": 1,
+      "extension_rebuilt": true
+    },
+    "black": "86 files unchanged; passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "protocol_codegen": "--check; passed",
+    "mypy_configured": "root 14 and client 26 source files; passed",
+    "mypy_full": "Found 991 errors in 12 files (checked 85 source files); FAILED; F29 remains open",
+    "platform": "Linux x86_64 CPython 3.11; no new Windows/macOS or Arrow version matrix acceptance",
+    "packaging": "editable extension rebuilt; optional patchelf warning; no new clean sdist/wheel validation"
+  },
+  "acceptance": {
+    "commit_consumer_offset_implemented": true,
+    "three_table_kinds_individual_offsets": true,
+    "empty_position_distinct_from_zero": true,
+    "empty_commit_can_register_identity": true,
+    "read_only_lookup_does_not_register_consumers": true,
+    "consumer_identity_cannot_rebind_to_another_table": true,
+    "group_offset_shared_with_exact_previous_offset_cas": true,
+    "concurrent_group_commit_has_one_winner": true,
+    "schema_version_fences_obsolete_ack": true,
+    "reject_regression_and_unpersisted_progress": true,
+    "server_actor_contract_required": true,
+    "identity_offset_revision_receipt_transaction_is_atomic": true,
+    "failed_request_retry_uses_same_request_id": true,
+    "exact_replay_after_restart_does_not_regress_progress": true,
+    "exact_replay_after_drop_does_not_resurrect_table": true,
+    "active_table_reads_fail_after_drop": true,
+    "oversized_invalid_orphan_and_over_watermark_records_fail_as_corruption": true,
+    "single_read_transaction_uses_existing_bounded_catalog_queue": true,
+    "flight_ack_channel": false,
+    "unified_subscription_service": false,
+    "connection_membership_and_delivery_sequence_fencing": false,
+    "atomic_frame_key_value_ack_delivery_verified": false,
+    "legacy_callback_migration": false,
+    "native_local_compute_output": false
+  },
+  "evidence": {
+    "workspace": {
+      "path": "/tmp/zippy-consumer-workspace.log",
+      "sha256": "c3d60740c5891c8718fe68f53b0f584020184911f29323912842908aec5dbb3d"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-consumer-clippy.log",
+      "sha256": "a7dfd715dd3de1cbf21c586ed8b4d9d1c4eb6a62fec58a6d3a4facad75fdcd56"
+    },
+    "maturin": {
+      "path": "/tmp/zippy-consumer-maturin.log",
+      "sha256": "8ceee9f0862ae67b91c68570b82f7622531f1670da83bed7a41759aecd93e812"
+    },
+    "python": {
+      "path": "/tmp/zippy-consumer-python.log",
+      "sha256": "2de4fd209ecfdbf7c541e1fb7c562ea835edab700e4c71e387f9c5aca604e18d"
+    },
+    "black": {
+      "path": "/tmp/zippy-consumer-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-consumer-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "mypy-configured": {
+      "path": "/tmp/zippy-consumer-mypy-configured.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "client-mypy": {
+      "path": "/tmp/zippy-consumer-client-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "mypy-full": {
+      "path": "/tmp/zippy-consumer-mypy-full.log",
+      "sha256": "53e95f51c2318a499c2e60f932178a876addd3daa3f543e1619f82e770c277a0"
+    },
+    "fmt": {
+      "path": "/tmp/zippy-consumer-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff": {
+      "path": "/tmp/zippy-consumer-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "codegen-check": {
+      "path": "/tmp/zippy-consumer-codegen-check.log",
+      "sha256": "e301a363b4c5b5629815f9fcad8f2d7760ef5aedf673d0bbec64ae6e4153067d"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-types/src/catalog.rs": "e29e09a9bae289f06dd11656eeb7b593480471f22ebb2c2df13b1eef7560fbc0",
+    "crates/zippy-types/src/catalog/wire_v1.rs": "a15052f9e00db8c9ffbbc7fef76c8124f62a53e53cd608961c5886bbbc8b7c2d",
+    "crates/zippy-types/src/lib.rs": "be2080e56a55fd1da610ab5c4522d32cb15f9cc935b4d98042de130d12eb6a2b",
+    "crates/zippy-catalog/src/lib.rs": "832aa713031e34bb21d06787a4f78e28e16bedae174dd814969c1d888ad44715",
+    "crates/zippy-catalog/src/consumer_domain.rs": "72539150e0201196c3163cbb0e411812703704a4f002ef035447a57e3d8ff763",
+    "crates/zippy-catalog/src/domain.rs": "cb61f806aae8d8dd17c594aadc32f19d1ddc2d09440e1d87fc8fd66da3f5dcd9",
+    "crates/zippy-catalog/src/service.rs": "03c73a786730587030c216cd07081035265ffbf50b4fe12e1912ee321b6ff265",
+    "crates/zippy-catalog/tests/sqlite_consumer_offsets.rs": "e9860e9ecfe17b05314f4936627e23366556d13f9b15c102e27550e29cfa1002",
+    "crates/zippy-catalog/README.md": "622dade50ff5efe67d6773a54ef9420f13d191cb85f28478ab69ea436903badc",
+    "docs/convergence-consumer-offsets-2026-09-22.md": "b3de3a753259243950f767383574fe0085bdddfee7daab900f5a9df2e5f44c43",
+    "docs/current-capabilities-2026-09-21.md": "eeb988b8fa8915d603841285ddf06c3cdc634ef658fc4b310ec61fa9f69a070e"
+  }
+}

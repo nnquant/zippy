@@ -1,30 +1,28 @@
-//! SQLite Catalog migration and typed command foundation for the single-node server.
+//! SQLite Catalog authority with an exact current layout and typed commands.
 //!
-//! Physical schema v2 stores the complete first domain layout with lossless
-//! unsigned encodings, while v3 adds the active-table cursor indexes.
-//! [`SqliteCatalog`] implements namespace and table-creation command slices plus
-//! exact SQLite snapshot reads, but legacy metadata remains authoritative in the
-//! server runtime. Physical SQLite schema versions are independent of
-//! CatalogCommand wire versions. Each handle confines its writable connection and
-//! read-only connections to dedicated OS worker threads.
+//! Empty databases initialize the current layout in one transaction; existing databases must
+//! already match it. Previous layouts are rejected without online migration. Native table
+//! identity, snapshot history and request replay remain independent of reusable table names.
+//! Physical SQLite schema versions are independent of CatalogCommand wire versions. Each
+//! handle confines its writable and read-only connections to dedicated OS worker threads.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod consumer_domain;
 mod domain;
+mod drop_domain;
 mod encoding;
 mod file_domain;
 mod gc_domain;
+mod layout;
 mod lease_domain;
-mod legacy_import_domain;
-mod legacy_projection_domain;
-mod legacy_reconcile_domain;
 mod manifest_domain;
-mod migration;
 mod pinned_snapshot;
 mod producer_domain;
 mod request_ledger;
 mod runtime_pins;
+mod schema_domain;
 mod service;
 mod snapshot_domain;
 mod storage_codec;
@@ -39,8 +37,7 @@ pub use runtime_pins::{
     SqliteCatalogRuntimeSnapshotPinRecord, SqliteCatalogRuntimeSnapshotPinStatus,
 };
 pub use service::{
-    SqliteCatalog, SqliteCatalogLegacyImportSession, SqliteCatalogLegacyReconcileHandle,
-    SqliteCatalogReadHandle, SqliteCatalogRuntimeSnapshotPinAdmissionControl,
+    SqliteCatalog, SqliteCatalogReadHandle, SqliteCatalogRuntimeSnapshotPinAdmissionControl,
     SqliteCatalogWriteHandle,
 };
 pub use snapshot_domain::{
@@ -63,8 +60,8 @@ use rusqlite::{Connection, Error as SqliteError, OpenFlags};
 use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
-/// The latest SQLite schema version understood by this crate.
-pub const CATALOG_SCHEMA_VERSION: u32 = 7;
+/// The only SQLite schema version accepted by this crate.
+pub const CATALOG_SCHEMA_VERSION: u32 = 11;
 
 /// SQLite header marker identifying a Zippy Catalog database.
 pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;
@@ -89,10 +86,10 @@ const MAX_BUSY_TIMEOUT_MILLIS: u128 = i32::MAX as u128;
 const ACTOR_THREAD_NAME: &str = "zippy-catalog-actor";
 const QUICK_CHECK_PROGRESS_INTERVAL: i32 = 1_000;
 
-/// The authority state exposed by the inspection-only migration handle.
+/// The authority state exposed by the inspection-only foundation handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogAuthorityState {
-    /// The handle may migrate and inspect the database but cannot serve Catalog APIs.
+    /// The handle may initialize and inspect the database but cannot serve Catalog APIs.
     FoundationOnly,
 }
 
@@ -238,7 +235,7 @@ pub enum CatalogIntegrity {
 pub struct CatalogMetadata {
     /// Stable on-disk catalog format marker.
     pub catalog_format: String,
-    /// Latest successfully committed migration version.
+    /// Exact supported physical layout version.
     pub schema_version: u32,
     /// Monotonic metadata revision, initialized to zero in this foundation.
     pub catalog_revision: u64,
@@ -273,8 +270,7 @@ pub struct SqliteCatalogFoundationStatus {
 /// A versioned SQLite Catalog foundation whose connection is actor-thread confined.
 ///
 /// This handle only initializes, validates, and inspects the physical Catalog;
-/// [`SqliteCatalog`] is the separate typed command handle. Neither handle takes
-/// authority from the legacy Registry in this migration slice.
+/// [`SqliteCatalog`] is the typed command authority used by the native Server runtime.
 ///
 /// ```compile_fail
 /// fn require_catalog<T: zippy_types::Catalog>() {}
@@ -287,9 +283,9 @@ pub struct SqliteCatalogFoundation {
 }
 
 impl SqliteCatalogFoundation {
-    /// Opens or migrates a SQLite catalog on its dedicated actor thread.
+    /// Opens or initializes a current-layout SQLite catalog on its dedicated actor thread.
     ///
-    /// The call returns only after WAL configuration, transactional migrations,
+    /// The call returns only after WAL configuration, current-layout initialization,
     /// metadata validation, and `quick_check` all succeed.
     pub fn open(config: SqliteCatalogConfig) -> Result<Self> {
         validate_config(&config)?;
@@ -454,13 +450,12 @@ fn open_on_actor(
     connection
         .busy_timeout(config.busy_timeout)
         .map_err(|error| map_sqlite_error("configure catalog busy timeout", error))?;
-    migration::preflight(&connection)?;
-    // Never advance the physical schema of a corrupt database. A failed post-migration check
-    // cannot roll back a transaction that has already committed, so the old version must first be
-    // proven healthy to preserve binary rollback.
+    layout::preflight(&connection)?;
+    // Reject unsupported layouts and corruption before enabling WAL or initializing an empty
+    // database. Existing directories are validated as-is and never upgraded in place.
     run_quick_check(&connection, config.integrity_check_timeout)?;
-    configure_durable_pragmas(&connection)?;
-    migration::migrate(&mut connection)?;
+    configure_durable_pragmas(&connection, config.busy_timeout)?;
+    layout::initialize(&mut connection)?;
     let integrity = run_quick_check(&connection, config.integrity_check_timeout)?;
     let status = inspect_connection(&connection, config, integrity)?;
     Ok((connection, status))
@@ -508,7 +503,7 @@ fn open_read_connection(config: &SqliteCatalogConfig) -> Result<Connection> {
             ),
         ));
     }
-    let _ = migration::validate_metadata(&connection)?;
+    let _ = layout::validate_metadata(&connection)?;
     Ok(connection)
 }
 
@@ -550,10 +545,32 @@ fn actor_loop(
     }
 }
 
-fn configure_durable_pragmas(connection: &Connection) -> Result<()> {
-    let journal_mode: String = connection
-        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-        .map_err(|error| map_sqlite_error("enable catalog WAL mode", error))?;
+fn configure_durable_pragmas(connection: &Connection, busy_timeout: Duration) -> Result<()> {
+    // A journal-mode change may report BUSY immediately during concurrent opens. Retry the
+    // complete statement after it releases its locks, within the configured total wait budget.
+    let started = std::time::Instant::now();
+    let journal_mode: String = loop {
+        connection
+            .busy_timeout(busy_timeout.saturating_sub(started.elapsed()))
+            .map_err(|error| map_sqlite_error("configure WAL transition timeout", error))?;
+        match connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0)) {
+            Ok(mode) => break mode,
+            Err(error) => {
+                let retryable_lock = matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                );
+                let remaining = busy_timeout.saturating_sub(started.elapsed());
+                if !retryable_lock || remaining.is_zero() {
+                    return Err(map_sqlite_error("enable catalog WAL mode", error));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+        }
+    };
+    connection
+        .busy_timeout(busy_timeout)
+        .map_err(|error| map_sqlite_error("restore catalog busy timeout", error))?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
         return Err(ServerError::new(
             ErrorCode::Unavailable,
@@ -607,8 +624,7 @@ fn inspect_connection(
             ),
         ));
     }
-    let (catalog_format, schema_version, catalog_revision) =
-        migration::validate_metadata(connection)?;
+    let (catalog_format, schema_version, catalog_revision) = layout::validate_metadata(connection)?;
     Ok(SqliteCatalogFoundationStatus {
         authority_state: CatalogAuthorityState::FoundationOnly,
         metadata: CatalogMetadata {
@@ -909,5 +925,36 @@ mod tests {
             map_sqlite_failure_code(SqliteErrorCode::OperationInterrupted),
             ErrorCode::DeadlineExceeded
         );
+    }
+}
+
+#[cfg(test)]
+mod wal_open_tests {
+    use std::time::Duration;
+
+    use rusqlite::Connection;
+    use zippy_types::ErrorCode;
+
+    use super::{configure_durable_pragmas, pragma};
+
+    #[test]
+    fn journal_transition_lock_timeout_is_bounded_and_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite");
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("CREATE TABLE probe(value INTEGER); BEGIN; SELECT * FROM probe;")
+            .unwrap();
+        let contender = Connection::open(&path).unwrap();
+        let timeout = Duration::from_millis(25);
+        let started = std::time::Instant::now();
+        let error = configure_durable_pragmas(&contender, timeout).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert!(error.retryable());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        holder.execute_batch("ROLLBACK").unwrap();
+        configure_durable_pragmas(&contender, timeout).unwrap();
+        assert_eq!(pragma::<String>(&contender, "journal_mode").unwrap(), "wal");
+        assert_eq!(pragma::<u64>(&contender, "busy_timeout").unwrap(), 25);
     }
 }

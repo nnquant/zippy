@@ -1,0 +1,4 @@
+   Compiling zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.45s

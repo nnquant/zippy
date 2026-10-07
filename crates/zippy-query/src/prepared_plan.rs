@@ -45,7 +45,7 @@ use crate::{
     PersistedTableDescription, QuerySessionPolicy, ZippyTableProvider,
 };
 
-const PROFILE_FORMAT_VERSION: u32 = 10;
+const PROFILE_FORMAT_VERSION: u32 = 12;
 const PREFLIGHT_FIXED_TRANSIENT_BYTES: u64 = 2 * 1024 * 1024;
 const PREFLIGHT_BYTES_PER_SQL_BYTE: u64 = 1024;
 const PREFLIGHT_BYTES_PER_BINDING: u64 = 64 * 1024;
@@ -694,6 +694,13 @@ pub async fn prepare_persisted_plan(
         .query_planner()
         .create_physical_plan(&optimized, &state)
         .await?;
+    // The public query result is one stream. Account its final merge before binding, rather
+    // than allowing execute_stream to create an unprofiled adapter after admission.
+    let plan = if plan.properties().output_partitioning().partition_count() > 1 {
+        Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>
+    } else {
+        plan
+    };
     let physical = validate_physical_plan(&plan, admitted.limits)?;
     drop(state);
     drop(context);
@@ -969,11 +976,7 @@ fn validate_profile_inputs(
             return Err(plan_error("persisted SQL table binding name is duplicated"));
         }
     }
-    let wildcard_expression_upper_bound = limits
-        .max_relation_occurrences
-        .checked_mul(snapshot.max_columns_per_table())
-        .ok_or_else(|| exhausted("wildcard expression expansion overflowed usize"))?;
-    preflight_persisted_sql(sql, limits, wildcard_expression_upper_bound)
+    preflight_persisted_sql(sql, limits, snapshot.max_columns_per_table())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -986,7 +989,7 @@ struct SqlPreflightMetrics {
 fn preflight_persisted_sql(
     sql: &str,
     limits: PersistedPlanLimits,
-    wildcard_expression_upper_bound: usize,
+    max_columns_per_table: usize,
 ) -> Result<SqlPreflightMetrics> {
     let mut statements = DFParser::parse_sql(sql)
         .map_err(|error| plan_error(format!("persisted SQL parse failed error=[{error}]")))?;
@@ -1019,14 +1022,55 @@ fn preflight_persisted_sql(
         structural_node_count: 0,
         expression_node_count: 0,
         relation_occurrence_count: 0,
-        wildcard_expression_upper_bound,
+        max_columns_per_table,
+        wildcard_count: 0,
+        derived_relation_count: 0,
     };
     match query.visit(&mut visitor) {
-        ControlFlow::Continue(()) => Ok(SqlPreflightMetrics {
-            structural_node_count: visitor.structural_node_count,
-            expression_node_count: visitor.expression_node_count,
-            relation_occurrence_count: visitor.relation_occurrence_count,
-        }),
+        ControlFlow::Continue(()) => {
+            // Count the actual AST relations, including aliases and UNION arms. The policy's
+            // maximum is an admission ceiling, not the number of schemas expanded by every '*'.
+            let wildcard_expressions = visitor
+                .wildcard_count
+                .checked_mul(visitor.relation_occurrence_count)
+                .and_then(|count| count.checked_mul(visitor.max_columns_per_table))
+                .ok_or_else(|| exhausted("SQL wildcard expression count overflowed usize"))?;
+            let mut expression_node_count = checked_add_bounded(
+                visitor.expression_node_count,
+                wildcard_expressions,
+                limits.max_expression_nodes,
+                "SQL wildcard expansion",
+            )?;
+            if visitor.derived_relation_count > 0 {
+                // A derived projection can substitute a compound expression at every outer
+                // reference. Multiply the maximum expression width of every SELECT layer;
+                // independent branches are deliberately overcounted. Wildcards can expose
+                // computed columns absent from the source schema, so charge them separately.
+                let computed_wildcards = visitor
+                    .wildcard_count
+                    .checked_mul(visitor.expression_node_count)
+                    .ok_or_else(|| exhausted("SQL derived wildcard expansion overflowed usize"))?;
+                expression_node_count = checked_add_bounded(
+                    expression_node_count,
+                    computed_wildcards,
+                    limits.max_expression_nodes,
+                    "SQL derived wildcard expansion",
+                )?;
+                let multiplier =
+                    derived_projection_multiplier(&query, limits.max_expression_nodes)?;
+                expression_node_count = expression_node_count
+                    .checked_mul(multiplier)
+                    .filter(|count| *count <= limits.max_expression_nodes)
+                    .ok_or_else(|| {
+                        exhausted("SQL derived projection expansion exceeds expression limit")
+                    })?;
+            }
+            Ok(SqlPreflightMetrics {
+                structural_node_count: visitor.structural_node_count,
+                expression_node_count,
+                relation_occurrence_count: visitor.relation_occurrence_count,
+            })
+        }
         ControlFlow::Break(error) => Err(error),
     }
 }
@@ -1036,7 +1080,9 @@ struct SqlPreflightVisitor {
     structural_node_count: usize,
     expression_node_count: usize,
     relation_occurrence_count: usize,
-    wildcard_expression_upper_bound: usize,
+    max_columns_per_table: usize,
+    wildcard_count: usize,
+    derived_relation_count: usize,
 }
 
 impl SqlPreflightVisitor {
@@ -1088,16 +1134,10 @@ impl SqlPreflightVisitor {
             self.limits.max_logical_nodes,
             "SQL structural nodes",
         )?;
-        let wildcard_expressions = inspected
+        self.wildcard_count = self
             .wildcard_count
-            .checked_mul(self.wildcard_expression_upper_bound)
-            .ok_or_else(|| exhausted("SQL wildcard expression count overflowed usize"))?;
-        self.expression_node_count = checked_add_bounded(
-            self.expression_node_count,
-            wildcard_expressions,
-            self.limits.max_expression_nodes,
-            "SQL expression nodes after wildcard expansion",
-        )?;
+            .checked_add(inspected.wildcard_count)
+            .ok_or_else(|| exhausted("SQL wildcard count overflowed usize"))?;
         Ok(())
     }
 
@@ -1141,9 +1181,16 @@ impl SqlPreflightVisitor {
             TableFactor::NestedJoin { .. } => Err(plan_error(
                 "persisted SQL nested joins are unsupported because join expansion is not pre-admissible",
             )),
-            TableFactor::Derived { .. } => Err(plan_error(
-                "persisted SQL derived relations are unsupported because optimizer rewrites are not pre-admissible",
-            )),
+            TableFactor::Derived { lateral: false, alias, .. }
+                if alias.as_ref().is_none_or(|alias| alias.columns.is_empty()) =>
+            {
+                self.derived_relation_count = checked_increment(
+                    self.derived_relation_count,
+                    self.limits.max_logical_nodes,
+                    "SQL derived relations",
+                )?;
+                Ok(())
+            }
             _ => Err(plan_error(format!(
                 "persisted SQL contains unsupported table factor factor=[{table_factor}]"
             ))),
@@ -1256,9 +1303,17 @@ impl SqlPreflightVisitor {
                 }
             } else {
                 let is_bounded_aggregate = function_name.is_some_and(|identifier| {
-                    ["count", "min", "max", "sum", "avg"]
-                        .iter()
-                        .any(|name| identifier.eq_ignore_ascii_case(name))
+                    [
+                        "count",
+                        "min",
+                        "max",
+                        "sum",
+                        "avg",
+                        "coalesce",
+                        "to_timestamp_nanos",
+                    ]
+                    .iter()
+                    .any(|name| identifier.eq_ignore_ascii_case(name))
                 });
                 if !is_bounded_aggregate {
                     return Err(plan_error(
@@ -1286,6 +1341,70 @@ impl SqlPreflightVisitor {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Bounds recursive projection substitution before any DataFusion optimizer runs.
+fn derived_projection_multiplier(query: &SqlQuery, limit: usize) -> Result<usize> {
+    struct ExpressionWidth {
+        count: usize,
+        limit: usize,
+    }
+    impl Visitor for ExpressionWidth {
+        type Break = DataFusionError;
+        fn pre_visit_expr(&mut self, _: &SqlExpr) -> ControlFlow<Self::Break> {
+            result_control_flow(
+                checked_increment(self.count, self.limit, "SQL projection expression width")
+                    .map(|count| self.count = count),
+            )
+        }
+    }
+    struct ProjectionMultiplier {
+        multiplier: usize,
+        limit: usize,
+    }
+    impl Visitor for ProjectionMultiplier {
+        type Break = DataFusionError;
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+            let result = (|| {
+                let mut pending = vec![query.body.as_ref()];
+                while let Some(body) = pending.pop() {
+                    match body {
+                        SetExpr::Select(select) => {
+                            let mut width = 1;
+                            for item in &select.projection {
+                                let mut counter = ExpressionWidth {
+                                    count: 0,
+                                    limit: self.limit,
+                                };
+                                if let ControlFlow::Break(error) = item.visit(&mut counter) {
+                                    return Err(error);
+                                }
+                                width = width.max(counter.count);
+                            }
+                            self.multiplier = self.multiplier.checked_mul(width)
+                                .filter(|count| *count <= self.limit)
+                                .ok_or_else(|| exhausted("SQL derived projection multiplier exceeds expression limit"))?;
+                        }
+                        SetExpr::SetOperation { left, right, .. } => {
+                            pending.push(left);
+                            pending.push(right);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })();
+            result_control_flow(result)
+        }
+    }
+    let mut visitor = ProjectionMultiplier {
+        multiplier: 1,
+        limit,
+    };
+    match query.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(visitor.multiplier),
+        ControlFlow::Break(error) => Err(error),
     }
 }
 
@@ -1434,19 +1553,6 @@ fn inspect_set_expr_structure(root: &SetExpr, limit: usize) -> Result<SetExprMet
                 wildcard_count = wildcard_count
                     .checked_add(select_wildcards)
                     .ok_or_else(|| exhausted("SQL wildcard count overflowed usize"))?;
-                if select_wildcards > 0
-                    && select.from.iter().any(|from| {
-                        !matches!(&from.relation, TableFactor::Table { .. })
-                            || from
-                                .joins
-                                .iter()
-                                .any(|join| !matches!(&join.relation, TableFactor::Table { .. }))
-                    })
-                {
-                    return Err(plan_error(
-                        "persisted SQL wildcard over a derived relation is unsupported",
-                    ));
-                }
                 let join_count = select.from.iter().try_fold(0_usize, |count, from| {
                     count
                         .checked_add(from.joins.len())
@@ -2233,8 +2339,45 @@ mod tests {
         .expect("ordinary GROUP BY expression remains supported");
     }
 
+    #[tokio::test]
+    async fn client_derived_projections_joins_and_timestamps_are_pre_admitted() {
+        let fixed_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let tables = vec![table_with_schema(0, 1, 1, fixed_schema)];
+        let bindings = vec![binding("ticks", 0)];
+        for sql in [
+            "select * from (select key, value + 1 as value from (select * from ticks) t) t order by key",
+            "select coalesce(a.key, b.key) as key from (select * from ticks) a full outer join (select * from ticks) b on a.key = b.key",
+            "select * from (select key from ticks union all select key from ticks) t where key > 0 order by key",
+            "select to_timestamp_nanos(value) as timestamp from ticks",
+        ] {
+            assert_sql_output_admitted(sql, &bindings, &tables).await;
+        }
+    }
+
     #[test]
-    fn optimizer_fanout_from_derived_set_operations_fails_closed() {
+    fn derived_projection_substitution_is_bounded_before_optimizer() {
+        let tables = vec![table(0, 1, 0)];
+        let bindings = vec![binding("ticks", 0)];
+        let mut sql = "select price from ticks".to_owned();
+        for _ in 0..8 {
+            sql = format!("select price + price as price from ({sql}) t");
+        }
+        let error = profile_persisted_plan(&sql, &bindings, &tables, limits())
+            .expect_err("exponential projection substitution must fail before planning");
+        assert!(error.to_string().contains("derived projection"));
+        for sql in [
+            "select * from lateral (select price from ticks) t",
+            "select * from (select price from ticks) t(renamed)",
+        ] {
+            assert!(profile_persisted_plan(sql, &bindings, &tables, limits()).is_err());
+        }
+    }
+
+    #[test]
+    fn optimizer_fanout_from_derived_set_operations_is_pre_admitted() {
         let tables = vec![table(0, 1, 0)];
         let bindings = vec![binding("ticks", 0)];
         let sql = concat!(
@@ -2242,9 +2385,9 @@ mod tests {
             "select price from ticks union all select price from ticks",
             ") union_ticks where price > 0"
         );
-        let error = profile_persisted_plan(sql, &bindings, &tables, limits())
-            .expect_err("derived set operation must fail before optimizer predicate fanout");
-        assert!(error.to_string().contains("derived relations"));
+        let profile = profile_persisted_plan(sql, &bindings, &tables, limits())
+            .expect("derived set operation is bounded before optimizer predicate fanout");
+        assert_eq!(profile.preflight.relation_occurrence_count, 2);
 
         profile_persisted_plan(
             "select price from ticks union all select price from ticks",
@@ -2518,14 +2661,13 @@ mod tests {
             profile_persisted_plan("select * from ticks", &bindings, &tables, wildcard_limit)
                 .expect_err("wide wildcard must fail before DataFusion planning");
         assert!(error.to_string().contains("wildcard expansion"));
-        let derived = profile_persisted_plan(
+        profile_persisted_plan(
             "select * from (select column_0 from ticks) derived_ticks",
             &bindings,
             &tables,
             limits(),
         )
-        .expect_err("derived wildcard must fail before DataFusion planning");
-        assert!(derived.to_string().contains("derived relation"));
+        .expect("derived wildcard width is charged before DataFusion planning");
 
         profile_persisted_plan(
             "select count(*) from ticks",

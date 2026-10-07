@@ -1,21 +1,16 @@
-"""Expression serialization and bounded frame codec tests."""
+"""Shared expression serialization tests."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import socket
-import struct
 
 import pyarrow as pa
-import pytest
 
-from zippy_client.errors import ProtocolError
 from zippy_client.expressions import (
     col,
     expression_to_json,
     normalize_temporal_filter,
 )
-from zippy_client.protocol import receive_frame, send_frame
 
 
 def test_temporal_day_equality_becomes_typed_half_open_range() -> None:
@@ -57,30 +52,3 @@ def test_is_in_serializes_values_as_one_literal_array() -> None:
             {"kind": "literal", "value": ["A", "B"]},
         ],
     }
-
-
-def test_frame_round_trip_uses_bounded_header_and_payload() -> None:
-    left, right = socket.socketpair()
-    try:
-        send_frame(left, {"status": "ok", "kind": "table"}, b"payload")
-        header, payload = receive_frame(right)
-    finally:
-        left.close()
-        right.close()
-
-    assert header == {"status": "ok", "kind": "table"}
-    assert payload == b"payload"
-
-
-def test_receive_frame_rejects_payload_length_above_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ZIPPY_CLIENT_MAX_FRAME_PAYLOAD_BYTES", "8")
-    left, right = socket.socketpair()
-    try:
-        left.sendall(struct.pack("!IQ", 2, 9) + b"{}")
-        with pytest.raises(ProtocolError, match="payload exceeds client budget"):
-            receive_frame(right)
-    finally:
-        left.close()
-        right.close()

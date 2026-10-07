@@ -1,0 +1,86 @@
+{
+  "date": "2026-09-22",
+  "batch": 8,
+  "overall_complete": false,
+  "audit_closed_total": 21,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11",
+    "F16"
+  ],
+  "additional_fixes": [
+    "F41: preserve historical source epochs after writer handoff in native query snapshot projections"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "rust_workspace": "passed; verified process exit 0",
+    "rust_test_count": "not aggregated: logging subprocess output interleaves",
+    "clippy": "passed; workspace, all targets, all features, warnings denied; process exit 0",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "python": "unchanged in this batch; not rebuilt or rerun",
+    "full_repository_mypy": "unresolved debt remains",
+    "platform": "Linux x86_64"
+  },
+  "acceptance": {
+    "ordered_append_replay_after_restart": true,
+    "frame_boundaries_after_wal_and_manifest_recovery": true,
+    "frame_lineage_split_across_files": "planner regression passed; a production compaction executor is still pending",
+    "key_value_raw_mutations_in_order": true,
+    "pinned_mixed_persisted_live_window_survives_checkpoint": true,
+    "cursor_clipping_gap_overlap_and_future_cursor_checks": true,
+    "utf8_bounded_decode_and_overflow_rejection": true,
+    "coalesced_notifications_snapshot_race_cancel_and_actor_exit": true,
+    "writer_handoff_log_and_analytical_query": true,
+    "query_cancel_drop_and_retained_results_accounting": true,
+    "flight_continuous_subscription": false,
+    "durable_subscription_ack": false,
+    "gateway_removed": false
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-log-workspace.log",
+      "sha256": "1a86e4b4c20205952c0c5a38246faee128d03012946525e03f70de61f437a016"
+    },
+    "clippy_workspace_all_targets_all_features": {
+      "path": "/tmp/zippy-log-clippy.log",
+      "sha256": "644188a2e54026509d96ef7d0f869ed13bd8392ba350c38550b1f66779a7f6d5"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-log-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-log-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-ingest/src/actor.rs": "e4f67d0ec27718c065565807db1e3a929df2626bcea1faa3781cf9bc5b3f93c1",
+    "crates/zippy-ingest/src/lib.rs": "483c2fa567f5d637027332ee99953a0596a490b3386e7030def6e75015eb54b6",
+    "crates/zippy-query/src/output_admission.rs": "1a257394c8920ed7b918e7bfe29c94a9428483d81b5be56bd32ad6e68b602c42",
+    "crates/zippy-server/Cargo.toml": "2e730dda0caa06bc5d0ceab6a58a8ca2eb18e12e8ed55faf22adb724edb9df9b",
+    "crates/zippy-server/src/native_log.rs": "3ac96a30f894bcb066165e5f91bb5488d65937be76f8325e1237ebf12f9e3df5",
+    "crates/zippy-server/src/native_query.rs": "756f12b5a8ff83641f851a811be193212d9e1a4682ab61618e0f88d6bbaa7740",
+    "crates/zippy-server/src/query_snapshot.rs": "18f1e4a2988f13ee0a65c91fb9ec997d2ef65c90012596bdaed0d6cd29297b91",
+    "crates/zippy-server/src/query_execution.rs": "7ad9fa3dda6cbd9f172c40c7f5d6c264202af28b8668d64d410d4c96f727023b",
+    "crates/zippy-server/src/query_service.rs": "5bf5c810ee948ee003a953525d1b6f972854e6a209eaf21904585a96028e218c",
+    "crates/zippy-server/src/lib.rs": "e67cd3e125613d384167624316468c1957cdefe0a7782e5b6c522eaa34c7e071",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "d4d08414e10a1d50d200b50b24d1baededae7245f59670fca8c8be8bfb0388da",
+    "crates/zippy-storage/src/candidate.rs": "68a029a97a3ee6097105e8feb70f88a3daf6a5b3a29960c16c9a27bc31e5ab80"
+  }
+}

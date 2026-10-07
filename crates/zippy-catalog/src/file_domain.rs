@@ -7,7 +7,7 @@ use zippy_types::catalog::{
     CatalogDataFileProbeMatch, CatalogDataFileProbeResult, CatalogDataFileReference,
     CatalogDataFileReferenceSnapshot, ManagedDataFileProbe,
 };
-use zippy_types::table::{DataFileLocation, DataFileState, ExternalDataPath, ManagedDataPath};
+use zippy_types::table::{DataFileLocation, DataFileState, ManagedDataPath};
 use zippy_types::{ErrorCode, FileId, Result, ServerError, TableId};
 
 use crate::encoding::{decode_optional_u64, decode_u64};
@@ -191,10 +191,8 @@ fn query_by_path(
     {
         charge_raw_bytes(raw_bytes, row)?;
         let reference = decode_reference(row)?;
-        let path = match &reference.location {
-            DataFileLocation::Managed(path) => path.as_str().to_owned(),
-            DataFileLocation::ExternalLegacy(path) => path.as_str().to_owned(),
-        };
+        let DataFileLocation::Managed(path) = &reference.location;
+        let path = path.as_str().to_owned();
         if output.insert(path.clone(), reference).is_some() {
             return Err(corruption(format!(
                 "catalog file-path probe returned a duplicate row path=[{path}]"
@@ -324,13 +322,6 @@ fn decode_location(kind: &str, path: String) -> Result<DataFileLocation> {
             .map_err(|error| {
                 corruption(format!(
                     "catalog file probe managed path is invalid error=[{error}]"
-                ))
-            }),
-        "external_legacy" => ExternalDataPath::new(path)
-            .map(DataFileLocation::ExternalLegacy)
-            .map_err(|error| {
-                corruption(format!(
-                    "catalog file probe external path is invalid error=[{error}]"
                 ))
             }),
         _ => Err(corruption(format!(

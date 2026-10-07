@@ -1,0 +1,11 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.14, pytest-9.0.2, pluggy-1.6.0
+rootdir: /home/jiangda/develop/zippy/clients/python
+configfile: pyproject.toml
+plugins: cov-7.1.0, anyio-4.13.0
+collected 79 items
+
+clients/python/tests/test_flight_transport.py .......................... [ 32%]
+.....................................................                    [100%]
+
+============================== 79 passed in 1.98s ==============================

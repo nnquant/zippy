@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sys
-import types
 import tomllib
+from typing import Any
 
 from click.testing import CliRunner
 import pytest
@@ -22,11 +21,11 @@ from zippy.pm_bridge import (
     custom_task,
     format_pm_toml,
     add_task,
-    master_task,
+    server_task,
 )
 
 
-def read_toml(path: Path) -> dict[str, object]:
+def read_toml(path: Path) -> dict[str, Any]:
     with path.open("rb") as handle:
         return tomllib.load(handle)
 
@@ -91,7 +90,7 @@ args = ["-m", "worker"]
         encoding="utf-8",
     )
 
-    add_task(config_path, "master", master_task())
+    add_task(config_path, "server", server_task())
 
     config = read_toml(config_path)
     assert config["defaults"] == {
@@ -100,7 +99,7 @@ args = ["-m", "worker"]
         "max_restarts": 7,
     }
     assert config["tasks"]["worker"]["cmd"] == "python"
-    assert config["tasks"]["master"]["cmd"] == "zippy"
+    assert config["tasks"]["server"]["cmd"] == "zippy"
 
 
 def test_pm_custom_task_rejects_invalid_env_key() -> None:
@@ -108,68 +107,48 @@ def test_pm_custom_task_rejects_invalid_env_key() -> None:
         custom_task("python -m worker", env=["BAD.KEY=1"])
 
 
-def test_pm_master_task_rejects_malformed_tcp_uri() -> None:
+def test_pm_server_task_rejects_malformed_tcp_uri() -> None:
     with pytest.raises(ValueError, match="tcp://"):
-        master_task("tcp://")
+        server_task("tcp://")
 
 
-def test_pm_add_master_writes_zippy_pm_toml() -> None:
+def test_pm_add_server_writes_zippy_pm_toml() -> None:
     runner = CliRunner()
     with runner.isolated_filesystem():
-        result = runner.invoke(main, ["pm", "add", "master"])
+        result = runner.invoke(main, ["pm", "add", "server"])
 
         assert result.exit_code == 0
-        assert "added [master]" in result.output
+        assert "added [server]" in result.output
 
         config = read_toml(Path(DEFAULT_PM_CONFIG_FILE))
-        task = config["tasks"]["master"]
+        task = config["tasks"]["server"]
         health = task["health"]
 
         assert config["project"]["name"] == "zippy-local"
         assert task["cmd"] == "zippy"
-        assert task["args"] == ["master", "run", "tcp://127.0.0.1:17690"]
+        assert task["args"] == ["server", "run", "--foreground", "tcp://127.0.0.1:17690"]
         assert task["autostart"] is True
         assert health["type"] == "tcp"
         assert health["address"] == "127.0.0.1:17690"
 
 
-def test_pm_add_gateway_writes_dependency_on_master() -> None:
+@pytest.mark.parametrize("command", ["master", "gateway"])
+def test_pm_old_service_tasks_are_rejected(command: str) -> None:
+    result = CliRunner().invoke(main, ["pm", "add", command])
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+
+
+def test_pm_server_task_owns_configured_data_listeners() -> None:
     runner = CliRunner()
     with runner.isolated_filesystem():
-        result = runner.invoke(
-            main,
-            [
-                "pm",
-                "add",
-                "gateway",
-                "--master-uri",
-                "tcp://127.0.0.1:17690",
-                "--endpoint",
-                "127.0.0.1:17691",
-                "--token",
-                "dev-token",
-            ],
-        )
-
-        assert result.exit_code == 0
-        assert "added [gateway]" in result.output
-
+        result = runner.invoke(main, ["pm", "add", "server", "--server-config", "/srv/zippy.toml"])
+        assert result.exit_code == 0, result.output
         config = read_toml(Path(DEFAULT_PM_CONFIG_FILE))
-        task = config["tasks"]["gateway"]
-
-        assert task["cmd"] == "zippy"
-        assert task["depends_on"] == ["master"]
-        assert task["start_when"] == "healthy"
-        assert task["args"] == [
-            "gateway",
-            "run",
-            "--master-uri",
-            "tcp://127.0.0.1:17690",
-            "--endpoint",
-            "127.0.0.1:17691",
-            "--token",
-            "dev-token",
-        ]
+        assert list(config["tasks"]) == ["server"]
+        args = config["tasks"]["server"]["args"]
+        assert isinstance(args, list)
+        assert args[-2:] == ["--config", "/srv/zippy.toml"]
 
 
 def test_pm_add_custom_writes_explicit_command() -> None:
@@ -264,22 +243,9 @@ def test_pm_apply_delegates_to_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.output == "apply dry-run [zippy-local] tasks=1\n"
 
 
-def test_pm_ls_delegates_table_rendering_to_rspm_render(
+def test_pm_ls_renders_daemon_fields_without_external_python_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rendered_tasks: list[list[PmTaskInfo]] = []
-    rspm_module = types.ModuleType("rspm")
-    render_module = types.ModuleType("rspm.render")
-
-    def format_task_table(tasks: list[PmTaskInfo]) -> str:
-        rendered_tasks.append(tasks)
-        return "rendered by rspm\n"
-
-    render_module.format_task_table = format_task_table  # type: ignore[attr-defined]
-    rspm_module.render = render_module  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "rspm", rspm_module)
-    monkeypatch.setitem(sys.modules, "rspm.render", render_module)
-
     class FakeRunner:
         def list_tasks(self) -> list[PmTaskInfo]:
             return [
@@ -323,10 +289,17 @@ def test_pm_ls_delegates_table_rendering_to_rspm_render(
     result = runner.invoke(main, ["pm", "ls"])
 
     assert result.exit_code == 0
-    assert result.output == "rendered by rspm\n"
-    assert len(rendered_tasks) == 1
-    assert rendered_tasks[0][0].name == "ldc-master"
-    assert rendered_tasks[0][1].schedule_state == "start 05-20 12:30:00Z"
+    for value in (
+        "TASK_ID",
+        "ldc-master",
+        "ldc-ctp-md",
+        "12.3",
+        "512.0",
+        "61.0",
+        "2026-05-20T12:30:00Z",
+        "start 05-20 12:30:00Z",
+    ):
+        assert value in result.output
 
 
 def test_pm_validate_rejects_missing_config() -> None:
@@ -478,8 +451,8 @@ def test_pm_supervisor_does_not_spawn_when_ready_probe_returns_rpc_error(
     config_path.write_text('[project]\nname = "zippy-local"\n', encoding="utf-8")
     spawned: list[Path] = []
 
-    class FakeClient:
-        def list_tasks(self) -> None:
+    class FakeClient(PmRpcClient):
+        def list_tasks(self) -> list[PmTaskInfo]:
             raise RuntimeError("auth failed")
 
     class FakeSupervisor(PmSupervisor):
@@ -503,8 +476,8 @@ def test_pm_supervisor_propagates_ready_probe_timeout_without_config_fallback(
     config_path = tmp_path / "missing-zippy.pm.toml"
     spawned: list[Path] = []
 
-    class FakeClient:
-        def list_tasks(self) -> None:
+    class FakeClient(PmRpcClient):
+        def list_tasks(self) -> list[PmTaskInfo]:
             raise TimeoutError("timed out")
 
     class FakeSupervisor(PmSupervisor):

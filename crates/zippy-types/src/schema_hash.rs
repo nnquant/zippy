@@ -13,9 +13,8 @@ const SHA256_PREFIX: &str = "sha256-v1:";
 
 /// Computes the durable Catalog V1 logical hash of an Arrow schema.
 ///
-/// This is distinct from the legacy stream control-plane FNV hash. Both the
-/// producer of a Catalog command and the Catalog storage verifier must call
-/// this function so a schema cannot cross hash domains accidentally.
+/// Catalog command producers and the storage verifier share this hash domain
+/// so a schema cannot be accepted under a different logical encoding.
 #[must_use]
 pub fn canonical_catalog_schema_hash_v1(schema: &Schema) -> String {
     let digest = canonical_catalog_schema_digest_output_v1(schema);

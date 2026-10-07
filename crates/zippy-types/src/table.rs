@@ -317,7 +317,7 @@ pub struct AppendTableDefinition {
 /// Definition fields specific to a frame table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrameTableDefinition {
-    /// The mandatory column that groups rows into independently updated frames.
+    /// The mandatory business grouping column of complete, append-only frames.
     pub by: ColumnName,
 }
 
@@ -431,6 +431,31 @@ pub enum TableState {
     Dropped,
     /// The table requires operator intervention before use.
     Failed,
+}
+
+/// The committed reason an old in-process table instance can no longer serve callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableRetirementReason {
+    /// The table identity was logically deleted.
+    Dropped,
+    /// The identity remains active with a new schema and fresh runtime instances.
+    SchemaChanged,
+}
+
+impl TableRetirementReason {
+    /// Returns the terminal error old writers, actors, and continuous readers must observe.
+    pub fn error(self, table_id: TableId) -> crate::ServerError {
+        let (code, message) = match self {
+            Self::Dropped => (crate::ErrorCode::NotFound, "native table was dropped"),
+            Self::SchemaChanged => (
+                crate::ErrorCode::SchemaMismatch,
+                "native table schema changed; reopen table handles",
+            ),
+        };
+        crate::ServerError::new(code, message)
+            .with_table_id(table_id)
+            .with_retryable(false)
+    }
 }
 
 /// The compatibility computed by the catalog for a schema version.
@@ -561,8 +586,6 @@ pub enum SnapshotOperation {
     Persist,
     /// Existing data files were compacted into replacement files.
     Compaction,
-    /// Existing data was imported from a legacy or external source.
-    Import,
     /// Retention changed the visible file set.
     Retention,
 }
@@ -597,7 +620,7 @@ impl ManagedDataPath {
     /// Validates and creates a managed relative data path.
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidDataPath> {
         let value = value.into();
-        validate_path(&value, false)?;
+        validate_path(&value)?;
         Ok(Self(value))
     }
 
@@ -617,46 +640,13 @@ impl<'de> Deserialize<'de> for ManagedDataPath {
     }
 }
 
-/// An explicitly mounted absolute legacy path outside the managed data root.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct ExternalDataPath(String);
-
-impl ExternalDataPath {
-    /// Validates and creates an absolute external legacy path.
-    pub fn new(value: impl Into<String>) -> Result<Self, InvalidDataPath> {
-        let value = value.into();
-        validate_path(&value, true)?;
-        Ok(Self(value))
-    }
-
-    /// Borrows the absolute UTF-8 path.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for ExternalDataPath {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
-
-fn validate_path(value: &str, must_be_absolute: bool) -> Result<(), InvalidDataPath> {
+fn validate_path(value: &str) -> Result<(), InvalidDataPath> {
     if value.is_empty() {
         return Err(InvalidDataPath::Empty);
     }
     let path = Path::new(value);
-    if path.is_absolute() != must_be_absolute {
-        return if must_be_absolute {
-            Err(InvalidDataPath::ExpectedAbsolute)
-        } else {
-            Err(InvalidDataPath::ExpectedRelative)
-        };
+    if path.is_absolute() {
+        return Err(InvalidDataPath::ExpectedRelative);
     }
     if path.components().any(|component| {
         matches!(
@@ -669,7 +659,7 @@ fn validate_path(value: &str, must_be_absolute: bool) -> Result<(), InvalidDataP
     Ok(())
 }
 
-/// An invalid managed or external data-file path.
+/// An invalid managed data-file path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum InvalidDataPath {
     /// The path is empty.
@@ -678,9 +668,6 @@ pub enum InvalidDataPath {
     /// A managed path must be relative to the data root.
     #[error("managed data path must be relative")]
     ExpectedRelative,
-    /// An external legacy path must be absolute.
-    #[error("external data path must be absolute")]
-    ExpectedAbsolute,
     /// The path contains current, parent, or platform-prefix components.
     #[error("data path contains unsafe components")]
     UnsafeComponent,
@@ -692,8 +679,6 @@ pub enum InvalidDataPath {
 pub enum DataFileLocation {
     /// A server-managed path relative to the data root.
     Managed(ManagedDataPath),
-    /// An absolute read-only legacy path never removed by automatic GC.
-    ExternalLegacy(ExternalDataPath),
 }
 
 /// The identity of a source segment across slot reuse and producer lifetimes.
@@ -881,19 +866,12 @@ pub enum InvalidNativeDataFileProvenance {
     },
 }
 
-/// Mutually exclusive native and legacy data-file provenance.
+/// Native data-file provenance with exact offsets and source lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataFileProvenance {
     /// A server-produced file with exact offsets and non-empty source lineage.
     Native(NativeDataFileProvenance),
-    /// An imported file whose logical boundary may be unavailable.
-    Legacy {
-        /// Reconstructed offsets, when migration could prove them.
-        offsets: Option<OffsetRange>,
-        /// Whether reads must preserve discovery order during migration.
-        preserve_discovery_order: bool,
-    },
 }
 
 /// A complete, fsynced file candidate not yet visible in any catalog snapshot.
@@ -905,13 +883,13 @@ pub struct PendingDataFile {
     pub table_id: TableId,
     /// The schema version encoded in the file.
     pub schema_version: u64,
-    /// The typed managed or external location.
+    /// The typed managed location.
     pub location: DataFileLocation,
     /// The physical file size in bytes.
     pub file_size_bytes: u64,
     /// The nonzero logical row count in the file.
     pub row_count: NonZeroU64,
-    /// Typed native or legacy origin and its compatible ordering semantics.
+    /// Exact native offset coverage and source lineage.
     pub provenance: DataFileProvenance,
     /// Stable partition key/value pairs.
     pub partition: MetadataMap,
@@ -942,11 +920,6 @@ pub enum DataFileState {
 pub struct DataFileDescriptor {
     /// The complete pre-commit file metadata.
     pub file: PendingDataFile,
-    /// Gateway-compatible scan position for a preserved legacy manifest.
-    ///
-    /// Frozen mutation wires carry this value separately from `PendingDataFile`; descriptor JSON
-    /// includes it so inspection round trips remain lossless.
-    pub legacy_discovery_order: Option<u64>,
     /// The first snapshot version in which the file is visible.
     pub added_snapshot_version: u64,
     /// The first snapshot version in which the file is no longer visible.
@@ -958,20 +931,6 @@ pub struct DataFileDescriptor {
 impl DataFileDescriptor {
     /// Validates lifecycle state against the immutable visibility interval.
     pub fn validate(&self) -> Result<(), InvalidDataFileDescriptor> {
-        let preserve_discovery_order = matches!(
-            &self.file.provenance,
-            DataFileProvenance::Legacy {
-                preserve_discovery_order: true,
-                ..
-            }
-        );
-        if preserve_discovery_order != self.legacy_discovery_order.is_some() {
-            return Err(InvalidDataFileDescriptor::LegacyDiscoveryOrderMismatch {
-                file_id: self.file_id(),
-                preserve_discovery_order,
-                has_discovery_order: self.legacy_discovery_order.is_some(),
-            });
-        }
         if matches!(self.state, DataFileState::Deleting | DataFileState::Deleted)
             && self.removed_snapshot_version.is_none()
         {
@@ -1003,12 +962,6 @@ impl DataFileDescriptor {
         self.file.table_id
     }
 
-    /// Returns the Gateway-compatible scan position for a preserved legacy file.
-    #[must_use]
-    pub const fn legacy_discovery_order(&self) -> Option<u64> {
-        self.legacy_discovery_order
-    }
-
     /// Returns whether this file is visible at an exact historical snapshot.
     #[must_use]
     pub const fn is_visible_at(&self, snapshot_version: u64) -> bool {
@@ -1027,10 +980,9 @@ impl<'de> Deserialize<'de> for DataFileDescriptor {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawDataFileDescriptor {
             file: PendingDataFile,
-            #[serde(default)]
-            legacy_discovery_order: Option<u64>,
             added_snapshot_version: u64,
             removed_snapshot_version: Option<u64>,
             state: DataFileState,
@@ -1038,7 +990,6 @@ impl<'de> Deserialize<'de> for DataFileDescriptor {
         let raw = RawDataFileDescriptor::deserialize(deserializer)?;
         let descriptor = Self {
             file: raw.file,
-            legacy_discovery_order: raw.legacy_discovery_order,
             added_snapshot_version: raw.added_snapshot_version,
             removed_snapshot_version: raw.removed_snapshot_version,
             state: raw.state,
@@ -1051,18 +1002,6 @@ impl<'de> Deserialize<'de> for DataFileDescriptor {
 /// An invalid relationship between file lifecycle state and visibility versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum InvalidDataFileDescriptor {
-    /// Preserved legacy provenance and its Catalog scan position must appear together.
-    #[error(
-        "legacy discovery order presence mismatch file_id=[{file_id}] preserve=[{preserve_discovery_order}] has_order=[{has_discovery_order}]"
-    )]
-    LegacyDiscoveryOrderMismatch {
-        /// The invalid file identity.
-        file_id: FileId,
-        /// Whether provenance requires the old Gateway ordering contract.
-        preserve_discovery_order: bool,
-        /// Whether the Catalog descriptor retained a concrete scan position.
-        has_discovery_order: bool,
-    },
     /// Deleting and deleted files require the snapshot that removed them.
     #[error("removed file state lacks removal version file_id=[{file_id}] state=[{state:?}]")]
     RemovedStateWithoutVersion {
@@ -1187,7 +1126,7 @@ impl<'de> Deserialize<'de> for DataFiles {
 #[cfg(test)]
 mod tests {
     use super::{
-        CatalogName, ColumnName, ColumnSet, DataFileLocation, DataFileProvenance, ExternalDataPath,
+        CatalogName, ColumnName, ColumnSet, DataFileLocation, DataFileProvenance,
         FrameTableDefinition, KeyValueTableDefinition, ManagedDataPath, MetadataScalar,
         NativeDataFileProvenance, SourceSegmentIdentity, SourceSegmentLineage,
         SourceSegmentLineages, TableDefinition, TableKind,
@@ -1300,6 +1239,15 @@ mod tests {
             r#"{"type":"native","offsets":{"first":0,"last":0},"source_lineage":[]}"#
         )
         .is_err());
+        assert!(serde_json::from_str::<DataFileProvenance>(
+            r#"{"type":"legacy","offsets":null,"preserve_discovery_order":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<DataFileLocation>(
+            r#"{"type":"external_legacy","path":"/legacy/file.parquet"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<super::SnapshotOperation>(r#""import""#).is_err());
         assert_eq!(
             serde_json::to_string(&MetadataScalar::UInt64(4)).unwrap(),
             r#"{"type":"uint64","value":4}"#
@@ -1360,8 +1308,6 @@ mod tests {
         assert!(ManagedDataPath::new("parquet/table/file.parquet").is_ok());
         assert!(ManagedDataPath::new("../escape.parquet").is_err());
         assert!(ManagedDataPath::new("/absolute.parquet").is_err());
-        assert!(ExternalDataPath::new("/legacy/file.parquet").is_ok());
-        assert!(ExternalDataPath::new("legacy/file.parquet").is_err());
 
         let location =
             DataFileLocation::Managed(ManagedDataPath::new("parquet/table/file.parquet").unwrap());

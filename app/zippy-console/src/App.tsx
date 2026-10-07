@@ -1,7 +1,7 @@
 import { AlertTriangle, Clock, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { fetchDashboard, type DashboardPayload, type TableSummary } from "./api/client";
+import { fetchDashboard, tableKey, type DashboardPayload } from "./api/client";
 import { Sidebar, type ConsoleView } from "./components/Sidebar";
 import { statusTone } from "./components/status";
 import { Button } from "./components/ui/button";
@@ -24,10 +24,10 @@ export function App(): JSX.Element {
       setError(null);
       setLastRefresh(new Date());
       setSelectedTable((current) => {
-        if (current && payload.tables.some((table) => table.stream_name === current)) {
+        if (current && payload.tables.some((table) => tableKey(table) === current)) {
           return current;
         }
-        return payload.tables[0]?.stream_name || null;
+        return payload.tables[0] ? tableKey(payload.tables[0]) : null;
       });
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : String(requestError));
@@ -50,11 +50,8 @@ export function App(): JSX.Element {
       <main className="main-shell">
         <div className="topline">
           <div className="top-left">
-            <StatusChip label="Master" status={data?.master.status || (error ? "error" : "unknown")} />
-            <StatusChip
-              label="Gateway"
-              status={data?.gateway?.status || data?.gateway_status || "unknown"}
-            />
+            <StatusChip label="Catalog" status={data?.catalog.status || (error ? "error" : "unknown")} />
+            <StatusChip label="Processes" status={data?.pm.status || "unknown"} />
           </div>
           <div className="top-right">
             <div className="chip">
@@ -141,38 +138,11 @@ function issueSummary(
       message: requestError,
     };
   }
-  if (data.master.error) {
-    return {
-      level: "critical",
-      message:
-        "master client initialization failed, table registration and read/write requests may fail.",
-    };
+  if (data.catalog.error) {
+    return { level: "critical", message: `Catalog query failed: ${data.catalog.error}` };
   }
-  const bad = data.stale_error_tables || [];
-  if (bad.length) {
-    const severity = bad.some((table) => tableSeverity(table) === "error") ? "error" : "warning";
-    return {
-      level: severity,
-      message: `${bad.length} table(s) have ${severity} status, check writer ownership, descriptor_generation, and persist events.`,
-    };
-  }
-  return null;
-}
-
-function tableSeverity(table: TableSummary): "warning" | "error" | null {
-  const statuses = [table.health_status, table.status].map((status) => String(status || "").toLowerCase());
-  const alerts = table.alerts || [];
-  if (
-    statuses.some((status) => ["error", "failed"].includes(status)) ||
-    alerts.some((alert) => String(alert.severity || "").toLowerCase() === "error")
-  ) {
-    return "error";
-  }
-  if (
-    statuses.some((status) => ["warning", "stale"].includes(status)) ||
-    alerts.some((alert) => String(alert.severity || "").toLowerCase() === "warning")
-  ) {
-    return "warning";
+  if (data.pm.error) {
+    return { level: "warning", message: `Process query failed: ${data.pm.error}` };
   }
   return null;
 }

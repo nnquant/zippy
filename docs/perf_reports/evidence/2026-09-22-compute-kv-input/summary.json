@@ -1,0 +1,234 @@
+{
+  "date": "2026-09-22",
+  "batch": 28,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11",
+    "F13",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "input_contract": {
+    "old_and_native_kv_input_is_complete_changelog": true,
+    "empty_source_checks_exact_kernel_schema_before_worker_start": true,
+    "guard_includes_metadata_and_nullability": true,
+    "rejected_options_preserve_kernel_ownership": true,
+    "failed_start_removed_from_client_lifecycle": true,
+    "event_sequence": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "per_key_event_sequence_mean": [
+      null,
+      null,
+      2.0,
+      3.0,
+      4.0,
+      5.5
+    ],
+    "full_mutation_preserved_across_one_row_wire_fragments": true,
+    "same_kernel_survives_storage_restart": true,
+    "native_state_replay_becomes_empty_then_reinserts": true,
+    "snapshot_to_price_factor_adapter_complete": false,
+    "kernel_checkpoint_complete": false,
+    "restart_kind": "graceful SIGINT, not SIGKILL or power loss"
+  },
+  "validation": {
+    "python_full": {
+      "path": "/tmp/zippy-kv-compute-full.log",
+      "exit_code": 0,
+      "sha256": "29bfdd850ab3cc013e2529e8adc64d01551f072c212a31c43e2c6b9402ae3a09",
+      "tail": [
+        "........................................................................ [ 87%]",
+        "........................................................................ [ 96%]",
+        ".............................                                            [100%]",
+        "820 passed, 1 skipped in 68.42s (0:01:08)"
+      ]
+    },
+    "client_coverage": {
+      "path": "/tmp/zippy-kv-compute-client.log",
+      "exit_code": 0,
+      "sha256": "49e2e72709c9e27f78f1b5ce2873d1421201747eec3df068a31206ef7388dd1b",
+      "tail": [
+        "------------------------------------------------------------------------------------------",
+        "TOTAL                                                         3698    561    85%",
+        "Required test coverage of 80% reached. Total coverage: 84.83%",
+        "192 passed in 2.83s"
+      ]
+    },
+    "isolated_arrow_23": {
+      "path": "/tmp/zippy-kv-compute-isolated-23.log",
+      "exit_code": 0,
+      "sha256": "b70694629b73aa6da6139aadc35458cad3dd566f7938f43946cd0f9da8a9f5e9",
+      "tail": [
+        "----------------------------------------------------------------------------------------------------------------",
+        "TOTAL                                                                               3698    679    82%",
+        "Required test coverage of 80% reached. Total coverage: 81.64%",
+        "187 passed, 1 skipped in 2.60s"
+      ]
+    },
+    "isolated_arrow_25": {
+      "path": "/tmp/zippy-kv-compute-isolated-25.log",
+      "exit_code": 0,
+      "sha256": "cc9adb9add65e7521fffb301d5c1310d671fe8c319e84a9d8b1538949b2a66d6",
+      "tail": [
+        "----------------------------------------------------------------------------------------------------------------",
+        "TOTAL                                                                               3698    679    82%",
+        "Required test coverage of 80% reached. Total coverage: 81.64%",
+        "187 passed, 1 skipped in 2.49s"
+      ]
+    },
+    "native_acceptance": {
+      "path": "/tmp/zippy-kv-compute-native.log",
+      "exit_code": 0,
+      "sha256": "1f22144eb49e220af7879d00320a639ca57527ace8b9809ee009964aca9519cd",
+      "tail": [
+        "2026-09-22 14:04:45.898 | ERROR    | zippy.compute:_fail:255 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:04:45.941 | ERROR    | zippy.compute:_fail:255 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 14:04:45.985 | ERROR    | zippy.compute:_fail:255 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-kv-compute-black-all.log",
+      "exit_code": 0,
+      "sha256": "e56c16527fcc9bd1df5ace9bc4bc284b726bf72583916b5251f892fde8c43e8b",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "93 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-kv-compute-ruff.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-kv-compute-mypy-root.log",
+      "exit_code": 0,
+      "sha256": "fc409d91e6c781eb25a1ec1310b7fcb0086b74ed3aa2c415bcd73f884f23f07a",
+      "tail": [
+        "Success: no issues found in 15 source files"
+      ]
+    },
+    "mypy_changed_scope": {
+      "path": "/tmp/zippy-kv-compute-mypy.log",
+      "exit_code": 0,
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad",
+      "tail": [
+        "Success: no issues found in 26 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-kv-compute-mypy-full.log",
+      "exit_code": 1,
+      "sha256": "8da7bbf995a8a8917ce6a6ec71e6057565d7241b147d34135dd0a5c3c1120aa7",
+      "tail": [
+        "pytests/test_python_cli.py:956: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:1043: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:1044: error: Value of type \"object\" is not indexable  [index]",
+        "Found 978 errors in 12 files (checked 92 source files)"
+      ]
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-kv-compute-diff.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    }
+  },
+  "native_matrix": {
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_sha256": {
+    "clients/python/src/zippy_client/flight_subscriber.py": "d16e247d0acb879019a6b09f5643489e403cded0bab3eba075feecfe6143ecb3",
+    "clients/python/src/zippy_client/client.py": "40de6589f4d6fc8f2aa4f4358eff50d85091feba0261cb0f3415ebae1d39d173",
+    "python/zippy/compute.py": "86a3a92b60b53d3aea2a8d4adf79cf40680db183ab21bcfafd952f86e51d19c0",
+    "clients/python/tests/test_flight_subscriber.py": "23357cdc3f6702ff20a9e8cb6b33692edce0209d8fecf0b30121c323bdfa6229",
+    "pytests/test_native_compute.py": "07f1e6833af8c6a8f6a6a26ef5cd03f241180b6a388d396d2f3b06ad0a25f3b2",
+    "scripts/check_compute_kv_input.py": "fc0479f20697f2deb0aadf1e6453b072ee790bf959262ab5fb0fc8a2ad25f9b9",
+    "scripts/check_native_client.py": "25e2551a080c7fd049e42f6a46b4c22f3111c2c0765e474585236c2a1c7b19b7",
+    "docs/native-compute.md": "45ce2e478592d266775f9be6273a2cc0ed8c58029a9a3fe41c0f9aab37ba9cb4",
+    "docs/convergence-compute-kv-input-2026-09-22.md": "06a50b124b9e57cdb0d2c40ab87593a92eaaae5f1ec048f9c94ca3ba89fc3ff5"
+  },
+  "server_sha256": "05572a341f970070fae99e8c41f7fa5052cfa3d192404cae14cade3ccef493d9",
+  "rust_changes_this_batch": false,
+  "rust_workspace_and_clippy_rerun_this_batch": false,
+  "environment": "Linux x86_64, CPython 3.11; isolated clients Arrow 23.0.1 and 25.0.1"
+}

@@ -28,6 +28,6 @@ export function displayValue(value: unknown): string {
 }
 
 export function displayNumber(value: unknown): string {
-  const numberValue = Number(value);
-  return Number.isFinite(numberValue) ? numberValue.toLocaleString() : displayValue(value);
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toLocaleString() : displayValue(value);
 }

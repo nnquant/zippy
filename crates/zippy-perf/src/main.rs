@@ -5,32 +5,21 @@ use tracing::{error, info};
 use zippy_core::{setup_log, LogConfig};
 use zippy_perf::{
     format_report, plan_baseline_manifest, run_profile, write_baseline_manifest_json,
-    write_report_json, BaselineManifest, OverflowPolicyConfig, PerfConfig, PerfProfile,
+    write_report_json, BaselineManifest, PerfConfig, PerfProfile,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CliProfile {
-    InprocTimeseries,
-    RemotePipelineUpstream,
-    RemotePipelineDownstream,
+    TimeseriesKernel,
     StreamTableSegmentCopy,
-    StreamTableSegmentForward,
     SingleRowLowRate,
     WriteToSubscribeE2e,
-    RuntimeStreamTableE2e,
     StreamTableSubscriberE2e,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum CliOverflowPolicy {
-    Block,
-    Reject,
-    DropOldest,
 }
 
 #[derive(Debug, Parser)]
 #[command(name = "zippy-perf")]
-#[command(about = "performance harness for sustained in-process and remote zippy pipelines")]
+#[command(about = "performance harness for synchronous kernels and native shared-memory storage")]
 struct Cli {
     #[arg(value_enum)]
     profile: CliProfile,
@@ -44,18 +33,10 @@ struct Cli {
     warmup_sec: u64,
     #[arg(long, default_value_t = 1024)]
     symbols: usize,
-    #[arg(long, default_value_t = 4096)]
-    buffer_capacity: usize,
-    #[arg(long, value_enum, default_value_t = CliOverflowPolicy::Block)]
-    overflow_policy: CliOverflowPolicy,
     #[arg(long)]
     max_p95_micros: Option<f64>,
     #[arg(long)]
     max_p99_micros: Option<f64>,
-    #[arg(long)]
-    max_queue_depth: Option<usize>,
-    #[arg(long, default_value = "tcp://127.0.0.1:5560")]
-    endpoint: String,
     #[arg(long)]
     report_json: Option<PathBuf>,
     #[arg(long)]
@@ -77,14 +58,10 @@ fn main() {
     ));
     let config = PerfConfig {
         profile: match cli.profile {
-            CliProfile::InprocTimeseries => PerfProfile::InprocTimeseries,
-            CliProfile::RemotePipelineUpstream => PerfProfile::RemotePipelineUpstream,
-            CliProfile::RemotePipelineDownstream => PerfProfile::RemotePipelineDownstream,
+            CliProfile::TimeseriesKernel => PerfProfile::TimeseriesKernel,
             CliProfile::StreamTableSegmentCopy => PerfProfile::StreamTableSegmentCopy,
-            CliProfile::StreamTableSegmentForward => PerfProfile::StreamTableSegmentForward,
             CliProfile::SingleRowLowRate => PerfProfile::SingleRowLowRate,
             CliProfile::WriteToSubscribeE2e => PerfProfile::WriteToSubscribeE2e,
-            CliProfile::RuntimeStreamTableE2e => PerfProfile::RuntimeStreamTableE2e,
             CliProfile::StreamTableSubscriberE2e => PerfProfile::StreamTableSubscriberE2e,
         },
         rows_per_batch: cli.rows_per_batch,
@@ -92,16 +69,8 @@ fn main() {
         duration_sec: cli.duration_sec,
         warmup_sec: cli.warmup_sec,
         symbols: cli.symbols,
-        endpoint: cli.endpoint,
-        buffer_capacity: cli.buffer_capacity,
-        overflow_policy: match cli.overflow_policy {
-            CliOverflowPolicy::Block => OverflowPolicyConfig::Block,
-            CliOverflowPolicy::Reject => OverflowPolicyConfig::Reject,
-            CliOverflowPolicy::DropOldest => OverflowPolicyConfig::DropOldest,
-        },
         max_p95_micros: cli.max_p95_micros,
         max_p99_micros: cli.max_p99_micros,
-        max_queue_depth: cli.max_queue_depth,
     };
 
     let planned_manifest = match cli.baseline_manifest_json.as_ref() {

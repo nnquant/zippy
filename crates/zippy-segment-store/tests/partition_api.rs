@@ -7,6 +7,43 @@ use zippy_segment_store::{
 const SHM_SEALED_OFFSET: usize = 48;
 
 #[test]
+fn recovered_origin_preserves_generation_and_rejects_reopen_or_rollover_conflicts() {
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let schema = compile_schema(&[ColumnSpec::new("value", ColumnType::Int64)]).unwrap();
+    let handle = store
+        .open_partition_with_schema_and_origin("ticks", "all", schema.clone(), 7, 42)
+        .unwrap();
+    let writer = handle.writer();
+    writer.write_row(|row| row.write_i64("value", 10)).unwrap();
+    let first = handle.active_descriptor_for_test();
+    assert_eq!(first.generation(), 42);
+    assert_eq!(first.writer_epoch(), 7);
+    writer.rollover().unwrap();
+    assert_eq!(handle.active_descriptor_for_test().generation(), 43);
+    let reopened = store
+        .open_partition_with_schema_and_origin("ticks", "all", schema.clone(), 7, 42)
+        .unwrap();
+    assert_eq!(reopened.active_descriptor_for_test().generation(), 43);
+    assert!(store
+        .open_partition_with_schema_and_origin("ticks", "all", schema.clone(), 7, 43)
+        .is_err());
+    let exhausted = store
+        .open_partition_with_schema_and_origin("ticks", "end", schema, 7, u64::MAX)
+        .unwrap();
+    let writer = exhausted.writer();
+    writer.write_row(|row| row.write_i64("value", 99)).unwrap();
+    assert!(writer.rollover().is_err());
+    assert_eq!(
+        exhausted.active_descriptor_for_test().generation(),
+        u64::MAX
+    );
+    assert_eq!(
+        exhausted.debug_snapshot_record_batch().unwrap().num_rows(),
+        1
+    );
+}
+
+#[test]
 fn open_partition_with_schema_supports_column_writes_and_debug_snapshot() {
     let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
     let schema = compile_schema(&[

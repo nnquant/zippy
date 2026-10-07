@@ -1,9 +1,7 @@
-from typing import Literal, NoReturn
-
-import polars as pl
 import pyarrow as pa
 
 __version__: str
+__build_revision__: str | None
 
 def _signal_server_process(
     pid: int,
@@ -28,12 +26,6 @@ def run_server_daemon(
     startup_timeout_sec: float | None = None,
     endpoint_explicit: bool = False,
 ) -> None: ...
-def run_master_daemon(
-    uri: str | None = None,
-    *,
-    control_endpoint: str | None = None,
-    config: str | None = None,
-) -> None: ...
 def setup_log(
     app: str,
     level: str = "info",
@@ -47,44 +39,6 @@ def log_info(
     message: str,
     status: str | None = None,
 ) -> None: ...
-
-class _WindowTypeValue: ...
-
-class WindowType:
-    TUMBLING: _WindowTypeValue
-
-class _LateDataPolicyValue: ...
-
-class LateDataPolicy:
-    REJECT: _LateDataPolicyValue
-    DROP_WITH_METRIC: _LateDataPolicyValue
-
-class _OverflowPolicyValue: ...
-
-class OverflowPolicy:
-    BLOCK: _OverflowPolicyValue
-    REJECT: _OverflowPolicyValue
-    DROP_OLDEST: _OverflowPolicyValue
-
-class _SourceModeValue: ...
-
-class SourceMode:
-    PIPELINE: _SourceModeValue
-    CONSUMER: _SourceModeValue
-
-class Duration:
-    total_nanoseconds: int
-
-    def __init__(self, total_nanoseconds: int) -> None: ...
-    @classmethod
-    def nanoseconds(cls, value: int) -> Duration: ...
-    @classmethod
-    def seconds(cls, value: int) -> Duration: ...
-    @classmethod
-    def minutes(cls, value: int) -> Duration: ...
-    @classmethod
-    def hours(cls, value: int) -> Duration: ...
-    def __int__(self) -> int: ...
 
 class TsEmaSpec:
     def __init__(
@@ -201,187 +155,6 @@ class CSZscoreSpec:
 class CSDemeanSpec:
     def __init__(self, column: str, output: str) -> None: ...
 
-class NullPublisher:
-    def __init__(self) -> None: ...
-
-class ParquetSink:
-    def __init__(self, *args: object, **kwargs: object) -> NoReturn: ...
-
-class ZmqPublisher:
-    def __init__(self, endpoint: str) -> None: ...
-
-class ZmqStreamPublisher:
-    def __init__(self, endpoint: str, stream_name: str, schema: pa.Schema) -> None: ...
-    def last_endpoint(self) -> str: ...
-    def publish(
-        self,
-        value: (
-            pl.DataFrame | pa.RecordBatch | pa.Table | dict[str, object] | list[dict[str, object]]
-        ),
-    ) -> None: ...
-    def publish_hello(self) -> None: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
-class ZmqSubscriber:
-    def __init__(self, endpoint: str, timeout_ms: int = 1000) -> None: ...
-    def recv(self) -> pa.RecordBatch: ...
-    def close(self) -> None: ...
-
-class ZmqSource:
-    def __init__(
-        self,
-        endpoint: str,
-        expected_schema: pa.Schema,
-        mode: _SourceModeValue,
-    ) -> None: ...
-
-class MasterServer:
-    def __init__(
-        self,
-        uri: str | None = None,
-        *,
-        control_endpoint: str | None = None,
-        config: dict[str, object] | None = None,
-    ) -> None: ...
-    def start(self, startup_timeout_sec: float = 10.0, /) -> None: ...
-    def join(self) -> None: ...
-    def stop(self) -> None: ...
-
-class MasterClient:
-    def __init__(
-        self,
-        uri: str | None = None,
-        *,
-        control_endpoint: str | None = None,
-    ) -> None: ...
-    def register_process(self, app: str) -> str: ...
-    def heartbeat(self) -> None: ...
-    def process_id(self) -> str | None: ...
-    def set_token(self, token: str) -> None: ...
-    def control_endpoint(self) -> str: ...
-    def register_stream(
-        self,
-        stream_name: str,
-        schema: pa.Schema,
-        buffer_size: int,
-        frame_size: int,
-    ) -> None: ...
-    def register_source(
-        self,
-        source_name: str,
-        source_type: str,
-        output_stream: str,
-        config: object,
-    ) -> None: ...
-    def unregister_source(self, source_name: str) -> None: ...
-    def register_engine(
-        self,
-        engine_name: str,
-        engine_type: str,
-        input_stream: str,
-        output_stream: str,
-        config: object,
-    ) -> None: ...
-    def update_status(
-        self,
-        kind: str,
-        name: str,
-        status: str,
-        metrics: object | None = None,
-    ) -> None: ...
-    def publish_segment_descriptor(
-        self,
-        stream_name: str,
-        descriptor: object,
-    ) -> None: ...
-    def publish_segment_descriptor_envelope(
-        self,
-        stream_name: str,
-        descriptor_envelope: bytes,
-        metadata: object | None = None,
-    ) -> None: ...
-    def publish_persisted_file(
-        self,
-        stream_name: str,
-        persisted_file: object,
-    ) -> None: ...
-    def replace_persisted_files(
-        self,
-        stream_name: str,
-        persisted_files: list[dict[str, object]],
-    ) -> None: ...
-    def publish_persist_event(
-        self,
-        stream_name: str,
-        persist_event: object,
-    ) -> None: ...
-    def acquire_segment_reader_lease(
-        self,
-        stream_name: str,
-        source_segment_id: int,
-        source_generation: int,
-    ) -> str: ...
-    def release_segment_reader_lease(
-        self,
-        stream_name: str,
-        lease_id: str,
-    ) -> None: ...
-    def get_segment_descriptor(self, stream_name: str) -> dict[str, object] | None: ...
-    def list_streams(self, include_internal: bool = False) -> list[dict[str, object]]: ...
-    def get_stream(self, stream_name: str) -> dict[str, object]: ...
-    def get_stream_status(self, stream_name: str) -> dict[str, object]: ...
-    def get_config(self) -> dict[str, object]: ...
-    def drop_table(
-        self,
-        table_name: str,
-        drop_persisted: bool = True,
-    ) -> dict[str, object]: ...
-
-class Query:
-    def __init__(self, source: str, master: MasterClient) -> None: ...
-    def tail(self, n: int) -> pa.Table: ...
-    def schema(self) -> pa.Schema: ...
-    def stream_info(self) -> dict[str, object]: ...
-    def snapshot(self) -> dict[str, object]: ...
-    def scan_live(self) -> pa.RecordBatchReader: ...
-
-class StreamSubscriber:
-    def __init__(
-        self,
-        source: str,
-        master: MasterClient,
-        callback: object,
-        poll_interval_ms: int = 1,
-        xfast: bool = False,
-        idle_spin_checks: int = 64,
-        row_factory: object | None = None,
-        instrument_ids: list[str] | tuple[str, ...] | str | None = None,
-        start_from: int = -1,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def stop(self) -> None: ...
-    def join(self) -> None: ...
-    def metrics(self) -> dict[str, object]: ...
-
-class SegmentStreamSource:
-    def __init__(
-        self,
-        stream_name: str,
-        expected_schema: pa.Schema,
-        master: MasterClient,
-        mode: _SourceModeValue | None = None,
-        xfast: bool = False,
-        start_from: int = -1,
-    ) -> None: ...
-
-WriteValue = pl.DataFrame | pa.RecordBatch | pa.Table | dict[str, object] | list[dict[str, object]]
-PublisherTarget = (
-    NullPublisher
-    | ZmqPublisher
-    | ZmqStreamPublisher
-    | list[NullPublisher | ZmqPublisher | ZmqStreamPublisher]
-)
 ReactiveFactor = (
     TsEmaSpec
     | TsReturnSpec
@@ -400,177 +173,6 @@ AggregationFactor = (
 )
 CrossSectionalFactor = CSRankSpec | CSZscoreSpec | CSDemeanSpec
 
-class ReactiveStateEngine:
-    def __init__(
-        self,
-        name: str,
-        input_schema: pa.Schema,
-        id_column: str,
-        factors: list[ReactiveFactor],
-        target: PublisherTarget,
-        *,
-        id_filter: list[str] | None = None,
-        state_failure_policy: Literal["fail_fast", "rollback"] = "fail_fast",
-        invalid_value_policy: Literal["reject", "skip"] = "reject",
-        source: (
-            str
-            | ReactiveStateEngine
-            | ReactiveLatestEngine
-            | StreamTableMaterializer
-            | TimeSeriesEngine
-            | BarGeneratorEngine
-            | CrossSectionalEngine
-            | ZmqSource
-            | SegmentStreamSource
-            | None
-        ) = None,
-        master: MasterClient | None = None,
-        buffer_capacity: int = 1024,
-        overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int | None = None,
-        xfast: bool = False,
-        descriptor_publisher: object | None = None,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def write(self, value: WriteValue) -> None: ...
-    def output_schema(self) -> pa.Schema: ...
-    def status(self) -> str: ...
-    def metrics(self) -> dict[str, int]: ...
-    def config(self) -> dict[str, object]: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
-class ReactiveLatestEngine:
-    def __init__(
-        self,
-        name: str,
-        input_schema: pa.Schema | None = None,
-        by: str | list[str] | None = None,
-        target: PublisherTarget | None = None,
-        *,
-        source: (
-            str
-            | ReactiveStateEngine
-            | ReactiveLatestEngine
-            | StreamTableMaterializer
-            | TimeSeriesEngine
-            | BarGeneratorEngine
-            | ZmqSource
-            | SegmentStreamSource
-            | None
-        ) = None,
-        master: MasterClient | None = None,
-        buffer_capacity: int = 1024,
-        overflow_policy: _OverflowPolicyValue | None = None,
-        xfast: bool = False,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def write(self, value: WriteValue) -> None: ...
-    def output_schema(self) -> pa.Schema: ...
-    def status(self) -> str: ...
-    def metrics(self) -> dict[str, int]: ...
-    def config(self) -> dict[str, object]: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
-class StreamTableMaterializer:
-    def __init__(
-        self,
-        name: str,
-        input_schema: pa.Schema,
-        target: PublisherTarget,
-        *,
-        source: (
-            str
-            | ReactiveStateEngine
-            | ReactiveLatestEngine
-            | StreamTableMaterializer
-            | TimeSeriesEngine
-            | BarGeneratorEngine
-            | ZmqSource
-            | SegmentStreamSource
-            | None
-        ) = None,
-        master: MasterClient | None = None,
-        buffer_capacity: int = 1024,
-        overflow_policy: _OverflowPolicyValue | None = None,
-        xfast: bool = False,
-        descriptor_publisher: object | None = None,
-        row_capacity: int | None = None,
-        writer_epoch: int | None = None,
-        retention_segments: int | None = None,
-        retention_guard: object | None = None,
-        dt_column: str | None = None,
-        id_column: str | None = None,
-        dt_part: str | None = None,
-        persist_path: str | None = None,
-        persist_publisher: object | None = None,
-        descriptor_forwarding: bool = False,
-        frame_per_batch: bool = False,
-        shard_key: list[str] | None = None,
-        shard_nums: int | None = None,
-        shard_version: int | None = None,
-        shard_stream_names: list[str] | None = None,
-        shard_writer_epochs: list[int] | None = None,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def write(self, value: WriteValue) -> None: ...
-    def output_schema(self) -> pa.Schema: ...
-    def status(self) -> str: ...
-    def metrics(self) -> dict[str, int]: ...
-    def config(self) -> dict[str, object]: ...
-    def active_descriptor(self) -> dict[str, object]: ...
-    def shard_names(self) -> list[str]: ...
-    def active_descriptors(self) -> list[dict[str, object]]: ...
-    def failed_shards(self) -> list[dict[str, object]]: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
-class KeyValueTableMaterializer:
-    def snapshot(self) -> pa.RecordBatch: ...
-    def __init__(
-        self,
-        name: str,
-        input_schema: pa.Schema,
-        by: str | list[str],
-        target: PublisherTarget,
-        *,
-        source: (
-            str
-            | ReactiveStateEngine
-            | ReactiveLatestEngine
-            | StreamTableMaterializer
-            | KeyValueTableMaterializer
-            | TimeSeriesEngine
-            | BarGeneratorEngine
-            | CrossSectionalEngine
-            | ZmqSource
-            | SegmentStreamSource
-            | None
-        ) = None,
-        master: MasterClient | None = None,
-        buffer_capacity: int = 1024,
-        overflow_policy: _OverflowPolicyValue | None = None,
-        xfast: bool = False,
-        descriptor_publisher: object | None = None,
-        row_capacity: int | None = None,
-        retention_guard: object | None = None,
-        replacement_retention_snapshots: int | None = None,
-        changelog_name: str | None = None,
-        changelog_descriptor_publisher: object | None = None,
-        changelog_writer_epoch: int | None = None,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def write(self, value: WriteValue) -> None: ...
-    def output_schema(self) -> pa.Schema: ...
-    def status(self) -> str: ...
-    def metrics(self) -> dict[str, int]: ...
-    def config(self) -> dict[str, object]: ...
-    def active_descriptor(self) -> dict[str, object]: ...
-    def changelog_active_descriptor(self) -> dict[str, object]: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
 class KeyValueState:
     def select(self, keys: list[list[str]]) -> pa.RecordBatch: ...
     def __init__(self, snapshot: pa.RecordBatch, max_pending_bytes: int) -> None: ...
@@ -579,108 +181,60 @@ class KeyValueState:
     @property
     def sequence(self) -> int: ...
 
-class TimeSeriesEngine:
-    def __init__(
-        self,
+def version() -> str: ...
+
+class NativeProcessor:
+    @staticmethod
+    def identity(name: str, input_schema: pa.Schema) -> NativeProcessor: ...
+    @staticmethod
+    def chain(
+        name: str,
+        processors: list[NativeProcessor],
+        *,
+        max_intermediate_bytes: int = 67_108_864,
+    ) -> NativeProcessor: ...
+    @staticmethod
+    def reactive(
+        name: str,
+        input_schema: pa.Schema,
+        id_column: str,
+        factors: list[ReactiveFactor],
+        *,
+        id_filter: list[str] | None = None,
+        state_failure_policy: str = "fail_fast",
+        invalid_value_policy: str = "reject",
+    ) -> NativeProcessor: ...
+    @staticmethod
+    def latest(name: str, input_schema: pa.Schema, by: list[str]) -> NativeProcessor: ...
+    @staticmethod
+    def timeseries(
         name: str,
         input_schema: pa.Schema,
         id_column: str,
         dt_column: str,
-        late_data_policy: _LateDataPolicyValue,
+        window_ns: int,
         factors: list[AggregationFactor],
-        target: PublisherTarget,
         *,
-        window: Duration | int | None = None,
-        window_type: _WindowTypeValue | None = None,
-        window_ns: int | None = None,
+        late_data_policy: str = "reject",
         pre_factors: list[ExpressionFactor] | None = None,
         post_factors: list[ExpressionFactor] | None = None,
         id_filter: list[str] | None = None,
-        source: (
-            str
-            | ReactiveStateEngine
-            | ReactiveLatestEngine
-            | StreamTableMaterializer
-            | TimeSeriesEngine
-            | BarGeneratorEngine
-            | ZmqSource
-            | SegmentStreamSource
-            | None
-        ) = None,
-        master: MasterClient | None = None,
-        buffer_capacity: int = 1024,
-        overflow_policy: _OverflowPolicyValue | None = None,
-        xfast: bool = False,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def write(self, value: WriteValue) -> None: ...
-    def output_schema(self) -> pa.Schema: ...
-    def status(self) -> str: ...
-    def metrics(self) -> dict[str, int]: ...
-    def config(self) -> dict[str, object]: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
-class BarGeneratorEngine:
-    def __init__(
-        self,
-        name: str,
-        input_schema: pa.Schema,
-        profile: object,
-        target: PublisherTarget,
-        *,
-        source: (
-            str
-            | ReactiveStateEngine
-            | ReactiveLatestEngine
-            | StreamTableMaterializer
-            | KeyValueTableMaterializer
-            | TimeSeriesEngine
-            | BarGeneratorEngine
-            | CrossSectionalEngine
-            | ZmqSource
-            | SegmentStreamSource
-            | None
-        ) = None,
-        master: MasterClient | None = None,
-        buffer_capacity: int = 1024,
-        overflow_policy: _OverflowPolicyValue | None = None,
-        xfast: bool = False,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def write(self, value: WriteValue) -> None: ...
-    def output_schema(self) -> pa.Schema: ...
-    def status(self) -> str: ...
-    def metrics(self) -> dict[str, int]: ...
-    def config(self) -> dict[str, object]: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
-class CrossSectionalEngine:
-    def __init__(
-        self,
+    ) -> NativeProcessor: ...
+    @staticmethod
+    def cross_sectional(
         name: str,
         input_schema: pa.Schema,
         id_column: str,
         dt_column: str,
-        trigger_interval: Duration | int,
-        late_data_policy: _LateDataPolicyValue,
+        trigger_interval_ns: int,
         factors: list[CrossSectionalFactor],
-        target: PublisherTarget,
-        *,
-        source: str | TimeSeriesEngine | BarGeneratorEngine | ZmqSource | None = None,
-        master: MasterClient | None = None,
-        buffer_capacity: int = 1024,
-        overflow_policy: _OverflowPolicyValue | None = None,
-        xfast: bool = False,
-    ) -> None: ...
-    def start(self) -> None: ...
-    def write(self, value: WriteValue) -> None: ...
+    ) -> NativeProcessor: ...
+    @staticmethod
+    def bars(name: str, input_schema: pa.Schema, profile: object) -> NativeProcessor: ...
+    def input_schema(self) -> pa.Schema: ...
     def output_schema(self) -> pa.Schema: ...
-    def status(self) -> str: ...
-    def metrics(self) -> dict[str, int]: ...
-    def config(self) -> dict[str, object]: ...
-    def flush(self) -> None: ...
-    def stop(self) -> None: ...
-
-def version() -> str: ...
+    def process(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]: ...
+    def flush(self) -> list[pa.RecordBatch]: ...
+    def finish(self) -> list[pa.RecordBatch]: ...
+    def transfer(self) -> NativeProcessor: ...
+    def close(self) -> None: ...

@@ -711,56 +711,31 @@ def format_pm_toml(config: dict[str, object]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def master_task(master_uri: str = DEFAULT_MASTER_URI) -> dict[str, object]:
+def server_task(
+    master_uri: str = DEFAULT_MASTER_URI, *, config: str | None = None
+) -> dict[str, object]:
     """
-    Build the managed zippy master task definition.
+    Build the single managed server task definition.
 
-    :param master_uri: TCP master URI passed to ``zippy master run``.
+    :param master_uri: TCP master URI passed to ``zippy server run --foreground``.
     :type master_uri: str
+    :param config: Optional server TOML path, including Gateway and Flight configuration.
+    :type config: str | None
     :returns: Task dictionary containing command, arguments, and TCP health check.
     :rtype: dict[str, object]
     :raises ValueError: If ``master_uri`` is not a TCP URI.
     """
+    args = ["server", "run", "--foreground", master_uri]
+    if config is not None:
+        args.extend(["--config", config])
     return {
         "cmd": "zippy",
-        "args": ["master", "run", master_uri],
+        "args": args,
         "autostart": True,
         "health": {
             "type": "tcp",
             "address": _tcp_health_address(master_uri),
         },
-    }
-
-
-def gateway_task(
-    master_uri: str = DEFAULT_MASTER_URI,
-    *,
-    endpoint: str | None = None,
-    token: str | None = None,
-) -> dict[str, object]:
-    """
-    Build the managed zippy gateway task definition.
-
-    :param master_uri: Master URI used by the gateway process.
-    :type master_uri: str
-    :param endpoint: Optional gateway endpoint.
-    :type endpoint: str | None
-    :param token: Optional gateway access token.
-    :type token: str | None
-    :returns: Task dictionary that starts after the master task is healthy.
-    :rtype: dict[str, object]
-    """
-    args = ["gateway", "run", "--master-uri", master_uri]
-    if endpoint is not None:
-        args.extend(["--endpoint", endpoint])
-    if token is not None:
-        args.extend(["--token", token])
-    return {
-        "cmd": "zippy",
-        "args": args,
-        "depends_on": ["master"],
-        "start_when": "healthy",
-        "autostart": True,
     }
 
 

@@ -1,9 +1,6 @@
-//! Manual release benchmarks for legacy query transport and native Flight ingest.
+//! Manual release benchmarks for native Flight ingest.
 
 use std::fs;
-use std::io::{Cursor, Write};
-use std::net::TcpStream;
-use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,7 +9,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::Int64Array;
-use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -21,50 +17,25 @@ use futures::{SinkExt, TryStreamExt};
 use prost::Message;
 use serde::Serialize;
 use zippy_protocol::ingest::encode_put_descriptor;
-use zippy_protocol::query::{
-    encode_query_descriptor, encode_query_request, FlightQueryRequest, FlightTableBinding,
-};
 use zippy_protocol::wire::{
     PutBatchResult, PutCommand, PutDurability, PutMutation, SessionOpenRequest,
     SessionOpenResponse, SessionRole,
 };
 use zippy_protocol::{AUTHORIZATION_METADATA_KEY, CURRENT_PROTOCOL_VERSION};
-use zippy_types::query::{QueryInput, QueryPriority, QueryRequest};
-use zippy_types::table::{CatalogName, TableRef};
-use zippy_types::{ConnectionId, ProducerId, QueryId, RequestId, ResourceLimit, SessionId};
+use zippy_types::{ConnectionId, ProducerId, RequestId, SessionId};
 
 use super::{
-    append_table_schema, read_gateway_frame, reserve_tcp_addr,
-    runtime_config_with_native_flight_frontend_and_persist_root,
-    runtime_config_with_native_query_frontend_and_persist_root, seed_legacy_append_table,
-    seed_native_append_table, wait_until_bindable, write_test_parquet, LegacyServerRuntime,
+    append_table_schema, reserve_tcp_addr, runtime_config_with_native_flight_frontend,
+    seed_native_append_table, wait_until_bindable, ServerRuntime,
 };
 
-const GATEWAY_TOKEN: &str = "shadow-catalog-test";
 const FLIGHT_READ_TOKEN: &str = "transport-perf-flight-read-token-00000001";
 const FLIGHT_WRITER_TOKEN: &str = "transport-perf-flight-writer-token-000001";
-const DEFAULT_SOURCE_ROWS: usize = 262_144;
 const DEFAULT_WARMUP_SAMPLES: usize = 3;
 const DEFAULT_MEASURED_SAMPLES: usize = 100;
-const DEFAULT_QUERY_ROWS: &[usize] = &[1, 1_024, 65_536];
 const DEFAULT_WRITE_ROWS: &[usize] = &[1, 1_024, 65_536];
-const DEFAULT_RESULT_BATCH_ROWS: usize = 8_192;
-const DEFAULT_MIN_FLIGHT_THROUGHPUT_RATIO: f64 = 0.90;
-const DEFAULT_MAX_FLIGHT_P99_RATIO: f64 = 1.20;
-const REPORT_VERSION: u32 = 3;
 const NATIVE_INGEST_REPORT_VERSION: u32 = 2;
 const PERSISTENT_INGEST_REPORT_VERSION: u32 = 1;
-
-#[derive(Debug, Clone)]
-struct BenchmarkConfig {
-    source_rows: usize,
-    warmup_samples: usize,
-    measured_samples: usize,
-    query_rows: Vec<usize>,
-    min_flight_throughput_ratio: f64,
-    max_flight_p99_ratio: f64,
-    output_path: Option<std::path::PathBuf>,
-}
 
 #[derive(Debug, Clone)]
 struct NativeIngestBenchmarkConfig {
@@ -99,73 +70,6 @@ impl NativeIngestBenchmarkConfig {
                 .map(Into::into),
         }
     }
-}
-
-impl BenchmarkConfig {
-    fn from_environment() -> Self {
-        let source_rows = env_usize("ZIPPY_TRANSPORT_PERF_SOURCE_ROWS", DEFAULT_SOURCE_ROWS);
-        let warmup_samples = env_usize(
-            "ZIPPY_TRANSPORT_PERF_WARMUP_SAMPLES",
-            DEFAULT_WARMUP_SAMPLES,
-        );
-        let measured_samples = env_usize_with_legacy_alias(
-            "ZIPPY_TRANSPORT_PERF_MEASURED_SAMPLES",
-            "ZIPPY_TRANSPORT_PERF_SAMPLES",
-            DEFAULT_MEASURED_SAMPLES,
-        );
-        assert!(source_rows > 0, "source row count must be positive");
-        assert!(
-            measured_samples > 0,
-            "measured sample count must be positive"
-        );
-        let query_rows = env_row_counts("ZIPPY_TRANSPORT_PERF_QUERY_ROWS", DEFAULT_QUERY_ROWS);
-        let min_flight_throughput_ratio = env_f64(
-            "ZIPPY_TRANSPORT_PERF_MIN_FLIGHT_THROUGHPUT_RATIO",
-            DEFAULT_MIN_FLIGHT_THROUGHPUT_RATIO,
-        );
-        let max_flight_p99_ratio = env_f64(
-            "ZIPPY_TRANSPORT_PERF_MAX_FLIGHT_P99_RATIO",
-            DEFAULT_MAX_FLIGHT_P99_RATIO,
-        );
-        assert!(
-            query_rows.iter().all(|rows| *rows <= source_rows),
-            "query row counts must not exceed source rows"
-        );
-        assert!(
-            min_flight_throughput_ratio.is_finite() && min_flight_throughput_ratio > 0.0,
-            "minimum Flight throughput ratio must be positive and finite"
-        );
-        assert!(
-            max_flight_p99_ratio.is_finite() && max_flight_p99_ratio > 0.0,
-            "maximum Flight p99 ratio must be positive and finite"
-        );
-        Self {
-            source_rows,
-            warmup_samples,
-            measured_samples,
-            query_rows,
-            min_flight_throughput_ratio,
-            max_flight_p99_ratio,
-            output_path: std::env::var_os("ZIPPY_TRANSPORT_PERF_REPORT_JSON").map(Into::into),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct BenchmarkReport {
-    format_version: u32,
-    git_sha: String,
-    target: String,
-    started_at_unix_ms: u128,
-    source_rows: usize,
-    warmup_samples: usize,
-    measured_samples: usize,
-    flight_session_open_micros: FlightSessionOpenLatency,
-    scenarios: Vec<ScenarioReport>,
-    gates: GateReport,
-    gateway_metrics: serde_json::Value,
-    flight_metrics: FlightMetrics,
-    process_rss_kib: ProcessRss,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,17 +122,6 @@ struct NativeIngestMetrics {
 }
 
 #[derive(Debug, Serialize)]
-struct ScenarioReport {
-    operation: &'static str,
-    rows_per_operation: usize,
-    logical_bytes_per_operation: usize,
-    gateway: SampleSummary,
-    flight: SampleSummary,
-    flight_to_gateway_rows_per_sec: f64,
-    flight_to_gateway_p99_latency: f64,
-}
-
-#[derive(Debug, Serialize)]
 struct SampleSummary {
     samples: usize,
     total_rows: u64,
@@ -265,20 +158,6 @@ struct ProcessRss {
     before_kib: u64,
     after_kib: u64,
     peak_kib: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct FlightSessionOpenLatency {
-    read: f64,
-    writer: Option<f64>,
-}
-
-#[derive(Debug, Serialize)]
-struct GateReport {
-    min_flight_throughput_ratio: f64,
-    max_flight_p99_ratio: f64,
-    pass: bool,
-    failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -336,144 +215,6 @@ impl RssSampler {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual release benchmark; run with --ignored --test-threads=1"]
-async fn flight_gateway_transport_performance_baseline() {
-    let config = BenchmarkConfig::from_environment();
-    let started_at_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock must follow the Unix epoch")
-        .as_millis();
-    let temp = tempfile::tempdir().expect("create transport benchmark directory");
-    let data_dir = temp.path().join("database");
-    let persist_root = temp.path().join("persisted");
-    fs::create_dir_all(&persist_root).expect("create persisted benchmark directory");
-    let parquet_path = persist_root.join("events.parquet");
-    write_test_parquet(
-        &parquet_path,
-        (0..config.source_rows)
-            .map(|value| i64::try_from(value).expect("source row index fits i64"))
-            .collect(),
-    );
-    seed_legacy_append_table(&data_dir, &persist_root, &parquet_path, config.source_rows);
-
-    let gateway_addr = reserve_tcp_addr();
-    let flight_addr = reserve_tcp_addr();
-    let runtime_config =
-        transport_runtime_config(&temp, &data_dir, &persist_root, gateway_addr, flight_addr);
-    let mut runtime = LegacyServerRuntime::start(runtime_config)
-        .expect("start combined Gateway and Flight benchmark runtime");
-    let health = runtime.health();
-    assert!(health.readiness.gateway_listener_ready);
-    assert!(health.readiness.flight_protocol_ready);
-
-    let (mut flight_reader, read_session, read_session_open) =
-        authenticated_flight_client(flight_addr, FLIGHT_READ_TOKEN, SessionRole::Read).await;
-    let gateway_endpoint = gateway_addr.to_string();
-    let rss_before = process_rss_kib().unwrap_or(0);
-    let rss_sampler = RssSampler::start(rss_before);
-    let mut identity = 1_u128;
-    let mut scenarios = Vec::new();
-
-    for rows in config.query_rows.iter().copied() {
-        let logical_bytes = rows.saturating_mul(std::mem::size_of::<i64>());
-        let mut gateway_samples = Vec::with_capacity(config.measured_samples);
-        let mut flight_samples = Vec::with_capacity(config.measured_samples);
-        for sample in 0..config
-            .warmup_samples
-            .saturating_add(config.measured_samples)
-        {
-            let gateway_first = sample % 2 == 0;
-            if gateway_first {
-                let elapsed = timed_gateway_query(&gateway_endpoint, identity, rows);
-                identity += 2;
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut gateway_samples);
-                let elapsed =
-                    timed_flight_query(&mut flight_reader, read_session, identity, rows).await;
-                identity += 1;
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut flight_samples);
-            } else {
-                let elapsed =
-                    timed_flight_query(&mut flight_reader, read_session, identity, rows).await;
-                identity += 1;
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut flight_samples);
-                let elapsed = timed_gateway_query(&gateway_endpoint, identity, rows);
-                identity += 2;
-                record_after_warmup(sample, config.warmup_samples, elapsed, &mut gateway_samples);
-            }
-        }
-        scenarios.push(scenario_report(
-            "query",
-            rows,
-            logical_bytes,
-            gateway_samples,
-            flight_samples,
-        ));
-    }
-
-    let gateway_metrics = runtime
-        .gateway_metrics()
-        .expect("combined runtime exposes Gateway metrics");
-    let flight_status = runtime
-        .flight_status()
-        .expect("combined runtime exposes Flight metrics");
-    assert_eq!(flight_status.pending_tickets, 0);
-    assert_eq!(flight_status.active_puts, 0);
-    let rss_after = process_rss_kib().unwrap_or(0);
-    let rss_peak = rss_sampler.stop().max(rss_before).max(rss_after);
-    let gates = evaluate_gates(
-        &scenarios,
-        config.min_flight_throughput_ratio,
-        config.max_flight_p99_ratio,
-    );
-    let gates_pass = gates.pass;
-    let report = BenchmarkReport {
-        format_version: REPORT_VERSION,
-        git_sha: current_git_sha(),
-        target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        started_at_unix_ms,
-        source_rows: config.source_rows,
-        warmup_samples: config.warmup_samples,
-        measured_samples: config.measured_samples,
-        flight_session_open_micros: FlightSessionOpenLatency {
-            read: duration_micros(read_session_open),
-            writer: None,
-        },
-        scenarios,
-        gates,
-        gateway_metrics,
-        flight_metrics: FlightMetrics {
-            issued_tickets: flight_status.issued_tickets,
-            consumed_tickets: flight_status.consumed_tickets,
-            put_batches: flight_status.put_batches,
-            put_rows: flight_status.put_rows,
-            put_bytes: flight_status.put_bytes,
-            active_puts: flight_status.active_puts,
-            transport_buffer_bytes_in_use: flight_status.transport_buffer_bytes_in_use,
-        },
-        process_rss_kib: ProcessRss {
-            before_kib: rss_before,
-            after_kib: rss_after,
-            peak_kib: rss_peak,
-        },
-    };
-    let encoded = serde_json::to_string_pretty(&report).expect("encode benchmark report");
-    println!("{encoded}");
-    if let Some(path) = config.output_path.as_ref() {
-        write_report(path, encoded.as_bytes());
-    }
-
-    drop(flight_reader);
-    let outcome = runtime.shutdown();
-    assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
-    wait_until_bindable(flight_addr);
-    wait_until_bindable(gateway_addr);
-    assert!(
-        gates_pass,
-        "Flight/Gateway transport performance gate failed"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "manual release benchmark; run with --ignored --test-threads=1"]
 async fn native_flight_ingest_performance_baseline() {
     const STREAM_NAME: &str = "native_flight_ingest_perf";
 
@@ -484,17 +225,13 @@ async fn native_flight_ingest_performance_baseline() {
         .as_millis();
     let temp = tempfile::tempdir().expect("create native Flight ingest benchmark directory");
     let data_dir = temp.path().join("database");
-    let persist_root = temp.path().join("persisted");
-    fs::create_dir_all(&persist_root).expect("create native persisted benchmark directory");
     seed_native_append_table(&data_dir, STREAM_NAME).await;
     let flight_addr = reserve_tcp_addr();
-    let runtime_config = native_ingest_runtime_config(&temp, &data_dir, &persist_root, flight_addr);
-    let mut runtime = LegacyServerRuntime::start(runtime_config)
-        .expect("start native Flight ingest benchmark runtime");
+    let runtime_config = native_ingest_runtime_config(&temp, &data_dir, flight_addr);
+    let mut runtime =
+        ServerRuntime::start(runtime_config).expect("start native Flight ingest benchmark runtime");
     let health = runtime.health();
-    assert!(!health.readiness.gateway_configured);
     assert!(health.readiness.flight_protocol_ready);
-    assert!(!health.readiness.memory_ingest_configured);
     assert!(runtime.native_ingest_status().unwrap().accepting);
 
     let (mut flight_writer, write_session, writer_session_open) =
@@ -647,12 +384,10 @@ async fn native_flight_persistent_ingest_performance_baseline() {
         .as_millis();
     let temp = tempfile::tempdir().expect("create persistent ingest benchmark directory");
     let data_dir = temp.path().join("database");
-    let persist_root = temp.path().join("persisted");
-    fs::create_dir_all(&persist_root).expect("create persistent ingest benchmark persist root");
     seed_native_append_table(&data_dir, STREAM_NAME).await;
     let flight_addr = reserve_tcp_addr();
-    let runtime_config = native_ingest_runtime_config(&temp, &data_dir, &persist_root, flight_addr);
-    let mut runtime = LegacyServerRuntime::start(runtime_config)
+    let runtime_config = native_ingest_runtime_config(&temp, &data_dir, flight_addr);
+    let mut runtime = ServerRuntime::start(runtime_config)
         .expect("start persistent Flight ingest benchmark runtime");
     let (mut flight_writer, write_session, writer_session_open) =
         authenticated_flight_client(flight_addr, FLIGHT_WRITER_TOKEN, SessionRole::Writer).await;
@@ -756,15 +491,9 @@ async fn native_flight_persistent_ingest_performance_baseline() {
 fn native_ingest_runtime_config(
     temp: &tempfile::TempDir,
     data_dir: &Path,
-    persist_root: &Path,
     flight_addr: std::net::SocketAddr,
-) -> super::LegacyServerRuntimeConfig {
-    let config = runtime_config_with_native_flight_frontend_and_persist_root(
-        temp,
-        data_dir,
-        flight_addr,
-        persist_root,
-    );
+) -> super::ServerRuntimeConfig {
+    let config = runtime_config_with_native_flight_frontend(temp, data_dir, flight_addr);
     let config_path = config
         .master()
         .config_path
@@ -780,9 +509,7 @@ fn native_ingest_runtime_config(
         .expect("protect native Flight read token");
     fs::set_permissions(&writer_token_path, fs::Permissions::from_mode(0o600))
         .expect("protect native Flight writer token");
-    let source = fs::read_to_string(config_path)
-        .expect("read native Flight benchmark config")
-        .replace("backend = \"sqlite_shadow\"", "backend = \"sqlite\"");
+    let source = fs::read_to_string(config_path).expect("read native Flight benchmark config");
     let source = format!(
         concat!(
             "{}\n\n",
@@ -806,49 +533,6 @@ fn native_ingest_runtime_config(
         writer_token_path.display().to_string(),
     );
     fs::write(config_path, source).expect("write native Flight benchmark config");
-    config
-}
-
-fn transport_runtime_config(
-    temp: &tempfile::TempDir,
-    data_dir: &Path,
-    persist_root: &Path,
-    gateway_addr: std::net::SocketAddr,
-    flight_addr: std::net::SocketAddr,
-) -> super::LegacyServerRuntimeConfig {
-    let config = runtime_config_with_native_query_frontend_and_persist_root(
-        temp,
-        data_dir,
-        gateway_addr,
-        persist_root,
-    );
-    let config_path = config
-        .master()
-        .config_path
-        .as_ref()
-        .expect("benchmark runtime config has an explicit path");
-    let read_token_path = temp.path().join("flight-read.token");
-    fs::write(&read_token_path, format!("{FLIGHT_READ_TOKEN}\n")).expect("write Flight read token");
-    fs::set_permissions(&read_token_path, fs::Permissions::from_mode(0o600))
-        .expect("protect Flight read token");
-    let mut source = fs::read_to_string(config_path).expect("read benchmark runtime config");
-    source.push_str(&format!(
-        concat!(
-            "\n[flight]\n",
-            "enabled = true\n",
-            "endpoint = {:?}\n",
-            "max_message_bytes = 2097152\n",
-            "max_pending_tickets = 64\n\n",
-            "[flight.auth]\n",
-            "enabled = true\n",
-            "token_file = {:?}\n",
-            "session_ttl_ms = 600000\n",
-            "max_sessions = 8\n"
-        ),
-        flight_addr.to_string(),
-        read_token_path.display().to_string(),
-    ));
-    fs::write(config_path, source).expect("write combined benchmark runtime config");
     config
 }
 
@@ -898,129 +582,6 @@ async fn authenticated_flight_client(
     (client, session_id, started.elapsed())
 }
 
-fn timed_gateway_query(endpoint: &str, identity: u128, rows: usize) -> OperationSample {
-    let header = serde_json::json!({
-        "kind": "query_sql",
-        "token": GATEWAY_TOKEN,
-        "query_id": QueryId::from_u128(identity).expect("query ID is nonzero"),
-        "session_id": SessionId::from_u128(identity + 1).expect("session ID is nonzero"),
-        "sql": format!("SELECT value FROM events LIMIT {rows}"),
-        "bindings": [{
-            "sql_name": "events",
-            "table": {"type": "name", "namespace": "default", "table": "events"},
-        }],
-        "result_batch_rows": DEFAULT_RESULT_BATCH_ROWS,
-    });
-    let encoded_header = serde_json::to_vec(&header).expect("encode Gateway query header");
-    let started = Instant::now();
-    let mut stream = TcpStream::connect(endpoint).expect("connect Gateway query endpoint");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("set Gateway query timeout");
-    stream
-        .write_all(&(encoded_header.len() as u32).to_be_bytes())
-        .expect("write Gateway query header length");
-    stream
-        .write_all(&0_u64.to_be_bytes())
-        .expect("write Gateway query payload length");
-    stream
-        .write_all(&encoded_header)
-        .expect("write Gateway query header");
-    let mut returned_rows = 0_usize;
-    let mut prepare = None;
-    let mut time_to_first_batch = None;
-    loop {
-        let (header, payload) = read_gateway_frame(&mut stream);
-        assert_ne!(header["status"], "error", "Gateway query failed: {header}");
-        match header.get("kind").and_then(serde_json::Value::as_str) {
-            Some("collect_start") => prepare = Some(started.elapsed()),
-            Some("collect_chunk") => {
-                let reader = StreamReader::try_new(Cursor::new(payload), None)
-                    .expect("decode Gateway query Arrow stream");
-                returned_rows += reader
-                    .map(|batch| batch.expect("decode Gateway query batch").num_rows())
-                    .sum::<usize>();
-                time_to_first_batch.get_or_insert_with(|| started.elapsed());
-            }
-            Some("collect_end") => break,
-            kind => panic!("unexpected Gateway query frame kind=[{kind:?}]"),
-        }
-    }
-    let elapsed = started.elapsed();
-    assert_eq!(returned_rows, rows);
-    OperationSample {
-        total: elapsed,
-        prepare,
-        time_to_first_batch,
-    }
-}
-
-async fn timed_flight_query(
-    client: &mut FlightClient,
-    session_id: SessionId,
-    identity: u128,
-    rows: usize,
-) -> OperationSample {
-    let table = TableRef::Name {
-        namespace: CatalogName::new("default").expect("valid namespace"),
-        table: CatalogName::new("events").expect("valid table name"),
-    };
-    let request = FlightQueryRequest {
-        request: QueryRequest {
-            query_id: QueryId::from_u128(identity).expect("query ID is nonzero"),
-            session_id,
-            input: QueryInput::Sql(format!("SELECT value FROM events LIMIT {rows}")),
-            tables: vec![table.clone()],
-            priority: QueryPriority::Interactive,
-            deadline_ns: None,
-            memory_limit_bytes: ResourceLimit::ServerDefault,
-            spill_limit_bytes: ResourceLimit::Disabled,
-            result_batch_rows: NonZeroU32::new(
-                u32::try_from(DEFAULT_RESULT_BATCH_ROWS).expect("result batch size fits u32"),
-            ),
-        },
-        bindings: vec![FlightTableBinding {
-            sql_name: "events".to_owned(),
-            table,
-        }],
-    };
-    let descriptor = encode_query_descriptor(
-        &encode_query_request(&request).expect("encode benchmark Flight query"),
-    );
-    let started = Instant::now();
-    let info = client
-        .get_flight_info(descriptor)
-        .await
-        .expect("prepare benchmark Flight query");
-    let prepare = started.elapsed();
-    let mut stream = client
-        .do_get(
-            info.endpoint[0]
-                .ticket
-                .clone()
-                .expect("Flight query has a ticket"),
-        )
-        .await
-        .expect("start benchmark Flight query");
-    let mut returned_rows = 0_usize;
-    let mut time_to_first_batch = None;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .expect("decode benchmark Flight query batch")
-    {
-        returned_rows = returned_rows.saturating_add(batch.num_rows());
-        time_to_first_batch.get_or_insert_with(|| started.elapsed());
-    }
-    let elapsed = started.elapsed();
-    assert_eq!(returned_rows, rows);
-    OperationSample {
-        total: elapsed,
-        prepare: Some(prepare),
-        time_to_first_batch,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn timed_native_flight_write(
     client: &mut FlightClient,
@@ -1037,6 +598,8 @@ async fn timed_native_flight_write(
     let rows = batch.num_rows();
     let put_id = RequestId::from_u128(identity).expect("put ID is nonzero");
     let descriptor = encode_put_descriptor(&PutCommand {
+        expected_table_id: None,
+        namespace: "default".to_owned(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         session_id: session_id.into_bytes().to_vec().into(),
         put_id: put_id.into_bytes().to_vec().into(),
@@ -1094,6 +657,8 @@ async fn timed_native_flight_persistent_writes(
 ) -> (Vec<OperationSample>, u64) {
     let put_id = RequestId::from_u128(identity).expect("put ID is nonzero");
     let descriptor = encode_put_descriptor(&PutCommand {
+        expected_table_id: None,
+        namespace: "default".to_owned(),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         session_id: session_id.into_bytes().to_vec().into(),
         put_id: put_id.into_bytes().to_vec().into(),
@@ -1207,34 +772,6 @@ fn record_after_warmup(
     }
 }
 
-fn scenario_report(
-    operation: &'static str,
-    rows_per_operation: usize,
-    logical_bytes_per_operation: usize,
-    gateway_samples: Vec<OperationSample>,
-    flight_samples: Vec<OperationSample>,
-) -> ScenarioReport {
-    let gateway = sample_summary(
-        &gateway_samples,
-        rows_per_operation,
-        logical_bytes_per_operation,
-    );
-    let flight = sample_summary(
-        &flight_samples,
-        rows_per_operation,
-        logical_bytes_per_operation,
-    );
-    ScenarioReport {
-        operation,
-        rows_per_operation,
-        logical_bytes_per_operation,
-        flight_to_gateway_rows_per_sec: ratio(flight.rows_per_second, gateway.rows_per_second),
-        flight_to_gateway_p99_latency: ratio(flight.latency_micros.p99, gateway.latency_micros.p99),
-        gateway,
-        flight,
-    }
-}
-
 fn sample_summary(
     samples: &[OperationSample],
     rows_per_operation: usize,
@@ -1319,48 +856,6 @@ fn percentile_uses_nearest_rank() {
     assert_eq!(percentile(&samples, 1.00), 100.0);
 }
 
-fn ratio(numerator: f64, denominator: f64) -> f64 {
-    if denominator == 0.0 {
-        0.0
-    } else {
-        numerator / denominator
-    }
-}
-
-fn evaluate_gates(
-    scenarios: &[ScenarioReport],
-    min_flight_throughput_ratio: f64,
-    max_flight_p99_ratio: f64,
-) -> GateReport {
-    let mut failures = Vec::new();
-    for scenario in scenarios {
-        if scenario.flight_to_gateway_rows_per_sec < min_flight_throughput_ratio {
-            failures.push(format!(
-                "Flight throughput ratio below gate operation=[{}] rows=[{}] ratio=[{:.6}] minimum=[{:.6}]",
-                scenario.operation,
-                scenario.rows_per_operation,
-                scenario.flight_to_gateway_rows_per_sec,
-                min_flight_throughput_ratio,
-            ));
-        }
-        if scenario.flight_to_gateway_p99_latency > max_flight_p99_ratio {
-            failures.push(format!(
-                "Flight p99 latency ratio above gate operation=[{}] rows=[{}] ratio=[{:.6}] maximum=[{:.6}]",
-                scenario.operation,
-                scenario.rows_per_operation,
-                scenario.flight_to_gateway_p99_latency,
-                max_flight_p99_ratio,
-            ));
-        }
-    }
-    GateReport {
-        min_flight_throughput_ratio,
-        max_flight_p99_ratio,
-        pass: failures.is_empty(),
-        failures,
-    }
-}
-
 fn duration_micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
 }
@@ -1369,22 +864,6 @@ fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).map_or(default, |value| {
         value
             .parse::<usize>()
-            .unwrap_or_else(|error| panic!("invalid {name} value=[{value}] error=[{error}]"))
-    })
-}
-
-fn env_usize_with_legacy_alias(name: &str, legacy_name: &str, default: usize) -> usize {
-    if std::env::var_os(name).is_some() {
-        env_usize(name, default)
-    } else {
-        env_usize(legacy_name, default)
-    }
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).map_or(default, |value| {
-        value
-            .parse::<f64>()
             .unwrap_or_else(|error| panic!("invalid {name} value=[{value}] error=[{error}]"))
     })
 }

@@ -183,7 +183,9 @@ impl fmt::Debug for OpenedSession {
 }
 
 pub(crate) struct SessionAuthority {
-    config: FlightBearerAuthConfig,
+    config: Option<FlightBearerAuthConfig>,
+    session_ttl: Duration,
+    max_sessions: usize,
     state: Mutex<SessionAuthorityState>,
     metrics: SessionAuthorityMetrics,
 }
@@ -215,37 +217,67 @@ impl SessionAuthority {
                 admission_open: true,
                 entries: HashMap::with_capacity(config.max_sessions.min(1_024)),
             }),
-            config,
+            session_ttl: config.session_ttl,
+            max_sessions: config.max_sessions,
+            config: Some(config),
             metrics: SessionAuthorityMetrics::default(),
         }
     }
 
+    pub(crate) fn validate_local_read(session_ttl: Duration, max_sessions: usize) -> Result<()> {
+        if session_ttl.is_zero() || session_ttl > MAX_SESSION_TTL || max_sessions == 0 {
+            return Err(invalid(
+                "local Flight session limits must be positive and TTL at most 24 hours",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn local_read(session_ttl: Duration, max_sessions: usize) -> Result<Self> {
+        Self::validate_local_read(session_ttl, max_sessions)?;
+        Ok(Self {
+            config: None,
+            session_ttl,
+            max_sessions,
+            state: Mutex::new(SessionAuthorityState {
+                admission_open: true,
+                entries: HashMap::with_capacity(max_sessions.min(1_024)),
+            }),
+            metrics: SessionAuthorityMetrics::default(),
+        })
+    }
+
     pub(crate) fn session_ttl(&self) -> Duration {
-        self.config.session_ttl
+        self.session_ttl
     }
 
     pub(crate) fn open(&self, metadata: &MetadataMap, now_ns: u64) -> Result<OpenedSession> {
-        let supplied = bearer_token(metadata).ok_or_else(|| self.authentication_failed())?;
-        let supplied_digest = digest(supplied.as_bytes());
-        let read_match = bool::from(self.config.bootstrap_digest.ct_eq(&supplied_digest));
-        let administrator_match = self
-            .config
-            .admin_bootstrap_digest
-            .as_ref()
-            .is_some_and(|digest| bool::from(digest.ct_eq(&supplied_digest)));
-        let writer_match = self
-            .config
-            .writer_bootstrap_digest
-            .as_ref()
-            .is_some_and(|digest| bool::from(digest.ct_eq(&supplied_digest)));
-        if !read_match && !administrator_match && !writer_match {
-            return Err(self.authentication_failed());
-        }
-        let role = if administrator_match {
-            FlightSessionRole::Administrator
-        } else if writer_match {
-            FlightSessionRole::Writer
+        let role = if let Some(config) = &self.config {
+            let supplied = bearer_token(metadata).ok_or_else(|| self.authentication_failed())?;
+            let supplied_digest = digest(supplied.as_bytes());
+            let read_match = bool::from(config.bootstrap_digest.ct_eq(&supplied_digest));
+            let administrator_match = config
+                .admin_bootstrap_digest
+                .as_ref()
+                .is_some_and(|digest| bool::from(digest.ct_eq(&supplied_digest)));
+            let writer_match = config
+                .writer_bootstrap_digest
+                .as_ref()
+                .is_some_and(|digest| bool::from(digest.ct_eq(&supplied_digest)));
+            if !read_match && !administrator_match && !writer_match {
+                return Err(self.authentication_failed());
+            }
+            if administrator_match {
+                FlightSessionRole::Administrator
+            } else if writer_match {
+                FlightSessionRole::Writer
+            } else {
+                FlightSessionRole::Read
+            }
         } else {
+            if metadata.contains_key(AUTHORIZATION_METADATA_KEY) {
+                return Err(self.authentication_failed());
+            }
             FlightSessionRole::Read
         };
         let expired = self.sweep_expired(now_ns);
@@ -255,7 +287,7 @@ impl SessionAuthority {
         if !state.admission_open {
             return Err(unavailable("Flight session admission is closed"));
         }
-        if state.entries.len() >= self.config.max_sessions {
+        if state.entries.len() >= self.max_sessions {
             self.metrics
                 .capacity_rejections
                 .fetch_add(1, Ordering::Relaxed);
@@ -266,8 +298,8 @@ impl SessionAuthority {
             .with_retryable(true));
         }
 
-        let expires_at_ns = now_ns
-            .saturating_add(u64::try_from(self.config.session_ttl.as_nanos()).unwrap_or(u64::MAX));
+        let expires_at_ns =
+            now_ns.saturating_add(u64::try_from(self.session_ttl.as_nanos()).unwrap_or(u64::MAX));
         for _ in 0..16 {
             let session_id = random_session_id()?;
             if state
@@ -331,6 +363,13 @@ impl SessionAuthority {
         })
     }
 
+    pub(crate) fn session_expiry(&self, session_id: SessionId) -> Option<u64> {
+        self.lock()
+            .entries
+            .values()
+            .find_map(|entry| (entry.session_id == session_id).then_some(entry.expires_at_ns))
+    }
+
     pub(crate) fn sweep_expired(&self, now_ns: u64) -> Vec<SessionId> {
         let expired = {
             let mut state = self.lock();
@@ -349,6 +388,17 @@ impl SessionAuthority {
             .expired_sessions
             .fetch_add(expired.len() as u64, Ordering::Relaxed);
         expired
+    }
+
+    pub(crate) fn revoke(&self, session_id: SessionId) -> bool {
+        let mut state = self.lock();
+        let token = state
+            .entries
+            .iter()
+            .find_map(|(token, entry)| (entry.session_id == session_id).then_some(*token));
+        token
+            .and_then(|token| state.entries.remove(&token))
+            .is_some()
     }
 
     pub(crate) fn close(&self) -> Vec<SessionId> {
@@ -482,6 +532,51 @@ mod tests {
     use tonic::metadata::MetadataValue;
 
     const BOOTSTRAP_TOKEN: &str = "test-only-flight-bootstrap-token-0001";
+
+    #[test]
+    fn local_read_sessions_use_the_same_bounded_token_authority() {
+        let authority = SessionAuthority::local_read(Duration::from_nanos(100), 1).unwrap();
+        let opened = authority.open(&MetadataMap::new(), 10).unwrap();
+        assert_eq!(opened.role, FlightSessionRole::Read);
+        assert_eq!(opened.expires_at_ns, 110);
+        let mut issued = MetadataMap::new();
+        issued.insert(
+            AUTHORIZATION_METADATA_KEY,
+            format!("Bearer {}", opened.bearer_token).parse().unwrap(),
+        );
+        assert_eq!(
+            authority.authenticate(&issued, 20).unwrap().session_id,
+            opened.session_id
+        );
+        assert_eq!(
+            authority.open(&issued, 20).unwrap_err().code(),
+            ErrorCode::Unauthenticated
+        );
+        assert_eq!(
+            authority.open(&MetadataMap::new(), 20).unwrap_err().code(),
+            ErrorCode::ResourceExhausted
+        );
+        let mut spoofed = MetadataMap::new();
+        spoofed.insert(
+            "x-zippy-session-id",
+            opened.session_id.to_string().parse().unwrap(),
+        );
+        assert_eq!(
+            authority.authenticate(&spoofed, 20).unwrap_err().code(),
+            ErrorCode::Unauthenticated
+        );
+        assert_eq!(
+            authority.authenticate(&issued, 110).unwrap_err().code(),
+            ErrorCode::Unauthenticated
+        );
+        let replacement = authority.open(&MetadataMap::new(), 111).unwrap();
+        assert_ne!(replacement.session_id, opened.session_id);
+        assert_eq!(authority.close(), vec![replacement.session_id]);
+        assert_eq!(
+            authority.open(&MetadataMap::new(), 112).unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+    }
 
     #[test]
     fn bootstrap_token_is_redacted_and_compared_before_session_issue() {

@@ -6,8 +6,6 @@ members = [
     "crates/zippy-core",
     "crates/zippy-operators",
     "crates/zippy-engines",
-    "crates/zippy-io",
-    "crates/zippy-gateway",
     "crates/zippy-ingest",
     "crates/zippy-python",
     "crates/zippy-perf",
@@ -17,7 +15,6 @@ members = [
     "crates/zippy-query",
     "crates/zippy-protocol",
     "crates/zippy-server",
-    "crates/zippy-client-py",
 ]
 resolver = "2"
 

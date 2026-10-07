@@ -1,5 +1,8 @@
 # Table Publish API Refactor Design
 
+> 历史设计：旧 Python Session/Pipeline、全局连接及表发布 API 已于 2026-09-22 删除。
+> 当前 API 见[原生示例指南](../examples/examples_guide.md)，当前实现边界见[能力表](current-capabilities-2026-09-21.md)。
+
 ## Background
 
 Zippy currently uses `stream_table()` for more than one table semantic. For normal
@@ -165,7 +168,7 @@ ReactiveLatestEngine + stream_table(name)
 New documentation should prefer the explicit semantic API: `append_table(...)` for independent
 events, `frame_table(..., by=...)` for complete ordered cross-sections, and
 `key_value_table(..., by=...)` for current state. `publish_append_table(...)` and
-`publish_key_value_table(...)` remain deprecated aliases for compatibility. `stream_table()` and
+`publish_key_value_table(...)` were removed; use the table builder followed by `.publish()`. `stream_table()` and
 `output_stream=...` never infer frame semantics because doing so would make strategy correctness
 depend on the engine class rather than an explicit publish contract.
 

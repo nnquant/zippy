@@ -1,5 +1,8 @@
 # Zippy Windows 可用性设计
 
+> 历史设计/验收说明：以下描述对应文中日期，不作为新版本安装和 API 指南。
+> 当前入口见[客户端使用指南](../clients/python/README.md)与[能力表](current-capabilities-2026-09-21.md)。
+
 > 日期：2026-05-02
 >
 > 目标：推进 Zippy 在 Windows 原生环境下的控制面和 live segment 跨进程链路可用性。

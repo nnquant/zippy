@@ -3,11 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -36,10 +35,17 @@ use zippy_types::{
     BoxFuture, ErrorCode, QueryId, Result, ServerError, ServerErrorDetails, SessionId,
 };
 
+use crate::admin::{
+    ALTER_TABLE_SCHEMA_ACTION, CREATE_NAMESPACE_ACTION, CREATE_TABLE_ACTION, DROP_TABLE_ACTION,
+    TABLE_DROP_CAPABILITY, TABLE_MANAGEMENT_CAPABILITY, TABLE_SCHEMA_CAPABILITY,
+};
 use crate::auth::{
     AuthenticatedFlightSession, FlightBearerAuthConfig, FlightSessionRole, SessionAuthority,
 };
 use crate::error::server_error_to_status;
+use crate::fixed_snapshot::{
+    CREATE_FIXED_SNAPSHOT_ACTION, FIXED_SNAPSHOT_CAPABILITY, RELEASE_FIXED_SNAPSHOT_ACTION,
+};
 use crate::ingest::{
     decode_put_descriptor, validate_put_batch_result, FlightPutBatch, FlightPutCommand,
     FlightPutLimits,
@@ -56,7 +62,7 @@ use crate::wire::{
     CapabilitiesRequest, CapabilitiesResponse, MetadataInfo, MetadataTicket, QueryTicket,
     SessionOpenRequest, SessionOpenResponse, SessionRole,
 };
-use crate::{CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION, SESSION_METADATA_KEY};
+use crate::{CAPABILITIES_ACTION, CURRENT_PROTOCOL_VERSION};
 
 const MIN_FLIGHT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_FLIGHT_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -109,6 +115,29 @@ pub type OpaqueFlightIngestWriter = Box<dyn FlightIngestWriter>;
 
 /// Query planner boundary consumed by the protocol service.
 pub trait FlightQueryFrontend: Send + Sync + 'static {
+    /// Reports committed native replay with durable atomic-unit ACK support.
+    fn supports_durable_log_subscription(&self) -> bool {
+        false
+    }
+
+    /// Reports support for ordered raw native event fragments over DoExchange.
+    fn supports_log_subscription(&self) -> bool {
+        false
+    }
+
+    /// Opens a single native log while retaining query ownership and cancellation identity.
+    fn open_log(
+        &self,
+        _request: crate::log::FlightLogRequest,
+    ) -> BoxFuture<'_, Result<crate::log::FlightLogSubscription>> {
+        Box::pin(async {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "native Flight log subscription is not configured",
+            ))
+        })
+    }
+
     /// Validates, binds, and physically prepares one query against an exact
     /// snapshot without producing result batches yet.
     fn prepare(
@@ -159,6 +188,136 @@ pub trait FlightQueryFrontend: Send + Sync + 'static {
         })
     }
 
+    /// Returns the native atomic frame row limit when frame ingestion is supported.
+    fn frame_row_capacity(&self) -> Option<u64> {
+        None
+    }
+
+    /// Resumes a recovered durable producer without changing its epoch or batch sequence.
+    fn supports_ingest_resume(&self) -> bool {
+        false
+    }
+
+    /// Reports support for session-owned immutable cross-query snapshots.
+    fn supports_fixed_snapshots(&self) -> bool {
+        false
+    }
+
+    /// Captures a fixed snapshot under authenticated session and resource ownership.
+    fn create_fixed_snapshot(
+        &self,
+        _request: crate::fixed_snapshot::FlightFixedSnapshotRequest,
+    ) -> BoxFuture<'_, Result<crate::wire::FixedSnapshotInfo>> {
+        Box::pin(async {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "fixed snapshots are unavailable",
+            ))
+        })
+    }
+
+    /// Releases an owned handle; an already-absent handle is an idempotent false result.
+    fn release_fixed_snapshot(
+        &self,
+        _session: SessionId,
+        _snapshot: QueryId,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "fixed snapshots are unavailable",
+            ))
+        })
+    }
+
+    /// Returns the number of retained cross-query leases for resource diagnostics.
+    fn active_fixed_snapshots(&self) -> usize {
+        0
+    }
+
+    /// Removes expired or session-revoked handles while prepared child queries keep their pins.
+    /// A timestamp of `u64::MAX` also permanently closes snapshot admission during shutdown.
+    fn sweep_fixed_snapshots(&self, _now_ns: u64, _expired_sessions: &[SessionId]) -> usize {
+        0
+    }
+
+    /// Reports whether atomic complete-state snapshots carry an exact native cursor.
+    fn supports_key_value_snapshot(&self) -> bool {
+        false
+    }
+
+    /// Reports whether native key-value upsert/delete mutations are supported.
+    fn supports_key_value_ingest(&self) -> bool {
+        false
+    }
+
+    /// Reports whether every write-open can enforce an immutable Catalog table identity.
+    fn supports_ingest_table_identity(&self) -> bool {
+        false
+    }
+
+    /// Reports whether the installed writer commits manifest-backed acknowledgements.
+    fn supports_persisted_ingest(&self) -> bool {
+        false
+    }
+
+    /// Creates a namespace after the protocol layer proves administrator authority.
+    fn create_namespace(
+        &self,
+        _request_id: zippy_types::RequestId,
+        _command: zippy_types::catalog::CreateNamespaceCommand,
+    ) -> BoxFuture<'_, Result<zippy_types::catalog::VersionedCatalogResponse>> {
+        Box::pin(async {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "Flight table management is not configured",
+            ))
+        })
+    }
+
+    /// Creates a native table and installs its runtime before acknowledgement.
+    fn create_table(
+        &self,
+        _request_id: zippy_types::RequestId,
+        _command: zippy_types::catalog::CreateTableCommand,
+    ) -> BoxFuture<'_, Result<zippy_types::catalog::VersionedCatalogResponse>> {
+        Box::pin(async {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "Flight table management is not configured",
+            ))
+        })
+    }
+
+    /// Deletes a native table after administrator authorization and snapshot validation.
+    fn drop_table(
+        &self,
+        _request_id: zippy_types::RequestId,
+        _command: zippy_types::catalog::DropTableCommand,
+    ) -> BoxFuture<'_, Result<zippy_types::catalog::VersionedCatalogResponse>> {
+        Box::pin(async {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "Flight table management is not configured",
+            ))
+        })
+    }
+
+    /// Evolves a native table after administrator authorization and runtime coordination.
+    fn alter_table_schema(
+        &self,
+        _request_id: zippy_types::RequestId,
+        _command: zippy_types::catalog::AlterTableSchemaCommand,
+        _key_value: Option<zippy_types::table::KeyValueTableDefinition>,
+    ) -> BoxFuture<'_, Result<zippy_types::catalog::VersionedCatalogResponse>> {
+        Box::pin(async {
+            Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "Flight table management is not configured",
+            ))
+        })
+    }
+
     /// Opens one stream-scoped producer-fenced append writer.
     fn open_ingest_writer(
         &self,
@@ -175,7 +334,7 @@ pub trait FlightQueryFrontend: Send + Sync + 'static {
     }
 }
 
-/// Resource and compatibility limits for one Flight query service.
+/// Resource limits and explicit session policy for one Flight query service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightServiceConfig {
     server_version: String,
@@ -183,7 +342,9 @@ pub struct FlightServiceConfig {
     max_pending_tickets: usize,
     transport_buffer_bytes: usize,
     bearer_auth: Option<FlightBearerAuthConfig>,
+    local_read_sessions: Option<(Duration, usize)>,
     query_control_enabled: bool,
+    table_management_enabled: bool,
     metadata: Option<FlightSqlMetadataLimits>,
     ingest: Option<FlightPutLimits>,
 }
@@ -222,7 +383,9 @@ impl FlightServiceConfig {
             max_pending_tickets,
             transport_buffer_bytes,
             bearer_auth: None,
+            local_read_sessions: None,
             query_control_enabled: false,
+            table_management_enabled: false,
             metadata: None,
             ingest: None,
         })
@@ -232,13 +395,36 @@ impl FlightServiceConfig {
     #[must_use]
     pub fn with_bearer_auth(mut self, auth: FlightBearerAuthConfig) -> Self {
         self.bearer_auth = Some(auth);
+        self.local_read_sessions = None;
         self
+    }
+
+    /// Enables server-issued read sessions without bootstrap credentials, on loopback only.
+    pub fn with_local_read_sessions(mut self, ttl: Duration, maximum: usize) -> Result<Self> {
+        SessionAuthority::validate_local_read(ttl, maximum)?;
+        if self.bearer_auth.is_some() {
+            return Err(invalid(
+                "local Flight sessions cannot replace configured bearer authentication",
+            ));
+        }
+        self.local_read_sessions = Some((ttl, maximum));
+        Ok(self)
     }
 
     /// Enables standard owner-bound and administrator `CancelFlightInfo` actions.
     #[must_use]
     pub fn with_query_control(mut self) -> Self {
         self.query_control_enabled = true;
+        self
+    }
+
+    /// Enables authenticated online table management when an administrator credential exists.
+    #[must_use]
+    pub fn with_table_management(mut self) -> Self {
+        self.table_management_enabled = self
+            .bearer_auth
+            .as_ref()
+            .is_some_and(FlightBearerAuthConfig::administrator_enabled);
         self
     }
 
@@ -304,6 +490,8 @@ pub struct FlightServiceStatus {
     pub session_admission_open: bool,
     /// Server-issued sessions that have not expired or been closed.
     pub active_sessions: usize,
+    /// Native fixed snapshots currently retained by authenticated sessions.
+    pub active_fixed_snapshots: usize,
     /// Active sessions issued from the distinct administrator credential.
     pub active_administrator_sessions: usize,
     /// Active sessions issued from the distinct writer credential.
@@ -352,7 +540,7 @@ struct FlightServiceInner {
     config: FlightServiceConfig,
     frontend: Arc<dyn FlightQueryFrontend>,
     tickets: TicketRegistry,
-    sessions: Option<SessionAuthority>,
+    sessions: SessionAuthority,
     transport_budget: Arc<Semaphore>,
     put_admission: Option<Arc<Semaphore>>,
     metrics: FlightMetrics,
@@ -404,7 +592,15 @@ impl ZippyFlightService {
                 "Flight ingest batch bytes must not exceed the shared transport budget",
             ));
         }
-        let sessions = config.bearer_auth.clone().map(SessionAuthority::new);
+        let sessions = if let Some(auth) = config.bearer_auth.clone() {
+            SessionAuthority::new(auth)
+        } else if let Some((ttl, maximum)) = config.local_read_sessions {
+            SessionAuthority::local_read(ttl, maximum)?
+        } else {
+            return Err(invalid(
+                "Flight requires bearer authentication or explicit local read sessions",
+            ));
+        };
         let put_admission = config
             .ingest
             .map(|limits| Arc::new(Semaphore::new(limits.max_concurrent_puts())));
@@ -423,14 +619,9 @@ impl ZippyFlightService {
 
     /// Stops new plans and releases every unconsumed prepared query.
     pub fn close_admission(&self) {
-        if let Some(sessions) = &self.inner.sessions {
-            let closed = sessions.close();
-            let revoked = self.inner.tickets.revoke_sessions(&closed);
-            self.inner.metrics.session_revoked_tickets.fetch_add(
-                u64::try_from(revoked).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-        }
+        let closed = self.inner.sessions.close();
+        self.inner.frontend.sweep_fixed_snapshots(u64::MAX, &closed);
+        self.revoke_session_tickets(&closed);
         self.inner.tickets.close();
         self.inner.transport_budget.close();
     }
@@ -439,20 +630,20 @@ impl ZippyFlightService {
     #[must_use]
     pub fn sweep_expired(&self) -> usize {
         let now_ns = unix_time_ns();
-        let revoked = self.sweep_expired_sessions_at(now_ns);
+        let swept = self.sweep_expired_sessions_at(now_ns);
         let expired = self.inner.tickets.sweep_expired(now_ns);
         self.inner.metrics.expired_tickets.fetch_add(
             u64::try_from(expired).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        expired.saturating_add(revoked)
+        expired.saturating_add(swept)
     }
 
     /// Returns bounded ticket and transport counters for readiness diagnostics.
     #[must_use]
     pub fn status(&self) -> FlightServiceStatus {
         let registry = self.inner.tickets.status();
-        let sessions = self.inner.sessions.as_ref().map(SessionAuthority::status);
+        let sessions = self.inner.sessions.status();
         let active_puts = self
             .inner
             .config
@@ -486,16 +677,16 @@ impl ZippyFlightService {
             encoded_bytes: self.inner.metrics.encoded_bytes.load(Ordering::Relaxed),
             transport_buffer_bytes_capacity,
             transport_buffer_bytes_in_use,
-            authentication_required: sessions.is_some(),
-            session_admission_open: sessions.is_none_or(|status| status.admission_open),
-            active_sessions: sessions.map_or(0, |status| status.active_sessions),
-            active_administrator_sessions: sessions
-                .map_or(0, |status| status.active_administrator_sessions),
-            active_writer_sessions: sessions.map_or(0, |status| status.active_writer_sessions),
-            opened_sessions: sessions.map_or(0, |status| status.opened_sessions),
-            expired_sessions: sessions.map_or(0, |status| status.expired_sessions),
-            authentication_failures: sessions.map_or(0, |status| status.auth_failures),
-            session_capacity_rejections: sessions.map_or(0, |status| status.capacity_rejections),
+            authentication_required: self.inner.config.bearer_auth.is_some(),
+            session_admission_open: sessions.admission_open,
+            active_sessions: sessions.active_sessions,
+            active_fixed_snapshots: self.inner.frontend.active_fixed_snapshots(),
+            active_administrator_sessions: sessions.active_administrator_sessions,
+            active_writer_sessions: sessions.active_writer_sessions,
+            opened_sessions: sessions.opened_sessions,
+            expired_sessions: sessions.expired_sessions,
+            authentication_failures: sessions.auth_failures,
+            session_capacity_rejections: sessions.capacity_rejections,
             session_revoked_tickets: self
                 .inner
                 .metrics
@@ -538,16 +729,24 @@ impl ZippyFlightService {
     }
 
     fn capabilities(&self) -> CapabilitiesResponse {
-        let authentication_required = self.inner.sessions.is_some();
+        let authentication_required = self.inner.config.bearer_auth.is_some();
         let mut capabilities = vec![
             QUERY_CAPABILITY.to_owned(),
             SINGLE_USE_TICKET_CAPABILITY.to_owned(),
             STRUCTURED_ERROR_CAPABILITY.to_owned(),
+            SERVER_SESSION_CAPABILITY.to_owned(),
+            "session.close.v1".to_owned(),
+            SESSION_ROLE_CAPABILITY.to_owned(),
         ];
         if authentication_required {
-            capabilities.push(SERVER_SESSION_CAPABILITY.to_owned());
             capabilities.push(BEARER_HANDSHAKE_CAPABILITY.to_owned());
-            capabilities.push(SESSION_ROLE_CAPABILITY.to_owned());
+        } else {
+            capabilities.push("auth.local_read_handshake.v1".to_owned());
+        }
+        if self.inner.config.table_management_enabled {
+            capabilities.push(TABLE_MANAGEMENT_CAPABILITY.to_owned());
+            capabilities.push(TABLE_DROP_CAPABILITY.to_owned());
+            capabilities.push(TABLE_SCHEMA_CAPABILITY.to_owned());
         }
         if self.inner.config.query_control_enabled {
             capabilities.push(QUERY_CANCEL_CAPABILITY.to_owned());
@@ -558,6 +757,33 @@ impl ZippyFlightService {
         if self.inner.config.ingest.is_some() {
             capabilities.push(FLIGHT_MEMORY_INGEST_CAPABILITY.to_owned());
             capabilities.push(FLIGHT_WAL_INGEST_CAPABILITY.to_owned());
+            if self.inner.frontend.supports_ingest_resume() {
+                capabilities.push("ingest.resume_after_restart.v1".to_owned());
+            }
+            if self.inner.frontend.supports_ingest_table_identity() {
+                capabilities.push("ingest.table_identity.v1".to_owned());
+            }
+            if self.inner.frontend.frame_row_capacity().is_some() {
+                capabilities.push("ingest.frame.v1".to_owned());
+            }
+            if self.inner.frontend.supports_key_value_ingest() {
+                capabilities.push("ingest.key_value.v1".to_owned());
+            }
+            if self.inner.frontend.supports_persisted_ingest() {
+                capabilities.push("ingest.append.persisted.v1".to_owned());
+            }
+        }
+        if self.inner.frontend.supports_fixed_snapshots() {
+            capabilities.push(FIXED_SNAPSHOT_CAPABILITY.to_owned());
+        }
+        if self.inner.frontend.supports_key_value_snapshot() {
+            capabilities.push("state.key_value_snapshot.v2".to_owned());
+        }
+        if self.inner.frontend.supports_log_subscription() {
+            capabilities.push(crate::log::LOG_CAPABILITY.to_owned());
+            if self.inner.frontend.supports_durable_log_subscription() {
+                capabilities.push(crate::log::DURABLE_LOG_CAPABILITY.to_owned());
+            }
         }
         let metadata = self.inner.config.metadata;
         let ingest = self.inner.config.ingest;
@@ -570,14 +796,8 @@ impl ZippyFlightService {
             max_pending_tickets: u64::try_from(self.inner.config.max_pending_tickets)
                 .unwrap_or(u64::MAX),
             authentication_required,
-            session_ttl_ms: self
-                .inner
-                .sessions
-                .as_ref()
-                .map(|sessions| {
-                    u64::try_from(sessions.session_ttl().as_millis()).unwrap_or(u64::MAX)
-                })
-                .unwrap_or(0),
+            session_ttl_ms: u64::try_from(self.inner.sessions.session_ttl().as_millis())
+                .unwrap_or(u64::MAX),
             administrator_authentication_enabled: self
                 .inner
                 .config
@@ -608,6 +828,11 @@ impl ZippyFlightService {
             ingest_max_batch_bytes: ingest
                 .map(|limits| u64::try_from(limits.max_batch_bytes()).unwrap_or(u64::MAX))
                 .unwrap_or(0),
+            ingest_max_rows_per_frame: if ingest.is_some() {
+                self.inner.frontend.frame_row_capacity().unwrap_or(0)
+            } else {
+                0
+            },
             ingest_max_bytes_per_put: ingest
                 .map(|limits| u64::try_from(limits.max_bytes_per_put()).unwrap_or(u64::MAX))
                 .unwrap_or(0),
@@ -618,19 +843,12 @@ impl ZippyFlightService {
         &self,
         metadata: &MetadataMap,
     ) -> std::result::Result<AuthenticatedFlightSession, Status> {
-        match &self.inner.sessions {
-            Some(sessions) => {
-                let now_ns = unix_time_ns();
-                let _ = self.sweep_expired_sessions_at(now_ns);
-                sessions
-                    .authenticate(metadata, now_ns)
-                    .map_err(|error| server_error_to_status(&error))
-            }
-            None => legacy_request_session(metadata).map(|session_id| AuthenticatedFlightSession {
-                session_id,
-                role: FlightSessionRole::Read,
-            }),
-        }
+        let now_ns = unix_time_ns();
+        let _ = self.sweep_expired_sessions_at(now_ns);
+        self.inner
+            .sessions
+            .authenticate(metadata, now_ns)
+            .map_err(|error| server_error_to_status(&error))
     }
 
     fn request_read_session(
@@ -671,21 +889,44 @@ impl ZippyFlightService {
         Ok(principal)
     }
 
+    /// Sweeps expired sessions and every fixed snapshot that is time-expired or owned by one.
+    ///
+    /// Returns revoked tickets plus released snapshots; a second snapshot sweep at the same
+    /// `now_ns` would find nothing, so callers must count snapshots from this single pass.
     fn sweep_expired_sessions_at(&self, now_ns: u64) -> usize {
-        let revoked = self
+        let expired_sessions = self.inner.sessions.sweep_expired(now_ns);
+        let revoked = self.revoke_session_tickets(&expired_sessions);
+        let snapshots = self
             .inner
-            .sessions
-            .as_ref()
-            .map(|sessions| {
-                let expired_sessions = sessions.sweep_expired(now_ns);
-                self.inner.tickets.revoke_sessions(&expired_sessions)
-            })
-            .unwrap_or(0);
+            .frontend
+            .sweep_fixed_snapshots(now_ns, &expired_sessions);
+        revoked.saturating_add(snapshots)
+    }
+
+    fn revoke_session_tickets(&self, sessions: &[SessionId]) -> usize {
+        let revoked = self.inner.tickets.revoke_sessions(sessions);
         self.inner.metrics.session_revoked_tickets.fetch_add(
             u64::try_from(revoked).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         revoked
+    }
+
+    /// Bounds an action body by the message limit and charges it to the transport budget.
+    fn admit_action_body(
+        &self,
+        body: &Bytes,
+        oversized: &str,
+        exhausted: &str,
+    ) -> std::result::Result<OwnedSemaphorePermit, Status> {
+        if body.len() > self.inner.config.max_message_bytes {
+            return Err(server_error_to_status(&invalid(oversized)));
+        }
+        Arc::clone(&self.inner.transport_budget)
+            .try_acquire_many_owned(body.len() as u32)
+            .map_err(|_| {
+                server_error_to_status(&ServerError::new(ErrorCode::ResourceExhausted, exhausted))
+            })
     }
 
     async fn cancel_flight_info(
@@ -869,6 +1110,42 @@ impl ZippyFlightService {
             .as_ref()
             .ok_or_else(|| invalid("Flight DoPut schema has no command descriptor"))?;
         let command = Arc::new(decode_put_descriptor(descriptor)?);
+        if command.expected_table_id.is_some()
+            && !self.inner.frontend.supports_ingest_table_identity()
+        {
+            return Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "Flight ingest table identity guard is unavailable",
+            ));
+        }
+        if matches!(
+            command.mutation,
+            crate::wire::PutMutation::KeyValueUpsert | crate::wire::PutMutation::KeyValueDelete
+        ) && !self.inner.frontend.supports_key_value_ingest()
+        {
+            return Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "native key-value ingest is not available",
+            ));
+        }
+        if command.mutation == crate::wire::PutMutation::Frame
+            && self.inner.frontend.frame_row_capacity().is_none()
+        {
+            return Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "native frame ingest is not available",
+            ));
+        }
+        if command.durability == zippy_types::ingest::Durability::Persisted
+            && !self.inner.frontend.supports_persisted_ingest()
+        {
+            return Err(ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "Flight frontend does not support persisted acknowledgements",
+            )
+            .with_request_id(command.put_id)
+            .with_retryable(false));
+        }
         if command.session_id != session.session_id {
             return Err(ServerError::new(
                 ErrorCode::PermissionDenied,
@@ -1048,11 +1325,7 @@ impl FlightService for ZippyFlightService {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> std::result::Result<Response<Self::HandshakeStream>, Status> {
-        let sessions = self
-            .inner
-            .sessions
-            .as_ref()
-            .ok_or_else(|| unsupported_status("Handshake"))?;
+        let sessions = &self.inner.sessions;
         let metadata = request.metadata().clone();
         let mut requests = request.into_inner();
         let request = requests
@@ -1213,6 +1486,18 @@ impl FlightService for ZippyFlightService {
                     "query command session differs from request metadata",
                 )
                 .with_query_id(query.request.query_id)
+                .with_retryable(false),
+            ));
+        }
+        if query.fixed_snapshot_id.is_some() && !self.inner.frontend.supports_fixed_snapshots() {
+            return Err(unsupported_status("native fixed snapshots"));
+        }
+        if query.key_value_snapshot && !self.inner.frontend.supports_key_value_snapshot() {
+            return Err(server_error_to_status(
+                &ServerError::new(
+                    ErrorCode::UnsupportedPlan,
+                    "native key-value snapshots are not configured",
+                )
                 .with_retryable(false),
             ));
         }
@@ -1393,6 +1678,135 @@ impl FlightService for ZippyFlightService {
         &self,
         request: Request<Action>,
     ) -> std::result::Result<Response<Self::DoActionStream>, Status> {
+        if request.get_ref().r#type == crate::CLOSE_SESSION_ACTION {
+            let principal = self.request_session(request.metadata())?;
+            let action = request.into_inner();
+            if action.body.len() > 16 {
+                return Err(server_error_to_status(&invalid(
+                    "session close request exceeds limit",
+                )));
+            }
+            let close = crate::wire::SessionCloseRequest::decode(action.body).map_err(|_| {
+                server_error_to_status(&invalid("session close request is malformed"))
+            })?;
+            if close.protocol_version != CURRENT_PROTOCOL_VERSION {
+                return Err(server_error_to_status(&invalid(
+                    "session close protocol version is unsupported",
+                )));
+            }
+            let closed = self.inner.sessions.revoke(principal.session_id);
+            let sessions = [principal.session_id];
+            self.revoke_session_tickets(&sessions);
+            self.inner
+                .frontend
+                .sweep_fixed_snapshots(unix_time_ns(), &sessions);
+            return Ok(single_action_result(
+                crate::wire::SessionCloseResponse {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    closed,
+                }
+                .encode_to_vec(),
+            ));
+        }
+        if matches!(
+            request.get_ref().r#type.as_str(),
+            CREATE_FIXED_SNAPSHOT_ACTION | RELEASE_FIXED_SNAPSHOT_ACTION
+        ) {
+            let principal = self.request_session(request.metadata())?;
+            if principal.role == FlightSessionRole::Writer {
+                return Err(server_error_to_status(&ServerError::new(
+                    ErrorCode::PermissionDenied,
+                    "fixed snapshots require read or administrator authority",
+                )));
+            }
+            if !self.inner.frontend.supports_fixed_snapshots() {
+                return Err(unsupported_status("fixed snapshots"));
+            }
+            let now_ns = unix_time_ns();
+            let expiry = self
+                .inner
+                .sessions
+                .session_expiry(principal.session_id)
+                .ok_or_else(|| {
+                    server_error_to_status(&ServerError::new(
+                        ErrorCode::Unauthenticated,
+                        "fixed snapshot session is unavailable",
+                    ))
+                })?;
+            let action = request.into_inner();
+            let _permit = self.admit_action_body(
+                &action.body,
+                "fixed snapshot action exceeds message limit",
+                "fixed snapshot transport budget is unavailable",
+            )?;
+            let body = if action.r#type == CREATE_FIXED_SNAPSHOT_ACTION {
+                let mut identity = [0_u8; 16];
+                fill_random_nonzero(&mut identity)
+                    .map_err(|error| server_error_to_status(&error))?;
+                let identity = QueryId::from_bytes(identity).expect("nonzero snapshot identity");
+                let request = crate::fixed_snapshot::decode_create(
+                    action.body,
+                    identity,
+                    principal.session_id,
+                    expiry,
+                    now_ns,
+                )
+                .map_err(|error| server_error_to_status(&error))?;
+                self.inner
+                    .frontend
+                    .create_fixed_snapshot(request)
+                    .await
+                    .map_err(|error| server_error_to_status(&error))?
+                    .encode_to_vec()
+            } else {
+                let identity = crate::fixed_snapshot::decode_release(action.body)
+                    .map_err(|error| server_error_to_status(&error))?;
+                let released = self
+                    .inner
+                    .frontend
+                    .release_fixed_snapshot(principal.session_id, identity)
+                    .await
+                    .map_err(|error| server_error_to_status(&error))?;
+                crate::wire::ReleaseFixedSnapshotResult {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    released,
+                }
+                .encode_to_vec()
+            };
+            return Ok(single_action_result(body));
+        }
+        if matches!(
+            request.get_ref().r#type.as_str(),
+            CREATE_NAMESPACE_ACTION
+                | CREATE_TABLE_ACTION
+                | DROP_TABLE_ACTION
+                | ALTER_TABLE_SCHEMA_ACTION
+        ) {
+            let principal = self.request_session(request.metadata())?;
+            if principal.role != FlightSessionRole::Administrator {
+                return Err(server_error_to_status(
+                    &ServerError::new(
+                        ErrorCode::PermissionDenied,
+                        "table management requires administrator authority",
+                    )
+                    .with_retryable(false),
+                ));
+            }
+            if !self.inner.config.table_management_enabled {
+                return Err(unsupported_status("table management"));
+            }
+            let action = request.into_inner();
+            let _permit = self.admit_action_body(
+                &action.body,
+                "table management request exceeds message limit",
+                "table management transport budget is unavailable",
+            )?;
+            let result =
+                crate::admin::execute(self.inner.frontend.as_ref(), &action.r#type, action.body)
+                    .await
+                    .map_err(|error| server_error_to_status(&error))?;
+            return Ok(single_action_result(result.encode_to_vec()));
+        }
         if request.get_ref().r#type == CANCEL_FLIGHT_INFO_ACTION {
             let principal = self.request_session(request.metadata())?;
             let action = request.into_inner();
@@ -1402,14 +1816,7 @@ impl FlightService for ZippyFlightService {
                 .cancel_flight_info(cancel, principal)
                 .await
                 .map_err(|error| server_error_to_status(&error))?;
-            return Ok(Response::new(
-                futures::stream::once(async move {
-                    Ok(arrow_flight::Result {
-                        body: Bytes::from(result.encode_to_vec()),
-                    })
-                })
-                .boxed(),
-            ));
+            return Ok(single_action_result(result.encode_to_vec()));
         }
         let action = request.into_inner();
         if action.r#type != CAPABILITIES_ACTION {
@@ -1429,10 +1836,7 @@ impl FlightService for ZippyFlightService {
                 "capabilities protocol version is unsupported",
             )));
         }
-        let body = Bytes::from(self.capabilities().encode_to_vec());
-        Ok(Response::new(
-            futures::stream::once(async move { Ok(arrow_flight::Result { body }) }).boxed(),
-        ))
+        Ok(single_action_result(self.capabilities().encode_to_vec()))
     }
 
     async fn list_actions(
@@ -1443,6 +1847,31 @@ impl FlightService for ZippyFlightService {
             r#type: CAPABILITIES_ACTION.to_owned(),
             description: "return Zippy Flight protocol capabilities".to_owned(),
         })];
+        actions.push(Ok(ActionType {
+            r#type: crate::CLOSE_SESSION_ACTION.to_owned(),
+            description: "close the authenticated session and release pending resources".to_owned(),
+        }));
+        if self.inner.frontend.supports_fixed_snapshots() {
+            for action in [CREATE_FIXED_SNAPSHOT_ACTION, RELEASE_FIXED_SNAPSHOT_ACTION] {
+                actions.push(Ok(ActionType {
+                    r#type: action.to_owned(),
+                    description: "capture or release a session-owned native snapshot".to_owned(),
+                }));
+            }
+        }
+        if self.inner.config.table_management_enabled {
+            for action in [
+                CREATE_NAMESPACE_ACTION,
+                CREATE_TABLE_ACTION,
+                DROP_TABLE_ACTION,
+                ALTER_TABLE_SCHEMA_ACTION,
+            ] {
+                actions.push(Ok(ActionType {
+                    r#type: action.to_owned(),
+                    description: "manage a native Catalog object as administrator".to_owned(),
+                }));
+            }
+        }
         if self.inner.config.query_control_enabled {
             actions.push(Ok(ActionType {
                 r#type: CANCEL_FLIGHT_INFO_ACTION.to_owned(),
@@ -1454,9 +1883,179 @@ impl FlightService for ZippyFlightService {
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> std::result::Result<Response<Self::DoExchangeStream>, Status> {
-        Err(unsupported_status("DoExchange"))
+        let session = self.request_read_session(request.metadata())?;
+        if !self.inner.frontend.supports_log_subscription() {
+            return Err(unsupported_status("native log DoExchange"));
+        }
+        let reservation = self
+            .inner
+            .tickets
+            .reserve(unix_time_ns())
+            .map_err(|error| server_error_to_status(&error))?;
+        let mut input = request.into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(10), input.message())
+            .await
+            .map_err(|_| {
+                server_error_to_status(&ServerError::new(
+                    ErrorCode::DeadlineExceeded,
+                    "log opening command timed out",
+                ))
+            })??
+            .ok_or_else(|| server_error_to_status(&invalid("log stream is empty")))?;
+        if !first.data_header.is_empty()
+            || !first.data_body.is_empty()
+            || !first.app_metadata.is_empty()
+        {
+            return Err(server_error_to_status(&invalid(
+                "log opening message must contain only a descriptor",
+            )));
+        }
+        let command =
+            crate::log::decode_log_descriptor(first.flight_descriptor.as_ref().ok_or_else(
+                || server_error_to_status(&invalid("log opening descriptor is missing")),
+            )?)
+            .map_err(|error| server_error_to_status(&error))?;
+        if command.session_id != session.session_id {
+            return Err(server_error_to_status(&ServerError::new(
+                ErrorCode::PermissionDenied,
+                "log command belongs to another authenticated session",
+            )));
+        }
+        let query_id = command.query_id;
+        let expected_consumer = command.consumer;
+        let subscription = self
+            .inner
+            .frontend
+            .open_log(command)
+            .await
+            .map_err(|error| server_error_to_status(&error))?;
+        if subscription.instance_id.query_id() != query_id {
+            return Err(server_error_to_status(&internal(
+                "log frontend returned a different query identity",
+            )));
+        }
+        let instance_id = subscription.instance_id;
+        let acknowledger = subscription.acknowledger.clone();
+        if subscription.consumer.is_some() != acknowledger.is_some()
+            || subscription.next_offset.is_some() != acknowledger.is_some()
+            || subscription.consumer != expected_consumer
+        {
+            return Err(server_error_to_status(&internal(
+                "log frontend returned inconsistent durable capabilities",
+            )));
+        }
+        drop(reservation);
+        let service = Arc::clone(&self.inner);
+        let encoder = crate::log::encode_log(
+            subscription,
+            service.config.max_message_bytes.saturating_sub(1024),
+        );
+        let output = encoder
+            .then(move |result| {
+                let service = Arc::clone(&service);
+                async move {
+                    let data = result.map_err(flight_error_to_status)?;
+                    budget_flight_data(
+                        data,
+                        Arc::clone(&service.transport_budget),
+                        service.config.max_message_bytes,
+                        service,
+                    )
+                    .await
+                }
+            })
+            .boxed();
+        let service = Arc::clone(&self.inner);
+        let stream = futures::stream::try_unfold(
+            (input, false, output, None, None),
+            move |(mut input, mut closed, mut output, mut emitted, mut confirmed)| {
+                let service = Arc::clone(&service);
+                let acknowledger = acknowledger.clone();
+                async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            control = input.message(), if !closed => {
+                                match control? {
+                                    None if acknowledger.is_some() => {
+                                        return Err(server_error_to_status(&invalid(
+                                            "durable log requires an open acknowledgement channel")));
+                                    }
+                                    None => closed = true,
+                                    Some(control) => {
+                                        match crate::log::decode_log_control(&control)
+                                            .map_err(|error| server_error_to_status(&error))? {
+                                            crate::log::FlightLogControl::Cancel => {
+                                                service.frontend.cancel_owned(session.session_id, instance_id).await
+                                                    .map_err(|error| server_error_to_status(&error))?;
+                                                return Err(server_error_to_status(&ServerError::new(
+                                                    ErrorCode::Cancelled, "log subscription cancelled by owner")));
+                                            }
+                                            crate::log::FlightLogControl::Acknowledge { request_id, acknowledgement } => {
+                                                let endpoint = acknowledger.as_ref().ok_or_else(||
+                                                    server_error_to_status(&invalid("raw log does not accept durable acknowledgements")))?;
+                                                if emitted != Some(acknowledgement) && confirmed != Some(acknowledgement) {
+                                                    return Err(server_error_to_status(&invalid(
+                                                        "acknowledgement does not match a completely emitted delivery")));
+                                                }
+                                                // A duplicate committed ACK needs no access to the native
+                                                // reader, which may already be waiting for a future unit.
+                                                if confirmed != Some(acknowledgement) {
+                                                    endpoint.acknowledge(request_id, acknowledgement).await
+                                                        .map_err(|error| server_error_to_status(&error))?;
+                                                }
+                                                confirmed = Some(acknowledgement);
+                                                let zippy_types::CommittedOffset::Known(offset) = acknowledgement.processed_through else {
+                                                    return Err(server_error_to_status(&internal("empty log acknowledgement")));
+                                                };
+                                                let data = FlightData {
+                                                    app_metadata: crate::wire::LogMetadata {
+                                                        payload: Some(crate::wire::log_metadata::Payload::Acknowledged(
+                                                            crate::wire::LogAcknowledgement {
+                                                                request_id: Bytes::copy_from_slice(&request_id.into_bytes()),
+                                                                delivery_sequence: acknowledgement.delivery_sequence,
+                                                                processed_through: offset.get(),
+                                                            })),
+                                                    }.encode_to_vec().into(),
+                                                    ..FlightData::default()
+                                                };
+                                                let data = budget_flight_data(data, Arc::clone(&service.transport_budget),
+                                                    service.config.max_message_bytes, Arc::clone(&service)).await?;
+                                                return Ok(Some((data, (input, closed, output, emitted, confirmed))));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            next = output.next() => {
+                                let Some(data) = next.transpose()? else { return Ok(None); };
+                                if acknowledger.is_some() && !data.app_metadata.is_empty() {
+                                    let metadata = crate::wire::LogMetadata::decode(data.app_metadata.clone())
+                                        .map_err(|_| server_error_to_status(&internal("invalid encoded log metadata")))?;
+                                    if let Some(crate::wire::log_metadata::Payload::Progress(progress)) = metadata.payload {
+                                        match (progress.delivery_sequence, progress.delivery_last_offset) {
+                                            (Some(sequence), Some(end)) if sequence > 0 && progress.last_offset <= end => {
+                                                if progress.last_offset == end {
+                                                    emitted = Some(zippy_types::subscription::SubscriptionAck {
+                                                        delivery_sequence: sequence,
+                                                        processed_through: zippy_types::CommittedOffset::Known(zippy_types::LogOffset::new(end)),
+                                                    });
+                                                }
+                                            }
+                                            _ => return Err(server_error_to_status(&internal("invalid encoded delivery boundary"))),
+                                        }
+                                    }
+                                }
+                                return Ok(Some((data, (input, closed, output, emitted, confirmed))));
+                            }
+                        }
+                    }
+                }
+            },
+        ).boxed();
+        Ok(Response::new(stream))
     }
 }
 
@@ -1962,28 +2561,11 @@ async fn budget_flight_data(
     Ok(data)
 }
 
-fn legacy_request_session(metadata: &MetadataMap) -> std::result::Result<SessionId, Status> {
-    let value = metadata
-        .get(SESSION_METADATA_KEY)
-        .ok_or_else(|| {
-            server_error_to_status(&ServerError::new(
-                ErrorCode::Unauthenticated,
-                "Flight request is missing the Zippy session metadata",
-            ))
-        })?
-        .to_str()
-        .map_err(|_| {
-            server_error_to_status(&ServerError::new(
-                ErrorCode::Unauthenticated,
-                "Flight session metadata is not valid ASCII",
-            ))
-        })?;
-    SessionId::from_str(value).map_err(|_| {
-        server_error_to_status(&ServerError::new(
-            ErrorCode::Unauthenticated,
-            "Flight session metadata is not a valid non-nil session ID",
-        ))
-    })
+fn single_action_result(
+    body: Vec<u8>,
+) -> Response<<ZippyFlightService as FlightService>::DoActionStream> {
+    let body = Bytes::from(body);
+    Response::new(futures::stream::once(async move { Ok(arrow_flight::Result { body }) }).boxed())
 }
 
 fn ticket_query_id(ticket: &QueryTicket) -> Result<QueryId> {

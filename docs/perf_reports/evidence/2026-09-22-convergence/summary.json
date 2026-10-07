@@ -1,0 +1,88 @@
+{
+  "date": "2026-09-22",
+  "overall_complete": false,
+  "audit_closed_total": 18,
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F17",
+    "F22",
+    "F26",
+    "F28",
+    "F29",
+    "F33"
+  ],
+  "closed_this_batch": [
+    "F25"
+  ],
+  "new_fixed_findings": [
+    "F36"
+  ],
+  "native_features": [
+    "online namespace creation",
+    "online append creation",
+    "dynamic actor and ingest registration",
+    "explicit write namespace",
+    "idempotent restart retry"
+  ],
+  "validation": {
+    "rust_passed": 1706,
+    "rust_ignored": 10,
+    "python_passed": 692,
+    "python_skipped": 1,
+    "client_passed": 88,
+    "client_coverage_percent": 81.28,
+    "clippy": "passed",
+    "full_mypy_errors": 982,
+    "full_mypy_error_files": 11,
+    "full_mypy_checked_files": 82,
+    "cross_language": "passed",
+    "pyarrow_version": "23.0.1"
+  },
+  "evidence": {
+    "rust": {
+      "path": "/tmp/zippy-convergence-rust-final.log",
+      "sha256": "68f46718f238ef7fc05fe1e5267c51c8f55398f98f55a7d0009c6aa44b759224"
+    },
+    "python": {
+      "path": "/tmp/zippy-convergence-python.log",
+      "sha256": "c6d1788be0de2fdddda68ea1c51e2df781e7744fa121bca2811bc3e7a86b9c11"
+    },
+    "client": {
+      "path": "/tmp/zippy-convergence-client-final.log",
+      "sha256": "05e28da490f2fb1a4fce90b322743749d0042004ff0a15266a899a4df5692cfa"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-convergence-clippy-final.log",
+      "sha256": "de7474bc31118039291ec70cc236f9c5756af2aae2b40b57a76d7e644e49f9a6"
+    },
+    "cross_language": {
+      "path": "/tmp/zippy-native-client-verified.log",
+      "sha256": "4442f280db66af75ee0953addacd830ab302a1eebd44609b1b5adf6d70e72fb3"
+    },
+    "black": {
+      "path": "/tmp/zippy-convergence-black-final.log",
+      "sha256": "c35fe108fd2b9f2dbda590eceeef09d8f95f46a259de574a74d9536171b689a4"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-convergence-ruff-final.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "protocol": {
+      "path": "/tmp/zippy-convergence-protocol-check.log",
+      "sha256": "9d09047d6e0164b7ad76b56146333e20ebe634303c433163cfea20268f7ddb3c"
+    },
+    "full_mypy": {
+      "path": "/tmp/zippy-convergence-all-mypy-final.log",
+      "sha256": "de456218c2873035cf01f2106cfd821793fe930acf2716c5d62a8f4dfb36732f"
+    }
+  }
+}

@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,32 +12,20 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zippy_core::{
-    spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine, EngineConfig,
-    EngineMetricsSnapshot, EngineStatus, LateDataPolicy, OverflowPolicy, Publisher, Result,
-    SchemaRef, SegmentTableView, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
-    StreamHello,
-};
-use zippy_engines::{
-    CrossSectionalEngine, StreamTableDescriptorPublisher, StreamTableMaterializer, TimeSeriesEngine,
-};
-use zippy_io::{NullPublisher, ZmqSource, ZmqStreamPublisher};
-use zippy_operators::{AggLastSpec, CSDemeanSpec, CSRankSpec, CSZscoreSpec};
+use zippy_core::{Engine, LateDataPolicy, Result, SchemaRef, SegmentTableView};
+use zippy_engines::{StreamTableMaterializer, TimeSeriesEngine};
+use zippy_operators::AggLastSpec;
 use zippy_segment_store::{
     compile_schema, ActiveSegmentReader, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan,
     RowSpanView, SegmentCellValue,
 };
 
 const DEFAULT_WINDOW_NS: i64 = 1_000_000;
-const REMOTE_STARTUP_DELAY_MS: u64 = 500;
-const REMOTE_SHUTDOWN_GRACE_SEC: u64 = 5;
-const REMOTE_IDLE_GRACE_SEC: u64 = 3;
-const REMOTE_STARTUP_GRACE_SEC: u64 = 30;
 const MIN_PASS_RATIO: f64 = 0.90;
 const WRITE_TO_SUBSCRIBE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TO_SUBSCRIBE_WAIT_SLICE: Duration = Duration::from_millis(10);
 const WRITE_TO_SUBSCRIBE_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(1);
-const BASELINE_MANIFEST_FORMAT_VERSION: u32 = 1;
+const BASELINE_MANIFEST_FORMAT_VERSION: u32 = 2;
 const SINGLE_NODE_REFACTOR_SUITE: &str = "single-node-refactor";
 const DEFAULT_SYNTHETIC_DATASET_ID: &str = "zippy-perf.synthetic.v1";
 
@@ -45,35 +33,15 @@ type PerfResult<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PerfProfile {
-    InprocTimeseries,
-    RemotePipelineUpstream,
-    RemotePipelineDownstream,
+    TimeseriesKernel,
     StreamTableSegmentCopy,
-    StreamTableSegmentForward,
     SingleRowLowRate,
     WriteToSubscribeE2e,
-    RuntimeStreamTableE2e,
     StreamTableSubscriberE2e,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OverflowPolicyConfig {
-    Block,
-    Reject,
-    DropOldest,
-}
-
-impl OverflowPolicyConfig {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Block => "block",
-            Self::Reject => "reject",
-            Self::DropOldest => "drop_oldest",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerfConfig {
     pub profile: PerfProfile,
     pub rows_per_batch: usize,
@@ -81,46 +49,28 @@ pub struct PerfConfig {
     pub duration_sec: u64,
     pub warmup_sec: u64,
     pub symbols: usize,
-    pub endpoint: String,
-    pub buffer_capacity: usize,
-    pub overflow_policy: OverflowPolicyConfig,
     pub max_p95_micros: Option<f64>,
     pub max_p99_micros: Option<f64>,
-    pub max_queue_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LatencySummary {
-    #[serde(default)]
     pub sample_count: u64,
     pub p50_micros: f64,
     pub p95_micros: f64,
     pub p99_micros: f64,
-    #[serde(default)]
     pub max_micros: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineMetricsReport {
     pub processed_batches_total: u64,
     pub processed_rows_total: u64,
     pub output_batches_total: u64,
-    pub dropped_batches_total: u64,
     pub late_rows_total: u64,
-    pub publish_errors_total: u64,
-    pub queue_depth: usize,
-    #[serde(default)]
-    pub max_observed_queue_depth: usize,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SourceMetricsReport {
-    pub source_events_total: u64,
-    pub source_data_batches_total: u64,
-    pub source_control_events_total: u64,
-    pub source_decode_errors_total: u64,
-    pub source_schema_mismatches_total: u64,
-    pub source_sequence_gaps_total: u64,
+    pub filtered_rows_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +98,7 @@ impl PerfReportMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerfReport {
     pub profile: PerfProfile,
     pub config: PerfConfig,
@@ -159,9 +110,7 @@ pub struct PerfReport {
     pub batches_per_sec: f64,
     pub latency: LatencySummary,
     pub secondary_latency: Option<LatencySummary>,
-    pub engine_status: String,
     pub engine_metrics: EngineMetricsReport,
-    pub source_metrics: Option<SourceMetricsReport>,
     pub pass: bool,
 }
 
@@ -267,7 +216,7 @@ pub struct PerfDatasetParameters {
 pub struct PerfDatasetManifest {
     /// Stable operator-supplied or derived dataset identifier.
     pub dataset_id: String,
-    /// Input source category, such as `synthetic` or `remote_stream`.
+    /// Input source category, currently `synthetic`.
     pub source_kind: String,
     /// Versioned logical input schema used by the profile.
     pub input_contract: String,
@@ -277,22 +226,16 @@ pub struct PerfDatasetManifest {
 
 impl PerfDatasetManifest {
     fn from_config(dataset_id: String, config: &PerfConfig) -> Self {
-        let source_kind = match config.profile {
-            PerfProfile::RemotePipelineUpstream | PerfProfile::RemotePipelineDownstream => {
-                "remote_stream"
-            }
-            _ => "synthetic",
-        };
         let input_contract = match config.profile {
-            PerfProfile::WriteToSubscribeE2e
-            | PerfProfile::RuntimeStreamTableE2e
-            | PerfProfile::StreamTableSubscriberE2e => "zippy-perf.timestamped-tick.v1",
+            PerfProfile::WriteToSubscribeE2e | PerfProfile::StreamTableSubscriberE2e => {
+                "zippy-perf.timestamped-tick.v1"
+            }
             _ => "zippy-perf.tick.v1",
         };
 
         Self {
             dataset_id,
-            source_kind: source_kind.to_string(),
+            source_kind: "synthetic".to_string(),
             input_contract: input_contract.to_string(),
             parameters: PerfDatasetParameters {
                 rows_per_batch: config.rows_per_batch,
@@ -366,7 +309,7 @@ pub fn plan_baseline_manifest(
     dataset_id: Option<&str>,
 ) -> PerfResult<BaselineManifest> {
     validate_config(config)?;
-    let dataset_id = resolve_dataset_id(config.profile, dataset_id)?;
+    let dataset_id = resolve_dataset_id(dataset_id)?;
     let source = PerfSourceIdentity::capture()?;
 
     Ok(BaselineManifest {
@@ -411,14 +354,10 @@ where
 
 fn dispatch_profile(config: &PerfConfig, metadata: PerfReportMetadata) -> PerfResult<PerfReport> {
     match config.profile {
-        PerfProfile::InprocTimeseries => run_inproc_timeseries(config, metadata),
-        PerfProfile::RemotePipelineUpstream => run_remote_pipeline_upstream(config, metadata),
-        PerfProfile::RemotePipelineDownstream => run_remote_pipeline_downstream(config, metadata),
-        PerfProfile::StreamTableSegmentCopy => run_stream_table_segment(config, false, metadata),
-        PerfProfile::StreamTableSegmentForward => run_stream_table_segment(config, true, metadata),
+        PerfProfile::TimeseriesKernel => run_timeseries_kernel(config, metadata),
+        PerfProfile::StreamTableSegmentCopy => run_stream_table_segment(config, metadata),
         PerfProfile::SingleRowLowRate => run_single_row_low_rate(config, metadata),
         PerfProfile::WriteToSubscribeE2e => run_write_to_subscribe_e2e(config, metadata),
-        PerfProfile::RuntimeStreamTableE2e => run_runtime_stream_table_e2e(config, metadata),
         PerfProfile::StreamTableSubscriberE2e => run_stream_table_subscriber_e2e(config, metadata),
     }
 }
@@ -482,19 +421,13 @@ fn sha256_reader(mut reader: impl Read) -> std::io::Result<String> {
     }
 }
 
-fn resolve_dataset_id(profile: PerfProfile, dataset_id: Option<&str>) -> PerfResult<String> {
+fn resolve_dataset_id(dataset_id: Option<&str>) -> PerfResult<String> {
     if let Some(dataset_id) = dataset_id {
         let dataset_id = dataset_id.trim();
         if dataset_id.is_empty() {
             return Err("dataset_id must not be empty".to_string());
         }
         return Ok(dataset_id.to_string());
-    }
-    if matches!(
-        profile,
-        PerfProfile::RemotePipelineUpstream | PerfProfile::RemotePipelineDownstream
-    ) {
-        return Err("remote pipeline profiles require an explicit dataset_id".to_string());
     }
     Ok(DEFAULT_SYNTHETIC_DATASET_ID.to_string())
 }
@@ -527,7 +460,6 @@ pub fn format_report(report: &PerfReport) -> String {
         format!("git_sha={}", report.metadata.git_sha),
         format!("target={}", report.metadata.target),
         format!("pass={}", report.pass),
-        format!("engine_status={}", report.engine_status),
         format!("input_rows_total={}", report.input_rows_total),
         format!("output_rows_total={}", report.output_rows_total),
         format!(
@@ -560,22 +492,10 @@ pub fn format_report(report: &PerfReport) -> String {
         ));
     }
 
-    if let Some(source_metrics) = report.source_metrics.as_ref() {
-        lines.push(format!(
-            "source_metrics[events={}, data_batches={}, control_events={}, decode_errors={}, schema_mismatches={}, sequence_gaps={}]",
-            source_metrics.source_events_total,
-            source_metrics.source_data_batches_total,
-            source_metrics.source_control_events_total,
-            source_metrics.source_decode_errors_total,
-            source_metrics.source_schema_mismatches_total,
-            source_metrics.source_sequence_gaps_total
-        ));
-    }
-
     lines.join("\n")
 }
 
-fn run_inproc_timeseries(
+fn run_timeseries_kernel(
     config: &PerfConfig,
     metadata: PerfReportMetadata,
 ) -> PerfResult<PerfReport> {
@@ -586,23 +506,28 @@ fn run_inproc_timeseries(
         config.symbols,
         config.target_rows_per_sec,
     )?;
-    let engine = build_timeseries_engine("perf_inproc_timeseries", Arc::clone(&tick_schema))
+    let mut engine = build_timeseries_engine("perf_timeseries_kernel", Arc::clone(&tick_schema))
         .map_err(|error| error.to_string())?;
-    let publisher = CountingPublisher::new(NullPublisher::default());
-    let publisher_counters = publisher.counters();
-    let mut handle = spawn_engine_with_publisher(engine, engine_config(config), publisher)
-        .map_err(|error| error.to_string())?;
-
-    let drive_stats = drive_engine_generator(config, &mut factory, &handle)?;
-
-    handle.flush().map_err(|error| error.to_string())?;
+    let mut engine_metrics = EngineMetricsReport::default();
+    let mut output_rows_total = 0;
+    let drive_stats = drive_engine_generator(config, &mut factory, &mut |batch: RecordBatch| {
+        let rows = batch.num_rows();
+        let output = engine
+            .on_data(SegmentTableView::from_record_batch(batch))
+            .map_err(|error| error.to_string())?;
+        engine_metrics.processed_batches_total += 1;
+        engine_metrics.processed_rows_total += rows as u64;
+        engine_metrics.output_batches_total += output.len() as u64;
+        output_rows_total += total_table_rows(&output);
+        Ok(())
+    })?;
+    let output = engine.on_flush().map_err(|error| error.to_string())?;
     let drain_completed_at = Instant::now();
-    handle.stop().map_err(|error| error.to_string())?;
-
-    let engine_metrics = engine_metrics_report_with_observed_queue_depth(
-        handle.metrics(),
-        drive_stats.max_observed_queue_depth,
-    );
+    engine_metrics.output_batches_total += output.len() as u64;
+    output_rows_total += total_table_rows(&output);
+    let delta = engine.drain_metrics();
+    engine_metrics.late_rows_total = delta.late_rows_total;
+    engine_metrics.filtered_rows_total = delta.filtered_rows_total;
     validate_inproc_completion(
         drive_stats.input_rows_total,
         engine_metrics.processed_rows_total,
@@ -616,16 +541,8 @@ fn run_inproc_timeseries(
         count_per_sec_over_elapsed(drive_stats.steady_rows_total, steady_elapsed);
     let batches_per_sec =
         count_per_sec_over_elapsed(drive_stats.steady_batches_total, steady_elapsed);
-    let output_rows_total = publisher_counters.output_rows_total.load(Ordering::Relaxed);
     let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
-    let pass = evaluate_pass(
-        config,
-        actual_average_rows_per_sec,
-        handle.status(),
-        &engine_metrics,
-        None,
-        &latency,
-    );
+    let pass = evaluate_pass(config, actual_average_rows_per_sec, &latency);
 
     Ok(PerfReport {
         profile: config.profile,
@@ -638,150 +555,17 @@ fn run_inproc_timeseries(
         batches_per_sec,
         latency,
         secondary_latency: None,
-        engine_status: handle.status().as_str().to_string(),
         engine_metrics,
-        source_metrics: None,
         pass,
     })
 }
 
-fn run_remote_pipeline_upstream(
-    config: &PerfConfig,
-    metadata: PerfReportMetadata,
-) -> PerfResult<PerfReport> {
-    let tick_schema = build_tick_schema();
-    let bar_schema = build_bar_schema(&tick_schema).map_err(|error| error.to_string())?;
-    let stream_publisher =
-        ZmqStreamPublisher::bind(&config.endpoint, "perf_bars", Arc::clone(&bar_schema))
-            .map_err(|error| error.to_string())?;
-    let publisher = CountingPublisher::new(stream_publisher);
-    let publisher_counters = publisher.counters();
-    let mut factory = TickBatchFactory::new(
-        Arc::clone(&tick_schema),
-        config.rows_per_batch,
-        config.symbols,
-        config.target_rows_per_sec,
-    )?;
-    let engine = build_timeseries_engine("perf_remote_upstream", Arc::clone(&tick_schema))
-        .map_err(|error| error.to_string())?;
-    let mut handle = spawn_engine_with_publisher(engine, engine_config(config), publisher)
-        .map_err(|error| error.to_string())?;
-
-    thread::sleep(Duration::from_millis(REMOTE_STARTUP_DELAY_MS));
-    let drive_stats = drive_engine_generator(config, &mut factory, &handle)?;
-
-    handle.flush().map_err(|error| error.to_string())?;
-    handle.stop().map_err(|error| error.to_string())?;
-
-    let engine_metrics = engine_metrics_report_with_observed_queue_depth(
-        handle.metrics(),
-        drive_stats.max_observed_queue_depth,
-    );
-    let actual_average_rows_per_sec = drive_stats.steady_rows_total as f64
-        / Duration::from_secs(config.duration_sec).as_secs_f64();
-    let output_rows_total = publisher_counters.output_rows_total.load(Ordering::Relaxed);
-    let output_batches_total = publisher_counters
-        .output_batches_total
-        .load(Ordering::Relaxed);
-    let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
-    let pass = evaluate_pass(
-        config,
-        actual_average_rows_per_sec,
-        handle.status(),
-        &engine_metrics,
-        None,
-        &latency,
-    );
-
-    Ok(PerfReport {
-        profile: config.profile,
-        config: config.clone(),
-        metadata,
-        input_rows_total: drive_stats.input_rows_total,
-        output_rows_total,
-        actual_average_rows_per_sec,
-        actual_peak_rows_per_sec: drive_stats.actual_peak_rows_per_sec,
-        batches_per_sec: compute_batches_per_sec(output_batches_total, config.duration_sec as f64),
-        latency,
-        secondary_latency: None,
-        engine_status: handle.status().as_str().to_string(),
-        engine_metrics,
-        source_metrics: None,
-        pass,
-    })
-}
-
-fn run_remote_pipeline_downstream(
-    config: &PerfConfig,
-    metadata: PerfReportMetadata,
-) -> PerfResult<PerfReport> {
-    let tick_schema = build_tick_schema();
-    let bar_schema = build_bar_schema(&tick_schema).map_err(|error| error.to_string())?;
-    let source = ZmqSource::connect(
-        "perf_remote_source",
-        &config.endpoint,
-        Arc::clone(&bar_schema),
-        SourceMode::Pipeline,
-    )
-    .map_err(|error| error.to_string())?;
-    let counting_source = CountingSource::new(source);
-    let source_counters = counting_source.counters();
-    let publisher = CountingPublisher::new(NullPublisher::default());
-    let publisher_counters = publisher.counters();
-    let engine = build_cross_sectional_engine("perf_remote_downstream", Arc::clone(&bar_schema))
-        .map_err(|error| error.to_string())?;
-    let mut handle = spawn_source_engine_with_publisher(
-        Box::new(counting_source),
-        engine,
-        engine_config(config),
-        publisher,
-    )
-    .map_err(|error| error.to_string())?;
-
-    wait_for_remote_shutdown(&mut handle, config, &source_counters)?;
-
-    let engine_metrics = engine_metrics_report(handle.metrics());
-    let source_metrics = source_metrics_report(&source_counters);
-    let output_rows_total = publisher_counters.output_rows_total.load(Ordering::Relaxed);
-    let output_batches_total = publisher_counters
-        .output_batches_total
-        .load(Ordering::Relaxed);
-    let observed_secs = source_counters
-        .observed_seconds()
-        .unwrap_or(config.duration_sec as f64)
-        .max(1e-9);
-    let average_rows_per_sec = engine_metrics.processed_rows_total as f64 / observed_secs;
-    let latency = LatencySummary::default();
-    let pass = evaluate_pass(
-        config,
-        average_rows_per_sec,
-        handle.status(),
-        &engine_metrics,
-        Some(&source_metrics),
-        &latency,
-    );
-
-    Ok(PerfReport {
-        profile: config.profile,
-        config: config.clone(),
-        metadata,
-        input_rows_total: engine_metrics.processed_rows_total,
-        output_rows_total,
-        actual_average_rows_per_sec: average_rows_per_sec,
-        actual_peak_rows_per_sec: average_rows_per_sec,
-        batches_per_sec: compute_batches_per_sec(output_batches_total, observed_secs),
-        latency,
-        secondary_latency: None,
-        engine_status: handle.status().as_str().to_string(),
-        engine_metrics,
-        source_metrics: Some(source_metrics),
-        pass,
-    })
+fn total_table_rows(tables: &[SegmentTableView]) -> u64 {
+    tables.iter().map(|table| table.num_rows() as u64).sum()
 }
 
 fn run_stream_table_segment(
     config: &PerfConfig,
-    forwarding: bool,
     metadata: PerfReportMetadata,
 ) -> PerfResult<PerfReport> {
     let row_capacity = config
@@ -789,7 +573,7 @@ fn run_stream_table_segment(
         .saturating_mul(64)
         .max(config.rows_per_batch)
         .min(1_048_576);
-    run_stream_table_segment_with_row_capacity(config, forwarding, row_capacity, metadata)
+    run_stream_table_segment_with_row_capacity(config, row_capacity, metadata)
 }
 
 fn run_single_row_low_rate(
@@ -798,12 +582,11 @@ fn run_single_row_low_rate(
 ) -> PerfResult<PerfReport> {
     let profile_config = single_row_profile_config(config);
     let row_capacity = expected_single_row_capacity(&profile_config)?;
-    run_stream_table_segment_with_row_capacity(&profile_config, false, row_capacity, metadata)
+    run_stream_table_segment_with_row_capacity(&profile_config, row_capacity, metadata)
 }
 
 fn run_stream_table_segment_with_row_capacity(
     config: &PerfConfig,
-    forwarding: bool,
     row_capacity: usize,
     metadata: PerfReportMetadata,
 ) -> PerfResult<PerfReport> {
@@ -819,13 +602,6 @@ fn run_stream_table_segment_with_row_capacity(
         row_capacity,
     )
     .map_err(|error| error.to_string())?;
-    let descriptor_publisher = Arc::new(CountingDescriptorPublisher::default());
-    if forwarding {
-        materializer = materializer
-            .with_descriptor_publisher(descriptor_publisher)
-            .with_descriptor_forwarding(true);
-    }
-
     let drive_stats = drive_segment_view(config, &table, |input| {
         materializer
             .on_data(input)
@@ -839,21 +615,11 @@ fn run_stream_table_segment_with_row_capacity(
         processed_batches_total,
         processed_rows_total: drive_stats.input_rows_total,
         output_batches_total: processed_batches_total,
-        dropped_batches_total: 0,
         late_rows_total: 0,
-        publish_errors_total: 0,
-        queue_depth: 0,
-        max_observed_queue_depth: 0,
+        filtered_rows_total: 0,
     };
     let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
-    let pass = evaluate_pass(
-        config,
-        drive_stats.actual_average_rows_per_sec,
-        EngineStatus::Stopped,
-        &engine_metrics,
-        None,
-        &latency,
-    );
+    let pass = evaluate_pass(config, drive_stats.actual_average_rows_per_sec, &latency);
 
     Ok(PerfReport {
         profile: config.profile,
@@ -869,9 +635,7 @@ fn run_stream_table_segment_with_row_capacity(
         ),
         latency,
         secondary_latency: None,
-        engine_status: EngineStatus::Stopped.as_str().to_string(),
         engine_metrics,
-        source_metrics: None,
         pass,
     })
 }
@@ -909,21 +673,11 @@ fn run_write_to_subscribe_e2e(
         processed_batches_total,
         processed_rows_total: drive_stats.consumed,
         output_batches_total: processed_batches_total,
-        dropped_batches_total: 0,
         late_rows_total: 0,
-        publish_errors_total: 0,
-        queue_depth: 0,
-        max_observed_queue_depth: 0,
+        filtered_rows_total: 0,
     };
     let latency = build_latency_summary(&drive_stats.latency_samples_micros);
-    let pass = evaluate_pass(
-        &profile_config,
-        actual_average_rows_per_sec,
-        EngineStatus::Stopped,
-        &engine_metrics,
-        None,
-        &latency,
-    );
+    let pass = evaluate_pass(&profile_config, actual_average_rows_per_sec, &latency);
 
     Ok(PerfReport {
         profile: profile_config.profile,
@@ -939,80 +693,7 @@ fn run_write_to_subscribe_e2e(
         ),
         latency,
         secondary_latency: None,
-        engine_status: EngineStatus::Stopped.as_str().to_string(),
         engine_metrics,
-        source_metrics: None,
-        pass,
-    })
-}
-
-fn run_runtime_stream_table_e2e(
-    config: &PerfConfig,
-    metadata: PerfReportMetadata,
-) -> PerfResult<PerfReport> {
-    let profile_config = single_row_profile_config(config);
-    let row_capacity = expected_single_row_capacity(&profile_config)?;
-    let tick_schema = build_tick_schema();
-    let emit_latencies = Arc::new(Mutex::new(Vec::new()));
-    let source = RuntimeSegmentSource {
-        config: profile_config.clone(),
-        schema: Arc::clone(&tick_schema),
-        row_capacity,
-        emit_latencies: Arc::clone(&emit_latencies),
-    };
-    let publisher = RuntimeLatencyPublisher::default();
-    let publisher_state = publisher.state();
-    let engine = StreamTableMaterializer::new_with_row_capacity(
-        "perf_runtime_stream_table",
-        tick_schema,
-        row_capacity,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut handle = spawn_source_engine_with_publisher(
-        Box::new(source),
-        engine,
-        engine_config(&profile_config),
-        publisher,
-    )
-    .map_err(|error| error.to_string())?;
-    wait_for_runtime_profile_stop(&mut handle, &profile_config)?;
-
-    let engine_metrics = engine_metrics_report(handle.metrics());
-    let output_rows_total = publisher_state.output_rows_total.load(Ordering::Relaxed);
-    let output_batches_total = publisher_state.output_batches_total.load(Ordering::Relaxed);
-    let publish_latencies = publisher_state.publish_latencies_micros.lock().unwrap();
-    let emit_latencies = emit_latencies.lock().unwrap();
-    let steady_rows_total = publish_latencies.len() as u64;
-    let steady_rows_per_sec = steady_rows_total as f64 / profile_config.duration_sec as f64;
-    let latency = build_latency_summary(&publish_latencies);
-    let secondary_latency = build_latency_summary(&emit_latencies);
-    let pass = evaluate_pass(
-        &profile_config,
-        steady_rows_per_sec,
-        handle.status(),
-        &engine_metrics,
-        None,
-        &latency,
-    );
-    handle.stop().map_err(|error| error.to_string())?;
-
-    Ok(PerfReport {
-        profile: profile_config.profile,
-        config: profile_config.clone(),
-        metadata,
-        input_rows_total: engine_metrics.processed_rows_total,
-        output_rows_total,
-        actual_average_rows_per_sec: steady_rows_per_sec,
-        actual_peak_rows_per_sec: steady_rows_per_sec,
-        batches_per_sec: compute_batches_per_sec(
-            output_batches_total,
-            profile_config.duration_sec as f64,
-        ),
-        latency,
-        secondary_latency: Some(secondary_latency),
-        engine_status: handle.status().as_str().to_string(),
-        engine_metrics,
-        source_metrics: None,
         pass,
     })
 }
@@ -1063,20 +744,14 @@ fn run_stream_table_subscriber_e2e(
         processed_batches_total,
         processed_rows_total: drive_stats.input_rows_total,
         output_batches_total: processed_batches_total,
-        dropped_batches_total: 0,
         late_rows_total: 0,
-        publish_errors_total: 0,
-        queue_depth: 0,
-        max_observed_queue_depth: 0,
+        filtered_rows_total: 0,
     };
     let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
     let secondary_latency = build_latency_summary(&drive_stats.secondary_latencies_micros);
     let pass = evaluate_pass(
         &profile_config,
         drive_stats.actual_average_rows_per_sec,
-        EngineStatus::Stopped,
-        &engine_metrics,
-        None,
         &latency,
     );
 
@@ -1094,84 +769,9 @@ fn run_stream_table_subscriber_e2e(
         ),
         latency,
         secondary_latency: Some(secondary_latency),
-        engine_status: EngineStatus::Stopped.as_str().to_string(),
         engine_metrics,
-        source_metrics: None,
         pass,
     })
-}
-
-fn wait_for_remote_shutdown(
-    handle: &mut zippy_core::EngineHandle,
-    config: &PerfConfig,
-    source_counters: &Arc<SourceCountersState>,
-) -> PerfResult<()> {
-    let startup_deadline = Instant::now() + Duration::from_secs(REMOTE_STARTUP_GRACE_SEC);
-
-    while handle.status() == EngineStatus::Running {
-        let now = Instant::now();
-        if let Some(first_observed_at) = source_counters.first_observed_at() {
-            let deadline = compute_remote_downstream_deadline(
-                first_observed_at,
-                config.warmup_sec,
-                config.duration_sec,
-                REMOTE_SHUTDOWN_GRACE_SEC,
-            );
-            if remote_downstream_should_stop_for_idle(
-                Some(first_observed_at),
-                source_counters.last_event_at(),
-                now,
-            ) {
-                handle.stop().map_err(|error| error.to_string())?;
-                break;
-            }
-            if now >= deadline {
-                handle.stop().map_err(|error| error.to_string())?;
-                return Err("remote downstream did not stop before deadline".to_string());
-            }
-        } else if now >= startup_deadline {
-            handle.stop().map_err(|error| error.to_string())?;
-            return Err(
-                "remote downstream did not observe source events before startup deadline"
-                    .to_string(),
-            );
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    let shutdown_deadline = Instant::now() + Duration::from_secs(REMOTE_SHUTDOWN_GRACE_SEC);
-    while handle.status() == EngineStatus::Running && Instant::now() < shutdown_deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    if handle.status() == EngineStatus::Running {
-        return Err("remote downstream did not stop after shutdown request".to_string());
-    }
-
-    handle.stop().map_err(|error| error.to_string())
-}
-
-fn compute_remote_downstream_deadline(
-    first_observed_at: Instant,
-    warmup_sec: u64,
-    duration_sec: u64,
-    shutdown_grace_sec: u64,
-) -> Instant {
-    first_observed_at + Duration::from_secs(warmup_sec + duration_sec + shutdown_grace_sec)
-}
-
-fn remote_downstream_should_stop_for_idle(
-    first_observed_at: Option<Instant>,
-    last_event_at: Option<Instant>,
-    now: Instant,
-) -> bool {
-    match (first_observed_at, last_event_at) {
-        (Some(_), Some(last_event_at)) => {
-            now.saturating_duration_since(last_event_at)
-                >= Duration::from_secs(REMOTE_IDLE_GRACE_SEC)
-        }
-        _ => false,
-    }
 }
 
 fn validate_config(config: &PerfConfig) -> PerfResult<()> {
@@ -1187,27 +787,7 @@ fn validate_config(config: &PerfConfig) -> PerfResult<()> {
     if config.symbols == 0 {
         return Err("symbols must be greater than zero".to_string());
     }
-    if config.buffer_capacity == 0 {
-        return Err("buffer_capacity must be greater than zero".to_string());
-    }
-    if config.endpoint.is_empty() {
-        return Err("endpoint must not be empty".to_string());
-    }
     Ok(())
-}
-
-fn engine_config(config: &PerfConfig) -> EngineConfig {
-    EngineConfig {
-        name: format!("{:?}", config.profile),
-        buffer_capacity: config.buffer_capacity,
-        overflow_policy: match config.overflow_policy {
-            OverflowPolicyConfig::Block => OverflowPolicy::Block,
-            OverflowPolicyConfig::Reject => OverflowPolicy::Reject,
-            OverflowPolicyConfig::DropOldest => OverflowPolicy::DropOldest,
-        },
-        late_data_policy: LateDataPolicy::Reject,
-        xfast: false,
-    }
 }
 
 fn build_tick_schema() -> SchemaRef {
@@ -1221,18 +801,6 @@ fn build_tick_schema() -> SchemaRef {
         Field::new("price", DataType::Float64, false),
         Field::new("volume", DataType::Float64, false),
     ]))
-}
-
-#[derive(Default)]
-struct CountingDescriptorPublisher {
-    published_total: AtomicU64,
-}
-
-impl StreamTableDescriptorPublisher for CountingDescriptorPublisher {
-    fn publish(&self, _descriptor_envelope: Vec<u8>) -> Result<()> {
-        self.published_total.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
 }
 
 fn build_tick_segment_table(
@@ -1299,11 +867,6 @@ fn tick_segment_batch(
     Ok(SegmentTableView::from_row_span(span))
 }
 
-fn build_bar_schema(tick_schema: &SchemaRef) -> Result<SchemaRef> {
-    let engine = build_timeseries_engine("perf_schema_probe", Arc::clone(tick_schema))?;
-    Ok(engine.output_schema())
-}
-
 fn build_timeseries_engine(name: &str, tick_schema: SchemaRef) -> Result<TimeSeriesEngine> {
     TimeSeriesEngine::new(
         name,
@@ -1315,22 +878,6 @@ fn build_timeseries_engine(name: &str, tick_schema: SchemaRef) -> Result<TimeSer
         vec![AggLastSpec::new("price", "close").build().unwrap()],
         vec![],
         vec![],
-    )
-}
-
-fn build_cross_sectional_engine(name: &str, bar_schema: SchemaRef) -> Result<CrossSectionalEngine> {
-    CrossSectionalEngine::new(
-        name,
-        bar_schema,
-        "symbol",
-        "window_start",
-        DEFAULT_WINDOW_NS,
-        LateDataPolicy::Reject,
-        vec![
-            CSRankSpec::new("close", "close_rank").build().unwrap(),
-            CSZscoreSpec::new("close", "close_z").build().unwrap(),
-            CSDemeanSpec::new("close", "close_dm").build().unwrap(),
-        ],
     )
 }
 
@@ -1400,279 +947,6 @@ impl TickBatchFactory {
     }
 }
 
-#[derive(Default)]
-struct PublisherCounters {
-    output_batches_total: AtomicU64,
-    output_rows_total: AtomicU64,
-}
-
-struct CountingPublisher<P> {
-    inner: P,
-    counters: Arc<PublisherCounters>,
-}
-
-impl<P> CountingPublisher<P> {
-    fn new(inner: P) -> Self {
-        Self {
-            inner,
-            counters: Arc::new(PublisherCounters::default()),
-        }
-    }
-
-    fn counters(&self) -> Arc<PublisherCounters> {
-        Arc::clone(&self.counters)
-    }
-}
-
-impl<P> Publisher for CountingPublisher<P>
-where
-    P: Publisher,
-{
-    fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
-        self.counters
-            .output_batches_total
-            .fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .output_rows_total
-            .fetch_add(table.num_rows() as u64, Ordering::Relaxed);
-        self.inner.publish_table(table)
-    }
-
-    fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.publish_table(&SegmentTableView::from_record_batch(batch.clone()))
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.inner.flush()
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.inner.close()
-    }
-}
-
-#[derive(Default)]
-struct SourceCountersState {
-    source_events_total: AtomicU64,
-    source_data_batches_total: AtomicU64,
-    source_control_events_total: AtomicU64,
-    source_decode_errors_total: AtomicU64,
-    source_schema_mismatches_total: AtomicU64,
-    source_sequence_gaps_total: AtomicU64,
-    first_observed_at: Mutex<Option<Instant>>,
-    first_data_at: Mutex<Option<Instant>>,
-    last_event_at: Mutex<Option<Instant>>,
-}
-
-impl SourceCountersState {
-    fn first_observed_at(&self) -> Option<Instant> {
-        *self.first_observed_at.lock().unwrap()
-    }
-
-    fn last_event_at(&self) -> Option<Instant> {
-        *self.last_event_at.lock().unwrap()
-    }
-
-    fn observed_seconds(&self) -> Option<f64> {
-        let first = *self.first_data_at.lock().unwrap();
-        let last = *self.last_event_at.lock().unwrap();
-        match (first, last) {
-            (Some(first), Some(last)) if last >= first => Some((last - first).as_secs_f64()),
-            _ => None,
-        }
-    }
-}
-
-struct CountingSource<S> {
-    inner: S,
-    counters: Arc<SourceCountersState>,
-}
-
-impl<S> CountingSource<S> {
-    fn new(inner: S) -> Self {
-        Self {
-            inner,
-            counters: Arc::new(SourceCountersState::default()),
-        }
-    }
-
-    fn counters(&self) -> Arc<SourceCountersState> {
-        Arc::clone(&self.counters)
-    }
-}
-
-struct CountingSourceSink {
-    inner: Arc<dyn SourceSink>,
-    counters: Arc<SourceCountersState>,
-}
-
-impl SourceSink for CountingSourceSink {
-    fn emit(&self, event: SourceEvent) -> Result<()> {
-        let now = Instant::now();
-        self.counters
-            .source_events_total
-            .fetch_add(1, Ordering::Relaxed);
-        {
-            let mut first_observed_at = self.counters.first_observed_at.lock().unwrap();
-            if first_observed_at.is_none() {
-                *first_observed_at = Some(now);
-            }
-        }
-        *self.counters.last_event_at.lock().unwrap() = Some(now);
-        match &event {
-            SourceEvent::Data(_) => {
-                self.counters
-                    .source_data_batches_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let mut first_data_at = self.counters.first_data_at.lock().unwrap();
-                if first_data_at.is_none() {
-                    *first_data_at = Some(now);
-                }
-            }
-            SourceEvent::Hello(_)
-            | SourceEvent::Flush
-            | SourceEvent::Stop
-            | SourceEvent::Error(_) => {
-                self.counters
-                    .source_control_events_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        self.inner.emit(event)
-    }
-}
-
-impl<S> Source for CountingSource<S>
-where
-    S: Source,
-{
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn output_schema(&self) -> SchemaRef {
-        self.inner.output_schema()
-    }
-
-    fn mode(&self) -> SourceMode {
-        self.inner.mode()
-    }
-
-    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> Result<SourceHandle> {
-        let Self { inner, counters } = *self;
-        let counting_sink = Arc::new(CountingSourceSink {
-            inner: sink,
-            counters: Arc::clone(&counters),
-        });
-        let inner_handle = Box::new(inner).start(counting_sink)?;
-        let stop_handle = inner_handle.clone();
-        let join_handle = thread::spawn(move || {
-            let result = inner_handle.join();
-            if let Err(error) = &result {
-                classify_source_error(error, &counters);
-            }
-            result
-        });
-
-        Ok(SourceHandle::new_with_stop(
-            join_handle,
-            Box::new(move || stop_handle.stop()),
-        ))
-    }
-}
-
-#[derive(Default)]
-struct RuntimeLatencyPublisherState {
-    output_batches_total: AtomicU64,
-    output_rows_total: AtomicU64,
-    publish_latencies_micros: Mutex<Vec<u64>>,
-}
-
-#[derive(Default)]
-struct RuntimeLatencyPublisher {
-    state: Arc<RuntimeLatencyPublisherState>,
-}
-
-impl RuntimeLatencyPublisher {
-    fn state(&self) -> Arc<RuntimeLatencyPublisherState> {
-        Arc::clone(&self.state)
-    }
-}
-
-impl Publisher for RuntimeLatencyPublisher {
-    fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
-        let observed_ns = current_unix_epoch_ns();
-        if let Some(sent_ns) = first_dt_ns(table)? {
-            if sent_ns > 0 {
-                self.state
-                    .publish_latencies_micros
-                    .lock()
-                    .unwrap()
-                    .push(observed_ns.saturating_sub(sent_ns) as u64 / 1_000);
-            }
-        }
-        self.state
-            .output_batches_total
-            .fetch_add(1, Ordering::Relaxed);
-        self.state
-            .output_rows_total
-            .fetch_add(table.num_rows() as u64, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.publish_table(&SegmentTableView::from_record_batch(batch.clone()))
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-struct RuntimeSegmentSource {
-    config: PerfConfig,
-    schema: SchemaRef,
-    row_capacity: usize,
-    emit_latencies: Arc<Mutex<Vec<u64>>>,
-}
-
-impl Source for RuntimeSegmentSource {
-    fn name(&self) -> &str {
-        "perf_runtime_segment_source"
-    }
-
-    fn output_schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn mode(&self) -> SourceMode {
-        SourceMode::Pipeline
-    }
-
-    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> Result<SourceHandle> {
-        let Self {
-            config,
-            schema,
-            row_capacity,
-            emit_latencies,
-        } = *self;
-        let join_handle = thread::spawn(move || -> Result<()> {
-            sink.emit(SourceEvent::Hello(StreamHello::new(
-                "perf_runtime_stream",
-                schema,
-                1,
-            )?))?;
-            run_runtime_segment_source(config, row_capacity, emit_latencies, sink)?;
-            Ok(())
-        });
-        Ok(SourceHandle::new(join_handle))
-    }
-}
-
 struct DriveStats {
     input_rows_total: u64,
     actual_average_rows_per_sec: f64,
@@ -1734,83 +1008,25 @@ struct EngineDriveStats {
     steady_ends_at: Instant,
     actual_peak_rows_per_sec: f64,
     batch_latencies_micros: Vec<u64>,
-    max_observed_queue_depth: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EngineAdmissionObservation {
-    write_elapsed: Duration,
-    queue_depth: usize,
-}
-
-trait EngineBatchAdmission {
-    fn admit_batch(&self, batch: RecordBatch) -> PerfResult<()>;
-
-    fn observed_queue_depth(&self) -> usize;
-}
-
-impl EngineBatchAdmission for zippy_core::EngineHandle {
-    fn admit_batch(&self, batch: RecordBatch) -> PerfResult<()> {
-        self.write(batch).map_err(|error| error.to_string())
-    }
-
-    fn observed_queue_depth(&self) -> usize {
-        self.metrics().queue_depth
-    }
-}
-
-fn observe_engine_admission<A, N>(
-    admission: &A,
+fn drive_kernel_batch<F, N>(
+    process: &mut F,
     batch: RecordBatch,
-    write_started_at: Instant,
-    write_completion_clock: &mut N,
-) -> PerfResult<EngineAdmissionObservation>
-where
-    A: EngineBatchAdmission,
-    N: FnMut() -> Instant,
-{
-    admission.admit_batch(batch)?;
-    let write_completed_at = write_completion_clock();
-    let queue_depth = admission.observed_queue_depth();
-    Ok(EngineAdmissionObservation {
-        write_elapsed: write_completed_at.duration_since(write_started_at),
-        queue_depth,
-    })
-}
-
-fn record_engine_admission(
-    observation: EngineAdmissionObservation,
+    started_at: Instant,
+    completion_clock: &mut N,
     measured: bool,
-    max_observed_queue_depth: &mut usize,
-    batch_latencies_micros: &mut Vec<u64>,
-) {
-    *max_observed_queue_depth = (*max_observed_queue_depth).max(observation.queue_depth);
-    if measured {
-        batch_latencies_micros.push(observation.write_elapsed.as_micros() as u64);
-    }
-}
-
-fn drive_engine_batch_admission<A, N>(
-    admission: &A,
-    batch: RecordBatch,
-    write_started_at: Instant,
-    write_completion_clock: &mut N,
-    measured: bool,
-    max_observed_queue_depth: &mut usize,
-    batch_latencies_micros: &mut Vec<u64>,
+    latencies_micros: &mut Vec<u64>,
 ) -> PerfResult<()>
 where
-    A: EngineBatchAdmission,
+    F: FnMut(RecordBatch) -> PerfResult<()>,
     N: FnMut() -> Instant,
 {
-    let observation =
-        observe_engine_admission(admission, batch, write_started_at, write_completion_clock)?;
-    record_engine_admission(
-        observation,
-        measured,
-        max_observed_queue_depth,
-        batch_latencies_micros,
-    );
+    process(batch)?;
+    let completed_at = completion_clock();
+    if measured {
+        latencies_micros.push(completed_at.duration_since(started_at).as_micros() as u64);
+    }
     Ok(())
 }
 
@@ -1850,13 +1066,13 @@ fn is_engine_drive_measured(
     batch_start >= steady_started_at && should_admit_engine_batch(batch_start, end)
 }
 
-fn drive_engine_generator<A>(
+fn drive_engine_generator<F>(
     config: &PerfConfig,
     factory: &mut TickBatchFactory,
-    admission: &A,
+    process: &mut F,
 ) -> PerfResult<EngineDriveStats>
 where
-    A: EngineBatchAdmission,
+    F: FnMut(RecordBatch) -> PerfResult<()>,
 {
     let warmup_duration = Duration::from_secs(config.warmup_sec);
     let steady_duration = Duration::from_secs(config.duration_sec);
@@ -1876,7 +1092,6 @@ where
     let mut steady_batches_total = 0_u64;
     let mut peak_tracker = RowPeakTracker::new(steady_started_at);
     let mut batch_latencies_micros = Vec::new();
-    let mut max_observed_queue_depth = 0;
     let mut write_completion_clock = Instant::now;
 
     loop {
@@ -1901,13 +1116,12 @@ where
             break;
         }
         let measured = is_engine_drive_measured(batch_start, steady_started_at, end);
-        drive_engine_batch_admission(
-            admission,
+        drive_kernel_batch(
+            process,
             batch,
             batch_start,
             &mut write_completion_clock,
             measured,
-            &mut max_observed_queue_depth,
             &mut batch_latencies_micros,
         )?;
         input_rows_total += config.rows_per_batch as u64;
@@ -1931,7 +1145,6 @@ where
         steady_ends_at: end,
         actual_peak_rows_per_sec: peak_rows_per_sec,
         batch_latencies_micros,
-        max_observed_queue_depth,
     })
 }
 
@@ -2707,165 +1920,6 @@ fn drive_stream_table_to_reader(
     })
 }
 
-fn run_runtime_segment_source(
-    config: PerfConfig,
-    row_capacity: usize,
-    emit_latencies: Arc<Mutex<Vec<u64>>>,
-    sink: Arc<dyn SourceSink>,
-) -> Result<()> {
-    let schema = compile_schema(&[
-        ColumnSpec::new("symbol", ColumnType::Utf8),
-        ColumnSpec::new("dt", ColumnType::TimestampNsTz("UTC")),
-        ColumnSpec::new("price", ColumnType::Float64),
-        ColumnSpec::new("volume", ColumnType::Float64),
-    ])
-    .map_err(|reason| zippy_core::ZippyError::Io {
-        reason: reason.to_string(),
-    })?;
-    let layout = LayoutPlan::for_schema(&schema, row_capacity).map_err(|reason| {
-        zippy_core::ZippyError::Io {
-            reason: reason.to_string(),
-        }
-    })?;
-    let mut writer =
-        ActiveSegmentWriter::new_for_runtime(schema, layout, 20_001, 0).map_err(|reason| {
-            zippy_core::ZippyError::Io {
-                reason: reason.to_string(),
-            }
-        })?;
-    let warmup_duration = Duration::from_secs(config.warmup_sec);
-    let steady_duration = Duration::from_secs(config.duration_sec);
-    let total_duration = warmup_duration + steady_duration;
-    let row_interval_ns = (1_000_000_000_u128 / config.target_rows_per_sec as u128).max(1) as u64;
-    let row_interval = Duration::from_nanos(row_interval_ns);
-    let start = Instant::now();
-    let warmup_end = start + warmup_duration;
-    let end = warmup_end + steady_duration;
-    let mut next_tick = start;
-    let mut row_index = 0_usize;
-
-    while Instant::now() < end {
-        let now = Instant::now();
-        if next_tick > now {
-            thread::sleep(next_tick - now);
-        }
-        let sample_start = Instant::now();
-        let timestamp_ns = if sample_start >= warmup_end {
-            current_unix_epoch_ns()
-        } else {
-            0
-        };
-        writer
-            .begin_row()
-            .map_err(|reason| zippy_core::ZippyError::Io {
-                reason: reason.to_string(),
-            })?;
-        writer
-            .write_utf8("symbol", &format!("S{:04}", row_index % config.symbols))
-            .map_err(|reason| zippy_core::ZippyError::Io {
-                reason: reason.to_string(),
-            })?;
-        writer
-            .write_i64("dt", timestamp_ns)
-            .map_err(|reason| zippy_core::ZippyError::Io {
-                reason: reason.to_string(),
-            })?;
-        writer
-            .write_f64("price", 10.0 + (row_index % 100) as f64 * 0.01)
-            .map_err(|reason| zippy_core::ZippyError::Io {
-                reason: reason.to_string(),
-            })?;
-        writer
-            .write_f64("volume", 100.0 + (row_index % 17) as f64)
-            .map_err(|reason| zippy_core::ZippyError::Io {
-                reason: reason.to_string(),
-            })?;
-        writer
-            .commit_row()
-            .map_err(|reason| zippy_core::ZippyError::Io {
-                reason: reason.to_string(),
-            })?;
-        let span = RowSpanView::from_active_descriptor(
-            writer.active_descriptor(),
-            row_index,
-            row_index + 1,
-        )
-        .map_err(|reason| zippy_core::ZippyError::Io {
-            reason: reason.to_string(),
-        })?;
-        let emit_start = Instant::now();
-        sink.emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))?;
-        if sample_start >= warmup_end {
-            emit_latencies
-                .lock()
-                .unwrap()
-                .push(emit_start.elapsed().as_micros() as u64);
-        }
-        row_index += 1;
-        next_tick += row_interval;
-        if Instant::now() - start >= total_duration {
-            break;
-        }
-    }
-
-    sink.emit(SourceEvent::Stop)
-}
-
-fn wait_for_runtime_profile_stop(
-    handle: &mut zippy_core::EngineHandle,
-    config: &PerfConfig,
-) -> PerfResult<()> {
-    let deadline =
-        Instant::now() + Duration::from_secs(config.duration_sec + config.warmup_sec + 5);
-    while handle.status() == EngineStatus::Running {
-        if Instant::now() >= deadline {
-            handle.stop().map_err(|error| error.to_string())?;
-            return Err("runtime stream table profile did not stop before deadline".to_string());
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    if handle.status() == EngineStatus::Failed {
-        return Err("runtime stream table profile failed".to_string());
-    }
-    Ok(())
-}
-
-fn first_dt_ns(table: &SegmentTableView) -> Result<Option<i64>> {
-    if table.num_rows() == 0 {
-        return Ok(None);
-    }
-    if let Some(row_view) = table.as_segment_row_view() {
-        return match row_view.row_span().cell_value(0, "dt").map_err(|error| {
-            zippy_core::ZippyError::Io {
-                reason: error.to_string(),
-            }
-        })? {
-            SegmentCellValue::TimestampNs(value) | SegmentCellValue::Int64(value) => {
-                Ok(Some(value))
-            }
-            SegmentCellValue::Null => Ok(None),
-            _ => Err(zippy_core::ZippyError::SchemaMismatch {
-                reason: "dt column must be timestamp or int64".to_string(),
-            }),
-        };
-    }
-    let column = table.column("dt")?;
-    let timestamps = column
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .ok_or_else(|| zippy_core::ZippyError::SchemaMismatch {
-            reason: "dt column must be timestamp[ns]".to_string(),
-        })?;
-    Ok(Some(timestamps.value(0)))
-}
-
-fn current_unix_epoch_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
-        .unwrap_or_default()
-}
-
 fn single_row_profile_config(config: &PerfConfig) -> PerfConfig {
     let mut normalized = config.clone();
     normalized.rows_per_batch = 1;
@@ -2910,43 +1964,6 @@ fn percentile(sorted: &[u64], percentile: f64) -> f64 {
     sorted[index] as f64
 }
 
-fn engine_metrics_report(snapshot: EngineMetricsSnapshot) -> EngineMetricsReport {
-    EngineMetricsReport {
-        processed_batches_total: snapshot.processed_batches_total,
-        processed_rows_total: snapshot.processed_rows_total,
-        output_batches_total: snapshot.output_batches_total,
-        dropped_batches_total: snapshot.dropped_batches_total,
-        late_rows_total: snapshot.late_rows_total,
-        publish_errors_total: snapshot.publish_errors_total,
-        queue_depth: snapshot.queue_depth,
-        max_observed_queue_depth: snapshot.queue_depth,
-    }
-}
-
-fn engine_metrics_report_with_observed_queue_depth(
-    snapshot: EngineMetricsSnapshot,
-    max_observed_queue_depth: usize,
-) -> EngineMetricsReport {
-    let mut report = engine_metrics_report(snapshot);
-    report.max_observed_queue_depth = report
-        .max_observed_queue_depth
-        .max(max_observed_queue_depth);
-    report
-}
-
-fn source_metrics_report(counters: &Arc<SourceCountersState>) -> SourceMetricsReport {
-    SourceMetricsReport {
-        source_events_total: counters.source_events_total.load(Ordering::Relaxed),
-        source_data_batches_total: counters.source_data_batches_total.load(Ordering::Relaxed),
-        source_control_events_total: counters.source_control_events_total.load(Ordering::Relaxed),
-        source_decode_errors_total: counters.source_decode_errors_total.load(Ordering::Relaxed),
-        source_schema_mismatches_total: counters
-            .source_schema_mismatches_total
-            .load(Ordering::Relaxed),
-        source_sequence_gaps_total: counters.source_sequence_gaps_total.load(Ordering::Relaxed),
-    }
-}
-
 fn compute_batches_per_sec(output_batches_total: u64, observed_secs: f64) -> f64 {
     output_batches_total as f64 / observed_secs.max(1e-9)
 }
@@ -2975,43 +1992,8 @@ fn validate_inproc_completion(accepted_rows: u64, processed_rows: u64) -> PerfRe
     Ok(())
 }
 
-fn classify_source_error(error: &zippy_core::ZippyError, counters: &Arc<SourceCountersState>) {
-    match error {
-        zippy_core::ZippyError::SchemaMismatch { .. } => {
-            counters
-                .source_schema_mismatches_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        zippy_core::ZippyError::Io { .. } => {
-            counters
-                .source_decode_errors_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        _ => {}
-    }
-}
-
-fn evaluate_pass(
-    config: &PerfConfig,
-    average_rows_per_sec: f64,
-    status: EngineStatus,
-    engine_metrics: &EngineMetricsReport,
-    source_metrics: Option<&SourceMetricsReport>,
-    latency: &LatencySummary,
-) -> bool {
-    if status == EngineStatus::Failed {
-        return false;
-    }
+fn evaluate_pass(config: &PerfConfig, average_rows_per_sec: f64, latency: &LatencySummary) -> bool {
     if average_rows_per_sec < config.target_rows_per_sec as f64 * MIN_PASS_RATIO {
-        return false;
-    }
-    if engine_metrics.dropped_batches_total != 0 || engine_metrics.publish_errors_total != 0 {
-        return false;
-    }
-    if config
-        .max_queue_depth
-        .is_some_and(|max_queue_depth| engine_metrics.max_observed_queue_depth > max_queue_depth)
-    {
         return false;
     }
     if config
@@ -3025,11 +2007,6 @@ fn evaluate_pass(
         .is_some_and(|max_p99_micros| latency.p99_micros > max_p99_micros)
     {
         return false;
-    }
-    if let Some(source_metrics) = source_metrics {
-        if source_metrics.source_decode_errors_total != 0 {
-            return false;
-        }
     }
     true
 }
@@ -3045,37 +2022,26 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        checked_write_to_subscribe_elapsed_ns, compute_remote_downstream_deadline,
-        consume_write_to_subscribe_rows, consume_write_to_subscribe_span,
-        count_per_sec_over_elapsed, drive_engine_batch_admission, drive_segment_write_to_consumer,
-        engine_batch_deadline_offset, engine_metrics_report_with_observed_queue_depth,
-        inproc_processing_elapsed, is_engine_drive_measured, is_write_to_subscribe_measured,
-        merge_write_to_subscribe_results, merge_write_to_subscribe_startup_error,
-        produce_write_to_subscribe_rows, remote_downstream_should_stop_for_idle, run_profile,
+        checked_write_to_subscribe_elapsed_ns, consume_write_to_subscribe_rows,
+        consume_write_to_subscribe_span, count_per_sec_over_elapsed,
+        drive_segment_write_to_consumer, engine_batch_deadline_offset, inproc_processing_elapsed,
+        is_engine_drive_measured, is_write_to_subscribe_measured, merge_write_to_subscribe_results,
+        merge_write_to_subscribe_startup_error, produce_write_to_subscribe_rows, run_profile,
         run_profile_with_hooks, should_admit_engine_batch, validate_inproc_completion,
         validate_write_to_subscribe_counts, write_report_json,
         write_to_subscribe_consumer_complete, write_to_subscribe_deadline_offset, BaselineManifest,
         BaselineRunState, ConsumerJoinGuard, ConsumerStats, EngineMetricsReport, LatencySummary,
-        OverflowPolicyConfig, PerfBinaryIdentity, PerfConfig, PerfDatasetManifest,
-        PerfDatasetParameters, PerfProfile, PerfReport, PerfReportMetadata, PerfSourceIdentity,
-        ProducerOutcome, ProducerState, RowPeakTracker, SteadyPeakTracker, WriteToSubscribeTiming,
-        BASELINE_MANIFEST_FORMAT_VERSION, REMOTE_IDLE_GRACE_SEC, SINGLE_NODE_REFACTOR_SUITE,
+        PerfBinaryIdentity, PerfConfig, PerfDatasetManifest, PerfDatasetParameters, PerfProfile,
+        PerfReport, PerfReportMetadata, PerfSourceIdentity, ProducerOutcome, ProducerState,
+        RowPeakTracker, SteadyPeakTracker, WriteToSubscribeTiming,
+        BASELINE_MANIFEST_FORMAT_VERSION, SINGLE_NODE_REFACTOR_SUITE,
     };
-    use zippy_core::{EngineMetricsSnapshot, EngineStatus};
     use zippy_segment_store::{
         compile_schema, ActiveSegmentReader, ActiveSegmentWriter, ColumnSpec, ColumnType,
         LayoutPlan,
     };
 
-    fn test_endpoint() -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("tcp://127.0.0.1:{}", 20_000 + (nanos % 20_000) as u16)
-    }
-
-    fn test_config(profile: PerfProfile, endpoint: String) -> PerfConfig {
+    fn test_config(profile: PerfProfile) -> PerfConfig {
         PerfConfig {
             profile,
             rows_per_batch: 256,
@@ -3083,12 +2049,8 @@ mod tests {
             duration_sec: 1,
             warmup_sec: 0,
             symbols: 32,
-            endpoint,
-            buffer_capacity: 1024,
-            overflow_policy: OverflowPolicyConfig::Block,
             max_p95_micros: None,
             max_p99_micros: None,
-            max_queue_depth: None,
         }
     }
 
@@ -3096,7 +2058,7 @@ mod tests {
     fn tick_generators_cover_all_symbols_across_batch_boundaries() {
         use arrow::array::{Array, StringArray};
         for (rows, symbols) in [(64, 10_000), (8, 3), (1, 1)] {
-            let mut config = test_config(PerfProfile::InprocTimeseries, String::new());
+            let mut config = test_config(PerfProfile::TimeseriesKernel);
             config.rows_per_batch = rows;
             config.symbols = symbols;
             let mut factory = super::TickBatchFactory::new(
@@ -3145,16 +2107,14 @@ mod tests {
             batches_per_sec: 0.0,
             latency: LatencySummary::default(),
             secondary_latency: None,
-            engine_status: EngineStatus::Stopped.as_str().to_string(),
             engine_metrics: EngineMetricsReport::default(),
-            source_metrics: None,
             pass: true,
         }
     }
 
     #[test]
     fn profile_report_uses_metadata_captured_before_dispatch() {
-        let config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        let config = test_config(PerfProfile::TimeseriesKernel);
         let logical_time = Cell::new(1_000_u128);
 
         let report = run_profile_with_hooks(
@@ -3179,7 +2139,7 @@ mod tests {
 
     #[test]
     fn invalid_profile_config_skips_metadata_capture_and_dispatch() {
-        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        let mut config = test_config(PerfProfile::TimeseriesKernel);
         config.rows_per_batch = 0;
         let capture_called = Cell::new(false);
         let dispatch_called = Cell::new(false);
@@ -3208,7 +2168,7 @@ mod tests {
 
     #[test]
     fn baseline_manifest_serializes_build_config_dataset_and_completed_report() {
-        let config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        let config = test_config(PerfProfile::TimeseriesKernel);
         let metadata = PerfReportMetadata {
             git_sha: "0123456789ab".to_string(),
             target: "linux-x86_64".to_string(),
@@ -3254,7 +2214,7 @@ mod tests {
             .unwrap();
         let json = serde_json::to_value(completed).unwrap();
 
-        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["format_version"], 2);
         assert_eq!(json["suite"], "single-node-refactor");
         assert_eq!(json["state"], "completed");
         assert_eq!(json["metadata"]["git_sha"], "0123456789ab");
@@ -3274,24 +2234,6 @@ mod tests {
         assert_eq!(
             super::sha256_reader(Cursor::new(b"a")).unwrap(),
             "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
-        );
-    }
-
-    #[test]
-    fn remote_profile_requires_explicit_dataset_identity() {
-        let error =
-            super::resolve_dataset_id(PerfProfile::RemotePipelineDownstream, None).unwrap_err();
-        assert_eq!(
-            error,
-            "remote pipeline profiles require an explicit dataset_id"
-        );
-        assert_eq!(
-            super::resolve_dataset_id(
-                PerfProfile::RemotePipelineDownstream,
-                Some("fixture.remote-bars.v1")
-            )
-            .unwrap(),
-            "fixture.remote-bars.v1"
         );
     }
 
@@ -3373,37 +2315,14 @@ mod tests {
         writer.commit_row().unwrap();
     }
 
-    struct FakeEngineBatchAdmission<'a> {
-        metrics_sampled: &'a Cell<bool>,
-        write_calls: Cell<u64>,
-        queue_depth: usize,
-    }
-
-    impl super::EngineBatchAdmission for FakeEngineBatchAdmission<'_> {
-        fn admit_batch(&self, _batch: arrow::record_batch::RecordBatch) -> super::PerfResult<()> {
-            self.write_calls.set(self.write_calls.get() + 1);
-            Ok(())
-        }
-
-        fn observed_queue_depth(&self) -> usize {
-            assert_eq!(self.write_calls.get(), 1);
-            self.metrics_sampled.set(true);
-            self.queue_depth
-        }
-    }
-
     #[test]
-    fn inproc_timeseries_profile_produces_nonzero_rows_and_passes() {
-        let report =
-            run_profile(&test_config(PerfProfile::InprocTimeseries, test_endpoint())).unwrap();
+    fn timeseries_kernel_profile_produces_nonzero_rows_and_passes() {
+        let report = run_profile(&test_config(PerfProfile::TimeseriesKernel)).unwrap();
 
         assert!(report.input_rows_total > 0);
         assert_eq!(
             report.input_rows_total,
             report.engine_metrics.processed_rows_total
-        );
-        assert!(
-            report.engine_metrics.max_observed_queue_depth >= report.engine_metrics.queue_depth
         );
         assert!(report.actual_average_rows_per_sec > 0.0);
         assert!(report.batches_per_sec > 0.0);
@@ -3574,88 +2493,16 @@ mod tests {
     }
 
     #[test]
-    fn remote_upstream_driver_carries_sampled_queue_without_metrics_latency() {
-        let metrics_sampled = Cell::new(false);
-        let admission = FakeEngineBatchAdmission {
-            metrics_sampled: &metrics_sampled,
-            write_calls: Cell::new(0),
-            queue_depth: 3,
-        };
-        let write_started_at = Instant::now();
-        let mut write_completion_clock = || {
-            if metrics_sampled.get() {
-                write_started_at + Duration::from_secs(1)
-            } else {
-                write_started_at + Duration::from_micros(7)
-            }
-        };
-        let batch = arrow::record_batch::RecordBatch::new_empty(Arc::new(
-            arrow::datatypes::Schema::empty(),
-        ));
-
-        let mut max_observed_queue_depth = 0;
-        let mut batch_latencies_micros = Vec::new();
-        drive_engine_batch_admission(
-            &admission,
-            batch,
-            write_started_at,
-            &mut write_completion_clock,
-            true,
-            &mut max_observed_queue_depth,
-            &mut batch_latencies_micros,
-        )
-        .unwrap();
-        let engine_metrics = engine_metrics_report_with_observed_queue_depth(
-            EngineMetricsSnapshot {
-                queue_depth: 0,
-                ..EngineMetricsSnapshot::default()
-            },
-            max_observed_queue_depth,
-        );
-        let mut config = test_config(PerfProfile::RemotePipelineUpstream, test_endpoint());
-
-        assert!(metrics_sampled.get());
-        assert_eq!(admission.write_calls.get(), 1);
-        assert_eq!(batch_latencies_micros, vec![7]);
-        assert_eq!(engine_metrics.queue_depth, 0);
-        assert_eq!(engine_metrics.max_observed_queue_depth, 3);
-        assert!(super::evaluate_pass(
-            &config,
-            config.target_rows_per_sec as f64,
-            EngineStatus::Stopped,
-            &engine_metrics,
-            None,
-            &LatencySummary::default(),
-        ));
-
-        config.max_queue_depth = Some(2);
-        assert!(!super::evaluate_pass(
-            &config,
-            config.target_rows_per_sec as f64,
-            EngineStatus::Stopped,
-            &engine_metrics,
-            None,
-            &LatencySummary::default(),
-        ));
-    }
-
-    #[test]
-    fn stream_table_segment_profiles_produce_nonzero_rows_and_pass() {
-        for profile in [
-            PerfProfile::StreamTableSegmentCopy,
-            PerfProfile::StreamTableSegmentForward,
-        ] {
-            let report = run_profile(&test_config(profile, test_endpoint())).unwrap();
-
-            assert!(report.input_rows_total > 0);
-            assert!(report.actual_average_rows_per_sec > 0.0);
-            assert!(report.pass);
-        }
+    fn stream_table_segment_copy_profile_produces_nonzero_rows_and_passes() {
+        let report = run_profile(&test_config(PerfProfile::StreamTableSegmentCopy)).unwrap();
+        assert!(report.input_rows_total > 0);
+        assert!(report.actual_average_rows_per_sec > 0.0);
+        assert!(report.pass);
     }
 
     #[test]
     fn single_row_low_rate_profile_produces_nonzero_rows_and_passes() {
-        let mut config = test_config(PerfProfile::SingleRowLowRate, test_endpoint());
+        let mut config = test_config(PerfProfile::SingleRowLowRate);
         config.rows_per_batch = 1;
         config.target_rows_per_sec = 200;
         config.symbols = 1;
@@ -3670,7 +2517,7 @@ mod tests {
 
     #[test]
     fn write_to_subscribe_live_profile_reports_complete_consumer_boundary_samples() {
-        let mut config = test_config(PerfProfile::WriteToSubscribeE2e, test_endpoint());
+        let mut config = test_config(PerfProfile::WriteToSubscribeE2e);
         config.rows_per_batch = 1;
         config.target_rows_per_sec = 200;
         config.warmup_sec = 0;
@@ -3845,7 +2692,7 @@ mod tests {
 
     #[test]
     fn write_to_subscribe_producer_error_sets_done_and_cancelled() {
-        let mut config = test_config(PerfProfile::WriteToSubscribeE2e, test_endpoint());
+        let mut config = test_config(PerfProfile::WriteToSubscribeE2e);
         config.target_rows_per_sec = 1_000_000_000;
         config.symbols = 1;
         let (mut writer, _reader) = write_to_subscribe_test_segment(1);
@@ -3875,7 +2722,7 @@ mod tests {
 
     #[test]
     fn write_to_subscribe_producer_error_before_first_row_joins_consumer_and_clears_waiter() {
-        let mut config = test_config(PerfProfile::WriteToSubscribeE2e, test_endpoint());
+        let mut config = test_config(PerfProfile::WriteToSubscribeE2e);
         config.target_rows_per_sec = 1_000_000_000;
         config.symbols = 1;
         let (mut writer, mut reader) = write_to_subscribe_test_segment(1);
@@ -3952,28 +2799,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_stream_table_e2e_reports_publish_and_emit_return_latency() {
-        let mut config = test_config(PerfProfile::RuntimeStreamTableE2e, test_endpoint());
-        config.rows_per_batch = 1;
-        config.target_rows_per_sec = 200;
-        config.symbols = 1;
-
-        let report = run_profile(&config).unwrap();
-
-        assert!(report.input_rows_total > 0);
-        assert!(report.output_rows_total > 0);
-        assert!(report.latency.p99_micros >= report.latency.p50_micros);
-        let secondary = report
-            .secondary_latency
-            .as_ref()
-            .expect("runtime profile must report source emit return latency");
-        assert!(secondary.p99_micros >= secondary.p50_micros);
-        assert!(report.pass);
-    }
-
-    #[test]
     fn stream_table_subscriber_e2e_reports_target_reader_latency() {
-        let mut config = test_config(PerfProfile::StreamTableSubscriberE2e, test_endpoint());
+        let mut config = test_config(PerfProfile::StreamTableSubscriberE2e);
         config.rows_per_batch = 1;
         config.target_rows_per_sec = 200;
         config.symbols = 1;
@@ -3993,7 +2820,7 @@ mod tests {
 
     #[test]
     fn single_row_profiles_reject_capacity_above_single_segment_limit() {
-        let mut config = test_config(PerfProfile::WriteToSubscribeE2e, test_endpoint());
+        let mut config = test_config(PerfProfile::WriteToSubscribeE2e);
         config.rows_per_batch = 1;
         config.target_rows_per_sec = 1_000_000;
         config.duration_sec = 60;
@@ -4005,37 +2832,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_pipeline_profiles_exchange_data_and_pass() {
-        let endpoint = test_endpoint();
-        let downstream_handle = std::thread::spawn({
-            let endpoint = endpoint.clone();
-            move || {
-                run_profile(&test_config(
-                    PerfProfile::RemotePipelineDownstream,
-                    endpoint,
-                ))
-            }
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let upstream_report = run_profile(&test_config(
-            PerfProfile::RemotePipelineUpstream,
-            endpoint.clone(),
-        ))
-        .unwrap();
-        let downstream_report = downstream_handle.join().unwrap().unwrap();
-
-        assert!(upstream_report.input_rows_total > 0);
-        assert!(downstream_report.output_rows_total > 0);
-        assert!(upstream_report.pass);
-        assert!(downstream_report.pass);
-    }
-
-    #[test]
     fn writes_report_json_with_profile_and_pass_fields() {
-        let report =
-            run_profile(&test_config(PerfProfile::InprocTimeseries, test_endpoint())).unwrap();
+        let report = run_profile(&test_config(PerfProfile::TimeseriesKernel)).unwrap();
         let path = std::env::temp_dir().join(format!(
             "zippy-perf-report-{}.json",
             SystemTime::now()
@@ -4080,21 +2878,8 @@ mod tests {
     }
 
     #[test]
-    fn latency_summary_deserializes_legacy_json_without_additive_fields() {
-        let summary: LatencySummary =
-            serde_json::from_str(r#"{"p50_micros": 4.0, "p95_micros": 9.0, "p99_micros": 9.0}"#)
-                .unwrap();
-
-        assert_eq!(summary.sample_count, 0);
-        assert_eq!(summary.max_micros, 0.0);
-        assert_eq!(summary.p50_micros, 4.0);
-        assert_eq!(summary.p95_micros, 9.0);
-        assert_eq!(summary.p99_micros, 9.0);
-    }
-
-    #[test]
     fn evaluate_pass_rejects_latency_above_configured_p99_threshold() {
-        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        let mut config = test_config(PerfProfile::TimeseriesKernel);
         config.max_p99_micros = Some(100.0);
         let latency = LatencySummary {
             sample_count: 1,
@@ -4104,21 +2889,14 @@ mod tests {
             max_micros: 101.0,
         };
 
-        let pass = super::evaluate_pass(
-            &config,
-            10_000.0,
-            EngineStatus::Stopped,
-            &EngineMetricsReport::default(),
-            None,
-            &latency,
-        );
+        let pass = super::evaluate_pass(&config, 10_000.0, &latency);
 
         assert!(!pass);
     }
 
     #[test]
     fn evaluate_pass_rejects_latency_above_configured_p95_threshold() {
-        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        let mut config = test_config(PerfProfile::TimeseriesKernel);
         config.max_p95_micros = Some(50.0);
         let latency = LatencySummary {
             sample_count: 1,
@@ -4128,82 +2906,101 @@ mod tests {
             max_micros: 80.0,
         };
 
-        let pass = super::evaluate_pass(
-            &config,
-            10_000.0,
-            EngineStatus::Stopped,
-            &EngineMetricsReport::default(),
-            None,
-            &latency,
-        );
+        let pass = super::evaluate_pass(&config, 10_000.0, &latency);
 
         assert!(!pass);
     }
-
     #[test]
-    fn evaluate_pass_rejects_queue_depth_above_configured_threshold() {
-        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
-        config.max_queue_depth = Some(2);
-        let engine_metrics = EngineMetricsReport {
-            queue_depth: 0,
-            max_observed_queue_depth: 3,
-            ..EngineMetricsReport::default()
+    fn kernel_latency_includes_processing_and_excludes_unmeasured_batches() {
+        let processed = Cell::new(false);
+        let start = Instant::now();
+        let mut process = |_| {
+            processed.set(true);
+            Ok(())
         };
-
-        let pass = super::evaluate_pass(
-            &config,
-            10_000.0,
-            EngineStatus::Stopped,
-            &engine_metrics,
-            None,
-            &LatencySummary::default(),
-        );
-
-        assert!(!pass);
-    }
-
-    #[test]
-    fn engine_metrics_report_deserializes_legacy_json_without_observed_queue_depth() {
-        let metrics: EngineMetricsReport = serde_json::from_str(
-            r#"{"processed_batches_total":1,"processed_rows_total":2,"output_batches_total":1,"dropped_batches_total":0,"late_rows_total":0,"publish_errors_total":0,"queue_depth":0}"#,
+        let mut clock = || {
+            assert!(processed.get());
+            start + Duration::from_micros(7)
+        };
+        let batch = arrow::record_batch::RecordBatch::new_empty(Arc::new(
+            arrow::datatypes::Schema::empty(),
+        ));
+        let mut samples = Vec::new();
+        super::drive_kernel_batch(
+            &mut process,
+            batch.clone(),
+            start,
+            &mut clock,
+            false,
+            &mut samples,
         )
         .unwrap();
-
-        assert_eq!(metrics.max_observed_queue_depth, 0);
-        assert_eq!(metrics.queue_depth, 0);
+        assert!(samples.is_empty());
+        super::drive_kernel_batch(&mut process, batch, start, &mut clock, true, &mut samples)
+            .unwrap();
+        assert_eq!(samples, vec![7]);
     }
 
     #[test]
-    fn remote_downstream_deadline_starts_after_first_observed_event() {
-        let observed_at = std::time::Instant::now();
-        let deadline =
-            compute_remote_downstream_deadline(observed_at, 10, 60, REMOTE_IDLE_GRACE_SEC);
-
-        assert_eq!(
-            deadline.saturating_duration_since(observed_at),
-            std::time::Duration::from_secs(10 + 60 + REMOTE_IDLE_GRACE_SEC),
-        );
-    }
-
-    #[test]
-    fn remote_downstream_stops_after_idle_once_stream_was_observed() {
-        let now = std::time::Instant::now();
-
-        assert!(remote_downstream_should_stop_for_idle(
-            Some(now - std::time::Duration::from_secs(10)),
-            Some(now - std::time::Duration::from_secs(REMOTE_IDLE_GRACE_SEC + 1)),
-            now,
+    fn failed_kernel_batch_does_not_produce_success_latency() {
+        let mut process = |_| Err("kernel rejected input".to_string());
+        let mut clock = || panic!("failed work must not be sampled");
+        let batch = arrow::record_batch::RecordBatch::new_empty(Arc::new(
+            arrow::datatypes::Schema::empty(),
         ));
+        let mut samples = Vec::new();
+        let error = super::drive_kernel_batch(
+            &mut process,
+            batch,
+            Instant::now(),
+            &mut clock,
+            true,
+            &mut samples,
+        )
+        .unwrap_err();
+        assert_eq!(error, "kernel rejected input");
+        assert!(samples.is_empty());
     }
 
     #[test]
-    fn remote_downstream_does_not_stop_for_idle_before_observing_stream() {
-        let now = std::time::Instant::now();
+    fn performance_contract_rejects_retired_profiles_and_queue_configuration() {
+        for profile in [
+            "InprocTimeseries",
+            "RemotePipelineUpstream",
+            "RemotePipelineDownstream",
+            "RuntimeStreamTableE2e",
+            "StreamTableSegmentForward",
+        ] {
+            assert!(serde_json::from_value::<PerfProfile>(serde_json::json!(profile)).is_err());
+        }
+        let config = test_config(PerfProfile::TimeseriesKernel);
+        for (field, value) in [
+            ("endpoint", serde_json::json!("tcp://127.0.0.1:5560")),
+            ("buffer_capacity", serde_json::json!(1024)),
+            ("overflow_policy", serde_json::json!("Block")),
+            ("max_queue_depth", serde_json::json!(64)),
+        ] {
+            let mut wire = serde_json::to_value(&config).unwrap();
+            wire[field] = value;
+            assert!(
+                serde_json::from_value::<PerfConfig>(wire).is_err(),
+                "{field}"
+            );
+        }
+    }
 
-        assert!(!remote_downstream_should_stop_for_idle(
-            None,
-            Some(now - std::time::Duration::from_secs(REMOTE_IDLE_GRACE_SEC + 1)),
-            now,
-        ));
+    #[test]
+    fn latency_contract_requires_complete_current_measurements() {
+        for field in ["sample_count", "max_micros"] {
+            let mut wire = serde_json::to_value(LatencySummary::default()).unwrap();
+            wire.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<LatencySummary>(wire).is_err(),
+                "{field}"
+            );
+        }
+        let mut wire = serde_json::to_value(EngineMetricsReport::default()).unwrap();
+        wire["queue_depth"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<EngineMetricsReport>(wire).is_err());
     }
 }

@@ -32,30 +32,17 @@ from zippy.server_process import (
 )
 
 
-def _unused_gateway_endpoint() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        host, port = listener.getsockname()
-    return f"{host}:{port}"
-
-
 def _valid_ready_record() -> dict[str, object]:
     return {
-        "schema_version": 7,
+        "schema_version": 11,
         "status": "ready",
         "health": {
             "readiness": {
                 "admission_open": True,
                 "master_listener_ready": True,
-                "memory_ingest_configured": True,
-                "memory_ingest_ready": True,
-                "gateway_configured": True,
-                "gateway_listener_ready": True,
-                "gateway_master_reachable": True,
                 "flight_configured": False,
                 "flight_listener_ready": False,
                 "flight_protocol_ready": False,
-                "native_storage_configured": True,
                 "native_catalog_ready": True,
                 "native_current_snapshot_files_ready": True,
                 "storage_reconciliation_complete": True,
@@ -64,10 +51,9 @@ def _valid_ready_record() -> dict[str, object]:
             "services": {
                 "accepting_work": True,
                 "admission_open": True,
-                "catalog": "degraded",
-                "query": "degraded",
+                "catalog": "ready",
+                "query": "unavailable",
                 "master_lifecycle_running": True,
-                "gateway_facade_available": True,
                 "end_to_end_liveness": True,
             },
         },
@@ -108,7 +94,7 @@ def test_server_startup_summary_reports_health_logs_and_unmanaged_webui() -> Non
         "status": "healthy",
         "version": "0.5.0.dev1+g1234567",
         "pid": 4321,
-        "mode": "catalog_only",
+        "mode": "control_only",
         "startup_elapsed_ms": 15.2,
         "requested_control_endpoint": "tcp://127.0.0.1:17690",
         "control_endpoint": "tcp://127.0.0.1:17690",
@@ -116,7 +102,6 @@ def test_server_startup_summary_reports_health_logs_and_unmanaged_webui() -> Non
             "status": "healthy",
             "endpoint": "tcp://127.0.0.1:17690",
         },
-        "gateway": {"enabled": False, "status": "disabled"},
         "flight": {
             "enabled": True,
             "endpoint": "127.0.0.1:17700",
@@ -141,7 +126,6 @@ def test_server_startup_summary_reports_health_logs_and_unmanaged_webui() -> Non
     assert "version: 0.5.0.dev1+g1234567" in summary
     assert "health: healthy" in summary
     assert "master: healthy" in summary
-    assert "gateway: disabled" in summary
     assert (
         "flight: enabled endpoint=[127.0.0.1:17700] tls=[yes] "
         "ingest=[memory] writer_auth=[yes]" in summary
@@ -177,11 +161,10 @@ def test_server_run_defaults_to_detached_launcher(
             "status": "healthy",
             "version": "0.5.0",
             "pid": 4321,
-            "mode": "catalog_only",
+            "mode": "control_only",
             "requested_control_endpoint": control_endpoint,
             "control_endpoint": control_endpoint,
             "master": {"status": "healthy", "endpoint": control_endpoint},
-            "gateway": {"enabled": False, "status": "disabled"},
             "webui": {
                 "managed": False,
                 "status": "not_running",
@@ -421,15 +404,11 @@ def test_server_lock_without_state_is_starting_and_not_stoppable(
     ("section", "field"),
     [
         ("readiness", "master_listener_ready"),
-        ("readiness", "memory_ingest_ready"),
-        ("readiness", "gateway_listener_ready"),
-        ("readiness", "gateway_master_reachable"),
         ("readiness", "native_catalog_ready"),
         ("readiness", "native_current_snapshot_files_ready"),
         ("readiness", "storage_reconciliation_complete"),
         ("readiness", "commit_recovery_complete"),
         ("services", "accepting_work"),
-        ("services", "gateway_facade_available"),
         ("services", "end_to_end_liveness"),
     ],
 )
@@ -442,58 +421,6 @@ def test_server_ready_record_requires_all_runtime_facts(section: str, field: str
     target[field] = False
 
     with pytest.raises(_ServerProcessError, match="full readiness"):
-        _validate_ready_record(record)
-
-
-@pytest.mark.parametrize(
-    ("mode", "value"),
-    [
-        ("missing", None),
-        ("null", None),
-        ("string", "true"),
-    ],
-)
-def test_server_ready_record_requires_boolean_native_storage_configuration(
-    mode: str,
-    value: object,
-) -> None:
-    record = _valid_ready_record()
-    health = record["health"]
-    assert isinstance(health, dict)
-    readiness = health["readiness"]
-    assert isinstance(readiness, dict)
-    if mode == "missing":
-        readiness.pop("native_storage_configured")
-    else:
-        readiness["native_storage_configured"] = value
-
-    with pytest.raises(_ServerProcessError, match="invalid native storage configuration"):
-        _validate_ready_record(record)
-
-
-@pytest.mark.parametrize("value", [None, "true"])
-def test_server_ready_record_requires_boolean_gateway_configuration(value: object) -> None:
-    record = _valid_ready_record()
-    health = record["health"]
-    assert isinstance(health, dict)
-    readiness = health["readiness"]
-    assert isinstance(readiness, dict)
-    readiness["gateway_configured"] = value
-
-    with pytest.raises(_ServerProcessError, match="invalid gateway configuration"):
-        _validate_ready_record(record)
-
-
-@pytest.mark.parametrize("value", [None, "true"])
-def test_server_ready_record_requires_boolean_memory_ingest_configuration(value: object) -> None:
-    record = _valid_ready_record()
-    health = record["health"]
-    assert isinstance(health, dict)
-    readiness = health["readiness"]
-    assert isinstance(readiness, dict)
-    readiness["memory_ingest_configured"] = value
-
-    with pytest.raises(_ServerProcessError, match="invalid memory ingest configuration"):
         _validate_ready_record(record)
 
 
@@ -523,71 +450,20 @@ def test_server_ready_record_requires_configured_flight_listener_and_protocol() 
 
     readiness["flight_listener_ready"] = True
     readiness["flight_protocol_ready"] = True
+    with pytest.raises(_ServerProcessError, match="did not satisfy full readiness"):
+        _validate_ready_record(record)
+    services = health["services"]
+    assert isinstance(services, dict)
+    services["query"] = "ready"
     _validate_ready_record(record)
 
 
-def test_server_ready_record_rejects_previous_schema_version() -> None:
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
+def test_server_ready_record_rejects_other_schema_versions(version: int) -> None:
     record = _valid_ready_record()
-    record["schema_version"] = 1
-
+    record["schema_version"] = version
     with pytest.raises(_ServerProcessError, match="unsupported ready schema"):
         _validate_ready_record(record)
-
-
-def test_server_ready_record_accepts_previous_rolling_upgrade_schema() -> None:
-    record = _valid_ready_record()
-    record["schema_version"] = 4
-    health = record["health"]
-    assert isinstance(health, dict)
-    readiness = health["readiness"]
-    assert isinstance(readiness, dict)
-    readiness.pop("memory_ingest_configured")
-    readiness.pop("memory_ingest_ready")
-
-    _validate_ready_record(record)
-
-
-def test_server_ready_record_accepts_pre_flight_schema_without_flight_facts() -> None:
-    record = _valid_ready_record()
-    record["schema_version"] = 2
-    health = record["health"]
-    assert isinstance(health, dict)
-    readiness = health["readiness"]
-    assert isinstance(readiness, dict)
-    readiness.pop("flight_configured")
-    readiness.pop("flight_listener_ready")
-    readiness.pop("flight_protocol_ready")
-
-    _validate_ready_record(record)
-
-
-def test_server_status_normalizes_ready_v1_without_mutating_authoritative_state() -> None:
-    record = _valid_ready_record()
-    record["schema_version"] = 1
-    health = record["health"]
-    assert isinstance(health, dict)
-    readiness = health["readiness"]
-    assert isinstance(readiness, dict)
-    for field in (
-        "native_storage_configured",
-        "native_catalog_ready",
-        "native_current_snapshot_files_ready",
-        "storage_reconciliation_complete",
-        "commit_recovery_complete",
-    ):
-        readiness.pop(field)
-
-    compatibility = server_process._ready_record_for_status_validation(record)
-
-    _validate_ready_record(compatibility)
-    assert record["schema_version"] == 1
-    assert "native_storage_configured" not in readiness
-    compatibility_health = compatibility["health"]
-    assert isinstance(compatibility_health, dict)
-    compatibility_readiness = compatibility_health["readiness"]
-    assert isinstance(compatibility_readiness, dict)
-    assert compatibility_readiness["native_storage_configured"] is False
-    assert compatibility_readiness["memory_ingest_configured"] is False
 
 
 def test_master_health_probe_uses_one_absolute_deadline() -> None:
@@ -635,14 +511,13 @@ def test_server_status_rejects_generation_change_during_health_probe(
         log_dir=tmp_path / "logs",
     )
     state: dict[str, object] = {
-        "schema_version": 6,
+        "schema_version": 11,
         "status": "ready",
         "launch_nonce": "old-generation",
         "pid": 43001,
         "version": "0.5.0",
-        "mode": "catalog_only",
+        "mode": "control_only",
         "control_endpoint": control_endpoint,
-        "gateway": {"enabled": False},
         "launcher": {
             "process_identity": {"boot_id": "boot-old", "start_ticks": "1"},
             "requested_control_endpoint": control_endpoint,
@@ -662,7 +537,6 @@ def test_server_status_rejects_generation_change_during_health_probe(
         paths.state_file.write_text(json.dumps(replacement), encoding="utf-8")
         return (
             {"status": "healthy", "endpoint": control_endpoint},
-            {"enabled": False, "status": "disabled"},
             {"managed": False, "status": "not_running", "url": "http://127.0.0.1:17688/"},
         )
 
@@ -763,8 +637,6 @@ def test_webui_url_rejects_sensitive_path() -> None:
     reason="detached lifecycle requires Linux process identity",
 )
 def test_server_detached_lifecycle_is_ready_probeable_and_stoppable(tmp_path: Path) -> None:
-    if not getattr(zippy, "_NATIVE_AVAILABLE", False):
-        pytest.skip("native extension is unavailable")
 
     control_endpoint = tmp_path / "server.sock"
     run_dir = tmp_path / "run"
@@ -776,7 +648,8 @@ def test_server_detached_lifecycle_is_ready_probeable_and_stoppable(tmp_path: Pa
             [
                 "[server]",
                 f"data_dir = {json.dumps(str(data_dir))}",
-                "native_storage_enabled = true",
+                "[flight]",
+                "enabled = false",
                 "",
             ]
         ),
@@ -810,11 +683,9 @@ def test_server_detached_lifecycle_is_ready_probeable_and_stoppable(tmp_path: Pa
         assert startup["status"] == "healthy"
         assert startup["version"] == zippy.version()
         assert startup["master"]["status"] == "healthy"
-        assert startup["gateway"]["status"] == "disabled"
         assert startup["webui"]["status"] == "not_running"
         assert startup["webui"]["managed"] is False
         readiness = startup["runtime_health"]["readiness"]
-        assert readiness["native_storage_configured"] is True
         assert readiness["native_catalog_ready"] is True
         assert readiness["native_current_snapshot_files_ready"] is True
         assert readiness["storage_reconciliation_complete"] is True
@@ -910,8 +781,6 @@ def test_server_detached_lifecycle_is_ready_probeable_and_stoppable(tmp_path: Pa
     reason="detached lifecycle requires Linux process identity",
 )
 def test_server_child_remains_manageable_when_launcher_is_killed(tmp_path: Path) -> None:
-    if not getattr(zippy, "_NATIVE_AVAILABLE", False):
-        pytest.skip("native extension is unavailable")
 
     control_endpoint = tmp_path / "orphan-safe-server.sock"
     run_dir = tmp_path / "run"
@@ -1019,8 +888,6 @@ def test_server_child_remains_manageable_when_launcher_is_killed(tmp_path: Path)
     reason="detached lifecycle requires Linux process identity",
 )
 def test_server_bootstrap_state_is_stoppable_before_zippy_import(tmp_path: Path) -> None:
-    if not getattr(zippy, "_NATIVE_AVAILABLE", False):
-        pytest.skip("native extension is unavailable")
 
     control_endpoint = tmp_path / "bootstrap-paused-server.sock"
     run_dir = tmp_path / "run"
@@ -1134,7 +1001,7 @@ def test_old_stop_preserves_replacement_generation_state(
         log_dir=tmp_path / "logs",
     )
     old_state: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 11,
         "status": "ready",
         "launch_nonce": "old-generation",
         "pid": 41001,
@@ -1167,6 +1034,46 @@ def test_old_stop_preserves_replacement_generation_state(
         )
 
     assert json.loads(paths.state_file.read_text(encoding="utf-8")) == replacement
+
+
+def test_shutdown_cleanup_waits_for_transient_probe_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _server_paths(str(tmp_path / "probe.sock"), run_dir=tmp_path, log_dir=tmp_path)
+    paths.state_file.write_text(json.dumps({"pid": 41001, "launch_nonce": "same"}))
+    probe_fd = _acquire_launch_lock(paths.lock_file)
+    waits: list[float] = []
+
+    def release_probe(delay: float) -> None:
+        waits.append(delay)
+        os.close(probe_fd)
+
+    monkeypatch.setattr(server_process.time, "sleep", release_probe)
+    cleanup_fd = server_process._acquire_shutdown_cleanup_lock(
+        paths, pid=41001, launch_nonce="same", timeout_sec=1.0
+    )
+    try:
+        assert len(waits) == 1
+        assert server_process._lock_is_held(paths.lock_file)
+    finally:
+        os.close(cleanup_fd)
+    assert not server_process._lock_is_held(paths.lock_file)
+
+
+def test_shutdown_cleanup_lock_timeout_does_not_delete_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _server_paths(str(tmp_path / "busy.sock"), run_dir=tmp_path, log_dir=tmp_path)
+    state = {"pid": 41001, "launch_nonce": "same"}
+    paths.state_file.write_text(json.dumps(state))
+    monkeypatch.setattr(server_process, "_try_acquire_launch_lock", lambda _path: None)
+    ticks = iter([0.0, 2.0])
+    monkeypatch.setattr(server_process.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(_ServerProcessError, match="lock remained held"):
+        server_process._acquire_shutdown_cleanup_lock(
+            paths, pid=41001, launch_nonce="same", timeout_sec=1.0
+        )
+    assert json.loads(paths.state_file.read_text()) == state
 
 
 def test_failed_launcher_cleanup_preserves_replacement_generation(
@@ -1203,92 +1110,15 @@ def test_failed_launcher_cleanup_preserves_replacement_generation(
     not sys.platform.startswith("linux"),
     reason="detached lifecycle requires Linux process identity",
 )
-def test_server_detached_gateway_probe_does_not_persist_token(tmp_path: Path) -> None:
-    if not getattr(zippy, "_NATIVE_AVAILABLE", False):
-        pytest.skip("native extension is unavailable")
-
-    control_endpoint = tmp_path / "gateway-server.sock"
-    run_dir = tmp_path / "run"
-    log_dir = tmp_path / "logs"
-    config_path = tmp_path / "zippy.toml"
-    gateway_endpoint = _unused_gateway_endpoint()
-    token = "gateway-secret-must-not-be-persisted"
-    config_path.write_text(
-        f"""
-[master]
-shutdown_timeout_ms = 1000
-
-[gateway]
-enabled = true
-endpoint = "{gateway_endpoint}"
-token = "{token}"
-""",
-        encoding="utf-8",
-    )
-    runner = CliRunner()
-    pid: int | None = None
-    try:
-        started = runner.invoke(
-            main,
-            [
-                "server",
-                "run",
-                str(control_endpoint),
-                "--config",
-                str(config_path),
-                "--run-dir",
-                str(run_dir),
-                "--log-dir",
-                str(log_dir),
-                "--webui-url",
-                "http://127.0.0.1:1/",
-                "--json",
-            ],
-        )
-        assert started.exit_code == 0, started.output
-        startup = json.loads(started.output)
-        pid = int(startup["pid"])
-        state_file = Path(startup["state_file"])
-
-        assert startup["mode"] == "catalog_and_query"
-        assert startup["gateway"]["status"] == "healthy"
-        assert startup["gateway"]["endpoint"] == gateway_endpoint
-        assert token not in started.output
-        assert token not in state_file.read_text(encoding="utf-8")
-
-        stopped = runner.invoke(
-            main,
-            [
-                "server",
-                "stop",
-                str(control_endpoint),
-                "--run-dir",
-                str(run_dir),
-                "--json",
-            ],
-        )
-        assert stopped.exit_code == 0, stopped.output
-        pid = None
-    finally:
-        if pid is not None:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="detached lifecycle requires Linux process identity",
-)
 def test_server_startup_failure_rolls_back_master_and_state(tmp_path: Path) -> None:
-    if not getattr(zippy, "_NATIVE_AVAILABLE", False):
-        pytest.skip("native extension is unavailable")
 
     control_endpoint = tmp_path / "failed-server.sock"
     run_dir = tmp_path / "run"
     log_dir = tmp_path / "logs"
     config_path = tmp_path / "zippy.toml"
+    token_path = tmp_path / "reader.token"
+    token_path.write_text("startup-failure-secret-000000000000", encoding="utf-8")
+    token_path.chmod(0o600)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
         occupied.bind(("127.0.0.1", 0))
         occupied.listen()
@@ -1298,10 +1128,23 @@ def test_server_startup_failure_rolls_back_master_and_state(tmp_path: Path) -> N
 [master]
 shutdown_timeout_ms = 1000
 
-[gateway]
+[server]
+data_dir = "{tmp_path / "data"}"
+
+
+[catalog]
+
+
+[query]
+
+
+[flight]
 enabled = true
 endpoint = "{host}:{port}"
-token = "startup-failure-secret"
+
+[flight.auth]
+enabled = true
+token_file = "{token_path}"
 """,
             encoding="utf-8",
         )
@@ -1335,3 +1178,16 @@ token = "startup-failure-secret"
     outcome = json.loads(paths.outcome_file.read_text(encoding="utf-8"))
     assert outcome["clean"] is False
     assert "startup-failure-secret" not in json.dumps(outcome)
+    assert "bind Flight listener failed" in paths.bootstrap_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("catalog_health", ["degraded", "unavailable"])
+def test_server_native_ready_record_requires_native_catalog(catalog_health: str) -> None:
+    record = _valid_ready_record()
+    health = record["health"]
+    assert isinstance(health, dict)
+    services = health["services"]
+    assert isinstance(services, dict)
+    services["catalog"] = catalog_health
+    with pytest.raises(_ServerProcessError, match="did not satisfy full readiness"):
+        _validate_ready_record(record)

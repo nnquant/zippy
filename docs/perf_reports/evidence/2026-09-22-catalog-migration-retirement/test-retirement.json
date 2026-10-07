@@ -1,0 +1,322 @@
+{
+  "retired_or_rewritten": [
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "adopt_creates_only_valid_empty_v1_mapping_and_native_authority_splits_writes",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "bootstrap_replays_conflicts_and_preserves_empty_high_revision_history",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "checkpoint_sync_drop_enforce_cas_demotion_active_digest_and_continuity",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "drop_preserves_seeded_completeness_and_exact_replay",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "unprojected_drop_rejects_nonempty_advanced_v2_and_existing_history",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "unprojected_drop_rejects_wrong_option_revision_and_table_cas",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "unprojected_drop_rolls_back_bootstrapped_mapping_on_late_failure",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_projection_domain.rs",
+      "test": "unprojected_empty_v1_drop_bootstraps_dropped_seed_and_replays",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_reconcile_domain.rs",
+      "test": "replay_snapshot_shape_accepts_first_reconcile_snapshot",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_reconcile_domain.rs",
+      "test": "replay_snapshot_shape_accepts_later_contiguous_snapshot",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_reconcile_domain.rs",
+      "test": "replay_snapshot_shape_rejects_initial_snapshot",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/legacy_reconcile_domain.rs",
+      "test": "replay_snapshot_shape_rejects_wrong_parent_or_operation",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "cancelled_legacy_replay_probe_retains_admission_until_read_exits",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_import_replay_rejects_semantically_tampered_responses",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_import_session_is_exclusive_and_sealed_by_ordinary_writes",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_reconcile_bootstraps_a_strict_v1_empty_table_base_mapping",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_reconcile_commits_full_views_replays_and_preserves_historical_order",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_reconcile_handle_fails_terminally_after_catalog_close",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_replay_probe_rejects_v1_request_id_conflicts",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_replay_probe_reports_transactional_revision_and_committed_response",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_replay_probe_uses_only_fixed_control_read_admission",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_v2_import_demotes_ready_once_and_replay_is_side_effect_free",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_v3_first_commit_updates_projection_and_demotes_ready_once",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_v4_byte_budget_precedes_publication_gate_and_releases_command_permit",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_v4_drop_none_atomically_absorbs_and_drops_empty_v1_table",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "legacy_v4_service_routes_all_operations_replays_and_reads_complete_state",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "native_v1_table_commits_demote_ready_and_continue_under_native_authority",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "pinned_external_legacy_reader_rejects_same_size_content_replacement",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/src/service.rs",
+      "test": "pinned_external_legacy_reader_starts_at_offset_zero_after_checksum",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-catalog/tests/sqlite_foundation.rs",
+      "test": "current_layout_keeps_a_constrained_dedicated_permanent_replay_table",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-master/src/daemon.rs",
+      "test": "default_data_root_imports_endpoint_snapshot_once",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-master/src/daemon.rs",
+      "test": "default_data_root_requires_explicit_offline_import",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-master/src/daemon.rs",
+      "test": "explicit_data_root_does_not_import_endpoint_snapshot",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-master/src/daemon.rs",
+      "test": "managed_snapshot_remains_authoritative_when_endpoint_snapshot_exists",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/src/legacy_import.rs",
+      "test": "catalog_visible_external_file_requires_catalog_row_count",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/src/legacy_import.rs",
+      "test": "catalog_visible_external_file_requires_snapshot_schema",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/src/legacy_import.rs",
+      "test": "final_component_fifo_replacement_does_not_block_and_fails_closed",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/src/legacy_import.rs",
+      "test": "same_inode_rewrite_with_restored_mtime_is_rejected_by_ctime",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "changed_external_legacy_file_blocks_startup_without_exposing_path",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "managed_and_external_files_share_the_total_file_budget",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "managed_and_external_files_share_the_verification_byte_budget",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "symlinked_external_legacy_file_blocks_startup_without_exposing_path",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "verifies_current_visible_external_legacy_file",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/legacy_catalog_import.rs",
+      "test": "imports_real_legacy_parquet_and_replays_exactly_after_reopen",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/legacy_catalog_import.rs",
+      "test": "missing_legacy_file_is_blocked_before_catalog_admission",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/legacy_catalog_import.rs",
+      "test": "rejects_schema_proof_mismatch_before_catalog_commit",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/legacy_catalog_import.rs",
+      "test": "symbolic_link_legacy_file_is_blocked_before_catalog_admission",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    },
+    {
+      "file": "crates/zippy-storage/tests/legacy_catalog_import.rs",
+      "test": "v1_request_identity_conflicts_before_v2_import",
+      "reason": "removed migration interface or rewritten native multi-table budget fixture",
+      "replacement": "native Catalog publication and replay; two-native-table budget checks; legacy input rejection; public native recovery matrix"
+    }
+  ],
+  "added_or_renamed": [
+    {
+      "file": "crates/zippy-catalog/tests/sqlite_foundation.rs",
+      "test": "current_layout_has_no_legacy_channels_and_rejects_migration_request_versions"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_removed_endpoint_snapshot_import"
+    },
+    {
+      "file": "crates/zippy-master/src/daemon.rs",
+      "test": "endpoint_scoped_legacy_snapshot_is_never_read_or_copied"
+    },
+    {
+      "file": "crates/zippy-master/src/daemon.rs",
+      "test": "removed_import_configuration_fails_before_creating_data_directory"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "external_legacy_location_is_rejected_before_physical_read"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "native_tables_share_the_total_file_budget"
+    },
+    {
+      "file": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "test": "native_tables_share_the_verification_byte_budget"
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+{
+  "date": "2026-09-22",
+  "batch": 15,
+  "overall_complete": false,
+  "audit_closed_total": 24,
+  "closed_this_batch": [
+    "F10"
+  ],
+  "advanced_this_batch": [
+    "F09"
+  ],
+  "new_defects_closed": [
+    "F45"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "rust_workspace": "1751 passed, 10 ignored; exit 0",
+    "final_protocol": "44 passed after final Arrow error-header change; exit 0",
+    "clippy": "workspace all-targets all-features -D warnings; passed",
+    "python_combined": "726 passed, 1 skipped; root invocation includes client tests; rebuilt extension",
+    "python_client": "116 passed; independent client suite coverage 81.54%",
+    "mypy_configured": "14 root files and 26 client files; passed",
+    "mypy_repository": "FAILED: 991 errors in 12 files, checked 85 source files; F29 remains open",
+    "maturin": "editable extension rebuilt and installed; optional patchelf warning remains",
+    "black": "passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "protocol_codegen": "regenerated and --check passed",
+    "diff_check": "passed",
+    "native_acceptance": "Arrow 23.0.1 and 25.0.1; six starts each; passed",
+    "platform": "Linux x86_64, CPython 3.11; no new Windows/macOS results",
+    "distribution_archives": "not rebuilt this batch; editable extension and source clients tested"
+  },
+  "acceptance": {
+    "public_three_kind_create_persist_restart_query_drop_restart": true,
+    "read_role_cannot_delete": true,
+    "stale_snapshot_conflict_preserves_table": true,
+    "drop_replays_same_response_after_restart": true,
+    "actor_quiescence_rolls_back_on_catalog_failure": true,
+    "existing_writers_revoked": true,
+    "actor_materializer_retired": true,
+    "continuous_logs_terminate_including_historical_windows": true,
+    "fixed_live_spans_remain_readable": true,
+    "runtime_table_and_metadata_budgets_reused_64_cycles_per_kind": true,
+    "historical_create_replay_does_not_reinstall_dropped_table": true,
+    "arrow_structured_error_headers_verified": true,
+    "same_name_recreation": false,
+    "alter_schema": false,
+    "physical_wal_receipt_retirement": false,
+    "all_cancellation_interleavings_tested": false,
+    "gateway_removed": false,
+    "native_local_compute_output": false
+  },
+  "evidence": {
+    "runtime_three_kind_drop": {
+      "path": "/tmp/zippy-retire-native-test-final.log",
+      "sha256": "926ebe17b1d43a3a4f09d08b0182e954e97c34dc3df36e520a00d8e3596ec18b"
+    },
+    "rust_workspace": {
+      "path": "/tmp/zippy-drop-workspace-final.log",
+      "sha256": "7d9b68943de7da077f7b4db3240900086c2168afa89bd3709a7f8715c1c98680"
+    },
+    "final_protocol": {
+      "path": "/tmp/zippy-drop-protocol-final.log",
+      "sha256": "00c3a02c90cfac910deb3335fcfbb7f3be3341b2db88a6475f2b71d7845538c7"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-drop-clippy-final.log",
+      "sha256": "c924762842b436b73fc4c3a2afec680b1a6d1ef5f54577f69efcddc5c2514ca4"
+    },
+    "python_combined": {
+      "path": "/tmp/zippy-drop-root-tests.log",
+      "sha256": "75dc5b6aef1b9e4aef20fd916eeea6de89ced3b52083e15d7b73a2a9c15ce483"
+    },
+    "python_client": {
+      "path": "/tmp/zippy-drop-client-tests.log",
+      "sha256": "8d14fc4eb31ddfd663438b2b0849ada9bcf59a4346b9ec96f9f1b0090b051a95"
+    },
+    "maturin": {
+      "path": "/tmp/zippy-drop-maturin.log",
+      "sha256": "cc148fc6a0b381524fc50a0833c3a03e0c7666dee368b32362b15cbb75e36b37"
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-drop-mypy-configured.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "mypy_client": {
+      "path": "/tmp/zippy-drop-mypy-client.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "mypy_repository_failed": {
+      "path": "/tmp/zippy-drop-mypy-root-final.log",
+      "sha256": "53e95f51c2318a499c2e60f932178a876addd3daa3f543e1619f82e770c277a0"
+    },
+    "native_arrow23": {
+      "path": "/tmp/zippy-drop-native-client.log",
+      "sha256": "83599dccbaa4764867bd21fc972295c50188e0c70197774dbe774279cc8336ec"
+    },
+    "native_arrow25": {
+      "path": "/tmp/zippy-drop-native-arrow25.log",
+      "sha256": "dbad96cb152c02b41eb3a21da3f94f3f3aa30f82c159fc6a62c56e894b85c725"
+    },
+    "black": {
+      "path": "/tmp/zippy-drop-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-drop-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-drop-fmt-final.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "protocol_codegen": {
+      "path": "/tmp/zippy-drop-codegen-check.log",
+      "sha256": "8d2869b3bc0ea607420c86837d592476f0c94fe355d1a1e07cc4d50cbc71b626"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-drop-diff-final.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-ingest/src/actor.rs": "2d279e3c6c854973aa44cdcd3c40833b1b41ca72d2afe4c058fbef625b608a65",
+    "crates/zippy-ingest/src/lib.rs": "f6ae2dda831ad9386ffc69c2aee0ae72377f5a9f63a81772f1f037257524c667",
+    "crates/zippy-ingest/src/materializer.rs": "ee9710a0440b6be150e7273ceb89e526d6fe9f906de9190227152cd243ed299c",
+    "crates/zippy-storage/src/catalog_verify.rs": "7606ec7d319e5d955ed33c4b36cd9b96510c3728007881137163e9cde9ec00cf",
+    "crates/zippy-storage/tests/catalog_file_verification.rs": "c5e610d8c7e48e8dc7e3bf3b77c4b072f875e78ef96e66a76fc1d23199d02158",
+    "crates/zippy-server/src/table_admin.rs": "b8accf90a713e4015a9b6951eb46b67305d245cdbcf86553e2d4138d834845eb",
+    "crates/zippy-server/src/native_storage.rs": "5b95845da8e4883fa321395f1ffd1c8150d67d3e293430db4d794f38f5cc18bb",
+    "crates/zippy-server/src/native_log.rs": "acf288e4a9c3405db9971fe52efb0b92b0f1af9009650c6c34056795af235859",
+    "crates/zippy-server/src/flight_query.rs": "d05aee3bd04bebf9c673dcf3b9d78b6ea6eddcc09330d11dbdeeb54798bec3d8",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "a7ac4f3d85e0f09f581c7a155a44056f65591bd732e68fec6511ffd8ac45bcb9",
+    "crates/zippy-protocol/src/admin.rs": "75f6e22e88dcb19e63cbf005c9b9a53bc0ae9f3c7a37ad85db41e3fccb75f9f5",
+    "crates/zippy-protocol/src/server.rs": "8f2020d8040084df67b52738f6653eabcabb2d117fc048f764a6bdb0f8f058ad",
+    "crates/zippy-protocol/src/error.rs": "7185c57074fe9b172127c1652f13ebdc3823dd74fa6c859a64ae5ad8d1fd78e1",
+    "crates/zippy-protocol/src/wire.rs": "580ecbf7d1e1e54850dcc7b2e0e0583cefb2d18266eee49d2000edbf99ab5ac8",
+    "crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto": "8e3f0f2713ccff71dba468ea4e206d56e43a5d7800ee9544481965a05038fe84",
+    "clients/python/src/zippy_client/client.py": "aaeb3a48c712ef2663933cdf85da7a2901026dd25d4b6db925fd48415c54eb02",
+    "clients/python/src/zippy_client/transports/flight.py": "969a516a69dd138f1d76cf5d69e20cec90de338c003c3e8d00dd3a05066361bd",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.py": "97742837f9fc61029f96c875447eedd020b095ab9f118ca12bd40f06bdebe216",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.pyi": "be96c60a5e0c4f327c9eaf10097f41ab568ba096991b4bc5dd78cdd07c0c0f44",
+    "clients/python/tests/test_flight_transport.py": "cdfec505b32f67ad4e2c7649acb8a4cdaf93b0cc3ca5db30d35db901ab010461",
+    "scripts/check_native_client.py": "f9469a426868747303c4d209e88df1fa084d8a86baa75cc3c58d4476f203e20c"
+  }
+}

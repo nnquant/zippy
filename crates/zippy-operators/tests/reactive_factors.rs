@@ -190,7 +190,7 @@ fn reactive_factors_reject_non_finite_float_inputs() {
 
             match error {
                 ZippyError::SchemaMismatch { reason } => {
-                    assert!(reason.contains("non-finite"));
+                    assert!(reason.contains("non-finite"), "reason=[{reason}]");
                 }
                 other => panic!("unexpected error: {other:?}"),
             }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use zippy_core::{base_version, python_dev_version, rust_dev_version};
+use zippy_core::{base_version, build_revision};
 
 #[test]
 fn base_version_is_current_release_baseline() {
@@ -37,16 +37,13 @@ fn git_output(args: &[&str]) -> String {
 }
 
 #[test]
-fn derived_versions_match_current_git_head() {
-    let commit_count = git_output(&["rev-list", "--count", "HEAD"]);
-    let short_sha = git_output(&["rev-parse", "--short", "HEAD"]);
-
-    assert_eq!(
-        rust_dev_version(),
-        format!("{}-dev.{}+g{}", base_version(), commit_count, short_sha)
-    );
-    assert_eq!(
-        python_dev_version(),
-        format!("{}.dev{}+g{}", base_version(), commit_count, short_sha)
-    );
+fn build_revision_is_separate_from_release_version() {
+    if workspace_root().join(".git").exists() {
+        assert_eq!(
+            build_revision(),
+            Some(git_output(&["rev-parse", "HEAD"]).as_str())
+        );
+    } else {
+        assert_eq!(build_revision(), None);
+    }
 }

@@ -50,6 +50,87 @@ impl RowSpanBatchReader {
 }
 
 impl RowSpanView {
+    /// Computes a UTF-8 cell-size bound from offsets only, before allocating decoded values.
+    pub fn max_utf8_value_bytes(&self) -> Result<u64, ArrowError> {
+        let read = || {
+            let mut maximum = 0_u64;
+            for spec in self
+                .schema()
+                .columns()
+                .iter()
+                .filter(|spec| matches!(spec.data_type, ColumnType::Utf8))
+            {
+                match &self.backing {
+                    RowSpanBacking::Sealed(handle) => {
+                        let values =
+                            handle.inner.utf8_columns.get(spec.name()).ok_or_else(|| {
+                                ArrowError::SchemaError("missing sealed UTF-8 column".to_owned())
+                            })?;
+                        for offsets in values.offsets[self.start_row..=self.end_row].windows(2) {
+                            let length = offsets[1].checked_sub(offsets[0]).ok_or_else(|| {
+                                ArrowError::ParseError("decreasing UTF-8 offsets".to_owned())
+                            })?;
+                            let length = u64::try_from(length).map_err(|_| {
+                                ArrowError::ParseError("negative UTF-8 length".to_owned())
+                            })?;
+                            maximum = maximum.max(length);
+                        }
+                    }
+                    RowSpanBacking::Active(attachment) => {
+                        let layout = attachment
+                            .descriptor
+                            .layout
+                            .column(spec.name())
+                            .ok_or_else(|| {
+                                ArrowError::SchemaError("missing active UTF-8 column".to_owned())
+                            })?;
+                        let mut bytes = [0_u8; 4096];
+                        let mut next = self.start_row;
+                        let mut previous = None;
+                        while next <= self.end_row {
+                            let count = (self.end_row - next + 1).min(bytes.len() / 4);
+                            attachment
+                                .shm_region
+                                .read_at(
+                                    attachment.descriptor.payload_offset
+                                        + layout.offsets_offset
+                                        + next * 4,
+                                    &mut bytes[..count * 4],
+                                )
+                                .map_err(|error| ArrowError::ParseError(error.to_string()))?;
+                            for encoded in bytes[..count * 4].chunks_exact(4) {
+                                let offset = u32::from_ne_bytes(
+                                    encoded.try_into().expect("four-byte offset"),
+                                ) as usize;
+                                if offset > layout.values_len
+                                    || previous.is_some_and(|last| offset < last)
+                                {
+                                    return Err(ArrowError::ParseError(
+                                        "invalid active UTF-8 offset".to_owned(),
+                                    ));
+                                }
+                                if let Some(last) = previous {
+                                    maximum = maximum.max((offset - last) as u64);
+                                }
+                                previous = Some(offset);
+                            }
+                            next += count;
+                        }
+                    }
+                }
+            }
+            Ok(maximum)
+        };
+        match &self.backing {
+            RowSpanBacking::Sealed(_) => read(),
+            RowSpanBacking::Active(attachment) => {
+                read_active_payload_consistent(attachment, read, |error| {
+                    ArrowError::ParseError(error.to_string())
+                })
+            }
+        }
+    }
+
     /// 将行范围导出为调试用 `RecordBatch`。
     pub fn as_record_batch(&self) -> Result<RecordBatch, ArrowError> {
         let schema = self.arrow_schema();
@@ -359,7 +440,8 @@ pub(crate) fn build_arrow_schema(schema: &CompiledSchema) -> SchemaRef {
     let fields: Vec<Field> = schema
         .columns()
         .iter()
-        .map(|spec| {
+        .enumerate()
+        .map(|(index, spec)| {
             let data_type = match &spec.data_type {
                 ColumnType::Int64 => DataType::Int64,
                 ColumnType::Float64 => DataType::Float64,
@@ -372,9 +454,10 @@ pub(crate) fn build_arrow_schema(schema: &CompiledSchema) -> SchemaRef {
                 }
             };
             Field::new(spec.name(), data_type, spec.nullable)
+                .with_metadata(schema.field_metadata(index).clone())
         })
         .collect();
-    Arc::new(Schema::new(fields))
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 fn sealed_scalar_buffer<T: ArrowNativeType>(

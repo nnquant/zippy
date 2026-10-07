@@ -1,0 +1,680 @@
+{
+  "retired_or_migrated": [
+    {
+      "file": "crates/zippy-core/src/runtime.rs",
+      "test": "fast_data_path_install_worker_waits_for_emit_lock",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/core_contract.rs",
+      "test": "core_types_match_v1_contract",
+      "action": "migrated",
+      "replacement": "compute_kernel_contract_retains_name_and_explicit_late_policy",
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/queue_try_recv.rs",
+      "test": "queue_try_recv_returns_none_when_empty",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/queue_try_recv.rs",
+      "test": "queue_try_recv_returns_value_without_blocking",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "engine_handle_flush_with_xfast_does_not_overtake_fast_queue_data",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "engine_handle_stop_with_xfast_does_not_overtake_fast_queue_data",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "engine_handle_write_table_preserves_segment_view_to_publisher",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "source_consumer_block_mode_keeps_data_on_control_queue",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "source_pipeline_block_mode_uses_fast_data_path",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "source_pipeline_block_mode_with_xfast_keeps_control_ordering",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "source_pipeline_fast_path_keeps_control_events_on_control_queue",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_fast_path.rs",
+      "test": "source_pipeline_worker_failure_with_pending_fast_data_does_not_hang_control_events",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "blocked_write_after_data_failure_returns_invalid_state",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "drop_oldest_overflow_discards_queued_batch_and_updates_metrics",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "engine_config_accepts_explicit_xfast_flag",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "flush_after_worker_failure_returns_invalid_state_quickly",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "flush_failure_marks_engine_failed",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "lifecycle_flush_and_stop_emit_pending_batches",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "publish_failure_marks_engine_failed_and_updates_metrics",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "publish_failure_rolls_back_engine_transaction",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "reject_overflow_returns_error",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "runtime_emits_worker_failure_event",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "runtime_info_logs_lifecycle_without_flush_events",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "runtime_log_case_dispatch",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "stop_after_data_failure_returns_worker_error_and_failed_status",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "stop_preserves_control_semantics_when_reject_queue_is_full",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/runtime_lifecycle.rs",
+      "test": "write_after_worker_failure_returns_invalid_state",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "pipeline_source_runtime_forwards_flush_into_engine",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "prepared_source_runtime_abort_requests_source_shutdown_and_joins",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "prepared_source_runtime_drop_requests_source_shutdown_and_joins",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "prepared_source_runtime_processes_data_before_error_emitted_during_start",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "prepared_source_runtime_replays_events_emitted_during_start",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_consumer_handle_stop_requests_source_shutdown_before_joining",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_consumer_natural_exit_without_stop_is_failed",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_consumer_stop_ends_runtime_without_engine_stop",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_data_event_drives_engine_on_data",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_handle_concurrent_joiners_observe_same_error",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_marks_failed_when_source_thread_returns_error",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_pipeline_flush_flushes_publisher_barrier",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_pipeline_xfast_drains_fast_data_before_source_terminated_failure",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_pipeline_xfast_start_failure_cleans_up_fast_path_worker",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_rejects_duplicate_hello",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_rejects_flush_before_hello",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_rejects_stop_before_hello",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_requires_hello_before_data",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_stop_callback_failure_can_be_retried",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_stop_requested_does_not_swallow_source_error",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/source_runtime.rs",
+      "test": "source_runtime_stream_hello_schema_hash_is_stable_and_structure_sensitive",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "closing_full_queue_releases_all_writers_and_preserves_buffered_value",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "data_queue_performance_baseline",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "shared_queue_delivers_every_owned_value_once",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "spsc_queue_close_wakes_blocked_producer",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "spsc_queue_preserves_fifo_order",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "spsc_queue_preserves_order_across_concurrent_wraparound",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "spsc_queue_rejects_push_after_close",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-core/tests/spsc_data_queue.rs",
+      "test": "spsc_queue_rejects_zero_capacity",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-engines/tests/reactive_engine.rs",
+      "test": "reactive_engine_runtime_metrics_include_filtered_rows_total",
+      "action": "migrated",
+      "replacement": "reactive_engine_kernel_metrics_include_filtered_rows_total",
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-engines/tests/timeseries_engine.rs",
+      "test": "timeseries_runtime_records_filtered_rows_metric",
+      "action": "migrated",
+      "replacement": "timeseries_kernel_records_filtered_rows_metric",
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-engines/tests/timeseries_engine.rs",
+      "test": "timeseries_runtime_records_late_rows_metric_for_drop_with_metric",
+      "action": "migrated",
+      "replacement": "timeseries_kernel_records_late_rows_metric_for_drop_with_metric",
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_roundtrip.rs",
+      "test": "null_publisher_accepts_arrow_batches",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_roundtrip.rs",
+      "test": "null_publisher_accepts_segment_table_views",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_roundtrip.rs",
+      "test": "zmq_publisher_bind_fails_when_feature_is_disabled",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_roundtrip.rs",
+      "test": "zmq_publisher_binds_and_publishes_arrow_batches",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_roundtrip.rs",
+      "test": "zmq_publisher_roundtrips_arrow_batches_to_subscriber",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_roundtrip.rs",
+      "test": "zmq_subscriber_receives_arrow_batches_from_publisher",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_accepts_repeated_consistent_hello",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_decodes_data_payload_from_stream_publisher",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_decodes_flush_and_stop_without_payload_when_seq_no_present",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_fails_fast_on_schema_mismatch",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_ignores_data_before_hello_until_stream_lock",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_protocol_hello_schema_encodes_correctly",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_publisher_emits_seq_no_on_flush_and_stop",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_publisher_repeats_hello_during_runtime",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_publisher_repeats_hello_while_idle",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_rejects_flush_without_seq_no",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_rejects_hello_without_schema_hash",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_rejects_repeated_inconsistent_hello",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-io/tests/zmq_source.rs",
+      "test": "zmq_source_rejects_stop_without_seq_no",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "engine_metrics_report_deserializes_legacy_json_without_observed_queue_depth",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "evaluate_pass_rejects_queue_depth_above_configured_threshold",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "inproc_timeseries_profile_produces_nonzero_rows_and_passes",
+      "action": "migrated",
+      "replacement": "timeseries_kernel_profile_produces_nonzero_rows_and_passes",
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "latency_summary_deserializes_legacy_json_without_additive_fields",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "remote_downstream_deadline_starts_after_first_observed_event",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "remote_downstream_does_not_stop_for_idle_before_observing_stream",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "remote_downstream_stops_after_idle_once_stream_was_observed",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "remote_pipeline_profiles_exchange_data_and_pass",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "remote_profile_requires_explicit_dataset_identity",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "remote_upstream_driver_carries_sampled_queue_without_metrics_latency",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "runtime_stream_table_e2e_reports_publish_and_emit_return_latency",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    },
+    {
+      "file": "pytests/test_python_api.py",
+      "test": "test_zippy_io_does_not_export_removed_parquet_sink_api",
+      "action": "retired",
+      "replacement": null,
+      "reason": "retired background runtime, queue, ZeroMQ or performance compatibility contract; native actor/Flight/recovery tests retained"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-core/tests/core_contract.rs",
+      "test": "compute_kernel_contract_retains_name_and_explicit_late_policy"
+    },
+    {
+      "file": "crates/zippy-engines/tests/reactive_engine.rs",
+      "test": "reactive_engine_kernel_metrics_include_filtered_rows_total"
+    },
+    {
+      "file": "crates/zippy-engines/tests/timeseries_engine.rs",
+      "test": "timeseries_kernel_records_filtered_rows_metric"
+    },
+    {
+      "file": "crates/zippy-engines/tests/timeseries_engine.rs",
+      "test": "timeseries_kernel_records_late_rows_metric_for_drop_with_metric"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "failed_kernel_batch_does_not_produce_success_latency"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "kernel_latency_includes_processing_and_excludes_unmeasured_batches"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "latency_contract_requires_complete_current_measurements"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "performance_contract_rejects_retired_profiles_and_queue_configuration"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "timeseries_kernel_profile_produces_nonzero_rows_and_passes"
+    }
+  ],
+  "retired_test_names": 85,
+  "migrated_test_names": 5,
+  "retained_boundaries": [
+    "native actor admission, transactions, WAL/manifest recovery and frame atomicity",
+    "native KV snapshot/delta continuity and real Flight subscription/ACK/reconnect",
+    "compute late and filtered metrics, transaction rollback and real restart recovery",
+    "rational pacing deadlines, half-open windows, drain-inclusive throughput and latency integrity"
+  ]
+}

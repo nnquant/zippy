@@ -1,0 +1,222 @@
+Building source distribution...
+running egg_info
+writing src/zippy_client.egg-info/PKG-INFO
+writing dependency_links to src/zippy_client.egg-info/dependency_links.txt
+writing requirements to src/zippy_client.egg-info/requires.txt
+writing top-level names to src/zippy_client.egg-info/top_level.txt
+reading manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+writing manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+running sdist
+running egg_info
+writing src/zippy_client.egg-info/PKG-INFO
+writing dependency_links to src/zippy_client.egg-info/dependency_links.txt
+writing requirements to src/zippy_client.egg-info/requires.txt
+writing top-level names to src/zippy_client.egg-info/top_level.txt
+reading manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+writing manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+running check
+creating zippy_client-0.1.0
+creating zippy_client-0.1.0/src/zippy_client
+creating zippy_client-0.1.0/src/zippy_client.egg-info
+creating zippy_client-0.1.0/src/zippy_client/_generated
+creating zippy_client-0.1.0/src/zippy_client/transports
+creating zippy_client-0.1.0/tests
+copying files to zippy_client-0.1.0...
+copying README.md -> zippy_client-0.1.0
+copying pyproject.toml -> zippy_client-0.1.0
+copying src/zippy_client/__init__.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/arrow_values.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/client.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/control.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/endpoints.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/errors.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/expressions.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/flight_subscriber.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/log_reader.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/models.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/py.typed -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/query.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/router.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/row.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/snapshot.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/sql.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client/writer.py -> zippy_client-0.1.0/src/zippy_client
+copying src/zippy_client.egg-info/PKG-INFO -> zippy_client-0.1.0/src/zippy_client.egg-info
+copying src/zippy_client.egg-info/SOURCES.txt -> zippy_client-0.1.0/src/zippy_client.egg-info
+copying src/zippy_client.egg-info/dependency_links.txt -> zippy_client-0.1.0/src/zippy_client.egg-info
+copying src/zippy_client.egg-info/requires.txt -> zippy_client-0.1.0/src/zippy_client.egg-info
+copying src/zippy_client.egg-info/top_level.txt -> zippy_client-0.1.0/src/zippy_client.egg-info
+copying src/zippy_client/_generated/__init__.py -> zippy_client-0.1.0/src/zippy_client/_generated
+copying src/zippy_client/_generated/protocol_pb2.py -> zippy_client-0.1.0/src/zippy_client/_generated
+copying src/zippy_client/_generated/protocol_pb2.pyi -> zippy_client-0.1.0/src/zippy_client/_generated
+copying src/zippy_client/transports/__init__.py -> zippy_client-0.1.0/src/zippy_client/transports
+copying src/zippy_client/transports/flight.py -> zippy_client-0.1.0/src/zippy_client/transports
+copying tests/test_endpoints_router.py -> zippy_client-0.1.0/tests
+copying tests/test_expressions_protocol.py -> zippy_client-0.1.0/tests
+copying tests/test_flight_subscriber.py -> zippy_client-0.1.0/tests
+copying tests/test_flight_transport.py -> zippy_client-0.1.0/tests
+copying tests/test_log_reader.py -> zippy_client-0.1.0/tests
+copying tests/test_temporal_contract.py -> zippy_client-0.1.0/tests
+copying tests/test_unit_contracts.py -> zippy_client-0.1.0/tests
+copying src/zippy_client.egg-info/SOURCES.txt -> zippy_client-0.1.0/src/zippy_client.egg-info
+Writing zippy_client-0.1.0/setup.cfg
+Creating tar archive
+removing 'zippy_client-0.1.0' (and everything under it)
+Successfully built /tmp/zippy-batch58-client-dist-final/client/zippy_client-0.1.0.tar.gz
+Building wheel...
+running egg_info
+writing src/zippy_client.egg-info/PKG-INFO
+writing dependency_links to src/zippy_client.egg-info/dependency_links.txt
+writing requirements to src/zippy_client.egg-info/requires.txt
+writing top-level names to src/zippy_client.egg-info/top_level.txt
+reading manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+writing manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+running bdist_wheel
+running build
+running build_py
+creating build/lib/zippy_client
+copying src/zippy_client/query.py -> build/lib/zippy_client
+copying src/zippy_client/log_reader.py -> build/lib/zippy_client
+copying src/zippy_client/endpoints.py -> build/lib/zippy_client
+copying src/zippy_client/row.py -> build/lib/zippy_client
+copying src/zippy_client/arrow_values.py -> build/lib/zippy_client
+copying src/zippy_client/client.py -> build/lib/zippy_client
+copying src/zippy_client/flight_subscriber.py -> build/lib/zippy_client
+copying src/zippy_client/__init__.py -> build/lib/zippy_client
+copying src/zippy_client/control.py -> build/lib/zippy_client
+copying src/zippy_client/expressions.py -> build/lib/zippy_client
+copying src/zippy_client/sql.py -> build/lib/zippy_client
+copying src/zippy_client/writer.py -> build/lib/zippy_client
+copying src/zippy_client/errors.py -> build/lib/zippy_client
+copying src/zippy_client/models.py -> build/lib/zippy_client
+copying src/zippy_client/router.py -> build/lib/zippy_client
+copying src/zippy_client/snapshot.py -> build/lib/zippy_client
+creating build/lib/zippy_client/_generated
+copying src/zippy_client/_generated/__init__.py -> build/lib/zippy_client/_generated
+copying src/zippy_client/_generated/protocol_pb2.py -> build/lib/zippy_client/_generated
+creating build/lib/zippy_client/transports
+copying src/zippy_client/transports/flight.py -> build/lib/zippy_client/transports
+copying src/zippy_client/transports/__init__.py -> build/lib/zippy_client/transports
+copying src/zippy_client/py.typed -> build/lib/zippy_client
+copying src/zippy_client/_generated/protocol_pb2.pyi -> build/lib/zippy_client/_generated
+installing to build/bdist.linux-x86_64/wheel
+running install
+running install_lib
+creating build/bdist.linux-x86_64/wheel
+creating build/bdist.linux-x86_64/wheel/zippy_client
+copying build/lib/zippy_client/query.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/log_reader.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/endpoints.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/row.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/arrow_values.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/client.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/flight_subscriber.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/__init__.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+creating build/bdist.linux-x86_64/wheel/zippy_client/_generated
+copying build/lib/zippy_client/_generated/__init__.py -> build/bdist.linux-x86_64/wheel/./zippy_client/_generated
+copying build/lib/zippy_client/_generated/protocol_pb2.py -> build/bdist.linux-x86_64/wheel/./zippy_client/_generated
+copying build/lib/zippy_client/_generated/protocol_pb2.pyi -> build/bdist.linux-x86_64/wheel/./zippy_client/_generated
+copying build/lib/zippy_client/control.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/expressions.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/sql.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+creating build/bdist.linux-x86_64/wheel/zippy_client/transports
+copying build/lib/zippy_client/transports/flight.py -> build/bdist.linux-x86_64/wheel/./zippy_client/transports
+copying build/lib/zippy_client/transports/__init__.py -> build/bdist.linux-x86_64/wheel/./zippy_client/transports
+copying build/lib/zippy_client/writer.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/errors.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/models.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/router.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/py.typed -> build/bdist.linux-x86_64/wheel/./zippy_client
+copying build/lib/zippy_client/snapshot.py -> build/bdist.linux-x86_64/wheel/./zippy_client
+running install_egg_info
+running egg_info
+writing src/zippy_client.egg-info/PKG-INFO
+writing dependency_links to src/zippy_client.egg-info/dependency_links.txt
+writing requirements to src/zippy_client.egg-info/requires.txt
+writing top-level names to src/zippy_client.egg-info/top_level.txt
+reading manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+writing manifest file 'src/zippy_client.egg-info/SOURCES.txt'
+Copying src/zippy_client.egg-info to build/bdist.linux-x86_64/wheel/./zippy_client-0.1.0-py3.11.egg-info
+running install_scripts
+creating build/bdist.linux-x86_64/wheel/zippy_client-0.1.0.dist-info/WHEEL
+creating '/tmp/zippy-batch58-client-dist-final/wheels/.tmp-fba772vw/zippy_client-0.1.0-py3-none-any.whl' and adding 'build/bdist.linux-x86_64/wheel' to it
+adding 'zippy_client/__init__.py'
+adding 'zippy_client/arrow_values.py'
+adding 'zippy_client/client.py'
+adding 'zippy_client/control.py'
+adding 'zippy_client/endpoints.py'
+adding 'zippy_client/errors.py'
+adding 'zippy_client/expressions.py'
+adding 'zippy_client/flight_subscriber.py'
+adding 'zippy_client/log_reader.py'
+adding 'zippy_client/models.py'
+adding 'zippy_client/py.typed'
+adding 'zippy_client/query.py'
+adding 'zippy_client/router.py'
+adding 'zippy_client/row.py'
+adding 'zippy_client/snapshot.py'
+adding 'zippy_client/sql.py'
+adding 'zippy_client/writer.py'
+adding 'zippy_client/_generated/__init__.py'
+adding 'zippy_client/_generated/protocol_pb2.py'
+adding 'zippy_client/_generated/protocol_pb2.pyi'
+adding 'zippy_client/transports/__init__.py'
+adding 'zippy_client/transports/flight.py'
+adding 'zippy_client-0.1.0.dist-info/METADATA'
+adding 'zippy_client-0.1.0.dist-info/WHEEL'
+adding 'zippy_client-0.1.0.dist-info/top_level.txt'
+adding 'zippy_client-0.1.0.dist-info/RECORD'
+removing build/bdist.linux-x86_64/wheel
+Successfully built /tmp/zippy-batch58-client-dist-final/wheels/zippy_client-0.1.0-py3-none-any.whl
+Using CPython 3.11.14 interpreter at: /home/jiangda/develop/zippy/.venv/bin/python3
+Creating virtual environment at: client-venv
+Activate with: source client-venv/bin/activate
+Using Python 3.11.14 environment at: client-venv
+Resolved 11 packages in 8ms
+Prepared 1 package in 28ms
+Installed 11 packages in 8ms
+ + coverage==7.16.1
+ + iniconfig==2.3.0
+ + loguru==0.7.3
+ + packaging==26.3
+ + pluggy==1.6.0
+ + protobuf==6.33.6
+ + pyarrow==23.0.1
+ + pygments==2.21.0
+ + pytest==9.1.1
+ + pytest-cov==7.1.0
+ + zippy-client==0.1.0 (from file:///tmp/zippy-batch58-client-dist-final/wheels/zippy_client-0.1.0-py3-none-any.whl)
+isolated pure Python client verified /tmp/zippy-batch58-client-dist-final/client-venv/lib/python3.11/site-packages/zippy_client/__init__.py
+........................................................................ [ 32%]
+........................................................................ [ 65%]
+........................................................................ [ 98%]
+....                                                                     [100%]
+================================ tests coverage ================================
+_______________ coverage: platform linux, python 3.11.14-final-0 _______________
+
+Name                                                                               Stmts   Miss  Cover   Missing
+----------------------------------------------------------------------------------------------------------------
+client-venv/lib/python3.11/site-packages/zippy_client/__init__.py                     12      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/_generated/__init__.py           0      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/_generated/protocol_pb2.py     113    101    11%   30-130
+client-venv/lib/python3.11/site-packages/zippy_client/arrow_values.py                 23      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/client.py                      225     41    82%   103, 143, 204, 233, 261, 290, 322, 355, 383-385, 412-414, 441-443, 551-552, 593, 641, 667, 699, 751, 754-756, 760-762, 765-766, 768, 799-803, 825-829
+client-venv/lib/python3.11/site-packages/zippy_client/control.py                     150     66    56%   44, 46, 61, 74-88, 92-97, 104, 108-125, 133-134, 140-141, 143, 162-169, 174-180, 183-191, 194-205, 210-211, 214, 223, 226
+client-venv/lib/python3.11/site-packages/zippy_client/endpoints.py                    89     14    84%   64-65, 73-76, 93, 122-126, 141, 143
+client-venv/lib/python3.11/site-packages/zippy_client/errors.py                       29      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/expressions.py                 252      4    98%   256, 281, 288, 325
+client-venv/lib/python3.11/site-packages/zippy_client/flight_subscriber.py           229      4    98%   257, 302, 311, 322
+client-venv/lib/python3.11/site-packages/zippy_client/log_reader.py                  296     27    91%   109, 119, 130, 133, 149, 159, 169, 184, 193, 201, 211, 249, 256, 258, 282, 286, 330, 382, 391, 405, 430-433, 461-462, 468, 474
+client-venv/lib/python3.11/site-packages/zippy_client/models.py                       33      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/query.py                       186      7    96%   40, 47, 169, 200, 267-268, 286
+client-venv/lib/python3.11/site-packages/zippy_client/router.py                       19      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/row.py                          30      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/snapshot.py                     48      2    96%   110-111
+client-venv/lib/python3.11/site-packages/zippy_client/sql.py                         323     45    86%   107, 127, 144, 147, 171, 174, 184, 188, 191, 211, 214, 217, 220-222, 234, 255, 257, 262, 266, 270, 282, 301, 321, 342, 362, 382, 384, 405, 414, 417, 422, 424, 426, 433, 443, 459-461, 473-475, 480, 486, 489
+client-venv/lib/python3.11/site-packages/zippy_client/transports/__init__.py           2      0   100%
+client-venv/lib/python3.11/site-packages/zippy_client/transports/flight.py          1129    158    86%   160, 164-165, 169-170, 221, 223, 225, 255, 257, 259, 342, 344, 518, 546, 582, 586-587, 643, 646-654, 656, 671, 674-676, 699-700, 704, 706, 719-725, 738-739, 785, 850, 954, 1016, 1022, 1036, 1046, 1079, 1154, 1169, 1178, 1184, 1186, 1190, 1192, 1222, 1247, 1296-1298, 1308-1310, 1412, 1421, 1517, 1534, 1669-1670, 1690, 1694-1695, 1697, 1702, 1725, 1727, 1748, 1770-1771, 1784-1785, 1787-1788, 1807, 1812-1814, 1832, 1834-1835, 1837, 1851, 1871, 1888, 1904, 1912, 1915, 1918, 1939, 1942, 1948, 1961, 1982, 1986, 1990, 2005-2006, 2019, 2030, 2036, 2038, 2043, 2045, 2058-2059, 2061, 2063, 2093-2094, 2096, 2098, 2100, 2105, 2111, 2113, 2131, 2135, 2138, 2140, 2145, 2147, 2149, 2154, 2157, 2161-2163, 2193, 2202, 2209-2216, 2230, 2252-2253, 2263, 2282, 2302, 2305, 2322, 2324
+client-venv/lib/python3.11/site-packages/zippy_client/writer.py                      105     18    83%   60, 62, 65, 96, 102, 118, 128-131, 135, 138-139, 162-163, 172-173, 177
+----------------------------------------------------------------------------------------------------------------
+TOTAL                                                                               3293    487    85%
+Required test coverage of 80% reached. Total coverage: 85.21%
+220 passed in 3.00s

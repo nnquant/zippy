@@ -1,0 +1,456 @@
+{
+  "batch": 54,
+  "date": "2026-09-23",
+  "audit_closed_total": 33,
+  "closed_this_batch": [
+    "F08"
+  ],
+  "deferred_by_user": [
+    "F28 Windows/macOS physical acceptance"
+  ],
+  "overall_audit_complete": false,
+  "local_implementation_complete": true,
+  "rust_workspace": {
+    "passed_records": 1196,
+    "ignored": 7,
+    "summaries": 94
+  },
+  "python_pytest_passed": 543,
+  "mypy_source_files": 91,
+  "client_mypy_files": 27,
+  "native_recovery": {
+    "catalog_v11_native_files_watermarks_and_request_versions": true,
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+    "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+    "sdk_only_flight_examples_write_query_callbacks_and_restart": true,
+    "flight_short_session_snapshot_cleanup_capacity_reuse": true,
+    "public_examples_three_kinds_compute_and_restart_without_legacy_api": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "flight_only_buffered_writer_lazy_plan_and_restart": true,
+    "independent_client_native_child_without_main_import": true,
+    "server_launch": "repository_binary",
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "default_native_storage_query_and_flight_without_feature_switches": true,
+    "native_restart_never_creates_legacy_registry": true,
+    "native_recovery_without_old_table_configuration_or_external_persist_root": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "retired_tests": [
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "rollover_enqueues_sealed_segment_for_persistence",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "manual_enqueue_is_rejected_after_rollover_auto_enqueue",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "parquet_flush_paths_do_not_conflict_across_stores",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "persistence_worker_flushes_rollover_segments_in_background",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "persistence_worker_shutdown_drains_queued_segments",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "persistence_worker_reports_failed_segment_with_target_path",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "persistence_worker_uses_atomic_rename_and_cleans_temp_on_rename_failure",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "persistence_failure_can_retry_after_target_is_repaired",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "persistence_worker_retries_failed_flush_until_target_is_repaired",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "persistence_worker_writes_dead_letter_manifest_after_retries_exhaust",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "sync_flush_is_rejected_while_persistence_worker_is_running",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "test": "second_persistence_worker_is_rejected",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/persistence_crash_failpoint.rs",
+      "test": "process_abort_after_parquet_close_leaves_only_replayable_temporary_file",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-segment-store/tests/persistence_crash_failpoint.rs",
+      "test": "crash_child_after_parquet_close_before_rename",
+      "reason": "removed segment-store persistence worker; native controller and recovery tests remain"
+    },
+    {
+      "file": "crates/zippy-storage/tests/persist_controller.rs",
+      "test": "controller_rejects_a_coordinator_without_publication_control",
+      "reason": "coordinator cannot be constructed without publication control"
+    }
+  ],
+  "source_changes": [
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-ingest/src/actor.rs",
+      "before_sha256": "de9d404db25163c8ae34dac2cce1a0134529aa608b89b6250d1aa49da97e9ec7",
+      "after_sha256": "18ef20708f720f36290b85234f414486d881413d702b98712e7ace2844e1e894",
+      "before_lines": 3622,
+      "after_lines": 3622
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/Cargo.toml",
+      "before_sha256": "187ec07876f15c5c3de012bc3e6263ef99210d97e48fbcac97ed1988b12c1d36",
+      "after_sha256": "ba68dc8e50d3f01f2eb47f12e3f6b2665c925c68485adcac779963fbc18e36bd",
+      "before_lines": 27,
+      "after_lines": 21
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/src/builder.rs",
+      "before_sha256": "ff75a58fc3512d1bfe7d8b7beeff0b8edf3afbc3943863a0c58a3951b4b8f1b0",
+      "after_sha256": "4c00ffbde93d9bb0c423728c3aecf6deae0552b2684a336d3614c406d8efd3d7",
+      "before_lines": 1932,
+      "after_lines": 1926
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/src/catalog.rs",
+      "before_sha256": "6d05e0252cb4bfed1c31c0bf39d88fd3d05e2691f0cf71df6468162095f530e7",
+      "after_sha256": "23a0a67226cff0c7a6211cff6308c2fdad1b347b26b73c42916a29d1028d0769",
+      "before_lines": 1472,
+      "after_lines": 1377
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/src/lib.rs",
+      "before_sha256": "cfbcce59cc31e7963368270797474900faab54ee2e19f54341e8637d40c36c8f",
+      "after_sha256": "137793bb5960ff0c0b987097b4016d12d05e96d1d357a93a97c7b2259c4cf869",
+      "before_lines": 63,
+      "after_lines": 53
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/src/persistence.rs",
+      "before_sha256": "d311999a40cf16324b418657d9a226e1dae671224f62972f0204080891920aa2",
+      "after_sha256": null,
+      "before_lines": 473,
+      "after_lines": 0
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/src/segment.rs",
+      "before_sha256": "5ccd784985b5fa3c695cfaab12a07ad66817bfe1c4a4709ef9ec1212fc547955",
+      "after_sha256": "0716f1bcbb49f0d8cf0bd711300b98a165621791b0a373063a66c97c038e9132",
+      "before_lines": 207,
+      "after_lines": 202
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/src/test_failpoints.rs",
+      "before_sha256": "54393dffcdd97cefb34521961ff45e1c8a61e5f6483c039bd67b1edd66db9002",
+      "after_sha256": null,
+      "before_lines": 21,
+      "after_lines": 0
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/tests/parquet_persistence.rs",
+      "before_sha256": "bedb25c2c1daab31c6ff038c6752b0c9ae49c7d657d2a46020461b8530c846aa",
+      "after_sha256": null,
+      "before_lines": 406,
+      "after_lines": 0
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/tests/partition_api.rs",
+      "before_sha256": "61353801ad7a21ea03d943e5c347cf9e5eeab2690978533801b02845955d14dd",
+      "after_sha256": "0037e058afcdaacd575a859d11750fd74d63aff358bede5b3b668e54ede1707e",
+      "before_lines": 709,
+      "after_lines": 709
+    },
+    {
+      "stage": "segment_worker",
+      "path": "crates/zippy-segment-store/tests/persistence_crash_failpoint.rs",
+      "before_sha256": "180da1f20630871d14493d2062a0a6ea9c7843a5dc87c612bb4dc09120b33a9b",
+      "after_sha256": null,
+      "before_lines": 118,
+      "after_lines": 0
+    },
+    {
+      "stage": "master_token",
+      "path": "crates/zippy-master/Cargo.toml",
+      "before_sha256": "6dd9cd3ac4d567eb7934e0379cbae31fbcaf0e7c1f53a9d948324e89d94f6b8a",
+      "after_sha256": "2c40ecff904e2a5ad588f5062f764457bb4435624ac481af60b095951f224cf2",
+      "before_lines": 18,
+      "after_lines": 19
+    },
+    {
+      "stage": "master_token",
+      "path": "crates/zippy-master/src/process_runtime.rs",
+      "before_sha256": "9c845b6540a3937a92849aa2ce6bf7df3bfaa0b7c2a66ac247df5480125391f3",
+      "after_sha256": "3f8d9413bddb83d136debb12e5192492a55615160e5a7ab6612204820f2af7da",
+      "before_lines": 712,
+      "after_lines": 701
+    },
+    {
+      "stage": "master_token",
+      "path": "crates/zippy-master/src/registry.rs",
+      "before_sha256": "732159fb75a0cf16643d7620758585343d335a0462530d9af6062f292fb7c2cd",
+      "after_sha256": "d52fc3b31a34ad63594010c4cc016d56c4627a42c10dfb2063d02f6d41d04103",
+      "before_lines": 327,
+      "after_lines": 352
+    },
+    {
+      "stage": "master_token",
+      "path": "crates/zippy-master/src/server.rs",
+      "before_sha256": "98ec40f10b20f6b8c1ffb942a7c8a3368aaf68f3ca98bf6cc7de92f2affb89ee",
+      "after_sha256": "9d61b1845fd8cd0b61786d20d8078ea3dd23c6d6247c3df85bb1fe979634b283",
+      "before_lines": 1323,
+      "after_lines": 1339
+    },
+    {
+      "stage": "master_token",
+      "path": "crates/zippy-master/tests/master_server.rs",
+      "before_sha256": "51d1e69d480621a494587e092447dd86fd4ba0b15e7e14628fe7c7eacbacf7aa",
+      "after_sha256": "77f88b13b62556fcf8c15ce481f61503f29b5ef74d6d3554457777a88ca37201",
+      "before_lines": 990,
+      "after_lines": 990
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-server/src/native_storage.rs",
+      "before_sha256": "59c994aa86a5bd044a0d45ddb1d90b806e82fd2dcb0b04a2d1f7e72aac18549a",
+      "after_sha256": "094c30bc0f38e2c0fbca6737328cee15cd2b4c99dfc70adb6f2b5a26ed2f1974",
+      "before_lines": 1719,
+      "after_lines": 1719
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-server/tests/native_storage_runtime.rs",
+      "before_sha256": "c8174178be7b1ef43122c17cdff1a94d0d68656f0e00f728a38b410980b376f5",
+      "after_sha256": "5999b7e1d2e6eca6a3d48d566acf59e90d1ebc00ff80bdd90157bb4a20e010c3",
+      "before_lines": 4411,
+      "after_lines": 4420
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-storage/README.md",
+      "before_sha256": "60f903e619b59bfd45513673916ab5d7fccee1ba2eb691885a3d647c5e840272",
+      "after_sha256": "7c361b224819d9b18ce67cbdb981fd6dfd1e3642f9dbab1c35fee636382ad760",
+      "before_lines": 154,
+      "after_lines": 157
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-storage/src/commit.rs",
+      "before_sha256": "bb1a3366916314a055f782a4fccfba0cc548c48dc6647ebe7d52bac525ca7cf1",
+      "after_sha256": "79ddf5790f317e8b3f074ea682fe27c78c9f81204a0f1fdcd9463c768b1a36dd",
+      "before_lines": 1883,
+      "after_lines": 1829
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-storage/src/persist.rs",
+      "before_sha256": "f3150f0cabb80d7e470bbf1e967a9bcb7927eab9be273bc72d6ea08530705760",
+      "after_sha256": "23454f9c06f0dfccbae8f09ecfec9f97b5e4d99f6e92b524772127c116956abc",
+      "before_lines": 1359,
+      "after_lines": 1351
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-storage/tests/catalog_commit.rs",
+      "before_sha256": "ef3d232adfe1ed9086d0e490843c1a10d8e3be3d6548f7d8d1b66bc4d96c6bc6",
+      "after_sha256": "73d44c49b2fdeb44b5974145ca4f57294b98c73216c620866691b8bdc712b1d2",
+      "before_lines": 858,
+      "after_lines": 900
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-storage/tests/orphan_reconciliation.rs",
+      "before_sha256": "c6d05a24adbd64765ae1085be8b998a39271b5826eb393c3ca3710b10a4707c0",
+      "after_sha256": "db4940ede846e08318496bd9b55abe796f18cf896efd17c1c294c68f333b960f",
+      "before_lines": 988,
+      "after_lines": 1000
+    },
+    {
+      "stage": "commit_constructor",
+      "path": "crates/zippy-storage/tests/persist_controller.rs",
+      "before_sha256": "ef7c4639d8eb92b98f9bb504ef6fb9f631a36833e81479f6043590f769b62d0c",
+      "after_sha256": "7d2eab1dcb4b296de1ab5b63e28abb153b5899488858a99a8ad5ed8688ed9a20",
+      "before_lines": 1398,
+      "after_lines": 1370
+    }
+  ],
+  "logs": {
+    "tests": {
+      "path": "/tmp/zippy-commit-workspace-tests.log",
+      "sha256": "6e3d42da17184ccb9314303ec15c3e1c5c18a1785ba829be5ca25682cb1540a3",
+      "bytes": 113424
+    },
+    "clippy": {
+      "path": "/tmp/zippy-commit-clippy.log",
+      "sha256": "33247b3e15a86f408f61f29fdc29e9bed4c0e5bf5bcc5c99943a9fc936a5399e",
+      "bytes": 1355
+    },
+    "build": {
+      "path": "/tmp/zippy-commit-build.log",
+      "sha256": "a7f8e514568eeedeec49b727c50e8503c5ab9cf3575b89746d2e707c1dab3e86",
+      "bytes": 2642
+    },
+    "pytest": {
+      "path": "/tmp/zippy-commit-pytest.log",
+      "sha256": "4295617c0590c44b38a9ee75d64bdec901e857b1c75cb47c4929dfc0b2ba5c01",
+      "bytes": 2662
+    },
+    "native": {
+      "path": "/tmp/zippy-commit-native.log",
+      "sha256": "0f22045609bf3d353ee3661e5ef7df800889ae4dbb53f628ba3ac78441c2cdd7",
+      "bytes": 30903
+    },
+    "mypy": {
+      "path": "/tmp/zippy-commit-mypy.log",
+      "sha256": "6e48d2986ce0d91c8cd60bff9ed577f4baf14c949620883ab530992e6c52e53a",
+      "bytes": 934
+    },
+    "mypy-client": {
+      "path": "/tmp/zippy-commit-mypy-client.log",
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f",
+      "bytes": 44
+    },
+    "ruff": {
+      "path": "/tmp/zippy-commit-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "bytes": 19
+    },
+    "black": {
+      "path": "/tmp/zippy-commit-black.log",
+      "sha256": "161579e1a9a654d62a83f487d90f72be3d8e9379f20fa777ad6cc1d93115ac60",
+      "bytes": 57
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-commit-rustfmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "diff": {
+      "path": "/tmp/zippy-commit-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "extension-links": {
+      "path": "/tmp/zippy-commit-extension-links.log",
+      "sha256": "8c779bdfb9eba11be80f2c2c66d479d09679d674ce577b789815b503ca20e01d",
+      "bytes": 445
+    },
+    "old-symbols": {
+      "path": "/tmp/zippy-commit-old-symbols.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "final-storage-clippy": {
+      "path": "/tmp/zippy-commit-final-storage-clippy.log",
+      "sha256": "275ebfbb6cd092ef407de3c43fb883e70e2882326a2cde969fa00fdea340d95d",
+      "bytes": 499
+    }
+  },
+  "report_sha256": "a3e76a1578c79602414b730acdda6f28d1d386b8c05b52b1c8a5dbec75a92f59",
+  "current_source_sha256": {
+    "crates/zippy-storage/src/candidate.rs": "f4dc82a6b26702d865823f43d8ae6d27402da9afda39338f8f6eac26081d9669",
+    "crates/zippy-storage/src/commit.rs": "79ddf5790f317e8b3f074ea682fe27c78c9f81204a0f1fdcd9463c768b1a36dd",
+    "crates/zippy-storage/src/persist.rs": "23454f9c06f0dfccbae8f09ecfec9f97b5e4d99f6e92b524772127c116956abc",
+    "crates/zippy-storage/README.md": "7c361b224819d9b18ce67cbdb981fd6dfd1e3642f9dbab1c35fee636382ad760"
+  },
+  "current_binary_evidence": {
+    "target/debug/zippy-server": "ad81defdd7d371dfad11ba3faf65bf9221d04c0f54b517d4b5bf87b1f15e75f3",
+    "python/zippy/_internal.cpython-311-x86_64-linux-gnu.so": "8563b5e119aa8df96bc959eb843b7738b2ecdbde8a69595e9d7f88cd5b5dce93"
+  },
+  "limitations": [
+    "Native matrix uses repository binary on Linux x86_64, CPython 3.11, Arrow 23.0.1.",
+    "Windows and macOS physical acceptance deferred by user instruction; no pass claimed.",
+    "No commit, push, deployment, or old data migration."
+  ]
+}

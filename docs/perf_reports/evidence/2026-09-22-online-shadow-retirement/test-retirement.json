@@ -1,0 +1,375 @@
+{
+  "tests": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_loads_and_validates_bounded_catalog_shadow_resources",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_loads_sqlite_shadow_backend_from_toml_and_environment",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_flight_ingest_with_sqlite_shadow_authority",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_sqlite_shadow_without_native_storage",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "canonical_comparison_ignores_volatile_fields_and_normalizes_native_shape",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "completed_and_in_flight_metadata_are_deduplicated",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "deterministic_file_order_mismatch_is_classified_separately",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "drop_cancels_active_lookup_joins_worker_and_releases_shadow_source",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "drop_defers_an_uncooperative_shadow_poll_after_bounded_join_wait",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "full_queue_drops_shadow_jobs_without_changing_primary_results",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "invalid_shadow_bounds_are_rejected_before_worker_spawn",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "outstanding_metadata_budget_rejects_second_job_while_first_is_active",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "per_comparison_byte_limit_drops_shadow_job_without_changing_primary_result",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "per_comparison_file_limit_drops_shadow_job_without_calling_native",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "primary_snapshot_returns_while_shadow_comparison_is_blocked",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-gateway/src/persisted_read_shadow.rs",
+      "test": "shadow_error_and_mismatch_remain_diagnostic_only",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_command_shadow.rs",
+      "test": "closed_is_distinct_from_candidate_eligibility",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_command_shadow.rs",
+      "test": "explicit_drop_intent_survives_event_batches_until_reconcile",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_command_shadow.rs",
+      "test": "planner_covers_bootstrap_adopt_sync_advance_and_drop",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_command_shadow.rs",
+      "test": "planner_rejects_dropped_generation_recreation",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_command_shadow.rs",
+      "test": "request_identity_is_stable_and_binds_the_full_fingerprint",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_command_shadow.rs",
+      "test": "worker_local_loss_epoch_is_compared_in_the_durable_epoch_domain",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_shadow.rs",
+      "test": "exact_revision_mapping_rejects_missing_stream_identity",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/catalog_shadow.rs",
+      "test": "exact_revision_mapping_requires_the_same_legacy_stream",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "bad_file_stops_before_its_table_and_every_later_v2_table",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "committed_v2_import_replays_without_physical_io_after_catalog_restart",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "exact_v4_checkpoint_is_the_only_state_that_supersedes_the_importer",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "file_root_precedes_explicit_fallback_and_missing_root_requires_it",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "imports_only_exact_empty_tables_and_replays_without_advancing_revision",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "missing_v2_replay_with_advanced_revision_fails_before_file_io",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "online_verifier_does_not_reuse_a_deleted_cached_file",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "online_verifier_reuses_retained_files_and_evicts_removed_entries",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "planner_rejects_cross_table_duplicate_paths_and_oversized_tables_before_io",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "rejects_nonempty_target_without_mutating_the_legacy_registry",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "resumes_only_from_an_exact_committed_command_prefix",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "v2_planner_preserves_a_stable_contiguous_import_prefix",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/legacy_catalog_migration.rs",
+      "test": "v2_plans_are_appended_after_frozen_v1_prefix_in_gateway_scan_order",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/query_snapshot.rs",
+      "test": "mixed_actor_and_persisted_only_snapshot_is_sorted_audited_and_lifecycle_bound",
+      "disposition": "renamed_and_migrated",
+      "replacement": "query_snapshot::tests::multi_actor_snapshot_is_sorted_audited_and_lifecycle_bound",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "initial_barrier_uses_soft_deadline_and_joins_before_rollback_returns",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "initial_recoverable_shadow_failure_completes_barrier_and_retries",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "legacy_fallback_root_requires_an_existing_scoped_directory",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "structural_shadow_failure_before_initial_barrier_rolls_back_startup",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "unexpected_unsealed_shadow_disconnect_cannot_complete_shutdown",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime/transport_performance.rs",
+      "test": "flight_gateway_transport_performance_baseline",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "durable_drop_tombstone_reconciles_after_shadow_misses_event",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "legacy_snapshot_without_catalog_revision_rebuilds_v4_shadow_baseline",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "native_gateway_query_matches_legacy_and_releases_on_budget_or_disconnect",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "native_query_frontend_is_advertised_only_while_its_runtime_is_ready",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "online_table_source_liveness_and_explicit_drop_converge_through_v4_projection",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "persisted_file_commit_reconciles_native_exact_snapshot_through_shadow_worker",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "source_unregister_is_liveness_only_and_offline_shadow_shutdown_is_clean",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "sqlite_shadow_migration_failure_is_degraded_without_closing_legacy_authority",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker",
+      "disposition": "retired_with_removed_interface",
+      "replacement": "config rejection; native_storage_runtime; native Flight query/ingest integration; scripts/check_native_client.py four-generation recovery",
+      "boundary": "No claim that legacy import or Gateway transport remains supported."
+    }
+  ]
+}

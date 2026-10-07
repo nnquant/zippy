@@ -41,9 +41,19 @@ impl ReceiptArchive {
             ))
             .map_err(archive_error)?;
         #[cfg(unix)]
-        std::fs::File::open(directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(archive_error)?;
+        {
+            // A new table directory must also be durable in its parent before a WAL
+            // acknowledgement can rely on the receipt archive after a crash.
+            let parent = directory
+                .parent()
+                .ok_or_else(|| archive_corruption("receipt archive directory has no parent"))?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(archive_error)?;
+            std::fs::File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(archive_error)?;
+        }
         Ok(Self { connection })
     }
 
@@ -114,6 +124,57 @@ impl ReceiptArchive {
             }
         }
         transaction.commit().map_err(archive_error)
+    }
+
+    /// Stores the first manifest-backed acknowledgement without changing its write identity.
+    pub fn promote_persisted(
+        &mut self,
+        epoch: u64,
+        receipt: &zippy_types::ingest::WriteReceipt,
+    ) -> Result<zippy_types::ingest::WriteReceipt> {
+        use zippy_types::ingest::Durability;
+        if receipt.durability_reached() != Durability::Persisted
+            || receipt
+                .persisted_snapshot_version()
+                .is_none_or(|version| version == 0)
+        {
+            return Err(archive_corruption(
+                "persisted receipt has no manifest version",
+            ));
+        }
+        let mut cached = self
+            .lookup(epoch, receipt.batch_sequence())?
+            .ok_or_else(|| {
+                archive_corruption("persisted receipt is absent from the durable archive")
+            })?;
+        let promoted = crate::native::promote_receipt(
+            &cached.receipt,
+            Durability::Persisted,
+            receipt.persisted_snapshot_version(),
+        );
+        if promoted != *receipt {
+            return Err(archive_corruption(
+                "persisted receipt identity conflicts with its archive",
+            ));
+        }
+        if cached.receipt.durability_reached() == Durability::Persisted {
+            return Ok(cached.receipt);
+        }
+        cached.receipt = receipt.clone();
+        let encoded = serde_json::to_vec(&cached).map_err(archive_error)?;
+        let transaction = self.connection.transaction().map_err(archive_error)?;
+        transaction
+            .execute(
+                "UPDATE receipts SET payload=?3 WHERE epoch=?1 AND sequence=?2",
+                params![
+                    number_key(epoch),
+                    number_key(receipt.batch_sequence()),
+                    encoded
+                ],
+            )
+            .map_err(archive_error)?;
+        transaction.commit().map_err(archive_error)?;
+        Ok(receipt.clone())
     }
 
     pub fn checkpoint(&self) -> Result<Option<WalCheckpoint>> {

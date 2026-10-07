@@ -1,0 +1,128 @@
+{
+  "date": "2026-09-22",
+  "batch": 13,
+  "overall_complete": false,
+  "audit_closed_total": 23,
+  "closed_this_batch": [
+    "F26"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "rust_workspace": "passed; exit 0",
+    "final_protocol_core": "passed after final listener and TTL checks; exit 0",
+    "clippy": "workspace all-targets all-features -D warnings; passed",
+    "python": "610 passed, 1 skipped; rebuilt native extension",
+    "python_client": "115 passed; coverage 81.57%",
+    "mypy": "root configured 14 files and client 26 files passed; full-repository F29 remains open",
+    "black": "86 files unchanged; passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "native_acceptance": "six service starts each for Arrow 23.0.1 and 25.0.1; passed",
+    "platform": "Linux x86_64, CPython 3.11; no Windows/macOS results"
+  },
+  "acceptance": {
+    "all_sessions_server_issued": true,
+    "local_mode_explicit_read_only_and_loopback": true,
+    "nonloopback_requires_tls_and_bootstrap_before_bind": true,
+    "local_sessions_capacity_expiry_and_shutdown": true,
+    "legacy_session_header_rejected": true,
+    "forged_command_identity_rejected": true,
+    "credential_downgrade_rejected": true,
+    "old_server_session_capability_rejected": true,
+    "authenticated_state_recovery_retained": true,
+    "local_read_query_snapshot_and_atomic_log": true,
+    "durable_ack": false,
+    "legacy_callbacks_migrated": false,
+    "gateway_removed": false
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-sessions-workspace.log",
+      "sha256": "6f8b53ddad477cb3202e6021f632c28d2a1fab701f9d4c936e136f9c0da6fd1c"
+    },
+    "final_protocol_core": {
+      "path": "/tmp/zippy-sessions-final-contracts.log",
+      "sha256": "185f03ad697334f44497b9b21506d6a15dd263043800cb3e084065d14d668c5b"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-sessions-clippy.log",
+      "sha256": "05f9dd6a2b9dd340bdc8dcd4e641f706ca88e13c0b97513bdcb917fc07245db4"
+    },
+    "python": {
+      "path": "/tmp/zippy-sessions-python.log",
+      "sha256": "54b2872093944e7ef6e3a19cf2108d63c62bb10a4e843d8b9b601a2054bcff1c"
+    },
+    "python_client": {
+      "path": "/tmp/zippy-sessions-client-final.log",
+      "sha256": "dd58e2dfdfd94d89f8a9845e7401c79142fb7dfc80ba704d4be7d1f277471ed1"
+    },
+    "mypy": {
+      "path": "/tmp/zippy-sessions-mypy.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "client_mypy": {
+      "path": "/tmp/zippy-sessions-client-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "native_arrow23": {
+      "path": "/tmp/zippy-sessions-native.log",
+      "sha256": "029e04e4b5d32783533ae92ead17f03bc4817cf76de2a9c37aef46893e4bb305"
+    },
+    "native_arrow25": {
+      "path": "/tmp/zippy-sessions-native-arrow25.log",
+      "sha256": "1db828703c5376d904ea117e0efbb32c534ddec9c65af9ad43451478e776fb66"
+    },
+    "black": {
+      "path": "/tmp/zippy-sessions-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-sessions-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-sessions-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-sessions-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "native_extension_rebuild": {
+      "path": "/tmp/zippy-sessions-develop.log",
+      "sha256": "43b886b38c900e99a24f05db35cd79df6e5c8a2078abebd1e3f8078ea6f44873"
+    },
+    "server_build": {
+      "path": "/tmp/zippy-sessions-build.log",
+      "sha256": "1630e03801ba436f8cd99986648a8bcf1dc32b438f035e58ebda73e35d9ebdd1"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-protocol/src/auth.rs": "e02f723577690b8178ab7a55816404cff582c31ed87c6122a5ac5c40752b8b0f",
+    "crates/zippy-protocol/src/server.rs": "ccc17cc42bc93f3bd52a83197d4f07038c48dd2269a25fd152863256bf89066d",
+    "crates/zippy-protocol/src/runtime.rs": "6ba89c1d06cced7e371c010411b323ea6b3783e373f79d3b6ecb25675c9be7f2",
+    "crates/zippy-protocol/src/lib.rs": "797df108925b91ca67343d18d2f4c263787efb7b2878b4f1ef1a21ada2ab83df",
+    "crates/zippy-protocol/tests/flight_query.rs": "15b375b3b73339f916d565a33a4e0259280f213ef066a192e55468c0974faa21",
+    "crates/zippy-core/src/config.rs": "d3b432bf3610bd4a060490b4d7a8f86042dd4f4b3000d8827aff406fcc35029b",
+    "crates/zippy-core/tests/config.rs": "b3a850d99260e934a534064e5b9a3d3306c72afb3ee651a49b9acc79e608ac9f",
+    "crates/zippy-server/src/runtime.rs": "95fa8a8bee75da9a5fc751b21f0d4a3fe13e7576fa7fd39b6ef29a9a2d647c06",
+    "crates/zippy-server/tests/server_runtime.rs": "12962dca990f412bf60dd887a814def587f56637996782b84ed4102cb5a91bcf",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "75367f3d2aa3d3f91521d3867f548e8fe792aeec3f581661d75b8523e3720142",
+    "clients/python/src/zippy_client/transports/flight.py": "9e800041c2bcf42b8f17a263f64da4f537e76d9d2d4db9e4a4821bf714d483b2",
+    "clients/python/tests/test_flight_transport.py": "1643d7642bb8e321fa914321fd34730f756ee467f0478d365dde6bdf11c5f5e1",
+    "scripts/check_native_client.py": "e0d58a698e46965236d1de516429ade45c1668da7d89bdd07d4da4da74a9313f"
+  }
+}

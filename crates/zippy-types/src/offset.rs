@@ -1,4 +1,4 @@
-//! Logical log positions with explicit empty and legacy-unknown semantics.
+//! Logical log positions with explicit empty and known boundaries.
 
 use std::fmt;
 
@@ -54,8 +54,6 @@ pub enum OffsetWatermark {
     Empty,
     /// The greatest committed logical offset is known, including offset zero.
     Known(LogOffset),
-    /// Imported legacy data has no reconstructable logical offset boundary.
-    LegacyUnknown,
 }
 
 /// The last accepted batch sequence when sequence zero is itself valid.
@@ -68,7 +66,7 @@ pub enum SequenceWatermark {
     Known(u64),
 }
 
-/// A durable consumer position that cannot encode legacy-unknown history.
+/// A durable consumer position with an explicit empty state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "state", content = "offset", rename_all = "snake_case")]
 pub enum CommittedOffset {
@@ -103,12 +101,12 @@ impl CommittedOffset {
 }
 
 impl OffsetWatermark {
-    /// Returns the known offset, excluding empty and legacy-unknown states.
+    /// Returns the known offset, excluding the empty state.
     #[must_use]
     pub const fn known(self) -> Option<LogOffset> {
         match self {
             Self::Known(offset) => Some(offset),
-            Self::Empty | Self::LegacyUnknown => None,
+            Self::Empty => None,
         }
     }
 }
@@ -245,9 +243,6 @@ mod tests {
             r#"{"first":0,"last":2}"#
         );
         assert_eq!(range.len(), 3);
-        assert_eq!(
-            serde_json::to_string(&OffsetWatermark::LegacyUnknown).unwrap(),
-            r#"{"state":"legacy_unknown"}"#
-        );
+        assert!(serde_json::from_str::<OffsetWatermark>(r#"{"state":"legacy_unknown"}"#).is_err());
     }
 }

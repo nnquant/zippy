@@ -1,0 +1,534 @@
+{
+  "retired_or_migrated": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_invalid_persist_method_when_enabled",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_legacy_partition_dt_part_format",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_wire_json_redacts_master_token",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "control_request_serialization_uses_buffer_and_frame_sizes",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_gets_single_stream",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_gets_single_stream_status",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_lists_stream_statuses",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_lists_streams",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_publishes_and_fetches_segment_descriptor",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_registers_control_plane_entities_and_updates_status",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_unregisters_source_for_registered_process",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "master_client_watches_generic_stream_resource",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "publish_segment_descriptor_fetches_writer_epoch_with_status_request",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "stream_info_persisted_files_revision_is_backward_compatible",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-core/tests/master_client.rs",
+      "test": "stream_info_serialization_includes_write_seq",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_runtime.rs",
+      "test": "legacy_expiry_does_not_mutate_generic_records_with_spoofed_attributes",
+      "action": "migrated",
+      "replacement": "process_expiry_does_not_mutate_generic_records_with_spoofed_attributes",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_runtime.rs",
+      "test": "legacy_lifecycle_is_projected_atomically_with_typed_attributes",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_runtime.rs",
+      "test": "reader_identity_is_unique_and_drop_table_removes_connection",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_runtime.rs",
+      "test": "repeated_stopping_and_failed_status_updates_remain_observable",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/src/server.rs",
+      "test": "generated_master_token_log_never_contains_the_secret",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "control_plane_child_process_entrypoint",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "drop_table_prevalidates_persisted_files_before_removing_registry_state",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "expired_source_writer_cannot_publish_after_new_source_takeover",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "forwarded_segment_descriptor_can_use_control_writer_epoch_for_authorization",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "get_stream_reports_invalid_active_descriptor_preflight",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "get_stream_reports_unreadable_active_segment_preflight",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "lease_reaper_reclaims_expired_segment_reader_leases",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_acquires_and_releases_segment_reader_lease",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_exposes_sealed_segments_as_stream_metadata",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_preserves_get_stream_not_found",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_publishes_persist_event_metadata",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_publishes_persisted_file_metadata",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_rejects_same_stream_with_different_schema",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_roundtrip_returns_registered_stream_schema_metadata",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_status_fetches_omit_historical_metadata",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_upserts_persisted_file_metadata_by_persist_file_id",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_waits_for_segment_descriptor_change",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_rejects_persisted_file_outside_configured_data_root",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_rejects_spoofed_persisted_file_stream_and_schema_metadata",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "os_process_source_writer_takeover_rejects_stale_publish",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "unregistering_active_source_detaches_writer_and_clears_descriptor",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_get_stream_reports_machine_readable_not_found",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_acquires_segment_reader_lease",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_fetches_single_stream_over_unix_socket",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_lists_registered_streams_over_unix_socket",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_publishes_and_fetches_segment_descriptor",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_rejects_segment_reader_lease_for_unknown_segment",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_rejects_stream_registration_with_frame_size_mismatch",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_rejects_zero_capacity_stream_registration",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_releases_segment_reader_lease",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_treats_duplicate_stream_registration_as_idempotent_success",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_typed_control_updates_source_status",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_watch_persisted_file_wakes_on_publish",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_watch_segment_descriptor_wakes_on_publish",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_watch_source_wakes_on_status_update",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_watch_stream_wakes_on_descriptor_publish",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_marks_control_plane_entities_lost_when_process_expires",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_register_source_rebinds_same_definition_to_new_process",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_register_source_rejects_rebind_while_owner_is_alive",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_rejects_duplicate_stream_names",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_rejects_second_active_writer_source_for_stream",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_rejects_segment_descriptor_publish_from_lost_source",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_rejects_stale_writer_after_new_source_takes_epoch",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_segment_descriptor_requires_alive_process",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_source_descriptor_takes_writer_ownership_after_old_writer_lost",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_source_owner_publishes_segment_descriptor",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_stores_process_and_stream_records",
+      "action": "migrated",
+      "replacement": "registry_stores_only_process_lease_records",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_unregister_source_requires_owner_process",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "runtime_status_updates_keep_latest_live_state",
+      "action": "retired",
+      "replacement": "native Flight table administration, WAL/manifest recovery, snapshot pins and process-only control regressions",
+      "reason": "remove retired data registry/configuration contract; retain process lease and current native authority checks"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_removed_table_and_master_token_configuration"
+    },
+    {
+      "file": "crates/zippy-master/src/process_runtime.rs",
+      "test": "process_expiry_does_not_mutate_generic_records_with_spoofed_attributes"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "lease_reaper_revokes_process_and_preserves_configuration_discovery"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "registry_stores_only_process_lease_records"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "retired_data_control_requests_are_rejected_without_mutation"
+    }
+  ],
+  "moved": [
+    {
+      "before": "crates/zippy-master/src/legacy_runtime.rs",
+      "after": "crates/zippy-master/src/process_runtime.rs",
+      "preserved_test_names": [
+        "adapter_boot_id_survives_clone_without_snapshot_persistence",
+        "heartbeat_advances_one_revision_without_rebuilding_the_registry",
+        "stable_contract_enforces_boot_revision_state_and_aba"
+      ]
+    }
+  ],
+  "retired_test_names": 67,
+  "migrated_test_names": 2,
+  "retained_boundaries": [
+    "all process authentication, heartbeat, shutdown, configuration discovery and listener bounds remain tested",
+    "typed runtime CAS, boot identity, revision and ABA checks remain tested",
+    "ready record owner-only mode and current process token exclusion remain tested",
+    "native table metadata, write receipts, fixed snapshots and real recovery remain tested"
+  ],
+  "new_regressions": [
+    "all 17 retired data control request variants and four retired watch variants reject",
+    "real listener remains usable and process registry untouched after retired requests",
+    "real lease reaper revokes expired process while configuration discovery remains available",
+    "removed table and master token inputs reject at every configuration entry"
+  ]
+}

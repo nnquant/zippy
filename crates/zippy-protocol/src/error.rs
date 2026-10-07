@@ -27,6 +27,14 @@ pub fn server_error_to_status(error: &ServerError) -> Status {
     let encoded = encode_error(error).encode_to_vec();
     let mut metadata = MetadataMap::new();
     metadata.insert_bin(ERROR_METADATA_KEY, MetadataValue::from_bytes(&encoded));
+    // Arrow C++ only reconstructs grpc-status-details-bin when x-arrow-status is present.
+    // Use Arrow IOError (5); the original gRPC code remains authoritative, and the binary
+    // envelope carries Zippy's exact code/retryability for all Python FlightError variants.
+    metadata.insert("x-arrow-status", MetadataValue::from_static("5"));
+    metadata.insert_bin(
+        "x-arrow-status-message-bin",
+        MetadataValue::from_bytes(error.message().as_bytes()),
+    );
     Status::with_details_and_metadata(
         grpc_code(error.code()),
         error.message().to_owned(),
@@ -70,9 +78,15 @@ fn encode_error(error: &ServerError) -> ErrorEnvelope {
         code: error.code().as_str().to_owned(),
         message: error.message().to_owned(),
         retryable: error.retryable(),
-        request_id: error.request_id().map(|value| value.into_bytes().to_vec()),
-        query_id: error.query_id().map(|value| value.into_bytes().to_vec()),
-        table_id: error.table_id().map(|value| value.into_bytes().to_vec()),
+        request_id: error
+            .request_id()
+            .map(|value| value.into_bytes().to_vec().into()),
+        query_id: error
+            .query_id()
+            .map(|value| value.into_bytes().to_vec().into()),
+        table_id: error
+            .table_id()
+            .map(|value| value.into_bytes().to_vec().into()),
         details: error.details().map(details_to_wire),
     }
 }
@@ -208,11 +222,10 @@ fn details_from_wire(details: Details) -> Option<ServerErrorDetails> {
     })
 }
 
-fn watermark_to_wire(value: OffsetWatermark) -> crate::wire::OffsetWatermark {
+pub(crate) fn watermark_to_wire(value: OffsetWatermark) -> crate::wire::OffsetWatermark {
     let (state, offset) = match value {
         OffsetWatermark::Empty => (OffsetState::Empty, 0),
         OffsetWatermark::Known(offset) => (OffsetState::Known, offset.get()),
-        OffsetWatermark::LegacyUnknown => (OffsetState::LegacyUnknown, 0),
     };
     crate::wire::OffsetWatermark {
         state: state as i32,
@@ -224,8 +237,7 @@ fn watermark_from_wire(value: crate::wire::OffsetWatermark) -> Option<OffsetWate
     match OffsetState::try_from(value.state).ok()? {
         OffsetState::Empty if value.offset == 0 => Some(OffsetWatermark::Empty),
         OffsetState::Known => Some(OffsetWatermark::Known(LogOffset::new(value.offset))),
-        OffsetState::LegacyUnknown if value.offset == 0 => Some(OffsetWatermark::LegacyUnknown),
-        OffsetState::Unspecified | OffsetState::Empty | OffsetState::LegacyUnknown => None,
+        OffsetState::Unspecified | OffsetState::Empty => None,
     }
 }
 
@@ -334,7 +346,38 @@ mod tests {
         let status = server_error_to_status(&source);
 
         assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.metadata().get("x-arrow-status").unwrap(), "5");
+        assert_eq!(
+            status
+                .metadata()
+                .get_bin("x-arrow-status-message-bin")
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            source.message().as_bytes(),
+        );
         assert_eq!(status_to_server_error(&status), source);
+    }
+
+    #[test]
+    fn wire_watermarks_reject_removed_state_and_preserve_empty_vs_zero() {
+        assert_eq!(
+            super::watermark_from_wire(crate::wire::OffsetWatermark {
+                state: 3,
+                offset: 0
+            }),
+            None
+        );
+        for watermark in [
+            zippy_types::OffsetWatermark::Empty,
+            zippy_types::OffsetWatermark::Known(zippy_types::LogOffset::new(0)),
+            zippy_types::OffsetWatermark::Known(zippy_types::LogOffset::new(u64::MAX)),
+        ] {
+            assert_eq!(
+                super::watermark_from_wire(super::watermark_to_wire(watermark)),
+                Some(watermark)
+            );
+        }
     }
 
     #[test]

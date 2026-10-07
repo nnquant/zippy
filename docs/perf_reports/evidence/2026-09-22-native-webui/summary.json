@@ -1,0 +1,413 @@
+{
+  "date": "2026-09-22",
+  "batch": 36,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F08",
+    "F14",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "removed": [
+    "WebUI registry snapshot loader",
+    "pgrep master inference",
+    "Gateway config and metrics",
+    "Master ops table listing and health",
+    "descriptor row counting and legacy readers/segments/files totals",
+    "MessageCell legacy table health component"
+  ],
+  "native_webui": [
+    "Flight Catalog listing without per-table queries",
+    "shared CLI/WebUI fixed identity and schema inspection",
+    "namespace/name tuple selection",
+    "three table kinds HTTP reads after restart",
+    "fixed preview schema and snapshot metadata",
+    "explicit multi-column tail ordering",
+    "exact limit+1 truncation",
+    "nanosecond timestamp and JavaScript-safe integer encoding",
+    "cancelled stale browser responses",
+    "completion-based auto refresh"
+  ],
+  "validation": {
+    "initial_unit_schema_call_failure": {
+      "path": "/tmp/zippy-webui-tests-initial.log",
+      "exit_code": 1,
+      "sha256": "887d92a5c3025ad41518822f782253bf7018c5abed37fd86b9b594c9d823ee41",
+      "tail": [
+        "FAILED pytests/test_native_webui.py::test_tail_uses_explicit_order_and_removes_lookahead_first[False-expected0]",
+        "FAILED pytests/test_native_webui.py::test_tail_uses_explicit_order_and_removes_lookahead_first[True-expected1]",
+        "FAILED pytests/test_native_webui.py::test_preview_json_preserves_nanoseconds_large_integers_and_nonfinite",
+        "6 failed, 64 passed in 1.64s"
+      ]
+    },
+    "native_units_and_cli": {
+      "path": "/tmp/zippy-webui-tests-final.log",
+      "exit_code": 0,
+      "sha256": "f2af93bbb6f9aa0498156810a78241d36e3c8653dc5fc661a29bf05c122b3308",
+      "tail": [
+        "......................................................................   [100%]",
+        "70 passed in 1.63s"
+      ]
+    },
+    "pytest": {
+      "path": "/tmp/zippy-webui-pytest.log",
+      "exit_code": 0,
+      "sha256": "e9d35156b4cf63c82c6070a970a744cf606c38a635962a796699bb5f509ca724",
+      "tail": [
+        "........................................................................ [ 88%]",
+        "........................................................................ [ 96%]",
+        "..............................                                           [100%]",
+        "893 passed, 1 skipped in 66.46s (0:01:06)"
+      ]
+    },
+    "coverage": {
+      "path": "/tmp/zippy-webui-coverage.log",
+      "exit_code": 0,
+      "sha256": "13f5b4858291370c7fd343c2b8265f54b93ddc7f58c87249ba7a28968f1a2a25",
+      "tail": [
+        "-----------------------------------------------------------------",
+        "TOTAL                                 268     41    85%",
+        "Required test coverage of 80% reached. Total coverage: 84.70%",
+        "70 passed in 3.69s"
+      ]
+    },
+    "native_repository": {
+      "path": "/tmp/zippy-webui-native.log",
+      "exit_code": 0,
+      "sha256": "15d9e4407dc2d58f1026304cf81731e55c06af64d626c57e6bc2a4d4a6edcc51",
+      "tail": [
+        "2026-09-22 16:50:24.663 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:50:24.704 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:50:24.744 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"native_table_cli_three_kinds_metadata_drop_and_restart\": true, \"native_webui_http_namespaces_three_kinds_preview_and_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"flight_only_buffered_writer_lazy_plan_and_restart\": true, \"independent_client_native_child_without_main_import\": true, \"server_launch\": \"repository_binary\", \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_finite_replay_examples_presubscription_and_output_after_stop\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "archive_build_install_and_native_runtime": {
+      "path": "/tmp/zippy-webui-release.log",
+      "exit_code": 0,
+      "sha256": "bbc45cf4884441cb1365f709a08f5f336bebeafa38ad1ae71e81d116db336ef4",
+      "tail": [
+        "2026-09-22 16:56:22.983 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:56:23.006 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 16:56:23.032 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"native_table_cli_three_kinds_metadata_drop_and_restart\": true, \"native_webui_http_namespaces_three_kinds_preview_and_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"flight_only_buffered_writer_lazy_plan_and_restart\": true, \"independent_client_native_child_without_main_import\": true, \"server_launch\": \"installed_cli\", \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_finite_replay_examples_presubscription_and_output_after_stop\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "initial_browser_locator_failure": {
+      "path": "/tmp/zippy-webui-browser.log",
+      "exit_code": 1,
+      "sha256": "77ffbf2a01b6b667d836c92689fbceb3fc165ebbe6cf8bc37c8807a11d380972",
+      "tail": [
+        "",
+        "    at /home/jiangda/develop/zippy/scripts/check_webui_browser.cjs:66:64 {",
+        "  name: 'TimeoutError'",
+        "}"
+      ]
+    },
+    "browser": {
+      "path": "/tmp/zippy-webui-browser-final.log",
+      "exit_code": 0,
+      "sha256": "1a062a0b7ac06c100201f9d9d73abe0d8f9db8e30edd579ba3ae7779333b8697",
+      "tail": [
+        "{\"ok\":true,\"checks\":[\"namespace_identity\",\"explicit_sort\",\"tail_requires_order\",\"request_cancellation\",\"snapshot_schema\",\"exact_integer_render_and_export\"],\"requests\":9}"
+      ]
+    },
+    "frontend_build": {
+      "path": "/tmp/zippy-webui-frontend-build.log",
+      "exit_code": 0,
+      "sha256": "03ac7f0e93ccdae11ce7c7664d58043418635eaf4d70f9229cdc5733c9a839c8",
+      "tail": [
+        "dist/assets/index-Bf6MBzvO.css   14.70 kB │ gzip:  3.60 kB",
+        "dist/assets/index-xnAFY8_m.js   246.64 kB │ gzip: 76.44 kB",
+        "",
+        "✓ built in 203ms"
+      ]
+    },
+    "frontend_bundle": {
+      "path": "/tmp/zippy-webui-frontend-bundle.log",
+      "exit_code": 0,
+      "sha256": "cc1f47002d76fdf35ed88194d080553bbdc66a51bf57d27e1cbdfc5657161550",
+      "tail": [
+        "frontend bundle verified files=[3]"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-webui-black.log",
+      "exit_code": 0,
+      "sha256": "b9da7343b5699a97b201d700d0d0400d419f2afc3912a09023ffa4d0eccc3159",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "104 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-webui-ruff.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-webui-rustfmt.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-webui-mypy-root.log",
+      "exit_code": 0,
+      "sha256": "88fe827c636a04c691d60cb768a7ac3077b3f88379842e946f181a3ad3f821ea",
+      "tail": [
+        "Success: no issues found in 18 source files"
+      ]
+    },
+    "mypy_changed": {
+      "path": "/tmp/zippy-webui-mypy-changed.log",
+      "exit_code": 0,
+      "sha256": "71144743c83babea384888a735db0c4daba3d4d7b7942b6839984bd5c21b52bb",
+      "tail": [
+        "Success: no issues found in 4 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-webui-mypy-all.log",
+      "exit_code": 1,
+      "sha256": "d0b535f07ad3a35cf344a162ba95aab83f710ba0b28c16a84feac19a193f85e3",
+      "tail": [
+        "pytests/test_python_cli.py:694: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:739: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:831: error: Value of type \"object\" is not indexable  [index]",
+        "Found 954 errors in 9 files (checked 103 source files)"
+      ]
+    },
+    "diff": {
+      "path": "/tmp/zippy-webui-diff.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    }
+  },
+  "native_matrices": {
+    "native": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+      "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+      "main_package_explicit_client_sql_aggregate_after_restart": true,
+      "flight_only_buffered_writer_lazy_plan_and_restart": true,
+      "independent_client_native_child_without_main_import": true,
+      "server_launch": "repository_binary",
+      "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+      "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+      "native_fixed_snapshot_expiry_roles_and_capacity": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+      "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+      "native_compute_empty_source_schema_guard": true,
+      "native_compute_parquet_plugin_three_native_output_kinds": true,
+      "native_compute_chain_and_plain_producer_after_restart": true,
+      "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_repeated_server_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "release": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+      "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+      "main_package_explicit_client_sql_aggregate_after_restart": true,
+      "flight_only_buffered_writer_lazy_plan_and_restart": true,
+      "independent_client_native_child_without_main_import": true,
+      "server_launch": "installed_cli",
+      "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+      "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+      "native_fixed_snapshot_expiry_roles_and_capacity": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+      "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+      "native_compute_empty_source_schema_guard": true,
+      "native_compute_parquet_plugin_three_native_output_kinds": true,
+      "native_compute_chain_and_plain_producer_after_restart": true,
+      "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_repeated_server_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    }
+  },
+  "coverage_percent": {
+    "webui_and_inspection": 84.7,
+    "inspection": 100,
+    "isolated_client": 85.19
+  },
+  "unit_cases": 20,
+  "pytest_passed": 893,
+  "pytest_skipped": 1,
+  "browser": {
+    "engine": "Google Chrome 143.0.7499.40",
+    "playwright_core": "1.50.1",
+    "node": "22.17.1",
+    "http_source": "controlled namespace and delayed-response fixtures",
+    "result": {
+      "ok": true,
+      "checks": [
+        "namespace_identity",
+        "explicit_sort",
+        "tail_requires_order",
+        "request_cancellation",
+        "snapshot_schema",
+        "exact_integer_render_and_export"
+      ],
+      "requests": 9
+    },
+    "screenshots_visually_reviewed": [
+      "/tmp/zippy-webui-browser-wide.png",
+      "/tmp/zippy-webui-browser-narrow.png"
+    ]
+  },
+  "source_sha256": {
+    "python/zippy/webui.py": "b63d46189cea595cb8ef75a83a2bff5b2b9ef78068a5b75c656f53886abad251",
+    "python/zippy/native_inspection.py": "fb1f965176225e801d29e761972aa99e3cd255849ef98bb86e7b4b0d61632709",
+    "python/zippy/cli_webui.py": "42c89e95b1f808f17a3b44d7b146d55347395339a257856289ad87c2aa1052cf",
+    "python/zippy/cli_table.py": "c6b22e3cad0cf1efce12b14cd36b810f227cfe17dfceb65d7a9d34c52e33d117",
+    "pyproject.toml": "fd95574d3529f6be7ce455e0c68ec48ef5c0f3cbaf90ab0c8db02e23ea5ebe34",
+    "pytests/test_native_webui.py": "02ac6541fd91bf3fdb233b8ac0969bfb11c77e3040ff5352d3cc055964f52933",
+    "pytests/test_python_cli.py": "9de2c76b2e3a10f3ccf48fa444a970865a7aa2736d3a80ce1cc0e4f1b1148cce",
+    "scripts/check_native_webui.py": "d548ce48057deb9250b3801f86edd94d1b90d4ad901f4287f1c996f390321962",
+    "scripts/check_native_client.py": "6fe2f9e53fbfdbd8bddb094529ac1afd55e673a851e118bdd78607df6a07040b",
+    "scripts/check_webui_browser.cjs": "b9fb6d0c22d9660346f15347d96427f95cbc60f25d3eaaa0e6195058921836c5",
+    "app/zippy-console/src/App.tsx": "c09024b71565d71ab30e698b6b10814c7814f562d984d2f28556ed668d2c9feb",
+    "app/zippy-console/src/api/client.ts": "48c9ac4b548906b2fff8a0dd9812f7cf9f83a5f8dd45a88ec652ab1e94822e0c",
+    "app/zippy-console/src/components/status.tsx": "1ece78f26ce8012bb2f8ecf903126d052201e1be52f30ac2a8759804f5f62119",
+    "app/zippy-console/src/views/DashboardView.tsx": "1a26cc47f59ffd2e5c675e991d85e03c6d2aa1b9716ae9174cd4a84ef1a0d77e",
+    "app/zippy-console/src/views/TablesView.tsx": "ea59eacf505cc22068853da3ae28c043f8c35c1383f0ff1852c7b292c95e58e3",
+    "app/zippy-console/src/styles/globals.css": "417a1d9e0461621b1dc7d9deff024a834213ed13ffb0bf96db432096725c1b1c",
+    "docs/native-webui.md": "7d562daffb8dac74a0bcb072b0a346400b5663c20c389523bfcbdc62ebb48728",
+    "docs/convergence-native-webui-2026-09-22.md": "4a81aff1594d0f2a791bcb3a1570e4063d8c8e4524c82049224d001d4e93216b",
+    "docs/current-capabilities-2026-09-21.md": "bb6f41cb5e62a7c8e8e255ecd67e4349cd1f043e05bb871b34c4f68c83118bc8",
+    "docs/architecture-convergence-audit-2026-09-18.md": "52f4210132a2ca644d64eccc7811e665be7afc950631921654b177070e918f1e",
+    "docs/server-owned-auxiliary-services.md": "24c1c934d9d391bcb1f50ad2b0294f3f486a93c0b51a62efd6b62dcab1d56d68",
+    "docs/single-node-server-runtime.md": "41aa12faa6c5b823c690df7898dd3b51bc497a1814d85736186934f54a70eeab",
+    "python/zippy/webui_static/index.html": "0d9e7ead31444e68d64dbf680e863e35a4439373b282e02cbe0ab40c262c9d50",
+    "python/zippy/webui_static/assets/index-xnAFY8_m.js": "0fc021e9ac31c0c27d40b41fac4f7755dfd6511ddeeeac984783152ee59e91a2",
+    "python/zippy/webui_static/assets/index-Bf6MBzvO.css": "cae79f98b09ddfdbc30f617996fd35657f0c0ce2eab2ab0473467740892d3d97"
+  },
+  "artifact_sha256": {
+    "/tmp/zippy-webui-release-arrow23/wheels/zippy-0.5.0-cp311-cp311-linux_x86_64.whl": "1bcc02746418c29a3ab0d644188a75f4200dbfd49341a80abf4e2220843f69c6",
+    "/tmp/zippy-webui-release-arrow23/wheels/zippy_client-0.1.0-py3-none-any.whl": "57873fc080fa579897ce03a5c98f0d9103222a999ff2d721e6cb3241f5106173",
+    "/tmp/zippy-webui-browser-wide.png": "a8a9a2f8cf099a8ea219ceee726c52c3f66fba1d62a8f858e2a7b620f6e92b11",
+    "/tmp/zippy-webui-browser-narrow.png": "c792f712d9ff3d8f1864ab27b30680274750ab409b45892af4a49eb83e6ea848"
+  },
+  "wheel_exact_module_and_static_bytes_verified": true,
+  "rust_modified": false,
+  "rust_workspace_clippy_rerun": false,
+  "arrow25_rerun": false,
+  "cross_platform_rerun": false,
+  "remaining": "main Table/Session/Pipeline/callbacks and server Legacy/shadow authority; full mypy 954 errors in 9 files; cross-platform runtime evidence remains incomplete"
+}

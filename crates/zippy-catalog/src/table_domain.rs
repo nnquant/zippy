@@ -83,11 +83,7 @@ pub(crate) struct PreparedCreateTable {
     initial_summary_blob: Vec<u8>,
 }
 
-impl PreparedCreateTable {
-    pub(crate) fn schema_hash(&self) -> &str {
-        &self.schema_hash
-    }
-}
+impl PreparedCreateTable {}
 
 /// Validates and encodes a CreateTable command without holding SQLite's writer lock.
 pub(crate) fn prepare_create_table(command: CreateTableCommand) -> Result<PreparedCreateTable> {
@@ -552,7 +548,7 @@ fn ensure_table_identity_available(
     }
     let name_exists = connection
         .query_row(
-            "SELECT 1 FROM tables WHERE namespace_id = ?1 AND name = ?2",
+            "SELECT 1 FROM tables WHERE namespace_id = ?1 AND name = ?2 AND state != 'dropped'",
             params![namespace_id.into_bytes().as_slice(), name.as_str()],
             |_| Ok(()),
         )

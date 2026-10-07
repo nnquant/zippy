@@ -14,22 +14,20 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      - name: setup rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: setup pinned rust
+        run: python scripts/setup_rust_toolchain.py
 
-      - name: run in-process timeseries profile
+      - name: run synchronous timeseries kernel profile
         run: |
-          cargo run -p zippy-perf --release -- inproc-timeseries \
+          cargo run -p zippy-perf --release -- timeseries-kernel \
             --rows-per-batch 4096 \
             --target-rows-per-sec 1000000 \
             --duration-sec 10 \
             --warmup-sec 2 \
             --symbols 1024 \
-            --buffer-capacity 4096 \
-            --max-p95-micros 1000 \
-            --max-p99-micros 5000 \
-            --max-queue-depth 64 \
-            --report-json target/zippy-perf-inproc-timeseries.json
+            --max-p95-micros 5000 \
+            --max-p99-micros 10000 \
+            --report-json target/zippy-perf-timeseries-kernel.json
 
       - name: run stream table copy profile
         run: |
@@ -42,18 +40,6 @@ jobs:
             --max-p95-micros 5000 \
             --max-p99-micros 20000 \
             --report-json target/zippy-perf-stream-table-copy.json
-
-      - name: run stream table forward profile
-        run: |
-          cargo run -p zippy-perf --release -- stream-table-segment-forward \
-            --rows-per-batch 4096 \
-            --target-rows-per-sec 1000000 \
-            --duration-sec 10 \
-            --warmup-sec 2 \
-            --symbols 1024 \
-            --max-p95-micros 1000 \
-            --max-p99-micros 5000 \
-            --report-json target/zippy-perf-stream-table-forward.json
 
       - name: run write-to-subscribe profile
         env:

@@ -20,9 +20,9 @@ use zippy_types::catalog::{
 };
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, ColumnName, DataFileLocation, DataFileProvenance,
-    DataFileState, ExternalDataPath, ManagedDataPath, MetadataMap, NativeDataFileProvenance,
-    PendingDataFile, SchemaIpcPayload, SnapshotOperation, SourceSegmentIdentity,
-    SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
+    DataFileState, ManagedDataPath, MetadataMap, NativeDataFileProvenance, PendingDataFile,
+    SchemaIpcPayload, SnapshotOperation, SourceSegmentIdentity, SourceSegmentLineage,
+    SourceSegmentLineages, TableDefinition,
 };
 use zippy_types::{
     ErrorCode, FileId, LeaseId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId,
@@ -225,29 +225,6 @@ fn native_file(
         last,
         vec![source_lineage(segment_id, 1, writer_epoch, first, last)],
     )
-}
-
-fn legacy_file(file: u128, table: u128) -> PendingDataFile {
-    PendingDataFile {
-        file_id: file_id(file),
-        table_id: table_id(table),
-        schema_version: 1,
-        location: DataFileLocation::ExternalLegacy(
-            ExternalDataPath::new(format!("/legacy/{table}/{file}.parquet"))
-                .expect("valid external legacy path"),
-        ),
-        file_size_bytes: 128,
-        row_count: NonZeroU64::new(1).expect("nonzero row count"),
-        provenance: DataFileProvenance::Legacy {
-            offsets: Some(offset_range(0, 0)),
-            preserve_discovery_order: false,
-        },
-        partition: MetadataMap::new(),
-        statistics: MetadataMap::new(),
-        metadata: MetadataMap::new(),
-        checksum: format!("sha256-v1:{file:064x}"),
-        created_at_ns: 1_000 + u64::try_from(file).expect("small test file identity"),
-    }
 }
 
 fn commit_data_files(
@@ -881,9 +858,7 @@ async fn commits_native_files_reads_exact_history_restarts_and_replays() {
         assert_eq!(descriptor.added_snapshot_version, 2);
         assert_eq!(descriptor.removed_snapshot_version, None);
         assert_eq!(descriptor.state, DataFileState::Committed);
-        let DataFileProvenance::Native(provenance) = &descriptor.file.provenance else {
-            panic!("persisted server file must retain typed native provenance");
-        };
+        let DataFileProvenance::Native(provenance) = &descriptor.file.provenance;
         assert_eq!(provenance.source_lineage().as_slice().len(), 1);
         assert_eq!(
             provenance.source_lineage().as_slice()[0]
@@ -965,17 +940,6 @@ async fn rejects_invalid_data_file_commits_without_advancing_revision() {
                 OffsetWatermark::Known(LogOffset::new(0)),
             ),
             ErrorCode::InvalidArgument,
-        ),
-        (
-            "legacy file",
-            commit_data_files(
-                13,
-                2,
-                1,
-                vec![legacy_file(10, TABLE)],
-                OffsetWatermark::Known(LogOffset::new(0)),
-            ),
-            ErrorCode::UnsupportedPlan,
         ),
         (
             "future writer epoch",

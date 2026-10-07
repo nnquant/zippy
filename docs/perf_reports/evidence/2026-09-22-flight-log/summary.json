@@ -1,0 +1,125 @@
+{
+  "date": "2026-09-22",
+  "batch": 10,
+  "overall_complete": false,
+  "audit_closed_total": 21,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11",
+    "F16"
+  ],
+  "additional_fixes": [
+    "F42: native Flight owner cancellation recreated a different capability nonce",
+    "serialize native event-window Catalog construction peaks under unchanged shared memory limits"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "rust_workspace": "passed; process exit 0",
+    "rust_test_count": "not aggregated: logging subprocess output interleaves",
+    "clippy": "passed; workspace, all targets, all features, warnings denied; process exit 0",
+    "python_client": "95 passed; coverage 80.86%; process exit 0",
+    "black": "83 files unchanged; single worker with /tmp cache outside sandbox; exit 0",
+    "black_environment": "two sandbox checks blocked; verified exact processes and terminated after successful equivalent check",
+    "ruff": "passed; repository configured checks",
+    "mypy": "passed: root configured 14 source files; client source and tests 24 files",
+    "full_repository_mypy": "unresolved F29 remains; configured checks do not cover all production/test code",
+    "protocol_codegen": "regenerated Rust/Python from canonical proto; --check passed",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "platform": "Linux x86_64; no Windows/macOS execution in this batch"
+  },
+  "acceptance": {
+    "native_flight_log_three_table_kinds": true,
+    "decoded_values_offsets_and_frame_boundaries": true,
+    "concurrent_local_and_remote_checkpoint_refresh": true,
+    "authenticated_transport_session_and_exact_generation_cancel": true,
+    "missing_or_mismatched_rpc_session_rejected": true,
+    "half_closed_input_waits_until_deadline": true,
+    "arrow_network_splits_preserve_offsets": true,
+    "result_owner_released_on_eof_and_partial_stream_drop": true,
+    "cancel_while_waiting_for_window_admission": true,
+    "durable_subscription_ack": false,
+    "atomic_frame_delivery_layer": false,
+    "python_high_level_flight_subscription": false,
+    "gateway_removed": false
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-flight-log-workspace.log",
+      "sha256": "ff128968bb6be3d087f55168169cd3023f8e7a72b32ceff62563512c2e600d20"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-flight-log-clippy.log",
+      "sha256": "a36172edef456eb6db066c7b87f58d9d30fac3b229393bf137c1a4ddd32eabfd"
+    },
+    "native_flight": {
+      "path": "/tmp/zippy-flight-log-native.log",
+      "sha256": "93a92998a85d1b3568d52935aa3996c14b2dd58110d464858ab207a7f3f02b8d"
+    },
+    "owner_cancel": {
+      "path": "/tmp/zippy-flight-log-cancel.log",
+      "sha256": "94bb8219d0342d54074894d9aebc9deff7e91133f505ee9f555e864a8ef49619"
+    },
+    "python_client": {
+      "path": "/tmp/zippy-flight-log-python.log",
+      "sha256": "5320e75564280a975571d1fcc0ea676b54c68d6f1323c50fef30ac0b58591e88"
+    },
+    "black": {
+      "path": "/tmp/zippy-flight-log-black-final.log",
+      "sha256": "c35fe108fd2b9f2dbda590eceeef09d8f95f46a259de574a74d9536171b689a4"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-flight-log-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-flight-log-mypy.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "mypy_client": {
+      "path": "/tmp/zippy-flight-log-client-mypy.log",
+      "sha256": "fa935e779fe5886f2480e415c7e46616bdedad407f9da1cca28e7d341d95f4d7"
+    },
+    "protocol_codegen": {
+      "path": "/tmp/zippy-flight-log-codegen-check.log",
+      "sha256": "9d98a520b5eb5bd4f7dc3df3e9b1b0f695a8a1378f0281f37c428ed8979e206c"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-flight-log-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-flight-log-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto": "7b7f4985c5926ef2341e31a417f63dba6df8a9567d744a96ec1541f4f32e1ab1",
+    "crates/zippy-protocol/src/log.rs": "7569f115dc5a09b45b92d369f3f5f83d7f22022aa6592d1ba7dbbc69a1e92f75",
+    "crates/zippy-protocol/src/wire.rs": "67b02da71b655bad325d8b85241440f6490cb82fc2e15b488452e8f945c89914",
+    "crates/zippy-protocol/src/lib.rs": "84c31a267d94acb4a59590ae21e58074f2a2041847c084b5a57214abf8bc5178",
+    "crates/zippy-protocol/src/server.rs": "3c17c2596ee3bcca20b45a963a4ef1095dbbe39fa8029e5da1b592efc64d90a2",
+    "crates/zippy-server/src/flight_query.rs": "4096d04b3a14ea79ab037c833d33d052894eb6d58b07895884514280918bcf4c",
+    "crates/zippy-server/src/native_query.rs": "112e4c1f66de4359d5b50100f96691c02c5e5a6641f1b9ee840721a6f01a0c68",
+    "crates/zippy-server/src/native_log.rs": "2f6eed5efe29ca0b15258347b96150da41adeaf4b09c54aafe95b396ff17702b",
+    "crates/zippy-server/src/query_service.rs": "a31e25b2213268042e19ec88f611a5fdf13737b79f116c10d2cc5f12c6cecb9a",
+    "crates/zippy-server/src/query_snapshot.rs": "a62db3ffd5bae8c83ff528856f8fe6b9d5b8117c795ce1f62e069ab78b9db0dc",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "8c79b2828b91c6e126daa9343c87019cc7fa4df83b8725fb453ab79cb9e000f9",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.py": "3e9f65e194ca4f500e9799731035e218d4506ef7a5f09459eae31ee91c7c558a",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.pyi": "49b3ac30a351e1dc216c0772b0ea83f01e6edff6118d4246a13dc4039355574a"
+  }
+}

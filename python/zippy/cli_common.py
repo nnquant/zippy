@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import NoReturn
 
 import click
+from zippy_client.endpoints import resolve_control_endpoint as resolve_client_endpoint
 
 DEFAULT_CONTROL_ENDPOINT = "tcp://127.0.0.1:17690"
 
@@ -32,9 +33,8 @@ def resolve_control_endpoint(control_endpoint: str) -> str:
     :returns: Resolved control endpoint URI or filesystem path.
     :rtype: str
     """
-    from zippy import _resolve_uri
-
-    return _resolve_uri(control_endpoint)
+    endpoint = resolve_client_endpoint(control_endpoint)
+    return f"tcp://{endpoint.address}" if endpoint.kind == "tcp" else endpoint.address
 
 
 def ensure_control_parent_dir(control_endpoint: str) -> None:
@@ -59,3 +59,11 @@ def cli_error(message: str) -> NoReturn:
     :raises click.ClickException: Always.
     """
     raise click.ClickException(message)
+
+
+def _endpoint_host_port(endpoint: str) -> tuple[str, str]:
+    if endpoint.startswith("tcp://"):
+        authority = endpoint.removeprefix("tcp://").split("/", 1)[0]
+        host, port = authority.rsplit(":", 1)
+        return host, port
+    return endpoint, ""

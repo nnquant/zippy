@@ -1,17 +1,8 @@
 """Lightweight Python client for local and remote Zippy servers."""
 
-from .client import (
-    Client,
-    client,
-    connect,
-    get_writer,
-    master,
-    read_sql,
-    read_table,
-    subscribe,
-    subscribe_table,
-)
+from .client import Client
 from .errors import (
+    AmbiguousAcknowledgementError,
     AmbiguousWriteError,
     AuthenticationError,
     CapabilityError,
@@ -24,30 +15,37 @@ from .errors import (
     ZippyConnectionError,
 )
 from .expressions import Expr, col, lit
+from .flight_subscriber import FlightSubscriber, SubscriptionOptions
+from .log_reader import FlightLogReader, LogCursor, LogEvent
 from .models import Operation, ServerCapabilities, Transport, TransportDecision
 from .query import Table
-from .subscriber import GatewaySubscriber, Row, ShmSubscriber, shm_available
-from .writer import FlightWriter, GatewayWriter
+from .snapshot import FixedSnapshot
+from .row import Row
+from .writer import FlightWriter
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "AmbiguousAcknowledgementError",
     "AmbiguousWriteError",
     "AuthenticationError",
     "CapabilityError",
     "Client",
     "ContinuityError",
     "Expr",
+    "FixedSnapshot",
     "FlightWriter",
-    "GatewaySubscriber",
-    "GatewayWriter",
+    "FlightLogReader",
+    "FlightSubscriber",
+    "SubscriptionOptions",
+    "LogCursor",
+    "LogEvent",
     "Operation",
     "ProtocolError",
     "QueryError",
     "Row",
     "ServerCapabilities",
     "ServerError",
-    "ShmSubscriber",
     "Table",
     "Transport",
     "TransportDecision",
@@ -55,15 +53,6 @@ __all__ = [
     "ZippyClientError",
     "ZippyConnectionError",
     "__version__",
-    "client",
     "col",
-    "connect",
-    "get_writer",
     "lit",
-    "master",
-    "read_sql",
-    "read_table",
-    "shm_available",
-    "subscribe",
-    "subscribe_table",
 ]

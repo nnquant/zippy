@@ -1,275 +1,154 @@
-"""
-Table management commands for the zippy CLI.
-"""
+"""Inspect and retire native Catalog tables through the shared Flight client."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from typing import Any
+import uuid
 
 import click
+from zippy_client import Client, ZippyClientError
 
-import zippy
-
+from .native_inspection import inspect_table, schema_info
 from .cli_common import DEFAULT_CONTROL_ENDPOINT, cli_error, echo_json
-
-
-def _master_client(uri: str, *, token: str | None = None) -> zippy.MasterClient:
-    """
-    Create a master client for table management commands.
-
-    :param uri: Master URI or explicit Unix control socket path.
-    :type uri: str
-    :param token: Optional master control token for privileged operations.
-    :type token: str | None
-    :returns: Connected master client.
-    :rtype: zippy.MasterClient
-    """
-    client = zippy.connect(uri=uri)
-    if token is not None:
-        set_token = getattr(client, "set_token", None)
-        if not callable(set_token):
-            raise RuntimeError("master client does not support control tokens")
-        set_token(token)
-    return client
 
 
 @click.group("table")
 def table_group() -> None:
-    """
-    Manage master-registered tables.
-    """
+    """Inspect and delete native Catalog tables."""
 
 
 @table_group.command("ls")
 @click.option(
     "--uri",
-    "uri",
     default=DEFAULT_CONTROL_ENDPOINT,
     show_default=True,
-    help="zippy-master URI",
+    help="Server control endpoint used for Flight discovery.",
 )
-@click.option(
-    "--control-endpoint",
-    "uri",
-    hidden=True,
-)
-@click.option("--json", "as_json", is_flag=True, default=False, help="emit JSON output")
-def list_tables(uri: str, as_json: bool) -> None:
-    """
-    List all registered tables.
+@click.option("--namespace", default=None, help="Restrict listing to one Catalog namespace.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON output.")
+def list_tables(uri: str, namespace: str | None, as_json: bool) -> None:
+    """List native tables with explicit namespaces.
+
+    :param uri: Server discovery endpoint.
+    :param namespace: Optional namespace filter.
+    :param as_json: Emit structured output instead of a text table.
+    :raises click.ClickException: Discovery, authorization or catalog access fails.
     """
     try:
-        tables = zippy.ops.list_tables(master=_master_client(uri))
-    except RuntimeError as error:
+        with Client(uri) as client:
+            tables = client.list_tables(namespace=namespace)
+    except (ZippyClientError, OSError, RuntimeError, ValueError) as error:
         cli_error(str(error))
-
+    tables.sort(key=lambda item: (str(item["namespace"]), str(item["name"])))
     if as_json:
         echo_json(tables)
         return
-
-    click.echo(
-        "TABLE NAME                  STATUS           ROWS  BUFFER SIZE  FRAME SIZE  SCHEMA HASH"
-    )
+    click.echo("NAMESPACE                TABLE                         TYPE")
     for table in tables:
-        row_count = _table_row_count(table)
-        click.echo(
-            f"{str(table['stream_name']):<27} "
-            f"{str(table['status']):<16} "
-            f"{row_count:<5} "
-            f"{table['buffer_size']:<12} "
-            f"{table['frame_size']:<11} "
-            f"{table.get('schema_hash', '')}"
-        )
+        click.echo(f"{str(table['namespace']):<24} {str(table['name']):<29} {table['table_type']}")
 
 
 @table_group.command("info")
 @click.argument("table_name")
-@click.option(
-    "--uri",
-    "uri",
-    default=DEFAULT_CONTROL_ENDPOINT,
-    show_default=True,
-    help="zippy-master URI",
-)
-@click.option(
-    "--control-endpoint",
-    "uri",
-    hidden=True,
-)
-@click.option("--json", "as_json", is_flag=True, default=False, help="emit JSON output")
-def table_info(table_name: str, uri: str, as_json: bool) -> None:
-    """
-    Show metadata for one registered table.
+@click.option("--uri", default=DEFAULT_CONTROL_ENDPOINT, show_default=True)
+@click.option("--namespace", default="default", show_default=True)
+@click.option("--json", "as_json", is_flag=True)
+def table_info(table_name: str, uri: str, namespace: str, as_json: bool) -> None:
+    """Show authoritative table identity by name and logical Arrow schema.
+
+    :param table_name: Native table name.
+    :param uri: Server discovery endpoint.
+    :param namespace: Explicit Catalog namespace.
+    :param as_json: Emit structured output.
+    :raises click.ClickException: The table is missing or access fails.
     """
     try:
-        info = zippy.ops.table_info(table_name, master=_master_client(uri))
-    except (RuntimeError, ValueError) as error:
+        with Client(uri) as client:
+            info = inspect_table(client, table_name, namespace)
+    except (ZippyClientError, OSError, RuntimeError, ValueError) as error:
         cli_error(str(error))
-
     if as_json:
         echo_json(info)
         return
-
-    for key in [
-        "stream_name",
-        "status",
-        "schema_hash",
-        "buffer_size",
-        "frame_size",
-        "write_seq",
-        "writer_process_id",
-        "writer_epoch",
-        "reader_count",
-        "descriptor_generation",
-    ]:
-        click.echo(f"{key}: {info.get(key)}")
-    click.echo(f"persisted_file_count: {len(info.get('persisted_files') or [])}")
-    click.echo(f"sealed_segment_count: {len(info.get('sealed_segments') or [])}")
+    for name in ("namespace", "name", "catalog", "table_type"):
+        click.echo(f"{name}: {info[name]}")
+    echo_json(info["schema"])
+    echo_json(info["snapshots"])
 
 
 @table_group.command("schema")
 @click.argument("table_name")
-@click.option(
-    "--uri",
-    "uri",
-    default=DEFAULT_CONTROL_ENDPOINT,
-    show_default=True,
-    help="zippy-master URI",
-)
-@click.option(
-    "--control-endpoint",
-    "uri",
-    hidden=True,
-)
-@click.option("--json", "as_json", is_flag=True, default=False, help="emit JSON output")
-def table_schema(table_name: str, uri: str, as_json: bool) -> None:
-    """
-    Show the registered Arrow schema for one table.
+@click.option("--uri", default=DEFAULT_CONTROL_ENDPOINT, show_default=True)
+@click.option("--namespace", default="default", show_default=True)
+@click.option("--json", "as_json", is_flag=True)
+def table_schema(table_name: str, uri: str, namespace: str, as_json: bool) -> None:
+    """Show the exact native Arrow field types and metadata.
+
+    :param table_name: Native table name.
+    :param uri: Server discovery endpoint.
+    :param namespace: Explicit Catalog namespace.
+    :param as_json: Emit fields and base64 metadata as JSON.
+    :raises click.ClickException: Schema discovery or authentication fails.
     """
     try:
-        info = zippy.ops.table_info(table_name, master=_master_client(uri))
-    except (RuntimeError, ValueError) as error:
+        with Client(uri) as client, client.read_table(table_name, namespace=namespace) as table:
+            schema = table.schema()
+    except (ZippyClientError, OSError, RuntimeError, ValueError) as error:
         cli_error(str(error))
-
-    schema = info.get("schema") or {}
     if as_json:
-        echo_json(schema)
+        echo_json(schema_info(schema))
         return
-
-    fields = _schema_fields(schema)
-    click.echo(
-        "FIELD                      DATA TYPE                 SEGMENT TYPE       NULLABLE  TIMEZONE"
-    )
-    for field in fields:
-        click.echo(
-            f"{str(field.get('name', '')):<26} "
-            f"{str(field.get('data_type', '')):<25} "
-            f"{str(field.get('segment_type', '')):<18} "
-            f"{str(field.get('nullable', '')):<9} "
-            f"{_display_value(field.get('timezone'))}"
-        )
+    click.echo(str(schema))
 
 
 @table_group.command("drop")
-@click.argument("table_name")
+@click.argument("table_id", type=click.UUID)
+@click.option("--uri", default=DEFAULT_CONTROL_ENDPOINT, show_default=True)
 @click.option(
-    "--uri",
-    "uri",
-    default=DEFAULT_CONTROL_ENDPOINT,
-    show_default=True,
-    help="zippy-master URI",
+    "--expected-snapshot-version",
+    type=click.IntRange(min=1),
+    required=True,
+    help="Exact snapshot version observed in a native receipt or query metadata.",
 )
 @click.option(
-    "--control-endpoint",
-    "uri",
-    hidden=True,
+    "--request-id",
+    type=click.UUID,
+    required=True,
+    help="Stable non-nil request UUID; reuse unchanged after a lost response.",
 )
-@click.option(
-    "--keep-persisted",
-    is_flag=True,
-    default=False,
-    help="remove table metadata but keep registered persisted parquet files",
-)
-@click.option("-y", "--yes", is_flag=True, default=False, help="skip confirmation prompt")
-@click.option(
-    "--token",
-    envvar="ZIPPY_MASTER_TOKEN",
-    default=None,
-    help="master control token; defaults to ZIPPY_MASTER_TOKEN",
-)
-@click.option("--json", "as_json", is_flag=True, default=False, help="emit JSON output")
+@click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt.")
+@click.option("--json", "as_json", is_flag=True)
 def drop_table(
-    table_name: str,
+    table_id: uuid.UUID,
     uri: str,
-    keep_persisted: bool,
+    expected_snapshot_version: int,
+    request_id: uuid.UUID,
     yes: bool,
-    token: str | None,
     as_json: bool,
 ) -> None:
-    """
-    Drop one registered table from master.
-    """
-    drop_persisted = not keep_persisted
-    if not yes:
-        persisted_note = (
-            "and delete persisted files" if drop_persisted else "and keep persisted files"
-        )
-        confirmed = click.confirm(
-            f"drop table [{table_name}] {persisted_note}?",
-            default=False,
-        )
-        if not confirmed:
-            click.echo("drop aborted")
-            return
+    """Logically delete one immutable table with native concurrency protection.
 
+    :param table_id: Immutable native table UUID; names cannot target replacements.
+    :param uri: Server discovery endpoint.
+    :param expected_snapshot_version: Positive version previously observed by the caller.
+    :param request_id: Stable UUID reused for identical retries.
+    :param yes: Bypass the interactive confirmation.
+    :param as_json: Emit the committed response.
+    :raises click.ClickException: Authorization, version validation or retirement fails.
+    """
+    if not yes and not click.confirm(
+        f"drop native table [{table_id}] at snapshot [{expected_snapshot_version}]?", default=False
+    ):
+        click.echo("drop aborted")
+        return
     try:
-        result = zippy.ops.drop_table(
-            table_name,
-            drop_persisted=drop_persisted,
-            master=_master_client(uri, token=token),
-        )
-    except (RuntimeError, ValueError) as error:
+        with Client(uri) as client:
+            result: dict[str, Any] = client.drop_table(
+                table_id, expected_snapshot_version=expected_snapshot_version, request_id=request_id
+            )
+    except (ZippyClientError, OSError, RuntimeError, ValueError) as error:
         cli_error(str(error))
-
     if as_json:
         echo_json(result)
         return
-
-    click.echo(
-        "dropped table "
-        f"{result.get('table_name')} "
-        f"dropped={result.get('dropped')} "
-        f"sources_removed={result.get('sources_removed')} "
-        f"engines_removed={result.get('engines_removed')} "
-        f"persisted_files_deleted={result.get('persisted_files_deleted')}"
-    )
-
-
-def _schema_fields(schema: object) -> list[Mapping[str, object]]:
-    if not isinstance(schema, Mapping):
-        return []
-    fields = schema.get("fields") or []
-    return [field for field in fields if isinstance(field, Mapping)]
-
-
-def _table_row_count(table: Mapping[str, object]) -> int:
-    active = table.get("active_segment_descriptor")
-    row_count = 0
-    if isinstance(active, Mapping):
-        row_count += _int_value(active.get("committed_row_count"))
-    for segment in table.get("sealed_segments") or []:
-        if isinstance(segment, Mapping):
-            row_count += _int_value(segment.get("committed_row_count"))
-    return row_count
-
-
-def _int_value(value: object) -> int:
-    if isinstance(value, int):
-        return value
-    return 0
-
-
-def _display_value(value: object) -> str:
-    if value is None:
-        return "-"
-    return str(value)
+    click.echo(f"dropped table [{table_id}] request=[{request_id}]")

@@ -1,5 +1,6 @@
 //! Server-owned lifecycle for the SQLite Catalog and native manifest storage.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,17 +10,16 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use zippy_catalog::{
-    decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig,
-    SqliteCatalogLegacyReconcileHandle, SqliteCatalogReadHandle,
+    decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig, SqliteCatalogReadHandle,
     SqliteCatalogRuntimeSnapshotPinAdmissionControl, SqliteCatalogRuntimeSnapshotPinRecord,
     SqliteCatalogRuntimeSnapshotPinStatus, SqliteCatalogWriteHandle,
 };
 use zippy_core::OwnedDataDirectory;
 use zippy_ingest::{
-    NativeAppendMaterializerConfig, NativeAppendMaterializerSink, NativeIngestConfig,
-    NativeIngestHandle, NativeIngestRuntime, NativeIngestShutdownOutcome, NativeIngestStatus,
-    NativeIngestTableBootstrap, TableActorAdmissionControl, TableActorHandle, TableActorRegistry,
-    TableActorRegistryConfig, TableActorRegistryHandle, TableRuntimeBootstrap,
+    NativeIngestConfig, NativeIngestHandle, NativeIngestRuntime, NativeIngestShutdownOutcome,
+    NativeIngestStatus, NativeIngestTableBootstrap, NativeTableMaterializerConfig,
+    NativeTableMaterializerSink, TableActorAdmissionControl, TableActorHandle, TableActorRegistrar,
+    TableActorRegistry, TableActorRegistryConfig, TableActorRegistryHandle, TableRuntimeBootstrap,
     TableRuntimeRegistry,
 };
 use zippy_storage::{
@@ -32,14 +32,7 @@ use zippy_storage::{
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogPersistence, CatalogRead, CatalogWrite,
 };
-use zippy_types::table::TableDescriptor;
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
-
-use crate::legacy_catalog_migration::{
-    exact_v4_checkpoint_supersedes_import, execute_legacy_catalog_metadata_import,
-    LegacyCatalogMigrationDegradation, LegacyCatalogMigrationDegradedReason,
-    LegacyCatalogMigrationStartup, LegacyCatalogMigrationStatus, LEGACY_STREAM_NAME_CONFIG_KEY,
-};
 
 const SUPERVISOR_THREAD_NAME: &str = "zippy-native-storage";
 const REAPER_THREAD_NAME: &str = "zippy-native-storage-reaper";
@@ -63,7 +56,6 @@ pub struct NativeStorageRuntimeConfig {
     query_engine: crate::native_query::NativeQueryEngineConfig,
     query_canary: Option<crate::native_query_canary::NativeQueryCanaryRuntimeConfig>,
     actor: CatalogActor,
-    legacy_catalog_migration: LegacyCatalogMigrationStartup,
 }
 
 impl NativeStorageRuntimeConfig {
@@ -95,7 +87,6 @@ impl NativeStorageRuntimeConfig {
                 kind: CatalogActorKind::Server,
                 principal: DEFAULT_SERVER_ACTOR_PRINCIPAL.to_owned(),
             },
-            legacy_catalog_migration: LegacyCatalogMigrationStartup::Disabled,
         }
     }
 
@@ -190,14 +181,6 @@ impl NativeStorageRuntimeConfig {
     #[must_use]
     pub fn with_actor(mut self, actor: CatalogActor) -> Self {
         self.actor = actor;
-        self
-    }
-
-    pub(crate) fn with_legacy_catalog_migration(
-        mut self,
-        migration: LegacyCatalogMigrationStartup,
-    ) -> Self {
-        self.legacy_catalog_migration = migration;
         self
     }
 
@@ -403,12 +386,12 @@ impl NativeStorageStartup {
         NativeStorageRuntime {
             report: ready.reconciliation,
             catalog_file_verification: ready.catalog_file_verification,
-            legacy_catalog_migration: ready.legacy_catalog_migration,
             catalog_read_handle: ready.catalog_read_handle,
             catalog_write_handle: ready.catalog_write_handle,
-            catalog_legacy_reconcile_handle: ready.catalog_legacy_reconcile_handle,
             runtime_snapshot_pin_admission: ready.runtime_snapshot_pin_admission,
             table_actors: ready.table_actors,
+            table_registrar: ready.table_registrar,
+            table_admin_limits: ready.table_admin_limits,
             native_ingest_bootstraps: ready.native_ingest_bootstraps,
             table_actor_admission: ready.table_actor_admission,
             query_snapshot_coordinator,
@@ -417,6 +400,8 @@ impl NativeStorageStartup {
             query_engine,
             query_canary,
             native_ingest: None,
+            table_admin: None,
+            consumer_logs: None,
             healthy: ready.healthy,
             terminal_failure: Arc::clone(&self.terminal_failure),
             shutdown: self.shutdown.take(),
@@ -467,12 +452,12 @@ impl NativeStorageShutdownOutcome {
 pub struct NativeStorageRuntime {
     report: StartupOrphanReconciliationReport,
     catalog_file_verification: StartupCatalogFileVerificationReport,
-    legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
     catalog_write_handle: SqliteCatalogWriteHandle,
-    catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
     runtime_snapshot_pin_admission: SqliteCatalogRuntimeSnapshotPinAdmissionControl,
     table_actors: TableActorRegistryHandle,
+    table_registrar: TableActorRegistrar,
+    table_admin_limits: crate::table_admin::NativeTableAdminLimits,
     native_ingest_bootstraps: Arc<[NativeIngestTableBootstrap]>,
     table_actor_admission: TableActorAdmissionControl,
     query_snapshot_coordinator: crate::query_snapshot::NativeQuerySnapshotCoordinator,
@@ -481,6 +466,8 @@ pub struct NativeStorageRuntime {
     query_engine: crate::native_query::NativeQueryEngine,
     query_canary: Option<crate::native_query_canary::NativeQueryCanaryService>,
     native_ingest: Option<NativeIngestRuntime>,
+    table_admin: Option<crate::NativeTableAdmin>,
+    consumer_logs: Option<crate::NativeConsumerLogService>,
     healthy: Arc<AtomicBool>,
     terminal_failure: Arc<Mutex<Option<ServerError>>>,
     shutdown: Option<watch::Sender<bool>>,
@@ -540,12 +527,6 @@ impl NativeStorageRuntime {
         &self.catalog_file_verification
     }
 
-    /// Returns the observable startup legacy-to-SQLite Catalog migration result.
-    #[must_use]
-    pub const fn legacy_catalog_migration_status(&self) -> &LegacyCatalogMigrationStatus {
-        &self.legacy_catalog_migration
-    }
-
     /// Returns a lifecycle-safe clone of the running SQLite Catalog read endpoint.
     #[must_use]
     pub fn catalog_read_handle(&self) -> SqliteCatalogReadHandle {
@@ -556,12 +537,6 @@ impl NativeStorageRuntime {
     #[must_use]
     pub fn catalog_write_handle(&self) -> SqliteCatalogWriteHandle {
         self.catalog_write_handle.clone()
-    }
-
-    /// Returns a lifecycle-bound submitter for trusted legacy file-view reconciliation.
-    #[must_use]
-    pub fn catalog_legacy_reconcile_handle(&self) -> SqliteCatalogLegacyReconcileHandle {
-        self.catalog_legacy_reconcile_handle.clone()
     }
 
     /// Returns process-local query snapshot pin gauges, limits, and rejection counters.
@@ -651,7 +626,7 @@ impl NativeStorageRuntime {
         self.start_native_ingest_with_config(
             wal_root,
             NativeIngestConfig::new(),
-            NativeAppendMaterializerConfig::new(),
+            NativeTableMaterializerConfig::new(),
         )
     }
 
@@ -660,7 +635,7 @@ impl NativeStorageRuntime {
         &mut self,
         wal_root: impl Into<PathBuf>,
         ingest_config: NativeIngestConfig,
-        materializer_config: NativeAppendMaterializerConfig,
+        materializer_config: NativeTableMaterializerConfig,
     ) -> Result<NativeIngestHandle> {
         if let Some(runtime) = &self.native_ingest {
             return Ok(runtime.handle());
@@ -674,16 +649,23 @@ impl NativeStorageRuntime {
         }
         let wal_root = wal_root.into();
         let bootstraps = self.native_ingest_bootstraps.to_vec();
-        let sink = Arc::new(NativeAppendMaterializerSink::start(
+        let sink = Arc::new(NativeTableMaterializerSink::start(
             materializer_config,
             &bootstraps,
             &self.table_actors,
         )?);
         let catalog: Arc<dyn CatalogWrite> = Arc::new(self.catalog_write_handle.clone());
+        let ingest_sink = Arc::clone(&sink);
         let runtime = thread::Builder::new()
             .name(NATIVE_INGEST_START_THREAD_NAME.to_owned())
             .spawn(move || {
-                NativeIngestRuntime::start(ingest_config, wal_root, catalog, bootstraps, sink)
+                NativeIngestRuntime::start(
+                    ingest_config,
+                    wal_root,
+                    catalog,
+                    bootstraps,
+                    ingest_sink,
+                )
             })
             .map_err(|error| {
                 ServerError::new(
@@ -701,8 +683,42 @@ impl NativeStorageRuntime {
                 .with_retryable(false)
             })??;
         let handle = runtime.handle();
+        self.table_admin = Some(crate::NativeTableAdmin::new(
+            self.catalog_read_handle.clone(),
+            self.catalog_write_handle.clone(),
+            self.table_actors.clone(),
+            self.table_registrar.clone(),
+            sink,
+            handle.clone(),
+            crate::table_admin::NativeTableAdminLimits {
+                max_tables: self.table_admin_limits.max_tables,
+                max_metadata_bytes: self.table_admin_limits.max_metadata_bytes,
+                initial_metadata_bytes: self.table_admin_limits.initial_metadata_bytes,
+                initial_table_bytes: std::mem::take(
+                    &mut self.table_admin_limits.initial_table_bytes,
+                ),
+            },
+        ));
+        self.consumer_logs = Some(crate::NativeConsumerLogService::new(
+            self.query_engine.clone(),
+            self.catalog_read_handle.clone(),
+            self.catalog_write_handle.clone(),
+            handle.clone(),
+        ));
         self.native_ingest = Some(runtime);
         Ok(handle)
+    }
+
+    /// Returns the online table-management capability after native ingest startup.
+    #[must_use]
+    pub fn table_admin(&self) -> Option<crate::NativeTableAdmin> {
+        self.table_admin.clone()
+    }
+
+    /// Returns the shared native durable consumer service after ingest startup.
+    #[must_use]
+    pub fn consumer_logs(&self) -> Option<crate::NativeConsumerLogService> {
+        self.consumer_logs.clone()
     }
 
     /// Returns the producer-fenced ingest endpoint when configured.
@@ -752,7 +768,6 @@ impl NativeStorageRuntime {
             self.shutdown_requested = true;
             self.query_snapshot_coordinator.close_admission();
             self.runtime_snapshot_pin_admission.close_admission();
-            self.table_actor_admission.close();
         }
         self.query_resources.begin_shutdown();
         self.try_signal_storage_shutdown();
@@ -826,6 +841,12 @@ impl NativeStorageRuntime {
         if self.storage_shutdown_signalled {
             return true;
         }
+        // Accepted ingest/checkpoint work still needs actors and persistence. The
+        // ingest runtime is removed only after its complete, checked drain.
+        if self.native_ingest.is_some() {
+            return false;
+        }
+        self.table_actor_admission.close();
         let queries_drained = self.query_resources.status().lifecycle
             == crate::query_service::QueryServiceLifecycle::Stopped;
         let snapshot_planning_drained = self.query_snapshot_coordinator.planning_drained();
@@ -863,6 +884,13 @@ impl NativeStorageRuntime {
 impl Drop for NativeStorageRuntime {
     fn drop(&mut self) {
         self.begin_shutdown();
+        if self.native_ingest.is_some() {
+            // Drop is best-effort cleanup, not a successful graceful-shutdown
+            // receipt. Do not strand the supervisor when the owner omits drain
+            // or abandons a timed-out/failed shutdown.
+            self.table_actor_admission.close();
+            signal_shutdown(self.shutdown.as_ref());
+        }
         if self
             .supervisor
             .as_ref()
@@ -880,12 +908,12 @@ impl Drop for NativeStorageRuntime {
 struct SupervisorReady {
     reconciliation: StartupOrphanReconciliationReport,
     catalog_file_verification: StartupCatalogFileVerificationReport,
-    legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
     catalog_write_handle: SqliteCatalogWriteHandle,
-    catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
     runtime_snapshot_pin_admission: SqliteCatalogRuntimeSnapshotPinAdmissionControl,
     table_actors: TableActorRegistryHandle,
+    table_registrar: TableActorRegistrar,
+    table_admin_limits: crate::table_admin::NativeTableAdminLimits,
     native_ingest_bootstraps: Arc<[NativeIngestTableBootstrap]>,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
@@ -993,17 +1021,6 @@ async fn supervise_storage(
         );
     }
 
-    let legacy_catalog_migration = match run_legacy_catalog_migration(
-        config.legacy_catalog_migration.clone(),
-        Arc::clone(&catalog),
-        &mut shutdown,
-    )
-    .await
-    {
-        Ok(status) => status,
-        Err(error) => return (false, fail_storage(error, None, None, catalog).await),
-    };
-
     let pre_replay = match reconcile_once(
         &config,
         Arc::clone(&catalog),
@@ -1030,7 +1047,7 @@ async fn supervise_storage(
     let catalog_persistence: Arc<dyn CatalogPersistence> = catalog.clone();
     let coordinator = match wait_for_startup_stage(
         &mut shutdown,
-        CatalogCommitCoordinator::start_with_persistence(
+        CatalogCommitCoordinator::start(
             config.coordinator.clone(),
             Arc::clone(&config.data_directory),
             catalog_persistence,
@@ -1110,30 +1127,28 @@ async fn supervise_storage(
         );
     }
 
-    let table_runtimes = match build_table_runtime_registry(
-        catalog_bootstrap,
-        config
-            .catalog_file_verification
-            .max_runtime_metadata_bytes(),
-    ) {
-        Ok(registry) => registry,
-        Err(error) => {
-            return (
-                false,
-                fail_storage(error, None, Some(persist_controller), catalog).await,
-            );
-        }
-    };
+    let (table_runtimes, runtime_metadata_bytes, table_metadata_bytes) =
+        match build_table_runtime_registry(
+            catalog_bootstrap,
+            config
+                .catalog_file_verification
+                .max_runtime_metadata_bytes(),
+        ) {
+            Ok(registry) => registry,
+            Err(error) => {
+                return (
+                    false,
+                    fail_storage(error, None, Some(persist_controller), catalog).await,
+                );
+            }
+        };
     let native_ingest_bootstraps = match table_runtimes
         .iter()
         .map(|runtime| {
-            NativeIngestTableBootstrap::new(
-                runtime.table_id(),
-                runtime.table().definition.clone(),
-                runtime.schema_descriptor().schema_version,
+            NativeIngestTableBootstrap::from_catalog_snapshot(
+                runtime.table(),
                 Arc::clone(runtime.schema()),
-                runtime.writer_epoch(),
-                runtime.committed_log_offset(),
+                runtime.snapshot(),
             )
         })
         .collect::<Result<Vec<_>>>()
@@ -1146,7 +1161,7 @@ async fn supervise_storage(
             );
         }
     };
-    let mut table_actors = match TableActorRegistry::start_with_persistence(
+    let mut table_actors = match TableActorRegistry::start(
         config.table_actors.clone(),
         table_runtimes,
         persist_controller.handle(),
@@ -1232,7 +1247,6 @@ async fn supervise_storage(
         tables = table_actor_handle.len(),
         files = catalog_file_verification.file_count,
         managed_files = catalog_file_verification.managed_file_count,
-        external_legacy_files = catalog_file_verification.external_legacy_file_count,
         verified_bytes = catalog_file_verification.verified_bytes,
         "native storage recovery and bidirectional verification completed"
     );
@@ -1258,27 +1272,25 @@ async fn supervise_storage(
             );
         }
     };
-    let catalog_legacy_reconcile_handle = match catalog.legacy_reconcile_handle() {
-        Ok(handle) => handle,
-        Err(error) => {
-            return (
-                false,
-                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
-            );
-        }
-    };
     let runtime_snapshot_pin_admission = catalog.runtime_snapshot_pin_admission_control();
 
     if startup
         .send(Ok(SupervisorReady {
             reconciliation: post_replay,
             catalog_file_verification,
-            legacy_catalog_migration,
             catalog_read_handle,
             catalog_write_handle,
-            catalog_legacy_reconcile_handle,
             runtime_snapshot_pin_admission,
             table_actors: table_actor_handle,
+            table_registrar: table_actors.registrar(),
+            table_admin_limits: crate::table_admin::NativeTableAdminLimits {
+                max_tables: config.catalog_file_verification.max_tables(),
+                max_metadata_bytes: config
+                    .catalog_file_verification
+                    .max_runtime_metadata_bytes(),
+                initial_metadata_bytes: runtime_metadata_bytes,
+                initial_table_bytes: table_metadata_bytes,
+            },
             native_ingest_bootstraps,
             table_actor_admission,
             healthy: Arc::clone(&healthy),
@@ -1319,97 +1331,6 @@ async fn supervise_storage(
             true,
             close_storage(Some(table_actors), Some(persist_controller), catalog).await,
         ),
-    }
-}
-
-async fn run_legacy_catalog_migration(
-    startup: LegacyCatalogMigrationStartup,
-    catalog: Arc<SqliteCatalog>,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<LegacyCatalogMigrationStatus> {
-    match startup {
-        LegacyCatalogMigrationStartup::Disabled => Ok(LegacyCatalogMigrationStatus::disabled()),
-        LegacyCatalogMigrationStartup::Degraded(degradation) => {
-            tracing::error!(
-                component = "legacy_catalog_migration",
-                event = "legacy_catalog_migration_preflight_degraded",
-                reason = ?degradation.reason,
-                error_code = degradation
-                    .error_code
-                    .map_or("NONE", ErrorCode::as_str),
-                retryable = degradation.retryable,
-                error = degradation.message.as_deref().unwrap_or("none"),
-                "legacy Catalog remains authoritative after migration preflight failure"
-            );
-            Ok(LegacyCatalogMigrationStatus::degraded_before_execution(
-                degradation,
-            ))
-        }
-        LegacyCatalogMigrationStartup::Planned(plan) => {
-            let superseded = tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    let _ = changed;
-                    return Err(startup_cancelled());
-                }
-                result = exact_v4_checkpoint_supersedes_import(&plan, catalog.as_ref()) => result,
-            };
-            let superseded = match superseded {
-                Ok(superseded) => superseded,
-                Err(error) => {
-                    tracing::warn!(
-                        component = "legacy_catalog_migration",
-                        event = "legacy_catalog_v4_checkpoint_reuse_unavailable",
-                        error_code = %error.code(),
-                        "v4 checkpoint could not supersede the startup importer"
-                    );
-                    false
-                }
-            };
-            if superseded {
-                let session = catalog.begin_legacy_import_session()?;
-                session.seal();
-                tracing::info!(
-                    component = "legacy_catalog_migration",
-                    event = "legacy_catalog_metadata_import_superseded_by_v4",
-                    source_catalog_revision = plan.source_catalog_revision(),
-                    "exact v4 projection checkpoint superseded the startup V1/V2 importer"
-                );
-                return Ok(LegacyCatalogMigrationStatus::completed_by_v4_checkpoint());
-            }
-            let result = tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    let _ = changed;
-                    return Err(startup_cancelled());
-                }
-                result = execute_legacy_catalog_metadata_import(&plan, catalog.as_ref()) => result,
-            };
-            match result {
-                Ok(report) => {
-                    let status = LegacyCatalogMigrationStatus::from_report(report);
-                    if let Some(degradation) = status.degradation.as_ref() {
-                        tracing::warn!(
-                            component = "legacy_catalog_migration",
-                            event = "legacy_catalog_migration_incomplete",
-                            reason = ?degradation.reason,
-                            blocked_tables = status
-                                .report
-                                .as_ref()
-                                .map_or(0, |report| report.blocked_table_count()),
-                            "legacy Catalog remains authoritative for tables blocked on V2 import"
-                        );
-                    }
-                    Ok(status)
-                }
-                Err(error) => Ok(LegacyCatalogMigrationStatus::degraded_before_execution(
-                    LegacyCatalogMigrationDegradation::from_error(
-                        LegacyCatalogMigrationDegradedReason::ExecutionFailed,
-                        &error,
-                    ),
-                )),
-            }
-        }
     }
 }
 
@@ -1472,16 +1393,16 @@ async fn verify_catalog_files_once(
 fn build_table_runtime_registry(
     bootstrap: StartupCatalogBootstrap,
     max_runtime_metadata_bytes: u64,
-) -> Result<TableRuntimeRegistry> {
+) -> Result<(
+    TableRuntimeRegistry,
+    u64,
+    BTreeMap<zippy_types::TableId, u64>,
+)> {
     let catalog_revision = bootstrap.verification.catalog_revision;
     let mut tables = Vec::with_capacity(bootstrap.active_tables.len());
     let mut retained_bytes = bootstrap.runtime_metadata_bytes;
+    let mut table_bytes = BTreeMap::new();
     for descriptor in bootstrap.active_tables {
-        // Legacy authority still owns these tables; its unknown log watermark cannot seed a
-        // native ingest actor until an explicit authority-cutover transaction replaces it.
-        if is_legacy_catalog_shadow_table(&descriptor.table)? {
-            continue;
-        }
         let table_id = descriptor.table.table_id;
         let decoded = decode_persisted_table_schema(&descriptor.table, &descriptor.schema)?;
         let next_retained_bytes = retained_bytes
@@ -1508,6 +1429,18 @@ fn build_table_runtime_registry(
             .with_table_id(table_id)
             .with_retryable(false));
         }
+        table_bytes.insert(
+            table_id,
+            descriptor
+                .retained_metadata_bytes
+                .checked_add(decoded.retained_charge_bytes())
+                .ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::ResourceExhausted,
+                        "table metadata charge overflow",
+                    )
+                })?,
+        );
         retained_bytes = next_retained_bytes;
         tables.push(TableRuntimeBootstrap::new(
             descriptor.table,
@@ -1516,22 +1449,11 @@ fn build_table_runtime_registry(
             descriptor.snapshot,
         )?);
     }
-    TableRuntimeRegistry::from_bootstraps(catalog_revision, tables)
-}
-
-pub(crate) fn is_legacy_catalog_shadow_table(table: &TableDescriptor) -> Result<bool> {
-    let Some(stream_name) = table.config.get(LEGACY_STREAM_NAME_CONFIG_KEY) else {
-        return Ok(false);
-    };
-    if stream_name != table.name.as_str() {
-        return Err(ServerError::new(
-            ErrorCode::DataCorruption,
-            "legacy shadow table stream identity does not match its Catalog name",
-        )
-        .with_table_id(table.table_id)
-        .with_retryable(false));
-    }
-    Ok(true)
+    Ok((
+        TableRuntimeRegistry::from_bootstraps(catalog_revision, tables)?,
+        retained_bytes,
+        table_bytes,
+    ))
 }
 
 async fn wait_for_startup_stage<F, T>(shutdown: &mut watch::Receiver<bool>, future: F) -> Result<T>

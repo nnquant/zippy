@@ -1,89 +1,38 @@
 # zippy-perf
 
-`zippy-perf` 是 Zippy 的持续压测工具，用于验证进程内和跨进程 pipeline 在稳态流量下的吞吐、延迟和运行状态。
+性能工具只测量现行计算内核与共享内存基础设施。可用 profile：
 
-当前已实现的 profile：
+- `timeseries-kernel`：同步 TimeSeriesEngine 计算与最终 flush。
+- `stream-table-segment-copy`：物化写入 active segment。
+- `single-row-low-rate`：单行物化写入。
+- `write-to-subscribe-e2e`：独立 producer/consumer 的真实共享内存可见性。
+- `stream-table-subscriber-e2e`：物化器写入至外部 reader 读取。
 
-- `inproc-timeseries`
-- `remote-pipeline-upstream`
-- `remote-pipeline-downstream`
-- `stream-table-segment-copy`
-- `stream-table-segment-forward`
-- `single-row-low-rate`
-- `write-to-subscribe-e2e`
-- `runtime-stream-table-e2e`
-- `stream-table-subscriber-e2e`
+旧后台 Source/Publisher、ZeroMQ remote pipeline、runtime-stream-table 和 descriptor forwarding profile 已删除，
+CLI 不接受旧 profile、endpoint、buffer-capacity、overflow-policy 或 max-queue-depth。
+原生远端 Flight 的功能与恢复验收由 `scripts/check_native_client.py` 执行。
 
-## 最小用法
-
-查看帮助：
+## 同步计算基准
 
 ```bash
-cargo run -p zippy-perf -- --help
-```
-
-进程内时序压测：
-
-```bash
-cargo run -p zippy-perf --release -- inproc-timeseries \
+cargo run -p zippy-perf --release -- timeseries-kernel \
   --rows-per-batch 4096 \
   --target-rows-per-sec 1000000 \
   --duration-sec 60 \
   --warmup-sec 10 \
   --symbols 1024 \
-  --buffer-capacity 4096 \
-  --max-p95-micros 1000 \
-  --max-p99-micros 5000 \
-  --max-queue-depth 64
+  --max-p95-micros 5000 \
+  --max-p99-micros 10000 \
+  --report-json /tmp/zippy-perf-kernel.json
 ```
 
-`inproc-timeseries` 的 `latency_micros` 只测量 `EngineHandle::write()` 的 queue-admission
-返回耗时，不是 engine 完成处理或发布的端到端延迟。`actual_average_rows_per_sec` 和
-`batches_per_sec` 都以稳态窗口内成功接收的 rows/batches 为分子。分母从 `steady_start`
-计算到 `max(configured steady end, final flush completion)`：提前完成排空时仍至少覆盖完整的
-配置稳态窗口，排空延迟时则把超出的 drain 时间计入。
-
-`engine_metrics.max_observed_queue_depth` 是每次成功 `write()` 后读取 `queue_depth`
-快照所得的最大值，不是 runtime 原子维护的 high-water mark，采样间的瞬时峰值可能不会被
-捕获。定时/手动 workflow 在 `buffer_capacity=4096` 时使用 `max_queue_depth=64`，这是共享
-runner 上的宽松回归门禁，用来避免把一次正常 admission 误判为队列失败，不是生产 SLA。
-
-跨进程压测需要先启动 downstream，再启动 upstream：
-
-```bash
-cargo run -p zippy-perf --release -- remote-pipeline-downstream \
-  --endpoint tcp://127.0.0.1:5560 \
-  --rows-per-batch 4096 \
-  --target-rows-per-sec 1000000 \
-  --duration-sec 60 \
-  --warmup-sec 10 \
-  --symbols 1024
-```
-
-```bash
-cargo run -p zippy-perf --release -- remote-pipeline-upstream \
-  --endpoint tcp://127.0.0.1:5560 \
-  --rows-per-batch 4096 \
-  --target-rows-per-sec 1000000 \
-  --duration-sec 60 \
-  --warmup-sec 10 \
-  --symbols 1024
-```
-
-`remote-pipeline-downstream` 的运行时语义：
-
-- 会先等待远端 stream 的首个 `HELLO/DATA` 事件，再进入正式观察窗口
-- 在已经观测到远端 stream 后，如果长时间没有新的事件到达，会按 idle grace 主动收口
-- 因为底层控制事件走单通道 `PUB/SUB`，`STOP` 仍是 best-effort；idle 收口是为了避免下游因为漏掉 `STOP` 一直挂到 deadline
-
-输出 JSON 报告：
-
-```bash
-cargo run -p zippy-perf --release -- inproc-timeseries \
-  --duration-sec 10 \
-  --warmup-sec 0 \
-  --report-json /tmp/zippy-perf-report.json
-```
+`latency_micros` 包含 Arrow 输入转为 SegmentTableView、同步内核计算与输出计数耗时。
+旧 `inproc-timeseries` 仅测入队返回耗时，两者不能横向比较。新 CI 门禁为 p95 ≤ 5 ms、p99 ≤ 10 ms。目标速率下
+每批间隔为 4.096 ms，持续吞吐仍必须达到目标的 90%；尾延迟另给共享 runner 调度余量。
+目标主机应重新采集并校准同步内核基线。
+吞吐以稳态窗口内完成处理的 rows/batches 为分子，分母从 steady start 到
+`max(configured steady end, final flush completion)`；检查全部输入都完成处理。
+生成器使用有理数 deadline 和半开窗口，避免在测量窗口结束后继续接收批次。
 
 ## 单机重构基线清单
 
@@ -96,7 +45,7 @@ debug/release 构建身份、完整 `PerfConfig`、数据集 ID、输入契约�
 先用 dry-run 审计将要执行的基线，不会启动 benchmark：
 
 ```bash
-cargo run -p zippy-perf --release -- inproc-timeseries \
+cargo run -p zippy-perf --release -- timeseries-kernel \
   --duration-sec 60 \
   --warmup-sec 10 \
   --dataset-id zippy-perf.synthetic-ticks.v1 \
@@ -105,9 +54,8 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
 ```
 
 正式采集仍复用同一个 profile 驱动，只需去掉 `--dry-run`。如需保留独立原始报告，可以同时
-传入 `--report-json`；manifest 不依赖该选项。`remote-pipeline-upstream` 和
-`remote-pipeline-downstream` 无法自行证明对端数据身份，因此使用 baseline manifest 时必须显式
-传入 `--dataset-id`；本地 profile 未指定时使用版本化 synthetic 默认值。
+传入 `--report-json`；manifest 不依赖该选项。本地 profile 未指定数据集 ID 时使用版本化 synthetic 默认值。
+当前 manifest 格式为 v2；只支持当前配置和完整延迟字段，不为旧队列报告补默认值。
 
 Git SHA 和 dirty 状态在构建 `zippy-perf` 时嵌入，因此复制二进制后不依赖原源码目录。无 `.git`
 的可复现构建必须显式设置 `ZIPPY_BUILD_GIT_SHA` 和 `ZIPPY_BUILD_GIT_DIRTY=true|false`。
@@ -153,19 +101,6 @@ consumer 分布测量边界不同，不能横向比较。
 `p99 <= 5000 us`，只用于阻挡粗粒度回归。原生 Linux 固定主机的目标仍是
 `p99 <= 300 us`；落门禁前应在目标主机重复运行 10-20 次完成基线校准。
 
-runtime fast data path 基准：
-
-```bash
-TMPDIR=/dev/shm cargo run -p zippy-perf --release -- runtime-stream-table-e2e \
-  --target-rows-per-sec 200 \
-  --duration-sec 60 \
-  --warmup-sec 5 \
-  --symbols 32 \
-  --max-p99-micros 500
-```
-
-`runtime-stream-table-e2e` 强制 `rows_per_batch=1`。它启动一个 synthetic native source，按低频单行发送 `SegmentTableView` 给 `StreamTableMaterializer`，主 `latency_micros` 表示行内时间戳到 publisher 收到输出的端到端耗时，覆盖 `SourceSink::emit -> fast data queue -> worker -> stream_table on_data -> publisher`。`secondary_latency_micros` 表示 source 线程里 `sink.emit(SourceEvent::Data)` 返回耗时，通常主要反映入队和唤醒通知成本。这个 profile 不包含 Python callback 或 watcher 打印。
-
 stream_table 目标表 external reader 基准：
 
 ```bash
@@ -179,68 +114,15 @@ TMPDIR=/dev/shm cargo run -p zippy-perf --release -- stream-table-subscriber-e2e
 
 `stream-table-subscriber-e2e` 强制 `rows_per_batch=1`。它同步调用 `StreamTableMaterializer::on_data()` 写入目标 active segment，然后用外部 `ActiveSegmentReader::read_available()` 读取目标表新增 committed row。主 `latency_micros` 表示 `on_data -> external reader` 完整耗时，`secondary_latency_micros` 表示单独的 `on_data` 耗时。这个 profile 用来拆 `stream_table active segment -> subscriber read`，不包含 runtime queue 或 Python callback。
 
-## 性能门禁
+## 报告与门禁
 
-`zippy-perf` 的 `pass` 不是单纯的平均吞吐判断。默认会检查：
+内核、读写或 flush 失败直接返回错误，不生成成功报告。正常完成后，`pass` 要求平均吞吐
+至少达到目标的 90%，并满足显式设置的 `--max-p95-micros` / `--max-p99-micros`。
+当前报告只记录实际测得的输入、输出、吞吐、峰值、延迟和内核指标，不再输出恒为零的旧队列、
+发布错误或 Source 指标。延迟报告必须包含 sample_count 和 max_micros。
 
-- engine 没有进入 failed 状态
-- 平均吞吐不低于目标吞吐的 90%
-- 没有 dropped batches
-- 没有 publish errors
-- remote source 没有 decode errors
+`actual_peak_rows_per_sec` 取以稳态起点为 origin 的绝对半开 1 秒桶的最大行数。
+`metadata.started_at_unix_ms` 在配置验证后、耗时工作开始前捕获。
 
-可以用以下可选阈值把尾延迟和队列堆积纳入门禁：
-
-- `--max-p95-micros`
-- `--max-p99-micros`
-- `--max-queue-depth`
-
-示例：
-
-```bash
-cargo run -p zippy-perf --release -- stream-table-segment-copy \
-  --rows-per-batch 4096 \
-  --target-rows-per-sec 1000000 \
-  --duration-sec 60 \
-  --warmup-sec 10 \
-  --symbols 1024 \
-  --max-p95-micros 2000 \
-  --max-p99-micros 15000
-```
-
-## 当前输出
-
-首版报告包含：
-
-- metadata：git sha、target、started_at_unix_ms
-- input rows total
-- output rows total
-- actual average rows/s
-- actual peak rows/s
-- batches/s
-- latency sample count 和 p50/p95/p99/max
-- final engine status
-- engine metrics
-- remote profile 的 source metrics
-- pass/fail
-
-除 `remote-pipeline-downstream` 和 `runtime-stream-table-e2e` 外，
-`actual_peak_rows_per_sec` 取以 `steady_start` 为 origin 的绝对半开 1 秒桶
-`[steady_start + n s, steady_start + (n + 1) s)` 中的最大行数，不是滑动窗口。观测跨桶时，
-先结算旧桶，再把当前观测计入其所属桶。
-
-这两个例外 profile 未做逐秒峰值采样；其 `actual_peak_rows_per_sec` 当前等于各自的 steady
-average（`actual_average_rows_per_sec`），不能解释为真实峰值。
-
-`metadata.started_at_unix_ms` 在 config 校验成功后、profile dispatch 和耗时工作开始前捕获。
-
-定时/手动 workflow 使用 `if: always()` 上传已经生成的 JSON。尾延迟等阈值不通过时，CLI
-会先写报告再以 exit code `2` 退出，因此对应 JSON 可以保留；consumer timeout、计数不一致等
-profile 执行错误会在报告构造前以 exit code `1` 退出，只能从 workflow log 排查，不会产生可上传的
-JSON。
-
-## 当前边界
-
-- 远程压测通过两个独立进程运行，不自动拉起对端
-- `pass` 以目标吞吐的 `90%` 作为默认吞吐判定线，便于本地小规模 smoke 与高目标压测共用一套逻辑
-- 延迟和队列阈值默认关闭；生产门禁应显式设置这些阈值
+CLI 会在阈值不通过时先写报告再以 exit code 2 退出。执行错误以 exit code 1 退出，
+baseline manifest 记录 failed 状态与错误。CI 使用 `if: always()` 上传已生成报告。

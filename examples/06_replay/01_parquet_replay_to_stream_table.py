@@ -1,11 +1,11 @@
 """
-从 Parquet 回放数据到 StreamTable。
+通过原生有限源把 Parquet 回放到持久 append 表。
 
 这个示例适合在不开盘时构造可重复的系统测试输入。
 
 :example:
 
-    uv run python examples/06_replay/01_parquet_replay_to_stream_table.py --drop-existing
+    uv run python examples/06_replay/01_parquet_replay_to_stream_table.py --namespace-id <已有命名空间 UUID>
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+import uuid
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -67,55 +68,54 @@ def write_demo_parquet(path: Path) -> None:
 
 
 def main() -> None:
-    """
-    生成 parquet，回放到 StreamTable，再读取结果。
-
-    :returns: None
-    :rtype: None
-    """
-    parser = argparse.ArgumentParser(description="ParquetReplayEngine 示例")
-    parser.add_argument("--uri", default="default", help="master URI")
-    parser.add_argument("--table", default="replay_ticks", help="输出 StreamTable")
-    parser.add_argument("--root", default=str(DEFAULT_ROOT), help="示例数据目录")
-    parser.add_argument("--time-column", default="dt", help="时间窗口过滤列")
-    parser.add_argument("--start-ns", type=int, default=None, help="闭区间开始时间，单位 ns")
-    parser.add_argument("--end-ns", type=int, default=None, help="闭区间结束时间，单位 ns")
-    parser.add_argument("--replay-rate", type=float, default=None, help="固定回放速率，单位 rows/sec")
-    parser.add_argument("--drop-existing", action="store_true", help="运行前删除同名表")
+    """Create a native output, replay a finite source, then query after all workers stop."""
+    parser = argparse.ArgumentParser(description="原生 Parquet 回放示例")
+    parser.add_argument("--uri", default="zippy://default", help="服务控制地址")
+    parser.add_argument("--namespace", default="market")
+    parser.add_argument("--namespace-id", type=uuid.UUID, required=True)
+    parser.add_argument("--table", default="replay_ticks", help="新输出表名，不覆盖已有表")
+    parser.add_argument("--root", default=str(DEFAULT_ROOT))
+    parser.add_argument("--start-ns", type=int)
+    parser.add_argument("--end-ns", type=int)
+    parser.add_argument("--replay-rate", type=float)
     args = parser.parse_args()
-
-    zp.connect(uri=args.uri, app="example_parquet_replay")
-    root = Path(args.root)
-    parquet_path = root / "input" / "ticks.parquet"
+    parquet_path = Path(args.root) / "input" / f"ticks-{uuid.uuid4().hex}.parquet"
     write_demo_parquet(parquet_path)
-
-    if args.drop_existing:
-        try:
-            zp.ops.drop_table(args.table, drop_persisted=True)
-        except RuntimeError:
-            pass
-
-    replay = zp.ParquetReplayEngine(
+    source = zp.ParquetReplaySource(
         parquet_path,
-        output_stream=args.table,
         schema=tick_schema(),
-        name="example_parquet_replay",
         batch_size=2,
-        dt_column="dt",
-        id_column="instrument_id",
-        dt_part="%Y%m",
-        persist=None,
-        time_column=args.time_column,
+        replay_rate=args.replay_rate,
+        time_column="dt",
         start=args.start_ns,
         end=args.end_ns,
-        replay_rate=args.replay_rate,
-    ).run()
-
-    try:
-        # ParquetReplayEngine 默认等待 parquet 数据完成回放；engine 仍保持运行，方便继续查询。
-        print(replay.table().tail(10).collect())
-    finally:
-        replay.stop()
+    )
+    table_id = uuid.uuid4()
+    with zp.Client(args.uri) as client:
+        client.create_append_table(
+            args.table,
+            source._zippy_output_schema(),
+            namespace_id=args.namespace_id,
+            table_id=table_id,
+            request_id=uuid.uuid4(),
+        )
+        with zp.ComputePipeline(
+            client,
+            zp.NativeProcessor.identity("replay", source._zippy_output_schema()),
+            source=source,
+            output=args.table,
+            output_table_id=table_id,
+            output_namespace=args.namespace,
+            durability="persisted",
+        ) as job:
+            if not source.wait_replay(30):
+                raise TimeoutError("parquet replay did not finish")
+            job.join(2)
+        print(
+            client.read_table(args.table, namespace=args.namespace)
+            .sort(["dt", "instrument_id"])
+            .collect()
+        )
 
 
 if __name__ == "__main__":

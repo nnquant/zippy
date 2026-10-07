@@ -10,11 +10,8 @@ class Transport(str, Enum):
     """Transport requested for one client operation."""
 
     AUTO = "auto"
-    SHM = "shm"
     FLIGHT_LOCAL = "flight_local"
     FLIGHT_REMOTE = "flight_remote"
-    GATEWAY_LOCAL = "gateway_local"
-    GATEWAY_REMOTE = "gateway_remote"
 
     @classmethod
     def parse(cls, value: str | Transport) -> Transport:
@@ -56,12 +53,8 @@ class ServerCapabilities:
     :type flight: bool
     :param flight_protocol_version: Zippy Flight application protocol version.
     :type flight_protocol_version: int
-    :param flight_ingest: Whether append + memory DoPut is available.
+    :param flight_ingest: Whether any authenticated native DoPut durability is available.
     :type flight_ingest: bool
-    :param gateway: Whether a Gateway data endpoint is available.
-    :type gateway: bool
-    :param gateway_protocol_version: Gateway wire protocol version.
-    :type gateway_protocol_version: int
     :param query_sql: Whether server-side SQL execution is available.
     :type query_sql: bool
     :param resume_cursor: Whether live subscriptions support resume cursors.
@@ -71,8 +64,6 @@ class ServerCapabilities:
     flight: bool = False
     flight_protocol_version: int = 0
     flight_ingest: bool = False
-    gateway: bool = False
-    gateway_protocol_version: int = 0
     query_sql: bool = False
     resume_cursor: bool = False
 

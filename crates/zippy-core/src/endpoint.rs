@@ -57,21 +57,6 @@ impl ControlEndpoint {
         }
     }
 
-    /// Returns the pre-managed endpoint-scoped registry snapshot location.
-    pub fn legacy_snapshot_path(&self) -> PathBuf {
-        match self {
-            Self::Unix(path) => path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("master-registry.json"),
-            Self::Tcp(addr) => home_dir()
-                .join(CONTROL_ENDPOINT_ROOT)
-                .join(format!("tcp-{}", addr.port()))
-                .join("master-registry.json"),
-        }
-    }
-
     pub fn unix_path(&self) -> Option<&Path> {
         match self {
             Self::Unix(path) => Some(path.as_path()),
@@ -117,15 +102,15 @@ pub fn resolve_control_endpoint(uri: impl AsRef<str>) -> Result<ControlEndpoint>
 pub fn resolve_control_endpoint_with_home(uri: &str, home: &Path) -> Result<ControlEndpoint> {
     if uri.starts_with("zippy+tcp://") {
         return Err(ZippyError::InvalidConfig {
-            reason: "zippy+tcp:// uri is no longer supported; use zippy://host:port/profile"
+            reason: "zippy+tcp:// uri is no longer supported; use zippy://host:port/default"
                 .to_string(),
         });
     }
     if let Some(addr) = uri.strip_prefix("tcp://") {
-        return parse_tcp_endpoint(uri, addr);
+        return parse_tcp_endpoint(addr);
     }
-    if let Some(addr) = remote_zippy_authority(uri) {
-        return parse_tcp_endpoint(uri, addr);
+    if let Some(addr) = remote_zippy_authority(uri)? {
+        return parse_tcp_endpoint(addr);
     }
 
     #[cfg(not(unix))]
@@ -140,18 +125,29 @@ pub fn resolve_control_endpoint_with_home(uri: &str, home: &Path) -> Result<Cont
 
     #[cfg(not(unix))]
     {
-        if uri.starts_with("unix://") || uri.starts_with("file://") || looks_like_path(uri) {
+        resolve_non_unix_control_endpoint(uri)
+    }
+}
+
+#[cfg(any(test, not(unix)))]
+fn resolve_non_unix_control_endpoint(uri: &str) -> Result<ControlEndpoint> {
+    if uri.starts_with("unix://") || uri.starts_with("file://") || looks_like_path(uri) {
+        return Err(ZippyError::InvalidConfig {
+            reason: "unix control endpoint is not supported on this platform".to_owned(),
+        });
+    }
+    if let Some(name) = uri.strip_prefix("zippy://") {
+        if !name.is_empty() && name != "default" {
             return Err(ZippyError::InvalidConfig {
-                reason: format!(
-                    "unix control endpoint is not supported on this platform uri=[{uri}]"
-                ),
+                reason: "named control endpoint is not supported on this platform".to_owned(),
             });
         }
-        parse_tcp_endpoint(
-            &format!("tcp://{DEFAULT_WINDOWS_CONTROL_ADDR}"),
-            DEFAULT_WINDOWS_CONTROL_ADDR,
-        )
+        return parse_tcp_endpoint(DEFAULT_WINDOWS_CONTROL_ADDR);
     }
+    if uri.is_empty() || uri == "default" {
+        return parse_tcp_endpoint(DEFAULT_WINDOWS_CONTROL_ADDR);
+    }
+    parse_tcp_endpoint(uri)
 }
 
 pub fn default_control_endpoint_path() -> PathBuf {
@@ -202,13 +198,23 @@ fn looks_like_path(uri: &str) -> bool {
         || uri.ends_with(".sock")
 }
 
-fn remote_zippy_authority(uri: &str) -> Option<&str> {
-    let body = uri.strip_prefix("zippy://")?;
-    let authority = body.split('/').next().unwrap_or_default();
+fn remote_zippy_authority(uri: &str) -> Result<Option<&str>> {
+    let Some(body) = uri.strip_prefix("zippy://") else {
+        return Ok(None);
+    };
+    let (authority, profile) = match body.split_once('/') {
+        Some((authority, profile)) => (authority, Some(profile)),
+        None => (body, None),
+    };
     if authority.contains(':') {
-        Some(authority)
+        if profile.is_some_and(|profile| profile != "default") {
+            return Err(ZippyError::InvalidConfig {
+                reason: "remote zippy control URI supports only /default profile".to_owned(),
+            });
+        }
+        Ok(Some(authority))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -239,12 +245,12 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-fn parse_tcp_endpoint(original_uri: &str, addr: &str) -> Result<ControlEndpoint> {
+fn parse_tcp_endpoint(addr: &str) -> Result<ControlEndpoint> {
     let socket_addr = addr
         .parse::<SocketAddr>()
         .or_else(|_| resolve_named_socket_addr(addr))
         .map_err(|error| ZippyError::InvalidConfig {
-            reason: format!("invalid tcp control endpoint uri=[{original_uri}] error=[{error}]"),
+            reason: format!("invalid tcp control endpoint error=[{error}]"),
         })?;
     Ok(ControlEndpoint::Tcp(socket_addr))
 }
@@ -316,5 +322,23 @@ mod tests {
         assert!(looks_like_path(r"runtime\master.sock"));
         assert!(looks_like_path(r"C:\zippy\master.sock"));
         assert!(looks_like_path("master.sock"));
+    }
+
+    #[test]
+    fn non_unix_control_endpoint_does_not_route_unknown_names_to_default() {
+        for uri in ["zippy://other", "zippy://default/other", "other"] {
+            assert!(
+                resolve_non_unix_control_endpoint(uri).is_err(),
+                "uri=[{uri}]"
+            );
+        }
+        assert_eq!(
+            resolve_non_unix_control_endpoint("zippy://default").unwrap(),
+            ControlEndpoint::Tcp(DEFAULT_WINDOWS_CONTROL_ADDR.parse().unwrap())
+        );
+        assert_eq!(
+            resolve_non_unix_control_endpoint("127.0.0.1:17777").unwrap(),
+            ControlEndpoint::Tcp("127.0.0.1:17777".parse().unwrap())
+        );
     }
 }

@@ -1,0 +1,213 @@
+{
+  "batch": 53,
+  "date": "2026-09-23",
+  "audit_closed_total": 32,
+  "audit_remaining": [
+    "F08"
+  ],
+  "deferred": [
+    "F28 Windows/macOS physical acceptance by user instruction"
+  ],
+  "rust_affected_crates": {
+    "crates": [
+      "zippy-ingest",
+      "zippy-storage",
+      "zippy-server"
+    ],
+    "passed_records": 304,
+    "ignored": 5
+  },
+  "pytest_passed": 543,
+  "mypy_source_files": 91,
+  "client_mypy_files": 27,
+  "native_recovery": {
+    "catalog_v11_native_files_watermarks_and_request_versions": true,
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+    "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+    "sdk_only_flight_examples_write_query_callbacks_and_restart": true,
+    "flight_short_session_snapshot_cleanup_capacity_reuse": true,
+    "public_examples_three_kinds_compute_and_restart_without_legacy_api": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "flight_only_buffered_writer_lazy_plan_and_restart": true,
+    "independent_client_native_child_without_main_import": true,
+    "server_launch": "repository_binary",
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "default_native_storage_query_and_flight_without_feature_switches": true,
+    "native_restart_never_creates_legacy_registry": true,
+    "native_recovery_without_old_table_configuration_or_external_persist_root": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_changes_since_batch_52": [
+    {
+      "path": "ROADMAP.md",
+      "before_sha256": "d67d5b04d9a4c4431f77f46a0a982eb27ca3c0b08b335a4b9143ab9d08176306",
+      "after_sha256": "a5a948d8fb1c0f01fe6be3fea9ae205dc322530fe0a3854c3e93da5a6667f637"
+    },
+    {
+      "path": "crates/zippy-ingest/README.md",
+      "before_sha256": "cde9484deca196777658cb124b63488f4585f718fdccec6e52a0436d40a6a752",
+      "after_sha256": "29bf157a2a82b7caaffa82be3dcb1f18930b0194b158f297b96af54b43264055"
+    },
+    {
+      "path": "crates/zippy-ingest/src/actor.rs",
+      "before_sha256": "74c235ef370a6d13cdfb981213f9a199fdaee2dced1057182bf3e4d2068952c4",
+      "after_sha256": "de9d404db25163c8ae34dac2cce1a0134529aa608b89b6250d1aa49da97e9ec7"
+    },
+    {
+      "path": "crates/zippy-ingest/src/materializer.rs",
+      "before_sha256": "dcfc0481d5723994e0c71078cce740d6115c4190b0939f17a23a5aae002ad3a1",
+      "after_sha256": "e483c3ef94f89a0377fa75439b8755309dd58fc99cb3a697be2e4100e3234e11"
+    },
+    {
+      "path": "crates/zippy-server/src/native_storage.rs",
+      "before_sha256": "0024d1b18af85da961c7e375d8e6531ed3544fe3001786c793e5ceb1c12d82e9",
+      "after_sha256": "59c994aa86a5bd044a0d45ddb1d90b806e82fd2dcb0b04a2d1f7e72aac18549a"
+    },
+    {
+      "path": "crates/zippy-storage/src/catalog_verify.rs",
+      "before_sha256": "01cfd10fc0c3f3b48335cda424ea5e12bb08568721b379f793d4d53a77d990e0",
+      "after_sha256": "0392b2e1d960a1c0a46e2c95143bcfd058053fc0bc3a95f61347447c0ad61cc6"
+    },
+    {
+      "path": "crates/zippy-storage/tests/catalog_file_verification.rs",
+      "before_sha256": "9dbdc3ddae5d5fe7e8ff06a76a76c41f2cd79b1ba1973cf387af3ce90e945c76",
+      "after_sha256": "63fac0ccbe90f4a4615ba9b1a208f3092dadfb42bdc4cbe7e94204c2af7134c7"
+    },
+    {
+      "path": "docs/architecture-convergence-audit-2026-09-18.md",
+      "before_sha256": "a7ed55fe16890f3338bcadbfb0183ea42ec6b0b0edab9082817a8e5694f894f2",
+      "after_sha256": "9b6ea9dae479a3cccfb5ce9f80ac3ca59c0a3f347b8c347af75f67103c5cb158"
+    },
+    {
+      "path": "docs/current-capabilities-2026-09-21.md",
+      "before_sha256": "f8fb4e6dbe50daec700d39ad9da0b52289f222658b5e11597f4b677598dd973d",
+      "after_sha256": "c037b5fcacf984ab16eba1afd8df54a268cfa2d263ea9e3dbdd825a40f9e009f"
+    }
+  ],
+  "logs": {
+    "tests": {
+      "path": "/tmp/zippy-actor-contract-tests.log",
+      "sha256": "42f1bb5511d05e8d590a36b268c3c6366b6df12c05fb911b586efe0b2c67f715",
+      "bytes": 30152
+    },
+    "clippy": {
+      "path": "/tmp/zippy-actor-contract-clippy.log",
+      "sha256": "190c417d94d92338d9e27c2a73724070cbc1640d67c775d854bb090bedc075a7",
+      "bytes": 1882
+    },
+    "build": {
+      "path": "/tmp/zippy-actor-contract-build.log",
+      "sha256": "9ffc15a7353196fde85b47c02b504fd29a495f8aa97ff51cb3a065159e9255ea",
+      "bytes": 2697
+    },
+    "pytest": {
+      "path": "/tmp/zippy-actor-contract-pytest.log",
+      "sha256": "622950d0b93b4e6f49bd90bbfae4fd57b3a41029609ae5578b9c3f9317e3a9e8",
+      "bytes": 2662
+    },
+    "native": {
+      "path": "/tmp/zippy-actor-contract-native.log",
+      "sha256": "d78d2274a1b20229ef624cb86c08c013a93503ed707e8eb3ded38fcc40854a66",
+      "bytes": 30090
+    },
+    "mypy": {
+      "path": "/tmp/zippy-actor-contract-mypy.log",
+      "sha256": "6e48d2986ce0d91c8cd60bff9ed577f4baf14c949620883ab530992e6c52e53a",
+      "bytes": 934
+    },
+    "mypy-client": {
+      "path": "/tmp/zippy-actor-contract-mypy-client.log",
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f",
+      "bytes": 44
+    },
+    "ruff": {
+      "path": "/tmp/zippy-actor-contract-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "bytes": 19
+    },
+    "black": {
+      "path": "/tmp/zippy-actor-contract-black.log",
+      "sha256": "161579e1a9a654d62a83f487d90f72be3d8e9379f20fa777ad6cc1d93115ac60",
+      "bytes": 57
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-actor-contract-rustfmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "diff": {
+      "path": "/tmp/zippy-actor-contract-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    }
+  },
+  "report_sha256": "d8bd4667b0df9c43d859029aec8d9e4deab039848ddc8762e6748cebce33a493",
+  "current_binary_evidence": {
+    "target/debug/zippy-server": "2c857c06d4f3eabf89f2bd80e9b65e82e91bf091615197750e09a1e610fd22b8",
+    "python/zippy/_internal.cpython-311-x86_64-linux-gnu.so": "6580cb63ee858967e00d50d77f69420f6c309533d52dfe581a156d53f21be8d2"
+  },
+  "limitations": [
+    "Full Rust workspace last run in batch 51; affected crates and full workspace Clippy in this batch.",
+    "No Windows/macOS physical acceptance by user instruction.",
+    "No commit, push, deployment, or old data migration."
+  ]
+}

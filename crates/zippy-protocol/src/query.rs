@@ -16,6 +16,10 @@ use crate::wire::table_binding::Table;
 use crate::wire::{self, QueryCommand, QueryInfo, QueryTableVersion, QueryTicket, TableBinding};
 use crate::CURRENT_PROTOCOL_VERSION;
 
+/// Canonical complete-state query, with no caller filter, projection, or limit.
+pub const KEY_VALUE_SNAPSHOT_SQL: &str = "SELECT * FROM \"zippy_key_value_snapshot\"";
+/// Canonical table binding for atomic key-value state snapshots.
+pub const KEY_VALUE_SNAPSHOT_BINDING: &str = "zippy_key_value_snapshot";
 /// Maximum serialized query descriptor accepted by protocol version 1.
 pub const MAX_QUERY_COMMAND_BYTES: usize = 64 * 1024;
 /// Maximum UTF-8 SQL text accepted by protocol version 1.
@@ -41,6 +45,10 @@ pub struct FlightTableBinding {
 /// One validated Flight query request ready for a server query frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightQueryRequest {
+    /// Return a complete key-value state with its exact protocol-v2 cursor.
+    pub key_value_snapshot: bool,
+    /// Optional server-issued reusable snapshot; failure never falls back to current state.
+    pub fixed_snapshot_id: Option<QueryId>,
     /// Protocol-neutral query request.
     pub request: QueryRequest,
     /// Explicit relation-to-catalog bindings.
@@ -102,7 +110,17 @@ pub fn encode_query_request(request: &FlightQueryRequest) -> Result<QueryCommand
             .with_query_id(query_id));
         }
     }
+    validate_snapshot_query(
+        request.key_value_snapshot,
+        &sql,
+        &request.bindings,
+        request.fixed_snapshot_id.is_some(),
+    )?;
     Ok(QueryCommand {
+        key_value_snapshot: request.key_value_snapshot,
+        fixed_snapshot_id: request
+            .fixed_snapshot_id
+            .map(|id| Bytes::copy_from_slice(&id.into_bytes())),
         protocol_version: CURRENT_PROTOCOL_VERSION,
         query_id: Bytes::copy_from_slice(&request.request.query_id.into_bytes()),
         session_id: Bytes::copy_from_slice(&request.request.session_id.into_bytes()),
@@ -191,7 +209,19 @@ pub fn decode_query_command(command: QueryCommand) -> Result<FlightQueryRequest>
             })
         })
         .transpose()?;
+    validate_snapshot_query(
+        command.key_value_snapshot,
+        &command.sql,
+        &bindings,
+        command.fixed_snapshot_id.is_some(),
+    )?;
     Ok(FlightQueryRequest {
+        key_value_snapshot: command.key_value_snapshot,
+        fixed_snapshot_id: command
+            .fixed_snapshot_id
+            .as_ref()
+            .map(|id| decode_stable_id(id, QueryId::from_bytes, "fixed_snapshot_id"))
+            .transpose()?,
         request: QueryRequest {
             query_id,
             session_id,
@@ -205,6 +235,31 @@ pub fn decode_query_command(command: QueryCommand) -> Result<FlightQueryRequest>
         },
         bindings,
     })
+}
+
+fn validate_snapshot_query(
+    enabled: bool,
+    sql: &str,
+    bindings: &[FlightTableBinding],
+    fixed_snapshot: bool,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if sql != KEY_VALUE_SNAPSHOT_SQL
+        || bindings.len() != 1
+        || bindings[0].sql_name != KEY_VALUE_SNAPSHOT_BINDING
+    {
+        return Err(invalid(
+            "key-value snapshot requires the canonical complete-state query",
+        ));
+    }
+    if fixed_snapshot {
+        return Err(invalid(
+            "atomic key-value cursor snapshots cannot use a fixed query snapshot",
+        ));
+    }
+    Ok(())
 }
 
 /// Encodes a query ticket for Arrow Flight `DoGet`.
@@ -266,7 +321,7 @@ pub fn query_info(plan: &QueryPlanInfo, generation: NonZeroU64) -> QueryInfo {
 
 fn binding_to_wire(binding: &FlightTableBinding) -> TableBinding {
     let table = match &binding.table {
-        TableRef::Id { table_id } => Table::TableId(table_id.into_bytes().to_vec()),
+        TableRef::Id { table_id } => Table::TableId(table_id.into_bytes().to_vec().into()),
         TableRef::Name { namespace, table } => Table::Name(wire::TableName {
             namespace: namespace.as_str().to_owned(),
             table: table.as_str().to_owned(),
@@ -278,7 +333,7 @@ fn binding_to_wire(binding: &FlightTableBinding) -> TableBinding {
     }
 }
 
-fn binding_from_wire(binding: TableBinding) -> Result<FlightTableBinding> {
+pub(crate) fn binding_from_wire(binding: TableBinding) -> Result<FlightTableBinding> {
     require_name(&binding.sql_name, "binding sql_name")?;
     let table = match binding.table {
         Some(Table::Name(name)) => {
@@ -364,12 +419,31 @@ mod tests {
     use zippy_types::table::CatalogName;
     use zippy_types::ResourceLimit;
 
+    #[test]
+    fn state_snapshot_wire_requires_the_complete_canonical_query() {
+        let mut request = request();
+        request.key_value_snapshot = true;
+        assert!(encode_query_request(&request).is_err());
+        request.request.input = QueryInput::Sql(KEY_VALUE_SNAPSHOT_SQL.to_owned());
+        request.bindings[0].sql_name = KEY_VALUE_SNAPSHOT_BINDING.to_owned();
+        let command = encode_query_request(&request).unwrap();
+        assert_eq!(decode_query_command(command.clone()).unwrap(), request);
+        let mut filtered = command.clone();
+        filtered.sql.push_str(" LIMIT 1");
+        assert!(decode_query_command(filtered).is_err());
+        let mut duplicate = command;
+        duplicate.bindings.push(duplicate.bindings[0].clone());
+        assert!(decode_query_command(duplicate).is_err());
+    }
+
     fn request() -> FlightQueryRequest {
         let table = TableRef::Name {
             namespace: CatalogName::new("market").unwrap(),
             table: CatalogName::new("ticks").unwrap(),
         };
         FlightQueryRequest {
+            fixed_snapshot_id: None,
+            key_value_snapshot: false,
             request: QueryRequest {
                 query_id: QueryId::from_u128(1).unwrap(),
                 session_id: SessionId::from_u128(2).unwrap(),
@@ -386,6 +460,27 @@ mod tests {
                 table,
             }],
         }
+    }
+
+    #[test]
+    fn fixed_snapshot_identity_round_trips_and_cannot_mix_with_state_cursor() {
+        let mut request = request();
+        request.fixed_snapshot_id = Some(QueryId::from_u128(99).unwrap());
+        let command = encode_query_request(&request).unwrap();
+        assert_eq!(decode_query_command(command.clone()).unwrap(), request);
+        for bytes in [vec![], vec![0; 16], vec![1; 15], vec![1; 17]] {
+            let mut invalid = command.clone();
+            invalid.fixed_snapshot_id = Some(bytes.into());
+            assert!(decode_query_command(invalid).is_err());
+        }
+        request.key_value_snapshot = true;
+        request.request.input = QueryInput::Sql(KEY_VALUE_SNAPSHOT_SQL.to_owned());
+        request.bindings[0].sql_name = KEY_VALUE_SNAPSHOT_BINDING.to_owned();
+        assert!(encode_query_request(&request).is_err());
+        request.fixed_snapshot_id = None;
+        let mut state = encode_query_request(&request).unwrap();
+        state.fixed_snapshot_id = command.fixed_snapshot_id;
+        assert!(decode_query_command(state).is_err());
     }
 
     #[test]

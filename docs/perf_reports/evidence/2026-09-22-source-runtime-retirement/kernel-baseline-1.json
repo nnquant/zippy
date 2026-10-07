@@ -1,0 +1,85 @@
+{
+  "format_version": 2,
+  "suite": "single-node-refactor",
+  "state": "completed",
+  "metadata": {
+    "git_sha": "1d1be4db7271",
+    "target": "linux-x86_64",
+    "started_at_unix_ms": 1790083840048
+  },
+  "source": {
+    "git_sha": "1d1be4db72717b6159689f1c45da783c32f63902",
+    "git_dirty": true
+  },
+  "binary": {
+    "binary_name": "zippy-perf",
+    "package_version": "0.5.0",
+    "build_profile": "release",
+    "target": "linux-x86_64",
+    "executable_path": "/home/jiangda/develop/zippy/target/release/zippy-perf",
+    "executable_size_bytes": 7758688,
+    "executable_sha256": "388a9240a7d824b3abd41b5933ebe02f50fd8b1219aa2558d9bd08c0e097d785"
+  },
+  "config": {
+    "profile": "TimeseriesKernel",
+    "rows_per_batch": 4096,
+    "target_rows_per_sec": 1000000,
+    "duration_sec": 10,
+    "warmup_sec": 2,
+    "symbols": 1024,
+    "max_p95_micros": 5000.0,
+    "max_p99_micros": 10000.0
+  },
+  "dataset": {
+    "dataset_id": "zippy-perf.synthetic.v1",
+    "source_kind": "synthetic",
+    "input_contract": "zippy-perf.tick.v1",
+    "parameters": {
+      "rows_per_batch": 4096,
+      "target_rows_per_sec": 1000000,
+      "duration_sec": 10,
+      "warmup_sec": 2,
+      "symbols": 1024
+    }
+  },
+  "report": {
+    "profile": "TimeseriesKernel",
+    "config": {
+      "profile": "TimeseriesKernel",
+      "rows_per_batch": 4096,
+      "target_rows_per_sec": 1000000,
+      "duration_sec": 10,
+      "warmup_sec": 2,
+      "symbols": 1024,
+      "max_p95_micros": 5000.0,
+      "max_p99_micros": 10000.0
+    },
+    "metadata": {
+      "git_sha": "1d1be4db7271",
+      "target": "linux-x86_64",
+      "started_at_unix_ms": 1790083840048
+    },
+    "input_rows_total": 12001280,
+    "output_rows_total": 12001280,
+    "actual_average_rows_per_sec": 999833.6,
+    "actual_peak_rows_per_sec": 1003520.0,
+    "batches_per_sec": 244.1,
+    "latency": {
+      "sample_count": 2441,
+      "p50_micros": 1677.0,
+      "p95_micros": 2116.0,
+      "p99_micros": 2291.0,
+      "max_micros": 3041.0
+    },
+    "secondary_latency": null,
+    "engine_metrics": {
+      "processed_batches_total": 2930,
+      "processed_rows_total": 12001280,
+      "output_batches_total": 2931,
+      "late_rows_total": 0,
+      "filtered_rows_total": 0
+    },
+    "pass": true
+  },
+  "error": null
+}

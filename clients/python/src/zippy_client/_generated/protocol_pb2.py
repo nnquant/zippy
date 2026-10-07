@@ -4,89 +4,128 @@
 # source: protocol.proto
 # Protobuf Python Version: 6.33.5
 """Generated protocol buffer code."""
+
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
+
 _runtime_version.ValidateProtobufRuntimeVersion(
-    _runtime_version.Domain.PUBLIC,
-    6,
-    33,
-    5,
-    '',
-    'protocol.proto'
+    _runtime_version.Domain.PUBLIC, 6, 33, 5, "", "protocol.proto"
 )
 # @@protoc_insertion_point(imports)
 
 _sym_db = _symbol_database.Default()
 
 
-
-
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0eprotocol.proto\x12\x0fzippy.flight.v1\".\n\x12SessionOpenRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\"\x9c\x01\n\x13SessionOpenResponse\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x14\n\x0c\x62\x65\x61rer_token\x18\x03 \x01(\t\x12\x15\n\rexpires_at_ns\x18\x04 \x01(\x04\x12*\n\x04role\x18\x05 \x01(\x0e\x32\x1c.zippy.flight.v1.SessionRole\"\xcb\x02\n\nPutCommand\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x0e\n\x06put_id\x18\x03 \x01(\x0c\x12\x13\n\x0bstream_name\x18\x04 \x01(\t\x12\x1c\n\x14\x66irst_batch_sequence\x18\x05 \x01(\x04\x12.\n\x08mutation\x18\x06 \x01(\x0e\x32\x1c.zippy.flight.v1.PutMutation\x12\x32\n\ndurability\x18\x07 \x01(\x0e\x32\x1e.zippy.flight.v1.PutDurability\x12\x13\n\x0bproducer_id\x18\x08 \x01(\x0c\x12\x15\n\rconnection_id\x18\t \x01(\x0c\x12\"\n\x15\x65xpected_writer_epoch\x18\n \x01(\x04H\x00\x88\x01\x01\x42\x18\n\x16_expected_writer_epoch\"\xfa\x03\n\x0ePutBatchResult\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x0e\n\x06put_id\x18\x02 \x01(\x0c\x12\x16\n\x0e\x62\x61tch_sequence\x18\x03 \x01(\x04\x12\x11\n\trow_count\x18\x04 \x01(\x04\x12:\n\x12\x64urability_reached\x18\x05 \x01(\x0e\x32\x1e.zippy.flight.v1.PutDurability\x12\x12\n\nrequest_id\x18\x06 \x01(\x0c\x12\x16\n\x0eproducer_epoch\x18\x07 \x01(\x04\x12\x1d\n\x10\x66irst_log_offset\x18\x08 \x01(\x04H\x00\x88\x01\x01\x12\x1c\n\x0flast_log_offset\x18\t \x01(\x04H\x01\x88\x01\x01\x12=\n\x13previous_log_offset\x18\n \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12>\n\x14\x63ommitted_log_offset\x18\x0b \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12\'\n\x1apersisted_snapshot_version\x18\x0c \x01(\x04H\x02\x88\x01\x01\x42\x13\n\x11_first_log_offsetB\x12\n\x10_last_log_offsetB\x1d\n\x1b_persisted_snapshot_version\"\x89\x03\n\x0cQueryCommand\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x08query_id\x18\x02 \x01(\x0c\x12\x12\n\nsession_id\x18\x03 \x01(\x0c\x12\x0b\n\x03sql\x18\x04 \x01(\t\x12/\n\x08\x62indings\x18\x05 \x03(\x0b\x32\x1d.zippy.flight.v1.TableBinding\x12\x30\n\x08priority\x18\x06 \x01(\x0e\x32\x1e.zippy.flight.v1.QueryPriority\x12\x18\n\x0b\x64\x65\x61\x64line_ns\x18\x07 \x01(\x04H\x00\x88\x01\x01\x12\x34\n\x0cmemory_limit\x18\x08 \x01(\x0b\x32\x1e.zippy.flight.v1.ResourceLimit\x12\x33\n\x0bspill_limit\x18\t \x01(\x0b\x32\x1e.zippy.flight.v1.ResourceLimit\x12\x1e\n\x11result_batch_rows\x18\n \x01(\rH\x01\x88\x01\x01\x42\x0e\n\x0c_deadline_nsB\x14\n\x12_result_batch_rows\"i\n\x0cTableBinding\x12\x10\n\x08sql_name\x18\x01 \x01(\t\x12*\n\x04name\x18\x02 \x01(\x0b\x32\x1a.zippy.flight.v1.TableNameH\x00\x12\x12\n\x08table_id\x18\x03 \x01(\x0cH\x00\x42\x07\n\x05table\"-\n\tTableName\x12\x11\n\tnamespace\x18\x01 \x01(\t\x12\r\n\x05table\x18\x02 \x01(\t\"\xab\x01\n\rResourceLimit\x12\x31\n\x04kind\x18\x01 \x01(\x0e\x32#.zippy.flight.v1.ResourceLimit.Kind\x12\r\n\x05\x62ytes\x18\x02 \x01(\x04\"X\n\x04Kind\x12\x14\n\x10KIND_UNSPECIFIED\x10\x00\x12\x17\n\x13KIND_SERVER_DEFAULT\x10\x01\x12\x11\n\rKIND_DISABLED\x10\x02\x12\x0e\n\nKIND_BYTES\x10\x03\"\x93\x01\n\x0bQueryTicket\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x1a\n\x12server_instance_id\x18\x02 \x01(\x0c\x12\x11\n\tticket_id\x18\x03 \x01(\x0c\x12\x10\n\x08query_id\x18\x04 \x01(\x0c\x12\x12\n\ngeneration\x18\x05 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x06 \x01(\x04\"\x8a\x01\n\x0eMetadataTicket\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x1a\n\x12server_instance_id\x18\x02 \x01(\x0c\x12\x11\n\tticket_id\x18\x03 \x01(\x0c\x12\x18\n\x10\x63\x61talog_revision\x18\x04 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x05 \x01(\x04\"Y\n\x0cMetadataInfo\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x18\n\x10\x63\x61talog_revision\x18\x02 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x03 \x01(\x04\"\xca\x01\n\tQueryInfo\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x08query_id\x18\x02 \x01(\x0c\x12\x12\n\ngeneration\x18\x03 \x01(\x04\x12\x18\n\x10\x63\x61talog_revision\x18\x04 \x01(\x04\x12\x15\n\rplanned_at_ns\x18\x05 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x06 \x01(\x04\x12\x35\n\tsnapshots\x18\x07 \x03(\x0b\x32\".zippy.flight.v1.QueryTableVersion\"W\n\x11QueryTableVersion\x12\x10\n\x08table_id\x18\x01 \x01(\x0c\x12\x18\n\x10snapshot_version\x18\x02 \x01(\x04\x12\x16\n\x0eschema_version\x18\x03 \x01(\x04\"\xbb\x05\n\rErrorEnvelope\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x0c\n\x04\x63ode\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\x12\x11\n\tretryable\x18\x04 \x01(\x08\x12\x17\n\nrequest_id\x18\x05 \x01(\x0cH\x01\x88\x01\x01\x12\x15\n\x08query_id\x18\x06 \x01(\x0cH\x02\x88\x01\x01\x12\x15\n\x08table_id\x18\x07 \x01(\x0cH\x03\x88\x01\x01\x12>\n\x11revision_conflict\x18\n \x01(\x0b\x32!.zippy.flight.v1.RevisionConflictH\x00\x12\x39\n\x0eproducer_epoch\x18\x0b \x01(\x0b\x32\x1f.zippy.flight.v1.ExpectedActualH\x00\x12\x37\n\x0csequence_gap\x18\x0c \x01(\x0b\x32\x1f.zippy.flight.v1.ExpectedActualH\x00\x12\x39\n\x0eschema_version\x18\r \x01(\x0b\x32\x1f.zippy.flight.v1.ExpectedActualH\x00\x12\x38\n\x0eoffset_expired\x18\x0e \x01(\x0b\x32\x1e.zippy.flight.v1.OffsetExpiredH\x00\x12@\n\x0eresource_limit\x18\x0f \x01(\x0b\x32&.zippy.flight.v1.ResourceLimitExceededH\x00\x12:\n\x0f\x64\x61ta_corruption\x18\x10 \x01(\x0b\x32\x1f.zippy.flight.v1.DataCorruptionH\x00\x12<\n\x10unsupported_plan\x18\x11 \x01(\x0b\x32 .zippy.flight.v1.UnsupportedPlanH\x00\x42\t\n\x07\x64\x65tailsB\r\n\x0b_request_idB\x0b\n\t_query_idB\x0b\n\t_table_id\"4\n\x10RevisionConflict\x12\x10\n\x08\x65xpected\x18\x01 \x01(\x04\x12\x0e\n\x06\x61\x63tual\x18\x02 \x01(\x04\"2\n\x0e\x45xpectedActual\x12\x10\n\x08\x65xpected\x18\x01 \x01(\x04\x12\x0e\n\x06\x61\x63tual\x18\x02 \x01(\x04\"\xcf\x01\n\rOffsetExpired\x12\x33\n\trequested\x18\x01 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12\x32\n\x08\x65\x61rliest\x18\x02 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12\x30\n\x06latest\x18\x03 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12#\n\x1bsnapshot_recovery_available\x18\x04 \x01(\x08\"\xb4\x01\n\x0fOffsetWatermark\x12\x35\n\x05state\x18\x01 \x01(\x0e\x32&.zippy.flight.v1.OffsetWatermark.State\x12\x0e\n\x06offset\x18\x02 \x01(\x04\"Z\n\x05State\x12\x15\n\x11STATE_UNSPECIFIED\x10\x00\x12\x0f\n\x0bSTATE_EMPTY\x10\x01\x12\x0f\n\x0bSTATE_KNOWN\x10\x02\x12\x18\n\x14STATE_LEGACY_UNKNOWN\x10\x03\"k\n\x15ResourceLimitExceeded\x12\x10\n\x08resource\x18\x01 \x01(\t\x12-\n\x05limit\x18\x02 \x01(\x0b\x32\x1e.zippy.flight.v1.ResourceLimit\x12\x11\n\trequested\x18\x03 \x01(\x04\"\x88\x01\n\x0e\x44\x61taCorruption\x12\x0e\n\x06object\x18\x01 \x01(\t\x12\x1e\n\x11\x65xpected_checksum\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x1c\n\x0f\x61\x63tual_checksum\x18\x03 \x01(\tH\x01\x88\x01\x01\x42\x14\n\x12_expected_checksumB\x12\n\x10_actual_checksum\"#\n\x0fUnsupportedPlan\x12\x10\n\x08operator\x18\x01 \x01(\t\"/\n\x13\x43\x61pabilitiesRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\"\xc1\x04\n\x14\x43\x61pabilitiesResponse\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x16\n\x0eserver_version\x18\x02 \x01(\t\x12\x14\n\x0c\x63\x61pabilities\x18\x03 \x03(\t\x12\x19\n\x11max_message_bytes\x18\x04 \x01(\x04\x12\x1b\n\x13max_pending_tickets\x18\x05 \x01(\x04\x12\x1f\n\x17\x61uthentication_required\x18\x06 \x01(\x08\x12\x16\n\x0esession_ttl_ms\x18\x07 \x01(\x04\x12,\n$administrator_authentication_enabled\x18\x08 \x01(\x08\x12\x19\n\x11metadata_max_rows\x18\t \x01(\x04\x12\x1a\n\x12metadata_max_bytes\x18\n \x01(\x04\x12%\n\x1dwriter_authentication_enabled\x18\x0b \x01(\x08\x12\x16\n\x0eingest_enabled\x18\x0c \x01(\x08\x12\"\n\x1aingest_max_concurrent_puts\x18\r \x01(\x04\x12\"\n\x1aingest_max_batches_per_put\x18\x0e \x01(\x04\x12!\n\x19ingest_max_rows_per_batch\x18\x0f \x01(\x04\x12\x1f\n\x17ingest_max_rows_per_put\x18\x10 \x01(\x04\x12\x1e\n\x16ingest_max_batch_bytes\x18\x11 \x01(\x04\x12 \n\x18ingest_max_bytes_per_put\x18\x12 \x01(\x04*{\n\x0bSessionRole\x12\x1c\n\x18SESSION_ROLE_UNSPECIFIED\x10\x00\x12\x15\n\x11SESSION_ROLE_READ\x10\x01\x12\x1e\n\x1aSESSION_ROLE_ADMINISTRATOR\x10\x02\x12\x17\n\x13SESSION_ROLE_WRITER\x10\x03*D\n\x0bPutMutation\x12\x1c\n\x18PUT_MUTATION_UNSPECIFIED\x10\x00\x12\x17\n\x13PUT_MUTATION_APPEND\x10\x01*\x80\x01\n\rPutDurability\x12\x1e\n\x1aPUT_DURABILITY_UNSPECIFIED\x10\x00\x12\x19\n\x15PUT_DURABILITY_MEMORY\x10\x01\x12\x16\n\x12PUT_DURABILITY_WAL\x10\x02\x12\x1c\n\x18PUT_DURABILITY_PERSISTED\x10\x03*\x8a\x01\n\rQueryPriority\x12\x1e\n\x1aQUERY_PRIORITY_UNSPECIFIED\x10\x00\x12\x1e\n\x1aQUERY_PRIORITY_INTERACTIVE\x10\x01\x12\x19\n\x15QUERY_PRIORITY_NORMAL\x10\x02\x12\x1e\n\x1aQUERY_PRIORITY_MAINTENANCE\x10\x03\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
+    b'\n\x0eprotocol.proto\x12\x0fzippy.flight.v1".\n\x12SessionOpenRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r"\x9c\x01\n\x13SessionOpenResponse\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x14\n\x0c\x62\x65\x61rer_token\x18\x03 \x01(\t\x12\x15\n\rexpires_at_ns\x18\x04 \x01(\x04\x12*\n\x04role\x18\x05 \x01(\x0e\x32\x1c.zippy.flight.v1.SessionRole"/\n\x13SessionCloseRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r"@\n\x14SessionCloseResponse\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x0e\n\x06\x63losed\x18\x02 \x01(\x08"\x94\x03\n\nPutCommand\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nsession_id\x18\x02 \x01(\x0c\x12\x0e\n\x06put_id\x18\x03 \x01(\x0c\x12\x13\n\x0bstream_name\x18\x04 \x01(\t\x12\x1c\n\x14\x66irst_batch_sequence\x18\x05 \x01(\x04\x12.\n\x08mutation\x18\x06 \x01(\x0e\x32\x1c.zippy.flight.v1.PutMutation\x12\x32\n\ndurability\x18\x07 \x01(\x0e\x32\x1e.zippy.flight.v1.PutDurability\x12\x13\n\x0bproducer_id\x18\x08 \x01(\x0c\x12\x15\n\rconnection_id\x18\t \x01(\x0c\x12"\n\x15\x65xpected_writer_epoch\x18\n \x01(\x04H\x00\x88\x01\x01\x12\x11\n\tnamespace\x18\x0b \x01(\t\x12\x1e\n\x11\x65xpected_table_id\x18\x0c \x01(\x0cH\x01\x88\x01\x01\x42\x18\n\x16_expected_writer_epochB\x14\n\x12_expected_table_id"\xfa\x03\n\x0ePutBatchResult\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x0e\n\x06put_id\x18\x02 \x01(\x0c\x12\x16\n\x0e\x62\x61tch_sequence\x18\x03 \x01(\x04\x12\x11\n\trow_count\x18\x04 \x01(\x04\x12:\n\x12\x64urability_reached\x18\x05 \x01(\x0e\x32\x1e.zippy.flight.v1.PutDurability\x12\x12\n\nrequest_id\x18\x06 \x01(\x0c\x12\x16\n\x0eproducer_epoch\x18\x07 \x01(\x04\x12\x1d\n\x10\x66irst_log_offset\x18\x08 \x01(\x04H\x00\x88\x01\x01\x12\x1c\n\x0flast_log_offset\x18\t \x01(\x04H\x01\x88\x01\x01\x12=\n\x13previous_log_offset\x18\n \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12>\n\x14\x63ommitted_log_offset\x18\x0b \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12\'\n\x1apersisted_snapshot_version\x18\x0c \x01(\x04H\x02\x88\x01\x01\x42\x13\n\x11_first_log_offsetB\x12\n\x10_last_log_offsetB\x1d\n\x1b_persisted_snapshot_version"\xdb\x03\n\x0cQueryCommand\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x08query_id\x18\x02 \x01(\x0c\x12\x12\n\nsession_id\x18\x03 \x01(\x0c\x12\x0b\n\x03sql\x18\x04 \x01(\t\x12/\n\x08\x62indings\x18\x05 \x03(\x0b\x32\x1d.zippy.flight.v1.TableBinding\x12\x30\n\x08priority\x18\x06 \x01(\x0e\x32\x1e.zippy.flight.v1.QueryPriority\x12\x18\n\x0b\x64\x65\x61\x64line_ns\x18\x07 \x01(\x04H\x00\x88\x01\x01\x12\x34\n\x0cmemory_limit\x18\x08 \x01(\x0b\x32\x1e.zippy.flight.v1.ResourceLimit\x12\x33\n\x0bspill_limit\x18\t \x01(\x0b\x32\x1e.zippy.flight.v1.ResourceLimit\x12\x1e\n\x11result_batch_rows\x18\n \x01(\rH\x01\x88\x01\x01\x12\x1a\n\x12key_value_snapshot\x18\x0b \x01(\x08\x12\x1e\n\x11\x66ixed_snapshot_id\x18\x0c \x01(\x0cH\x02\x88\x01\x01\x42\x0e\n\x0c_deadline_nsB\x14\n\x12_result_batch_rowsB\x14\n\x12_fixed_snapshot_id"i\n\x0cTableBinding\x12\x10\n\x08sql_name\x18\x01 \x01(\t\x12*\n\x04name\x18\x02 \x01(\x0b\x32\x1a.zippy.flight.v1.TableNameH\x00\x12\x12\n\x08table_id\x18\x03 \x01(\x0cH\x00\x42\x07\n\x05table"-\n\tTableName\x12\x11\n\tnamespace\x18\x01 \x01(\t\x12\r\n\x05table\x18\x02 \x01(\t"\xab\x01\n\rResourceLimit\x12\x31\n\x04kind\x18\x01 \x01(\x0e\x32#.zippy.flight.v1.ResourceLimit.Kind\x12\r\n\x05\x62ytes\x18\x02 \x01(\x04"X\n\x04Kind\x12\x14\n\x10KIND_UNSPECIFIED\x10\x00\x12\x17\n\x13KIND_SERVER_DEFAULT\x10\x01\x12\x11\n\rKIND_DISABLED\x10\x02\x12\x0e\n\nKIND_BYTES\x10\x03"\x93\x01\n\x0bQueryTicket\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x1a\n\x12server_instance_id\x18\x02 \x01(\x0c\x12\x11\n\tticket_id\x18\x03 \x01(\x0c\x12\x10\n\x08query_id\x18\x04 \x01(\x0c\x12\x12\n\ngeneration\x18\x05 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x06 \x01(\x04"\x8a\x01\n\x0eMetadataTicket\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x1a\n\x12server_instance_id\x18\x02 \x01(\x0c\x12\x11\n\tticket_id\x18\x03 \x01(\x0c\x12\x18\n\x10\x63\x61talog_revision\x18\x04 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x05 \x01(\x04"Y\n\x0cMetadataInfo\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x18\n\x10\x63\x61talog_revision\x18\x02 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x03 \x01(\x04"\xca\x01\n\tQueryInfo\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x08query_id\x18\x02 \x01(\x0c\x12\x12\n\ngeneration\x18\x03 \x01(\x04\x12\x18\n\x10\x63\x61talog_revision\x18\x04 \x01(\x04\x12\x15\n\rplanned_at_ns\x18\x05 \x01(\x04\x12\x15\n\rexpires_at_ns\x18\x06 \x01(\x04\x12\x35\n\tsnapshots\x18\x07 \x03(\x0b\x32".zippy.flight.v1.QueryTableVersion"W\n\x11QueryTableVersion\x12\x10\n\x08table_id\x18\x01 \x01(\x0c\x12\x18\n\x10snapshot_version\x18\x02 \x01(\x04\x12\x16\n\x0eschema_version\x18\x03 \x01(\x04"\xbb\x05\n\rErrorEnvelope\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x0c\n\x04\x63ode\x18\x02 \x01(\t\x12\x0f\n\x07message\x18\x03 \x01(\t\x12\x11\n\tretryable\x18\x04 \x01(\x08\x12\x17\n\nrequest_id\x18\x05 \x01(\x0cH\x01\x88\x01\x01\x12\x15\n\x08query_id\x18\x06 \x01(\x0cH\x02\x88\x01\x01\x12\x15\n\x08table_id\x18\x07 \x01(\x0cH\x03\x88\x01\x01\x12>\n\x11revision_conflict\x18\n \x01(\x0b\x32!.zippy.flight.v1.RevisionConflictH\x00\x12\x39\n\x0eproducer_epoch\x18\x0b \x01(\x0b\x32\x1f.zippy.flight.v1.ExpectedActualH\x00\x12\x37\n\x0csequence_gap\x18\x0c \x01(\x0b\x32\x1f.zippy.flight.v1.ExpectedActualH\x00\x12\x39\n\x0eschema_version\x18\r \x01(\x0b\x32\x1f.zippy.flight.v1.ExpectedActualH\x00\x12\x38\n\x0eoffset_expired\x18\x0e \x01(\x0b\x32\x1e.zippy.flight.v1.OffsetExpiredH\x00\x12@\n\x0eresource_limit\x18\x0f \x01(\x0b\x32&.zippy.flight.v1.ResourceLimitExceededH\x00\x12:\n\x0f\x64\x61ta_corruption\x18\x10 \x01(\x0b\x32\x1f.zippy.flight.v1.DataCorruptionH\x00\x12<\n\x10unsupported_plan\x18\x11 \x01(\x0b\x32 .zippy.flight.v1.UnsupportedPlanH\x00\x42\t\n\x07\x64\x65tailsB\r\n\x0b_request_idB\x0b\n\t_query_idB\x0b\n\t_table_id"4\n\x10RevisionConflict\x12\x10\n\x08\x65xpected\x18\x01 \x01(\x04\x12\x0e\n\x06\x61\x63tual\x18\x02 \x01(\x04"2\n\x0e\x45xpectedActual\x12\x10\n\x08\x65xpected\x18\x01 \x01(\x04\x12\x0e\n\x06\x61\x63tual\x18\x02 \x01(\x04"\xcf\x01\n\rOffsetExpired\x12\x33\n\trequested\x18\x01 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12\x32\n\x08\x65\x61rliest\x18\x02 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12\x30\n\x06latest\x18\x03 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12#\n\x1bsnapshot_recovery_available\x18\x04 \x01(\x08"\xb6\x01\n\x0fOffsetWatermark\x12\x35\n\x05state\x18\x01 \x01(\x0e\x32&.zippy.flight.v1.OffsetWatermark.State\x12\x0e\n\x06offset\x18\x02 \x01(\x04"\\\n\x05State\x12\x15\n\x11STATE_UNSPECIFIED\x10\x00\x12\x0f\n\x0bSTATE_EMPTY\x10\x01\x12\x0f\n\x0bSTATE_KNOWN\x10\x02"\x04\x08\x03\x10\x03*\x14STATE_LEGACY_UNKNOWN"k\n\x15ResourceLimitExceeded\x12\x10\n\x08resource\x18\x01 \x01(\t\x12-\n\x05limit\x18\x02 \x01(\x0b\x32\x1e.zippy.flight.v1.ResourceLimit\x12\x11\n\trequested\x18\x03 \x01(\x04"\x88\x01\n\x0e\x44\x61taCorruption\x12\x0e\n\x06object\x18\x01 \x01(\t\x12\x1e\n\x11\x65xpected_checksum\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x1c\n\x0f\x61\x63tual_checksum\x18\x03 \x01(\tH\x01\x88\x01\x01\x42\x14\n\x12_expected_checksumB\x12\n\x10_actual_checksum"#\n\x0fUnsupportedPlan\x12\x10\n\x08operator\x18\x01 \x01(\t"/\n\x13\x43\x61pabilitiesRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r"\xe4\x04\n\x14\x43\x61pabilitiesResponse\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x16\n\x0eserver_version\x18\x02 \x01(\t\x12\x14\n\x0c\x63\x61pabilities\x18\x03 \x03(\t\x12\x19\n\x11max_message_bytes\x18\x04 \x01(\x04\x12\x1b\n\x13max_pending_tickets\x18\x05 \x01(\x04\x12\x1f\n\x17\x61uthentication_required\x18\x06 \x01(\x08\x12\x16\n\x0esession_ttl_ms\x18\x07 \x01(\x04\x12,\n$administrator_authentication_enabled\x18\x08 \x01(\x08\x12\x19\n\x11metadata_max_rows\x18\t \x01(\x04\x12\x1a\n\x12metadata_max_bytes\x18\n \x01(\x04\x12%\n\x1dwriter_authentication_enabled\x18\x0b \x01(\x08\x12\x16\n\x0eingest_enabled\x18\x0c \x01(\x08\x12"\n\x1aingest_max_concurrent_puts\x18\r \x01(\x04\x12"\n\x1aingest_max_batches_per_put\x18\x0e \x01(\x04\x12!\n\x19ingest_max_rows_per_batch\x18\x0f \x01(\x04\x12\x1f\n\x17ingest_max_rows_per_put\x18\x10 \x01(\x04\x12\x1e\n\x16ingest_max_batch_bytes\x18\x11 \x01(\x04\x12 \n\x18ingest_max_bytes_per_put\x18\x12 \x01(\x04\x12!\n\x19ingest_max_rows_per_frame\x18\x13 \x01(\x04"j\n\x16\x43reateNamespaceRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nrequest_id\x18\x02 \x01(\x0c\x12\x14\n\x0cnamespace_id\x18\x03 \x01(\x0c\x12\x0c\n\x04name\x18\x04 \x01(\t"\xc2\x02\n\x12\x43reateTableRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nrequest_id\x18\x02 \x01(\x0c\x12\x10\n\x08table_id\x18\x03 \x01(\x0c\x12\x14\n\x0cnamespace_id\x18\x04 \x01(\x0c\x12\x0c\n\x04name\x18\x05 \x01(\t\x12\x12\n\nschema_ipc\x18\x06 \x01(\x0c\x12\x35\n\x06\x61ppend\x18\x07 \x01(\x0b\x32#.zippy.flight.v1.AppendTableOptionsH\x00\x12\x33\n\x05\x66rame\x18\x08 \x01(\x0b\x32".zippy.flight.v1.FrameTableOptionsH\x00\x12:\n\tkey_value\x18\t \x01(\x0b\x32%.zippy.flight.v1.KeyValueTableOptionsH\x00\x42\x0c\n\ndefinition"u\n\x10\x44ropTableRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nrequest_id\x18\x02 \x01(\x0c\x12\x10\n\x08table_id\x18\x03 \x01(\x0c\x12!\n\x19\x65xpected_snapshot_version\x18\x04 \x01(\x04"\xc8\x01\n\x17\x41lterTableSchemaRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nrequest_id\x18\x02 \x01(\x0c\x12\x10\n\x08table_id\x18\x03 \x01(\x0c\x12\x1f\n\x17\x65xpected_schema_version\x18\x04 \x01(\x04\x12\x12\n\nschema_ipc\x18\x05 \x01(\x0c\x12\x38\n\tkey_value\x18\x06 \x01(\x0b\x32%.zippy.flight.v1.KeyValueTableOptions"J\n\x12\x41ppendTableOptions\x12\x1e\n\x11\x65vent_time_column\x18\x01 \x01(\tH\x00\x88\x01\x01\x42\x14\n\x12_event_time_column"\x1f\n\x11\x46rameTableOptions\x12\n\n\x02\x62y\x18\x01 \x01(\t"$\n\x14KeyValueTableOptions\x12\x0c\n\x04keys\x18\x01 \x03(\t"\x8a\x01\n\x15\x43\x61talogMutationResult\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x12\n\nrequest_id\x18\x02 \x01(\x0c\x12\x18\n\x10\x63\x61talog_revision\x18\x03 \x01(\x04\x12\x11\n\tobject_id\x18\x04 \x01(\x0c\x12\x16\n\x0eschema_version\x18\x05 \x01(\x04"\xf4\x02\n\nLogCommand\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x08query_id\x18\x02 \x01(\x0c\x12\x12\n\nsession_id\x18\x03 \x01(\x0c\x12,\n\x05table\x18\x04 \x01(\x0b\x32\x1d.zippy.flight.v1.TableBinding\x12\x10\n\x06latest\x18\x05 \x01(\x08H\x00\x12\x10\n\x06offset\x18\x06 \x01(\x04H\x00\x12\x13\n\tcommitted\x18\x0b \x01(\x08H\x00\x12\x18\n\x0b\x64\x65\x61\x64line_ns\x18\x07 \x01(\x04H\x01\x88\x01\x01\x12\x34\n\x0cmemory_limit\x18\x08 \x01(\x0b\x32\x1e.zippy.flight.v1.ResourceLimit\x12\x17\n\nbatch_rows\x18\t \x01(\rH\x02\x88\x01\x01\x12.\n\x08\x63onsumer\x18\n \x01(\x0b\x32\x1c.zippy.flight.v1.LogConsumerB\x07\n\x05startB\x0e\n\x0c_deadline_nsB\r\n\x0b_batch_rows"Y\n\x0bLogConsumer\x12\x13\n\x0b\x63onsumer_id\x18\x01 \x01(\x0c\x12\x14\n\nindividual\x18\x02 \x01(\x08H\x00\x12\x12\n\x08group_id\x18\x03 \x01(\x0cH\x00\x42\x0b\n\tauthority"^\n\x12LogAcknowledgement\x12\x12\n\nrequest_id\x18\x01 \x01(\x0c\x12\x19\n\x11\x64\x65livery_sequence\x18\x02 \x01(\x04\x12\x19\n\x11processed_through\x18\x03 \x01(\x04"\x7f\n\nLogControl\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x06\x63\x61ncel\x18\x02 \x01(\x08H\x00\x12:\n\x0b\x61\x63knowledge\x18\x03 \x01(\x0b\x32#.zippy.flight.v1.LogAcknowledgementH\x00\x42\t\n\x07\x63ontrol"\xb5\x01\n\x0bLogMetadata\x12,\n\x06opened\x18\x01 \x01(\x0b\x32\x1a.zippy.flight.v1.LogOpenedH\x00\x12\x30\n\x08progress\x18\x02 \x01(\x0b\x32\x1c.zippy.flight.v1.LogProgressH\x00\x12;\n\x0c\x61\x63knowledged\x18\x03 \x01(\x0b\x32#.zippy.flight.v1.LogAcknowledgementH\x00\x42\t\n\x07payload"\x80\x02\n\tLogOpened\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x08query_id\x18\x02 \x01(\x0c\x12\x12\n\ngeneration\x18\x03 \x01(\x04\x12\x10\n\x08table_id\x18\x04 \x01(\x0c\x12\x12\n\ntable_kind\x18\x05 \x01(\t\x12\x33\n\twatermark\x18\x06 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12.\n\x08\x63onsumer\x18\x07 \x01(\x0b\x32\x1c.zippy.flight.v1.LogConsumer\x12\x18\n\x0bnext_offset\x18\x08 \x01(\x04H\x00\x88\x01\x01\x42\x0e\n\x0c_next_offset"\xcd\x02\n\x0bLogProgress\x12\x14\n\x0c\x66irst_offset\x18\x01 \x01(\x04\x12\x13\n\x0blast_offset\x18\x02 \x01(\x04\x12\x1f\n\x12\x66rame_first_offset\x18\x03 \x01(\x04H\x00\x88\x01\x01\x12\x1e\n\x11\x66rame_last_offset\x18\x04 \x01(\x04H\x01\x88\x01\x01\x12\x33\n\twatermark\x18\x05 \x01(\x0b\x32 .zippy.flight.v1.OffsetWatermark\x12\x1e\n\x11\x64\x65livery_sequence\x18\x06 \x01(\x04H\x02\x88\x01\x01\x12!\n\x14\x64\x65livery_last_offset\x18\x07 \x01(\x04H\x03\x88\x01\x01\x42\x15\n\x13_frame_first_offsetB\x14\n\x12_frame_last_offsetB\x14\n\x12_delivery_sequenceB\x17\n\x15_delivery_last_offset"w\n\x1a\x43reateFixedSnapshotRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12/\n\x08\x62indings\x18\x02 \x03(\x0b\x32\x1d.zippy.flight.v1.TableBinding\x12\x0e\n\x06ttl_ms\x18\x03 \x01(\x04"\xa7\x01\n\x11\x46ixedSnapshotInfo\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x13\n\x0bsnapshot_id\x18\x02 \x01(\x0c\x12\x15\n\rexpires_at_ns\x18\x03 \x01(\x04\x12\x18\n\x10\x63\x61talog_revision\x18\x04 \x01(\x04\x12\x32\n\x06tables\x18\x05 \x03(\x0b\x32".zippy.flight.v1.QueryTableVersion"L\n\x1bReleaseFixedSnapshotRequest\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x13\n\x0bsnapshot_id\x18\x02 \x01(\x0c"H\n\x1aReleaseFixedSnapshotResult\x12\x18\n\x10protocol_version\x18\x01 \x01(\r\x12\x10\n\x08released\x18\x02 \x01(\x08*{\n\x0bSessionRole\x12\x1c\n\x18SESSION_ROLE_UNSPECIFIED\x10\x00\x12\x15\n\x11SESSION_ROLE_READ\x10\x01\x12\x1e\n\x1aSESSION_ROLE_ADMINISTRATOR\x10\x02\x12\x17\n\x13SESSION_ROLE_WRITER\x10\x03*\xa2\x01\n\x0bPutMutation\x12\x1c\n\x18PUT_MUTATION_UNSPECIFIED\x10\x00\x12\x17\n\x13PUT_MUTATION_APPEND\x10\x01\x12\x16\n\x12PUT_MUTATION_FRAME\x10\x02\x12!\n\x1dPUT_MUTATION_KEY_VALUE_UPSERT\x10\x03\x12!\n\x1dPUT_MUTATION_KEY_VALUE_DELETE\x10\x04*\x80\x01\n\rPutDurability\x12\x1e\n\x1aPUT_DURABILITY_UNSPECIFIED\x10\x00\x12\x19\n\x15PUT_DURABILITY_MEMORY\x10\x01\x12\x16\n\x12PUT_DURABILITY_WAL\x10\x02\x12\x1c\n\x18PUT_DURABILITY_PERSISTED\x10\x03*\x8a\x01\n\rQueryPriority\x12\x1e\n\x1aQUERY_PRIORITY_UNSPECIFIED\x10\x00\x12\x1e\n\x1aQUERY_PRIORITY_INTERACTIVE\x10\x01\x12\x19\n\x15QUERY_PRIORITY_NORMAL\x10\x02\x12\x1e\n\x1aQUERY_PRIORITY_MAINTENANCE\x10\x03\x62\x06proto3'
+)
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
-_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'protocol_pb2', _globals)
+_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "protocol_pb2", _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
-  DESCRIPTOR._loaded_options = None
-  _globals['_SESSIONROLE']._serialized_start=4600
-  _globals['_SESSIONROLE']._serialized_end=4723
-  _globals['_PUTMUTATION']._serialized_start=4725
-  _globals['_PUTMUTATION']._serialized_end=4793
-  _globals['_PUTDURABILITY']._serialized_start=4796
-  _globals['_PUTDURABILITY']._serialized_end=4924
-  _globals['_QUERYPRIORITY']._serialized_start=4927
-  _globals['_QUERYPRIORITY']._serialized_end=5065
-  _globals['_SESSIONOPENREQUEST']._serialized_start=35
-  _globals['_SESSIONOPENREQUEST']._serialized_end=81
-  _globals['_SESSIONOPENRESPONSE']._serialized_start=84
-  _globals['_SESSIONOPENRESPONSE']._serialized_end=240
-  _globals['_PUTCOMMAND']._serialized_start=243
-  _globals['_PUTCOMMAND']._serialized_end=574
-  _globals['_PUTBATCHRESULT']._serialized_start=577
-  _globals['_PUTBATCHRESULT']._serialized_end=1083
-  _globals['_QUERYCOMMAND']._serialized_start=1086
-  _globals['_QUERYCOMMAND']._serialized_end=1479
-  _globals['_TABLEBINDING']._serialized_start=1481
-  _globals['_TABLEBINDING']._serialized_end=1586
-  _globals['_TABLENAME']._serialized_start=1588
-  _globals['_TABLENAME']._serialized_end=1633
-  _globals['_RESOURCELIMIT']._serialized_start=1636
-  _globals['_RESOURCELIMIT']._serialized_end=1807
-  _globals['_RESOURCELIMIT_KIND']._serialized_start=1719
-  _globals['_RESOURCELIMIT_KIND']._serialized_end=1807
-  _globals['_QUERYTICKET']._serialized_start=1810
-  _globals['_QUERYTICKET']._serialized_end=1957
-  _globals['_METADATATICKET']._serialized_start=1960
-  _globals['_METADATATICKET']._serialized_end=2098
-  _globals['_METADATAINFO']._serialized_start=2100
-  _globals['_METADATAINFO']._serialized_end=2189
-  _globals['_QUERYINFO']._serialized_start=2192
-  _globals['_QUERYINFO']._serialized_end=2394
-  _globals['_QUERYTABLEVERSION']._serialized_start=2396
-  _globals['_QUERYTABLEVERSION']._serialized_end=2483
-  _globals['_ERRORENVELOPE']._serialized_start=2486
-  _globals['_ERRORENVELOPE']._serialized_end=3185
-  _globals['_REVISIONCONFLICT']._serialized_start=3187
-  _globals['_REVISIONCONFLICT']._serialized_end=3239
-  _globals['_EXPECTEDACTUAL']._serialized_start=3241
-  _globals['_EXPECTEDACTUAL']._serialized_end=3291
-  _globals['_OFFSETEXPIRED']._serialized_start=3294
-  _globals['_OFFSETEXPIRED']._serialized_end=3501
-  _globals['_OFFSETWATERMARK']._serialized_start=3504
-  _globals['_OFFSETWATERMARK']._serialized_end=3684
-  _globals['_OFFSETWATERMARK_STATE']._serialized_start=3594
-  _globals['_OFFSETWATERMARK_STATE']._serialized_end=3684
-  _globals['_RESOURCELIMITEXCEEDED']._serialized_start=3686
-  _globals['_RESOURCELIMITEXCEEDED']._serialized_end=3793
-  _globals['_DATACORRUPTION']._serialized_start=3796
-  _globals['_DATACORRUPTION']._serialized_end=3932
-  _globals['_UNSUPPORTEDPLAN']._serialized_start=3934
-  _globals['_UNSUPPORTEDPLAN']._serialized_end=3969
-  _globals['_CAPABILITIESREQUEST']._serialized_start=3971
-  _globals['_CAPABILITIESREQUEST']._serialized_end=4018
-  _globals['_CAPABILITIESRESPONSE']._serialized_start=4021
-  _globals['_CAPABILITIESRESPONSE']._serialized_end=4598
+    DESCRIPTOR._loaded_options = None
+    _globals["_SESSIONROLE"]._serialized_start = 7863
+    _globals["_SESSIONROLE"]._serialized_end = 7986
+    _globals["_PUTMUTATION"]._serialized_start = 7989
+    _globals["_PUTMUTATION"]._serialized_end = 8151
+    _globals["_PUTDURABILITY"]._serialized_start = 8154
+    _globals["_PUTDURABILITY"]._serialized_end = 8282
+    _globals["_QUERYPRIORITY"]._serialized_start = 8285
+    _globals["_QUERYPRIORITY"]._serialized_end = 8423
+    _globals["_SESSIONOPENREQUEST"]._serialized_start = 35
+    _globals["_SESSIONOPENREQUEST"]._serialized_end = 81
+    _globals["_SESSIONOPENRESPONSE"]._serialized_start = 84
+    _globals["_SESSIONOPENRESPONSE"]._serialized_end = 240
+    _globals["_SESSIONCLOSEREQUEST"]._serialized_start = 242
+    _globals["_SESSIONCLOSEREQUEST"]._serialized_end = 289
+    _globals["_SESSIONCLOSERESPONSE"]._serialized_start = 291
+    _globals["_SESSIONCLOSERESPONSE"]._serialized_end = 355
+    _globals["_PUTCOMMAND"]._serialized_start = 358
+    _globals["_PUTCOMMAND"]._serialized_end = 762
+    _globals["_PUTBATCHRESULT"]._serialized_start = 765
+    _globals["_PUTBATCHRESULT"]._serialized_end = 1271
+    _globals["_QUERYCOMMAND"]._serialized_start = 1274
+    _globals["_QUERYCOMMAND"]._serialized_end = 1749
+    _globals["_TABLEBINDING"]._serialized_start = 1751
+    _globals["_TABLEBINDING"]._serialized_end = 1856
+    _globals["_TABLENAME"]._serialized_start = 1858
+    _globals["_TABLENAME"]._serialized_end = 1903
+    _globals["_RESOURCELIMIT"]._serialized_start = 1906
+    _globals["_RESOURCELIMIT"]._serialized_end = 2077
+    _globals["_RESOURCELIMIT_KIND"]._serialized_start = 1989
+    _globals["_RESOURCELIMIT_KIND"]._serialized_end = 2077
+    _globals["_QUERYTICKET"]._serialized_start = 2080
+    _globals["_QUERYTICKET"]._serialized_end = 2227
+    _globals["_METADATATICKET"]._serialized_start = 2230
+    _globals["_METADATATICKET"]._serialized_end = 2368
+    _globals["_METADATAINFO"]._serialized_start = 2370
+    _globals["_METADATAINFO"]._serialized_end = 2459
+    _globals["_QUERYINFO"]._serialized_start = 2462
+    _globals["_QUERYINFO"]._serialized_end = 2664
+    _globals["_QUERYTABLEVERSION"]._serialized_start = 2666
+    _globals["_QUERYTABLEVERSION"]._serialized_end = 2753
+    _globals["_ERRORENVELOPE"]._serialized_start = 2756
+    _globals["_ERRORENVELOPE"]._serialized_end = 3455
+    _globals["_REVISIONCONFLICT"]._serialized_start = 3457
+    _globals["_REVISIONCONFLICT"]._serialized_end = 3509
+    _globals["_EXPECTEDACTUAL"]._serialized_start = 3511
+    _globals["_EXPECTEDACTUAL"]._serialized_end = 3561
+    _globals["_OFFSETEXPIRED"]._serialized_start = 3564
+    _globals["_OFFSETEXPIRED"]._serialized_end = 3771
+    _globals["_OFFSETWATERMARK"]._serialized_start = 3774
+    _globals["_OFFSETWATERMARK"]._serialized_end = 3956
+    _globals["_OFFSETWATERMARK_STATE"]._serialized_start = 3864
+    _globals["_OFFSETWATERMARK_STATE"]._serialized_end = 3956
+    _globals["_RESOURCELIMITEXCEEDED"]._serialized_start = 3958
+    _globals["_RESOURCELIMITEXCEEDED"]._serialized_end = 4065
+    _globals["_DATACORRUPTION"]._serialized_start = 4068
+    _globals["_DATACORRUPTION"]._serialized_end = 4204
+    _globals["_UNSUPPORTEDPLAN"]._serialized_start = 4206
+    _globals["_UNSUPPORTEDPLAN"]._serialized_end = 4241
+    _globals["_CAPABILITIESREQUEST"]._serialized_start = 4243
+    _globals["_CAPABILITIESREQUEST"]._serialized_end = 4290
+    _globals["_CAPABILITIESRESPONSE"]._serialized_start = 4293
+    _globals["_CAPABILITIESRESPONSE"]._serialized_end = 4905
+    _globals["_CREATENAMESPACEREQUEST"]._serialized_start = 4907
+    _globals["_CREATENAMESPACEREQUEST"]._serialized_end = 5013
+    _globals["_CREATETABLEREQUEST"]._serialized_start = 5016
+    _globals["_CREATETABLEREQUEST"]._serialized_end = 5338
+    _globals["_DROPTABLEREQUEST"]._serialized_start = 5340
+    _globals["_DROPTABLEREQUEST"]._serialized_end = 5457
+    _globals["_ALTERTABLESCHEMAREQUEST"]._serialized_start = 5460
+    _globals["_ALTERTABLESCHEMAREQUEST"]._serialized_end = 5660
+    _globals["_APPENDTABLEOPTIONS"]._serialized_start = 5662
+    _globals["_APPENDTABLEOPTIONS"]._serialized_end = 5736
+    _globals["_FRAMETABLEOPTIONS"]._serialized_start = 5738
+    _globals["_FRAMETABLEOPTIONS"]._serialized_end = 5769
+    _globals["_KEYVALUETABLEOPTIONS"]._serialized_start = 5771
+    _globals["_KEYVALUETABLEOPTIONS"]._serialized_end = 5807
+    _globals["_CATALOGMUTATIONRESULT"]._serialized_start = 5810
+    _globals["_CATALOGMUTATIONRESULT"]._serialized_end = 5948
+    _globals["_LOGCOMMAND"]._serialized_start = 5951
+    _globals["_LOGCOMMAND"]._serialized_end = 6323
+    _globals["_LOGCONSUMER"]._serialized_start = 6325
+    _globals["_LOGCONSUMER"]._serialized_end = 6414
+    _globals["_LOGACKNOWLEDGEMENT"]._serialized_start = 6416
+    _globals["_LOGACKNOWLEDGEMENT"]._serialized_end = 6510
+    _globals["_LOGCONTROL"]._serialized_start = 6512
+    _globals["_LOGCONTROL"]._serialized_end = 6639
+    _globals["_LOGMETADATA"]._serialized_start = 6642
+    _globals["_LOGMETADATA"]._serialized_end = 6823
+    _globals["_LOGOPENED"]._serialized_start = 6826
+    _globals["_LOGOPENED"]._serialized_end = 7082
+    _globals["_LOGPROGRESS"]._serialized_start = 7085
+    _globals["_LOGPROGRESS"]._serialized_end = 7418
+    _globals["_CREATEFIXEDSNAPSHOTREQUEST"]._serialized_start = 7420
+    _globals["_CREATEFIXEDSNAPSHOTREQUEST"]._serialized_end = 7539
+    _globals["_FIXEDSNAPSHOTINFO"]._serialized_start = 7542
+    _globals["_FIXEDSNAPSHOTINFO"]._serialized_end = 7709
+    _globals["_RELEASEFIXEDSNAPSHOTREQUEST"]._serialized_start = 7711
+    _globals["_RELEASEFIXEDSNAPSHOTREQUEST"]._serialized_end = 7787
+    _globals["_RELEASEFIXEDSNAPSHOTRESULT"]._serialized_start = 7789
+    _globals["_RELEASEFIXEDSNAPSHOTRESULT"]._serialized_end = 7861
 # @@protoc_insertion_point(module_scope)

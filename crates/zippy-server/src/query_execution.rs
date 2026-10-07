@@ -1065,6 +1065,7 @@ impl NativeExecutionLease {
     }
 
     /// Starts persisted execution under a hard DataFusion operator-memory reservation.
+    #[cfg(test)]
     pub(crate) fn execute(
         self,
         policy: QuerySessionPolicy,
@@ -1214,7 +1215,10 @@ fn publish_lease_failure(lease: NativeExecutionLease, error: ServerError) -> Ser
     }
 }
 
-fn result_batch_memory_bytes(batch: &RecordBatch, query_id: QueryId) -> Result<NonZeroU64> {
+pub(crate) fn result_batch_memory_bytes(
+    batch: &RecordBatch,
+    query_id: QueryId,
+) -> Result<NonZeroU64> {
     let arrays = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
         ServerError::new(
             ErrorCode::ResourceExhausted,
@@ -1368,7 +1372,6 @@ mod tests {
         OPERATOR_CONTEXT_RETAINED_MEMORY_BYTES, PERSISTED_FILE_TASK_MEMORY_BYTES,
         PHYSICAL_BUILD_CPU_SLOTS, RESULT_BATCH_FIXED_MEMORY_BYTES,
     };
-    use crate::legacy_catalog_migration::LEGACY_STREAM_NAME_CONFIG_KEY;
     use crate::native_storage::{
         NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
     };
@@ -1473,6 +1476,7 @@ mod tests {
             request_id(100),
             table_id(TABLE),
             1,
+            0,
             vec![candidate],
             OffsetWatermark::Known(offset),
         )
@@ -1501,7 +1505,7 @@ mod tests {
         .into()
     }
 
-    async fn seed_catalog(catalog: &SqliteCatalog, extra_revision: bool, active_table: bool) {
+    async fn seed_catalog(catalog: &SqliteCatalog, extra_revision: bool) {
         catalog
             .command(command(
                 1,
@@ -1513,10 +1517,7 @@ mod tests {
             ))
             .await
             .expect("create namespace");
-        let mut config = BTreeMap::new();
-        if !active_table {
-            config.insert(LEGACY_STREAM_NAME_CONFIG_KEY.to_owned(), "ticks".to_owned());
-        }
+        let config = BTreeMap::new();
         catalog
             .command(command(
                 2,
@@ -1547,7 +1548,7 @@ mod tests {
         }
     }
 
-    async fn start_runtime_with_table(extra_revision: bool, active_table: bool) -> TestRuntime {
+    async fn start_runtime(extra_revision: bool) -> TestRuntime {
         let temp = tempfile::tempdir().expect("create temp directory");
         let ownership = Arc::new(
             OwnedDataDirectory::acquire_or_initialize(temp.path().join("database"))
@@ -1555,7 +1556,7 @@ mod tests {
         );
         let catalog_config = SqliteCatalogConfig::new(&ownership);
         let catalog = SqliteCatalog::open(catalog_config.clone()).expect("open seed Catalog");
-        seed_catalog(&catalog, extra_revision, active_table).await;
+        seed_catalog(&catalog, extra_revision).await;
         catalog.close().expect("close seed Catalog");
         let runtime_config = NativeStorageRuntimeConfig::new(&ownership)
             .with_catalog_config(catalog_config)
@@ -1573,12 +1574,8 @@ mod tests {
         }
     }
 
-    async fn start_runtime(extra_revision: bool) -> TestRuntime {
-        start_runtime_with_table(extra_revision, false).await
-    }
-
     async fn start_runtime_with_file() -> TestRuntime {
-        let test = start_runtime_with_table(false, true).await;
+        let test = start_runtime(false).await;
         test.runtime
             .table_actor(table_id(TABLE))
             .expect("native table actor")

@@ -1,0 +1,87 @@
+{
+  "date": "2026-09-18",
+  "baseline_commit": "1d1be4db72717b6159689f1c45da783c32f63902",
+  "scope": "repository audit and convergence proposal; no business implementation changes",
+  "tracked_files_at_start": 505,
+  "workspace_crates": 18,
+  "findings": {
+    "total": 34,
+    "by_priority": {
+      "P1": 17,
+      "P2": 16,
+      "P3": 1
+    }
+  },
+  "rust_workspace_tests": {
+    "passed": 1710,
+    "failed": 0,
+    "ignored": 10,
+    "result_blocks": 114
+  },
+  "clippy_all_targets_all_features": "passed",
+  "rustfmt": "passed",
+  "python_installed_extension_baseline": {
+    "passed": 672,
+    "failed": 1,
+    "skipped": 1,
+    "failure": "git-derived runtime version referenced previous commit"
+  },
+  "python_rebuilt_extension": {
+    "main_passed": 605,
+    "main_skipped": 1,
+    "client_passed": 68,
+    "client_coverage_percent": 80.12
+  },
+  "python_configured_checks": {
+    "black": "passed with separate package configurations and one worker",
+    "ruff": "passed",
+    "main_mypy_files": 15,
+    "client_mypy_files": 24
+  },
+  "expanded_mypy": {
+    "error_count": 1029,
+    "errors_by_file": {
+      "python/zippy/__init__.py": 258,
+      "pytests/test_control_uri.py": 3,
+      "python/zippy/remote_gateway_perf.py": 2,
+      "python/zippy/cli_table.py": 3,
+      "pytests/test_python_api.py": 748,
+      "pytests/test_python_pm_cli.py": 8,
+      "pytests/test_python_cli.py": 7
+    }
+  },
+  "console_build": "passed",
+  "no_git_build_script_probe": {
+    "exit_code": 101,
+    "error": ".git indirection file should be readable: No such file or directory"
+  },
+  "control_probe_after_rebuild": {
+    "changed_version_and_identity_returns_cached_response": true,
+    "cached_response_kind": [
+      "ProcessRegistered"
+    ],
+    "cached_process_token_present": true
+  },
+  "limitations": [
+    "no production deployment or data modification",
+    "no Windows/macOS execution",
+    "no clean source-distribution or distributable-wheel acceptance",
+    "no full-trading-day performance test",
+    "patchelf not installed for local editable build",
+    "static scan does not prove absence of other defects"
+  ],
+  "temporary_log_sha256": {
+    "zippy-audit-cargo-test-local.log": "e90cf87923fcb31ee4458496ac0e718fb94bab7d65828fd3a51a5d9f1ee9d4e3",
+    "zippy-audit-clippy.log": "26b22fb9efc7b2d9f4c741e8d364a71113c42d6810df598a88b4b2ac5e17cdc8",
+    "zippy-audit-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "zippy-audit-pytest-local.log": "5b2c109b57b408c25affd9645b6b6870e99130afe267a6be511c0b7767496017",
+    "zippy-audit-pytest-rebuilt.log": "867a1f7c09d183a0419cad381771811f4db1599210fa218a3accc8c0b94e53e1",
+    "zippy-audit-client-tests-rebuilt.log": "713721d5e137e17ce83038ea01a209c02f0e38a6dc612c023d96618536079327",
+    "zippy-audit-control-probe-rebuilt.log": "f65d25c885c7d0ede824afe2593141e5406147a305c0ce33f8bcfe1016457f5d",
+    "zippy-audit-mypy-expanded.log": "6ecd575fd9c1865b9af0e0737fd110862eb3821dc72547019abcc358a0d49bec",
+    "zippy-audit-maturin.log": "0624001523be790c8e664ea3ff90e92c3f0460b8ad2ff6dafba6dc6610d36a91",
+    "zippy-audit-console-build.log": "0300d878cf00fc93751864e1f2384b9b84959ecc29e4a09a529d76a1dd5b30b3",
+    "zippy-audit-black-root.log": "a5a4071ed30305555dae16aeec282d73d470aac5e7f81673ec0add0d8e96d232",
+    "zippy-audit-black-client.log": "caaf9c9f44ebad2558494696d47c4c344e326f71f1b8c6273bfc3f465aa462f8"
+  }
+}

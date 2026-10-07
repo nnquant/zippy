@@ -1,0 +1,267 @@
+{
+  "date": "2026-09-22",
+  "batch": 32,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F14",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "removed": [
+    "zippy.read_sql",
+    "zippy._normalize_native_sql_bindings",
+    "GatewayTransport.read_sql",
+    "client Gateway SQL stream frames",
+    "_gateway_query_sql_enabled",
+    "SQL parameters option",
+    "ignored Flight SQL stream option"
+  ],
+  "single_entry": "zippy.Client is zippy_client.Client; Client.read_sql uses Flight and explicit bindings",
+  "old_server_gateway_and_main_table_removed": false,
+  "main_module_lines": 10804,
+  "validation": {
+    "native": {
+      "path": "/tmp/zippy-sql-native-final.log",
+      "exit_code": 0,
+      "sha256": "48dee6b3db095f0f5dd97c601cacd69d9dcd4900220f0a9933cc0b40a43252eb",
+      "tail": [
+        "2026-09-22 15:23:31.929 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 15:23:31.973 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 15:23:32.018 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"main_package_explicit_client_sql_aggregate_after_restart\": true, \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "pytest": {
+      "path": "/tmp/zippy-sql-pytest-final.log",
+      "exit_code": 0,
+      "sha256": "dfd79308d43e964badb66711e56520e22ef9c4342947769f92076ebd33d9b742",
+      "tail": [
+        "........................................................................ [ 83%]",
+        "........................................................................ [ 91%]",
+        "......................................................................   [100%]",
+        "861 passed, 1 skipped in 72.98s (0:01:12)"
+      ]
+    },
+    "client_coverage": {
+      "path": "/tmp/zippy-sql-client-final.log",
+      "exit_code": 0,
+      "sha256": "86ab2b055e479b42044dcb2c5a9ddef0613314fd3be74eb0ca1e38d8ad98e7d2",
+      "tail": [
+        "------------------------------------------------------------------------------------------",
+        "TOTAL                                                         3688    555    85%",
+        "Required test coverage of 80% reached. Total coverage: 84.95%",
+        "211 passed in 3.08s"
+      ]
+    },
+    "arrow23": {
+      "path": "/tmp/zippy-sql-arrow23.log",
+      "exit_code": 0,
+      "sha256": "656736a407e146140de7c95dad9acbdf5db41cd59a44f072ada1af5850d04e6d",
+      "tail": [
+        "----------------------------------------------------------------------------------------------------------------",
+        "TOTAL                                                                               3688    672    82%",
+        "Required test coverage of 80% reached. Total coverage: 81.78%",
+        "206 passed, 1 skipped in 2.83s"
+      ]
+    },
+    "arrow25": {
+      "path": "/tmp/zippy-sql-arrow25.log",
+      "exit_code": 0,
+      "sha256": "2a96dc4541a37b8ebb7d14c4ea51f09416b7d4cc0fe16b0d2e0b07295f3eb943",
+      "tail": [
+        "----------------------------------------------------------------------------------------------------------------",
+        "TOTAL                                                                               3688    672    82%",
+        "Required test coverage of 80% reached. Total coverage: 81.78%",
+        "206 passed, 1 skipped in 2.50s"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-sql-black-final.log",
+      "exit_code": 0,
+      "sha256": "d3013679730ea940bddebbac194f36538babef7285713dad859cab4ddd1b5405",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "99 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-sql-ruff-final.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-sql-mypy-root-final.log",
+      "exit_code": 0,
+      "sha256": "ca16d6d1a06c6903f5407ba5268cb8b5eb5d8c7811b7532282916ec31807c328",
+      "tail": [
+        "Success: no issues found in 16 source files"
+      ]
+    },
+    "mypy_client_and_tests": {
+      "path": "/tmp/zippy-sql-mypy-final.log",
+      "exit_code": 0,
+      "sha256": "bf185f292f8e01cb8d13f0509070e47dd978821f7bcbeabc80a992a1e3ec77ef",
+      "tail": [
+        "clients/python/tests/test_flight_transport.py:2238: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]",
+        "clients/python/tests/test_flight_transport.py:2242: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]",
+        "clients/python/tests/test_flight_transport.py:2260: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]",
+        "Success: no issues found in 31 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-sql-mypy-full-final.log",
+      "exit_code": 1,
+      "sha256": "970c40eb114474547bfebc791321e7a53a6ee4f377f6bc8e03d855ff61301d85",
+      "tail": [
+        "pytests/test_python_cli.py:956: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:1043: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:1044: error: Value of type \"object\" is not indexable  [index]",
+        "Found 971 errors in 12 files (checked 98 source files)"
+      ]
+    },
+    "rust_format": {
+      "path": "/tmp/zippy-sql-fmt.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    },
+    "diff": {
+      "path": "/tmp/zippy-sql-diff-final.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    },
+    "removed_surface": {
+      "path": "/tmp/zippy-sql-surface.log",
+      "exit_code": 0,
+      "sha256": "7162513972e0e14e5b89129de71ea92877216ede6a05272c917c1bb7130c0ab7",
+      "tail": [
+        "{\"shared_client_class\": true, \"old_main_sql_absent\": true, \"gateway_client_sql_absent\": true, \"removed_sql_options_absent\": true}"
+      ]
+    },
+    "initial_subset_failures": {
+      "path": "/tmp/zippy-sql-client-unit.log",
+      "exit_code": 1,
+      "sha256": "f15ad051f8466f5c6384924ffd43309602a39504f5fadfd70047a92670933c8d",
+      "tail": [
+        "ERROR clients/python/tests/test_endpoints_router.py::test_flight_list_wait_and_table_info_share_catalog",
+        "ERROR clients/python/tests/test_endpoints_router.py::test_flight_wait_does_not_hide_authentication_or_capability_errors",
+        "ERROR clients/python/tests/test_endpoints_router.py::test_flight_fixed_snapshot_and_implicit_sql_fallback_are_rejected",
+        "5 failed, 44 passed, 3 errors in 1.12s"
+      ]
+    }
+  },
+  "native_matrix": {
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "surface": {
+    "shared_client_class": true,
+    "old_main_sql_absent": true,
+    "gateway_client_sql_absent": true,
+    "removed_sql_options_absent": true
+  },
+  "coverage_percent": {
+    "client": 84.95,
+    "isolated_arrow23": 81.78,
+    "isolated_arrow25": 81.78
+  },
+  "source_sha256": {
+    "python/zippy/__init__.py": "74ca39e906f166931186fc584efe088527e741e500002759f35a0bff58232fba",
+    "clients/python/src/zippy_client/client.py": "eb765ecf23620fcfb73959ac2cbee481fe5d677f5deb1ee55b1c8938cf6e5536",
+    "clients/python/src/zippy_client/router.py": "9fbb5ddcfa4828bad355bf6443846295094a7cd883c960443c3cfb9884e1b441",
+    "clients/python/src/zippy_client/query.py": "8c5dba81be364b543f7eed5c81d0c007276271a2928052e84bcb6357d4dcfb60",
+    "clients/python/src/zippy_client/transports/gateway.py": "9c6f838a814ba3cc8481ad45cab41b5dd6bae28e8764ae0c22393cd5206925b0",
+    "clients/python/src/zippy_client/transports/flight.py": "d61ab7e035def83743f402f709fe80f524c701af469e3b0e55769d1e45c5f122",
+    "clients/python/tests/test_endpoints_router.py": "04b4ef281ba2432f587c194100795a72794518166b61c4112624846933880a24",
+    "clients/python/tests/test_unit_contracts.py": "7cf418a0ff7ce4b27d44217b9613039475c329a1f570a177bf9adf06bbd9e827",
+    "clients/python/tests/test_flight_transport.py": "4a2b220bfe327e2f497d97680298f9e3cb4ad7a99c6757c83f8a4c81d4c204d9",
+    "pytests/test_python_api.py": "decb2b793f3e78cc9d41dc653ce48c0ff675317d258971f4d52172fe53df4c2f",
+    "scripts/check_native_client.py": "1555ed65200e1d771bfb10f34bc2ae993694066934f8831f0083c5152c297ea3",
+    "scripts/check_distributions.py": "3fb6512dfda7f38685c33ae122d0e196ac042bc2401436ab881708c2c4ef6688",
+    "clients/python/README.md": "a6add54746e970dc09e64aad51607a1df5c339b0ec39b989083408b105fe5251",
+    "docs/native-query-service.md": "1655546904d54b0046064fed93d14752053b51acffe6c035b8e4384d3594d4b0",
+    "docs/convergence-sql-entry-2026-09-22.md": "0590442fb5ba5b9588ffde8a49414173fa26056b5aa0c28561ae098aede688c2",
+    "docs/current-capabilities-2026-09-21.md": "6be634deaec8c98082033e8b914db178791673edea172207c827cdce3e789ec3"
+  },
+  "rust_modified": false,
+  "rust_workspace_clippy_rerun": false,
+  "main_distribution_and_cross_platform_rerun": false,
+  "initial_subset_failure_explanation": "removed SQL tests and fixture references required migration; socketpair forbidden in default sandbox; subset coverage below full-package threshold. Updated contracts passed full suite with socket access and coverage gate."
+}

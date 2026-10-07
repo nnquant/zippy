@@ -4,21 +4,25 @@ Lightweight local Web UI for Zippy runtime observability.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
-import subprocess
 import time
-from typing import Any
+from typing import cast
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, Response
 import uvicorn
 
-import zippy
+import pyarrow as pa
+from zippy_client import Client
+
+from .native_inspection import inspect_table, query_snapshots, schema_info
 from .pm_bridge import PmCommandRunner, PmTaskInfo
 
 SENSITIVE_LOG_FIELD_NAMES = {
@@ -136,23 +140,30 @@ def create_app(config: WebuiConfig) -> FastAPI:
     @app.get("/api/table/{table_name:path}/data")
     def table_data(
         table_name: str,
-        mode: str = Query(default="tail"),
-        limit: int = Query(default=100),
+        namespace: str = Query(default="default"),
+        mode: str = Query(default="head", pattern="^(head|tail)$"),
+        order_by: list[str] | None = Query(default=None),
+        descending: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=1000),
         uri: str | None = Query(default=None),
     ) -> dict[str, object]:
         return _table_data_preview(
             table_name=table_name,
             uri=uri or config.uri,
+            namespace=namespace,
             mode=mode,
             limit=limit,
+            order_by=order_by,
+            descending=descending,
         )
 
     @app.get("/api/table/{table_name:path}")
     def table_detail(
         table_name: str,
+        namespace: str = Query(default="default"),
         uri: str | None = Query(default=None),
     ) -> dict[str, object]:
-        return _table_detail(table_name, uri or config.uri)
+        return _table_detail(table_name, uri or config.uri, namespace)
 
     return app
 
@@ -182,63 +193,17 @@ class DashboardService:
     def dashboard(self, uri: str | None = None) -> dict[str, object]:
         query_uri = uri or self.config.uri
         now = time.time()
-        snapshot = _load_registry_snapshot(query_uri)
         logs = _read_recent_logs(self.config.log_dir)
-        master = _master_health(
-            uri=query_uri,
-            started_at=self.started_at,
-            logs=logs,
-        )
-        gateway = _gateway_unavailable("master connection not established")
+        catalog: dict[str, object] = {"status": "ok", "error": None}
         try:
-            client = zippy.connect(uri=query_uri)
-            gateway = _gateway_summary(client)
-            tables = list(zippy.ops.list_tables(master=client))
-            table_details = [_table_summary(table, client) for table in tables]
-            alerts = [
-                alert for table in table_details for alert in _dict_items(table.get("alerts"))
-            ]
-            overall_status = _overall_status(table_details, alerts)
-            master.update(
-                {
-                    "status": "ok",
-                    "table_count": len(table_details),
-                    "error": None,
-                }
-            )
+            with Client(query_uri) as client:
+                tables = client.list_tables()
+            tables.sort(key=lambda item: (str(item["namespace"]), str(item["name"])))
         except Exception as error:
-            table_details = []
-            alerts = []
-            overall_status = "error"
-            master.update(
-                {
-                    "status": "error",
-                    "table_count": 0,
-                    "error": str(error),
-                }
-            )
-
+            tables = []
+            catalog = {"status": "error", "error": str(error)}
         pm = _pm_summary()
-        tasks = _dict_items(pm.get("tasks"))
-        events = _recent_events(logs, snapshot, alerts)
-        stale_error_tables = [
-            table
-            for table in table_details
-            if table.get("status") in {"stale", "error", "failed"}
-            or table.get("health_status") in {"warning", "error"}
-        ]
-        totals = {
-            "tables": len(table_details),
-            "tasks": len(tasks),
-            "alerts": len(alerts),
-            "sealed_segments": sum(
-                _int_value(table.get("sealed_count")) for table in table_details
-            ),
-            "persisted_files": sum(
-                _int_value(table.get("persisted_count")) for table in table_details
-            ),
-            "readers": sum(_int_value(table.get("reader_count")) for table in table_details),
-        }
+        tasks = cast(list[dict[str, object]], pm["tasks"])
         return {
             "generated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
             "webui": {
@@ -247,223 +212,101 @@ class DashboardService:
                 "host": self.config.host,
                 "port": self.config.port,
             },
-            "master": master,
-            "overall_status": overall_status,
-            "gateway": gateway,
-            "gateway_status": gateway.get("status"),
+            "catalog": catalog,
             "pm": pm,
-            "totals": totals,
-            "tasks": tasks,
-            "tables": table_details,
-            "stale_error_tables": stale_error_tables,
-            "recent_events": events,
-            "log_tail": logs[-80:],
-            "snapshot": {
-                "path": snapshot.get("path"),
-                "loaded": bool(snapshot.get("loaded")),
-                "error": snapshot.get("error"),
-                "sources": _list_len(snapshot.get("sources")),
-                "engines": _list_len(snapshot.get("engines")),
+            "totals": {
+                "tables": len(tables),
+                "namespaces": len({str(table["namespace"]) for table in tables}),
+                "tasks": len(tasks),
             },
+            "tasks": tasks,
+            "tables": tables,
+            "log_tail": logs[-80:],
         }
 
 
-def _table_detail(table_name: str, uri: str) -> dict[str, object]:
+def _table_detail(table_name: str, uri: str, namespace: str) -> dict[str, object]:
     try:
-        client = zippy.connect(uri=uri)
-        info = zippy.ops.table_info(table_name, master=client)
-        health = zippy.ops.table_health(table_name, master=client)
-        return {"ok": True, "table": info, "health": health}
+        with Client(uri) as client:
+            return {"ok": True, "table": inspect_table(client, table_name, namespace)}
     except Exception as error:
-        return {"ok": False, "error": str(error), "table_name": table_name}
+        return {"ok": False, "error": str(error), "table_name": table_name, "namespace": namespace}
 
 
 def _table_data_preview(
     *,
     table_name: str,
     uri: str,
+    namespace: str,
     mode: str,
     limit: int,
+    order_by: list[str] | None,
+    descending: bool,
 ) -> dict[str, object]:
-    normalized_mode = mode if mode in {"head", "tail"} else "tail"
-    normalized_limit = min(max(int(limit), 1), 1000)
+    identity: dict[str, object] = {
+        "table_name": table_name,
+        "namespace": namespace,
+        "mode": mode,
+        "limit": limit,
+        "order_by": order_by or [],
+        "descending": descending,
+    }
     try:
-        client = zippy.connect(uri=uri)
-        query = zippy.read_table(table_name, master=client)
-        selected = (
-            query.head(normalized_limit)
-            if normalized_mode == "head"
-            else query.tail(normalized_limit)
-        )
-        table = selected.collect()
-        columns = list(table.column_names)
-        rows = [
-            {key: _json_safe_value(value) for key, value in row.items()}
-            for row in table.to_pylist()
-        ]
-        return {
-            "ok": True,
-            "table_name": table_name,
-            "mode": normalized_mode,
-            "limit": normalized_limit,
-            "columns": columns,
-            "rows": rows,
-            "row_count": len(rows),
-            "truncated": len(rows) >= normalized_limit,
-            "error": None,
-        }
+        if mode not in {"head", "tail"} or not 1 <= limit <= 1000:
+            raise ValueError("preview requires head or tail mode and a limit between 1 and 1000")
+        if mode == "tail" and not order_by:
+            raise ValueError("tail preview requires explicit order_by columns")
+        with ExitStack() as resources:
+            client = resources.enter_context(Client(uri))
+            query = resources.enter_context(
+                client.read_table(table_name, namespace=namespace, snapshot=True)
+            )
+            if order_by:
+                if any(name not in query.schema().names for name in order_by):
+                    raise ValueError("order_by contains an unknown column")
+                query = resources.enter_context(query.sort(order_by, descending=descending))
+            selected = resources.enter_context(
+                query.head(limit + 1) if mode == "head" else query.tail(limit + 1)
+            )
+            profile = selected.profile()
+            table = profile["result"]
+            if not isinstance(table, pa.Table):
+                raise RuntimeError("native preview did not return an Arrow table")
+            snapshots = query_snapshots(profile)
+            truncated = table.num_rows > limit
+            if truncated:
+                table = table.slice(0 if mode == "head" else 1, limit)
+            # Arrow string casts preserve nanoseconds without an optional pandas conversion.
+            columns = [
+                column.cast(pa.string()) if pa.types.is_timestamp(field.type) else column
+                for field, column in zip(table.schema, table.columns, strict=True)
+            ]
+            display_table = pa.Table.from_arrays(columns, names=table.column_names)
+            rows = [
+                {key: _json_safe_value(value) for key, value in row.items()}
+                for row in display_table.to_pylist()
+            ]
+            return {
+                **identity,
+                "ok": True,
+                "columns": table.column_names,
+                "schema": schema_info(table.schema),
+                "snapshots": _json_safe_value(snapshots),
+                "rows": rows,
+                "row_count": len(rows),
+                "truncated": truncated,
+                "error": None,
+            }
     except Exception as error:
         return {
+            **identity,
             "ok": False,
-            "table_name": table_name,
-            "mode": normalized_mode,
-            "limit": normalized_limit,
             "columns": [],
             "rows": [],
             "row_count": 0,
             "truncated": False,
             "error": str(error),
         }
-
-
-def _table_summary(table: dict[str, object], client: Any) -> dict[str, object]:
-    table_name = str(table.get("stream_name") or "")
-    try:
-        info = zippy.ops.table_info(table_name, master=client)
-    except Exception:
-        info = table
-    try:
-        health = zippy.ops.table_health(table_name, master=client)
-    except Exception as error:
-        health = {
-            "status": "error",
-            "alert_count": 1,
-            "alerts": [
-                {
-                    "severity": "error",
-                    "kind": "health_query_failed",
-                    "table_name": table_name,
-                    "message": str(error),
-                }
-            ],
-        }
-
-    schema = info.get("schema") if isinstance(info, dict) else {}
-    fields = _schema_fields(schema)
-    active = info.get("active_segment_descriptor") if isinstance(info, dict) else None
-    return {
-        "stream_name": table_name,
-        "status": info.get("status"),
-        "health_status": health.get("status"),
-        "schema_hash": info.get("schema_hash"),
-        "schema": schema,
-        "fields": fields,
-        "field_count": len(fields),
-        "buffer_size": info.get("buffer_size"),
-        "frame_size": info.get("frame_size"),
-        "write_seq": info.get("write_seq"),
-        "writer_process_id": info.get("writer_process_id"),
-        "writer_epoch": info.get("writer_epoch"),
-        "reader_count": info.get("reader_count"),
-        "descriptor_generation": info.get("descriptor_generation"),
-        "sealed_count": _list_len(info.get("sealed_segments")),
-        "persisted_count": _list_len(info.get("persisted_files")),
-        "persist_event_count": _list_len(info.get("persist_events")),
-        "active_rows": _descriptor_rows(active),
-        "row_count": _table_row_count(info),
-        "alerts": health.get("alerts") or [],
-    }
-
-
-def _master_health(
-    *,
-    uri: str,
-    started_at: float,
-    logs: list[dict[str, object]],
-) -> dict[str, object]:
-    process = _find_master_process()
-    master_start = next(
-        (item for item in reversed(logs) if item.get("event") == "master_start"),
-        None,
-    )
-    return {
-        "uri": uri,
-        "status": "unknown",
-        "pid": process.get("pid"),
-        "process": process,
-        "uptime_sec": int(time.time() - started_at),
-        "started_at": master_start.get("timestamp") if isinstance(master_start, dict) else None,
-        "table_count": 0,
-        "error": None,
-    }
-
-
-def _gateway_summary(client: object) -> dict[str, object]:
-    get_config = getattr(client, "get_config", None)
-    config: dict[str, object] = {}
-    if get_config is not None:
-        try:
-            loaded_config = get_config()
-        except Exception as error:
-            return _gateway_unavailable(str(error))
-        if isinstance(loaded_config, dict):
-            config = loaded_config
-
-    gateway = config.get("gateway", {})
-    if not isinstance(gateway, dict):
-        gateway = {}
-    enabled = gateway.get("enabled", True)
-    endpoint = gateway.get("endpoint")
-    protocol_version = gateway.get("protocol_version")
-    if enabled is False or not endpoint:
-        return {
-            "status": "ok",
-            "healthy": True,
-            "enabled": bool(enabled) if enabled is not None else True,
-            "endpoint": endpoint,
-            "protocol_version": protocol_version,
-            "metrics": {},
-            "error": None,
-        }
-
-    metrics: dict[str, object] = {}
-    gateway_metrics = getattr(client, "gateway_metrics", None)
-    if gateway_metrics is not None:
-        try:
-            loaded_metrics = gateway_metrics()
-        except Exception as error:
-            return {
-                "status": "error",
-                "healthy": False,
-                "enabled": True,
-                "endpoint": endpoint,
-                "protocol_version": protocol_version,
-                "metrics": {},
-                "error": str(error),
-            }
-        if isinstance(loaded_metrics, dict):
-            metrics = loaded_metrics
-    return {
-        "status": "ok",
-        "healthy": True,
-        "enabled": True,
-        "endpoint": endpoint,
-        "protocol_version": protocol_version,
-        "metrics": metrics,
-        "error": None,
-    }
-
-
-def _gateway_unavailable(error: str) -> dict[str, object]:
-    return {
-        "status": "error",
-        "healthy": False,
-        "enabled": None,
-        "endpoint": None,
-        "protocol_version": None,
-        "metrics": {},
-        "error": error,
-    }
 
 
 def _pm_summary() -> dict[str, object]:
@@ -512,109 +355,10 @@ def _pm_task_summary(task: PmTaskInfo) -> dict[str, object]:
     }
 
 
-def _find_master_process() -> dict[str, object]:
-    if os.name == "nt":
-        return {"pid": None, "command": None, "source": "not_available"}
-    try:
-        result = subprocess.run(
-            ["pgrep", "-af", "zippy.*master|python.*zippy.*master"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
-    except Exception as error:
-        return {"pid": None, "command": None, "source": "pgrep", "error": str(error)}
-    current_pid = str(os.getpid())
-    for line in result.stdout.splitlines():
-        parts = line.strip().split(maxsplit=1)
-        if not parts or parts[0] == current_pid:
-            continue
-        command = parts[1] if len(parts) > 1 else ""
-        if "webui" in command:
-            continue
-        return {"pid": parts[0], "command": command, "source": "pgrep"}
-    return {"pid": None, "command": None, "source": "pgrep"}
-
-
-def _task_summaries(
-    snapshot: dict[str, object],
-    tables: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    tasks: list[dict[str, object]] = []
-    for kind, key in [
-        ("source", "sources"),
-        ("engine", "engines"),
-    ]:
-        for item in _dict_items(snapshot.get(key)):
-            name = item.get(f"{kind}_name") or item.get("name")
-            tasks.append(
-                {
-                    "kind": kind,
-                    "name": name,
-                    "status": item.get("status"),
-                    "process_id": item.get("process_id"),
-                    "input_stream": item.get("input_stream"),
-                    "output_stream": item.get("output_stream"),
-                    "writer_epoch": item.get("writer_epoch"),
-                    "metrics": item.get("metrics"),
-                }
-            )
-    if tasks:
-        return tasks
-    for table in tables:
-        tasks.append(
-            {
-                "kind": "writer",
-                "name": table.get("stream_name"),
-                "status": table.get("status"),
-                "process_id": table.get("writer_process_id"),
-                "input_stream": None,
-                "output_stream": table.get("stream_name"),
-                "writer_epoch": table.get("writer_epoch"),
-                "metrics": {"reader_count": table.get("reader_count")},
-            }
-        )
-    return tasks
-
-
-def _recent_events(
-    logs: list[dict[str, object]],
-    snapshot: dict[str, object],
-    alerts: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    events = []
-    for alert in alerts[-20:]:
-        events.append(
-            {
-                "timestamp": None,
-                "level": "error" if alert.get("severity") == "error" else "warning",
-                "event": alert.get("kind"),
-                "message": alert.get("message"),
-                "table_name": alert.get("table_name"),
-            }
-        )
-    for item in logs[-80:]:
-        if item.get("event") or item.get("message"):
-            events.append(item)
-    if snapshot.get("error"):
-        events.append(
-            {
-                "timestamp": None,
-                "level": "warning",
-                "event": "snapshot_load_failed",
-                "message": snapshot.get("error"),
-            }
-        )
-    return events[-40:]
-
-
 def _read_recent_logs(log_dir: Path) -> list[dict[str, object]]:
-    files = sorted((log_dir / "zippy-master").glob("*.jsonl"), key=_mtime, reverse=True)
-    if not files:
-        files = sorted(log_dir.glob("**/*.jsonl"), key=_mtime, reverse=True)[:3]
+    files = sorted(log_dir.glob("**/*.jsonl"), key=_mtime, reverse=True)[:3]
     rows: list[tuple[tuple[float, str, int], dict[str, object]]] = []
-    for path in files[:3]:
+    for path in files:
         for line_index, line in enumerate(_tail_lines(path, 80)):
             row = _parse_log_line(line, path)
             rows.append((_log_sort_key(row, path, line_index), row))
@@ -702,100 +446,11 @@ def _normalize_numeric_timestamp(value: float) -> float:
     return value
 
 
-def _load_registry_snapshot(uri: str) -> dict[str, object]:
-    path = _registry_snapshot_path(uri)
-    result: dict[str, object] = {
-        "path": str(path) if path is not None else None,
-        "loaded": False,
-        "streams": [],
-        "sources": [],
-        "engines": [],
-        "error": None,
-    }
-    if path is None or not path.exists():
-        return result
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as error:
-        result["error"] = str(error)
-        return result
-    if not isinstance(payload, dict):
-        result["error"] = "snapshot root is not an object"
-        return result
-    result.update(
-        {
-            "loaded": True,
-            "streams": payload.get("streams") or [],
-            "sources": payload.get("sources") or [],
-            "engines": payload.get("engines") or [],
-        }
-    )
-    return result
-
-
-def _registry_snapshot_path(uri: str) -> Path | None:
-    try:
-        resolved = zippy._resolve_uri(uri)  # type: ignore[attr-defined]
-    except Exception:
-        resolved = uri
-    if resolved.startswith("tcp://"):
-        authority = resolved.removeprefix("tcp://").split("/", 1)[0]
-        try:
-            port = int(authority.rsplit(":", 1)[1])
-        except (IndexError, ValueError):
-            return None
-        return Path.home() / ".zippy" / "control_endpoints" / f"tcp-{port}" / "master-registry.json"
-    if resolved.startswith("zippy://"):
-        name = resolved.removeprefix("zippy://") or "default"
-        return Path.home() / ".zippy" / "control_endpoints" / name / "master-registry.json"
-    path = Path(resolved).expanduser()
-    return path.parent / "master-registry.json"
-
-
-def _schema_fields(schema: object) -> list[dict[str, object]]:
-    if not isinstance(schema, dict):
-        return []
-    return _dict_items(schema.get("fields"))
-
-
-def _table_row_count(info: dict[str, object]) -> int:
-    total = _descriptor_rows(info.get("active_segment_descriptor"))
-    for segment in _dict_items(info.get("sealed_segments")):
-        total += _descriptor_rows(segment)
-    return total
-
-
-def _dict_items(value: object) -> list[dict[str, object]]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, dict)]
-
-
-def _list_len(value: object) -> int:
-    return len(value) if isinstance(value, list) else 0
-
-
-def _descriptor_rows(descriptor: object) -> int:
-    if not isinstance(descriptor, dict):
-        return 0
-    return _int_value(descriptor.get("committed_row_count"))
-
-
-def _overall_status(tables: list[dict[str, object]], alerts: list[dict[str, object]]) -> str:
-    if any(alert.get("severity") == "error" for alert in alerts):
-        return "error"
-    if any(alert.get("severity") == "warning" for alert in alerts):
-        return "warning"
-    if any(table.get("status") in {"stale", "error", "failed"} for table in tables):
-        return "warning"
-    return "ok"
-
-
-def _int_value(value: object) -> int:
-    return value if isinstance(value, int) else 0
-
-
 def _json_safe_value(value: object) -> object:
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > 2**53 - 1:
+        return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, bytes):

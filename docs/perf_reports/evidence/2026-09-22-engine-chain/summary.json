@@ -1,0 +1,334 @@
+{
+  "date": "2026-09-22",
+  "batch": 31,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F08",
+    "F11",
+    "F13",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "native_chain": {
+    "state_preserving_exclusive_transfer": true,
+    "all_links_validated_before_transfer": true,
+    "ordered_complete_batches_and_upstream_first_drain": true,
+    "frozen_stage_output_schemas": true,
+    "per_stage_and_combined_drain_output_budget": true,
+    "budget_includes_kernel_state_or_transient_allocations": false,
+    "failure_terminal_without_transactional_rollback": true,
+    "plain_arrow_identity_producer": true,
+    "old_session_pipeline_removed": false,
+    "durable_operator_checkpoint": false
+  },
+  "frame_recovery": {
+    "root_cause": "same producer epoch restart reused segment 1 generation 0; stable frame lineage identities collided",
+    "initial_native_cursors": [
+      2,
+      3
+    ],
+    "expected_native_cursors": [
+      1,
+      2,
+      3
+    ],
+    "deterministic_before_fix_error": "frame source identity reappears after another frame",
+    "generation_seed": "logical next offset at native materializer construction",
+    "writer_epoch_and_receipt_sequence_unchanged": true,
+    "existing_five_second_deadline_and_assertions_unchanged": true,
+    "old_ambiguous_lineage_automatically_repaired": false
+  },
+  "shutdown_lock": {
+    "transient_busy_lock_is_not_proof_of_replacement": true,
+    "extra_cleanup_wait_max_seconds": 1,
+    "pid_nonce_and_clean_outcome_guards_preserved": true,
+    "replacement_state_preserved": true
+  },
+  "validation": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-chain-workspace-recovery-final.log",
+      "exit_code": 0,
+      "sha256": "bb97b2c2e603208bfafe9e8ff56e3885b16ed2541247716ab8710837badf84f1",
+      "tail": [
+        "test crates/zippy-types/src/storage.rs - storage::CatalogSnapshotMemoryLease (line 388) - compile fail ... ok",
+        "",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s",
+        ""
+      ]
+    },
+    "clippy": {
+      "path": "/tmp/zippy-chain-clippy-recovery-final.log",
+      "exit_code": 0,
+      "sha256": "7ce9585a5b1686d3fd40b9adad868b5ffcbb84d0a10ae9ee572e87e8b966729b",
+      "tail": [
+        "    Checking zippy-gateway v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-gateway)",
+        "    Checking zippy-query v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-query)",
+        "    Checking zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 30.99s"
+      ]
+    },
+    "server_build": {
+      "path": "/tmp/zippy-chain-server-recovery-final.log",
+      "exit_code": 0,
+      "sha256": "732186322402325172940531d8d6d7cfac85dc902585b2bef6715ad6839dacfd",
+      "tail": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s"
+      ]
+    },
+    "extension_build": {
+      "path": "/tmp/zippy-chain-maturin-recovery-final.log",
+      "exit_code": 0,
+      "sha256": "31550134bb924ae4093255389b4511cd636a2d5a066937985a7aa12354600407",
+      "tail": [
+        "⚠️ Warning: Failed to set rpath for /home/jiangda/develop/zippy/target/maturin/libzippy_internal.so: Failed to execute 'patchelf', did you install it? Hint: Try `pip install maturin[patchelf]` (or just `pip install patchelf`)",
+        "📦 Built wheel for CPython 3.11 to /tmp/.tmpC1uoOv/zippy-0.5.0-cp311-cp311-linux_x86_64.whl",
+        "✏️ Setting installed package as editable",
+        "🛠 Installed zippy-0.5.0"
+      ]
+    },
+    "initial_native_matrix_failure": {
+      "path": "/tmp/zippy-chain-native-final.log",
+      "exit_code": 1,
+      "sha256": "fa4f78239c1de2c82055fd715ab72b6912c6ade92f3fa22e653fbf78b3d26edc",
+      "tail": [
+        "  File \"/home/jiangda/develop/zippy/clients/python/src/zippy_client/log_reader.py\", line 318, in _read_chunk",
+        "    raise _translate_flight_error(error, \"DoExchange.log\") from error",
+        "zippy_client.errors.QueryError: Flight request timed out operation=[DoExchange.log]",
+        "compute recovery log incomplete table=[resume_compute_frame] cursors=[[2, 3]]"
+      ]
+    },
+    "deterministic_frame_regression_before": {
+      "path": "/tmp/zippy-chain-frame-regression-before.log",
+      "exit_code": 101,
+      "sha256": "bd6812dea690613c81e58bdd7f5a67596acae47ba67fbf80fa34363bc9334be7",
+      "tail": [
+        "",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.25s",
+        "",
+        "error: test failed, to rerun pass `-p zippy-server --test native_storage_runtime`"
+      ]
+    },
+    "deterministic_frame_regression_after": {
+      "path": "/tmp/zippy-chain-frame-regression-after.log",
+      "exit_code": 0,
+      "sha256": "e5fc6f9e2222857a5283a8858c5b4ab3b58af4aeb6e0150cebfc42fcad4a9e2d",
+      "tail": [
+        "test native_frames_keep_boundaries_through_wal_recovery_and_manifest_checkpoint ... ok",
+        "",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.29s",
+        ""
+      ]
+    },
+    "native_matrix_after_recovery_fix": {
+      "path": "/tmp/zippy-chain-native-recovery-final.log",
+      "exit_code": 0,
+      "sha256": "82074c11df0415583cb0c383e9cb8a18ad901e2fb43d1a3496eb43e41915a3ce",
+      "tail": [
+        "2026-09-22 15:07:05.512 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001072] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 15:07:05.556 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001073] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "2026-09-22 15:07:05.598 | ERROR    | zippy.compute:_fail:274 - native compute failed output_id=[00000000-0000-0000-0000-000000001074] error=[Flight write stopped after an ambiguous partial commit; do not retry the original table blindly]",
+        "{\"shared_sql_join_keys_column_order_range_and_time_after_restart\": true, \"shared_temporal_strict_literals_and_exact_native_row_timestamps\": true, \"shared_sql_query_budget_bytes\": 4294967296, \"shared_sql_one_gib_join_budget_rejected\": true, \"native_fixed_snapshots_three_kinds_schema_drop_and_restart\": true, \"native_fixed_snapshot_scope_clones_and_session_refresh\": true, \"native_fixed_snapshot_expiry_roles_and_capacity\": true, \"empty_directory_create\": true, \"native_compute_three_kinds_and_output_restart_recovery\": true, \"native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery\": true, \"native_compute_kv_changelog_delete_reinsert_and_restart\": true, \"native_compute_empty_source_schema_guard\": true, \"native_compute_parquet_plugin_three_native_output_kinds\": true, \"native_compute_chain_and_plain_producer_after_restart\": true, \"native_compute_rejects_same_name_replacement\": true, \"native_callbacks_ack_restart_all_three_kinds\": true, \"native_callbacks_reconnect_real_cancelled_transport\": true, \"native_callback_same_handle_survives_server_restart\": true, \"native_callback_rows_filter_latest_without_gateway\": true, \"durable_ack_atomic_replay_all_three_kinds\": true, \"durable_ack_lost_response_recovers_from_catalog\": true, \"durable_group_single_member_and_restart\": true, \"public_three_kind_drop_after_restart\": true, \"drop_replay_after_restart\": true, \"same_name_new_identity_recovers_after_restart\": true, \"old_requests_and_cursors_cannot_attach_to_replacement\": true, \"drop_rejects_read_role_and_stale_snapshot\": true, \"drop_terminates_continuous_logs\": true, \"flight_atomic_frames_and_mutations\": true, \"flight_identity_bound_resume_after_delivery\": true, \"flight_logs_across_repeated_server_starts\": true, \"server_issued_local_read_sessions\": true, \"legacy_session_header_rejected\": true, \"native_state_recovery_across_server_restart\": true, \"public_schema_evolution_all_three_kinds\": true, \"atomic_key_value_snapshot_cursor\": true, \"key_value_recovered\": {\"symbol\": [], \"price\": []}, \"deleted_state_cursor_recovered\": {\"sequence\": 10, \"version\": 6}, \"frame_rows_recovered\": [10, null, 12], \"namespace\": \"market\", \"durabilities\": [\"wal\", \"persisted\"], \"recovered_values\": [42, 43], \"idempotent_after_restart\": true, \"arrow_version\": \"23.0.1\"}"
+      ]
+    },
+    "initial_main_python_lifecycle_failure": {
+      "path": "/tmp/zippy-chain-python-full.log",
+      "exit_code": 1,
+      "sha256": "89a5b20229d17b7e6667b6c7ad1d5a8d0897c4fd5a866c3ea5eb22ed1e6e6ff9",
+      "tail": [
+        "pytests/test_server_process.py:816: AssertionError",
+        "=========================== short test summary info ============================",
+        "FAILED pytests/test_server_process.py::test_server_detached_lifecycle_is_ready_probeable_and_stoppable",
+        "1 failed, 648 passed, 1 skipped in 66.94s (0:01:06)"
+      ]
+    },
+    "lifecycle_after_lock_fix": {
+      "path": "/tmp/zippy-chain-lifecycle-final.log",
+      "exit_code": 0,
+      "sha256": "d8d6027ab92b8942825272369ea3b2ce49ef388cefd9ff6c79ad7910c7b2e864",
+      "tail": [
+        "......................................................                   [100%]",
+        "54 passed in 3.14s"
+      ]
+    },
+    "full_pytest": {
+      "path": "/tmp/zippy-chain-pytest-all-final.log",
+      "exit_code": 0,
+      "sha256": "77515f1e27426708faf6eda4ac0ef511eca95d3adf90ead40aea32d7ea4f79a2",
+      "tail": [
+        "........................................................................ [ 83%]",
+        "........................................................................ [ 91%]",
+        ".......................................................................  [100%]",
+        "862 passed, 1 skipped in 73.95s (0:01:13)"
+      ]
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-chain-mypy-root-final.log",
+      "exit_code": 0,
+      "sha256": "ca16d6d1a06c6903f5407ba5268cb8b5eb5d8c7811b7532282916ec31807c328",
+      "tail": [
+        "Success: no issues found in 16 source files"
+      ]
+    },
+    "mypy_chain_changes": {
+      "path": "/tmp/zippy-chain-mypy-final.log",
+      "exit_code": 0,
+      "sha256": "71144743c83babea384888a735db0c4daba3d4d7b7942b6839984bd5c21b52bb",
+      "tail": [
+        "Success: no issues found in 4 source files"
+      ]
+    },
+    "mypy_lifecycle_changes": {
+      "path": "/tmp/zippy-chain-mypy-lifecycle.log",
+      "exit_code": 0,
+      "sha256": "f9b031e5c45aa702cd4fef028d465551cb20a2c4698e0913c7b00766b20ac4d8",
+      "tail": [
+        "Success: no issues found in 2 source files"
+      ]
+    },
+    "mypy_full": {
+      "path": "/tmp/zippy-chain-mypy-full-final.log",
+      "exit_code": 1,
+      "sha256": "ce2b43ab06a580e73816609b80e0cb741892e12d1757d5252d76902b04f432ae",
+      "tail": [
+        "pytests/test_python_cli.py:956: error: \"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)  [attr-defined]",
+        "pytests/test_python_cli.py:1043: error: Value of type \"object\" is not indexable  [index]",
+        "pytests/test_python_cli.py:1044: error: Value of type \"object\" is not indexable  [index]",
+        "Found 976 errors in 12 files (checked 98 source files)"
+      ]
+    },
+    "black": {
+      "path": "/tmp/zippy-chain-black-final.log",
+      "exit_code": 0,
+      "sha256": "d3013679730ea940bddebbac194f36538babef7285713dad859cab4ddd1b5405",
+      "tail": [
+        "All done! ✨ 🍰 ✨",
+        "99 files would be left unchanged."
+      ]
+    },
+    "ruff": {
+      "path": "/tmp/zippy-chain-ruff-final.log",
+      "exit_code": 0,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18",
+      "tail": [
+        "All checks passed!"
+      ]
+    },
+    "rust_format": {
+      "path": "/tmp/zippy-chain-fmt-final.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    },
+    "diff": {
+      "path": "/tmp/zippy-chain-diff-final.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tail": []
+    }
+  },
+  "rust_test_totals": {
+    "passed": 1781,
+    "failed": 0,
+    "ignored": 10
+  },
+  "python_result": "862 passed, 1 skipped in 73.95s (0:01:13)",
+  "native_matrix": {
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "source_sha256": {
+    "crates/zippy-engines/src/chain.rs": "2595b7f0d525f4add3e82ef4d1f79b1ae611c85dcc320a48c246f99ff2bc0cc6",
+    "crates/zippy-engines/src/lib.rs": "a964e0bd274da5d45b45f6b864e294ec513e30b05dbefd148a0a2fb75d4b2643",
+    "crates/zippy-engines/src/stream_table.rs": "ab9546b1bf1a7827e657323107dcb58b2116703ea6af3b7076cdb7f426548086",
+    "crates/zippy-engines/tests/chain.rs": "c6afe42665f0aecd6070c5e9ab076bcfe1553adc9b95e88a12d58544be5b7fcb",
+    "crates/zippy-python/src/native_compute.rs": "b95a48b561da5fa6cc64afa72bee0d73a1950fd4a1f5d278b8839e78b1b36867",
+    "python/zippy/_internal.pyi": "17fb4cecb370a2b60cebcda72b0d4ac06b958ef02975af4591c6b735a41e1148",
+    "crates/zippy-segment-store/src/catalog.rs": "6d05e0252cb4bfed1c31c0bf39d88fd3d05e2691f0cf71df6468162095f530e7",
+    "crates/zippy-segment-store/tests/partition_api.rs": "61353801ad7a21ea03d943e5c347cf9e5eeab2690978533801b02845955d14dd",
+    "crates/zippy-ingest/src/materializer.rs": "387954bd74f71ee782ffad3195f8cc90fcb7d6e8b0d822b8c3a1bc5b98abb2b8",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "c8174178be7b1ef43122c17cdff1a94d0d68656f0e00f728a38b410980b376f5",
+    "pytests/test_native_chain.py": "809f01fc427c015a85caf5f773f0b148bba14c4783f16d00819b2bb54d74d147",
+    "scripts/check_compute_plugin.py": "927d00d0c00236ad6099ecab6f720f49336919d996cae2419eb4eb14ae56fe4b",
+    "scripts/check_compute_recovery.py": "0da2c64ef3d608b037dc3a45e14326961e9453be9c52bd0c6ce6b792df1a88a6",
+    "scripts/check_native_client.py": "6b04d98f219f4d0e536b3dac8212987f9b1f261f1bdece375eb776464041b6c3",
+    "python/zippy/server_process.py": "e231a71c185fb2a45deb4411008a6d4560aa3c9cc791a8d8a8ba03e07618c008",
+    "pytests/test_server_process.py": "78f55dd97ccc3262967394cd342c14275cdb468d7f3232fd704c7681ae95da05",
+    "docs/native-compute.md": "3f23c58b499d149717246c77f9e4c65cb497ce6002dc9199412056c39c75352e",
+    "docs/convergence-engine-chain-2026-09-22.md": "e1ab178eb32054dff36cda3fae085df86d7e47eca4dc2fbddc1058dcd5adf375",
+    "docs/current-capabilities-2026-09-21.md": "815a96265fa77252611ee64abe46306ee5df58d7b321fb68466847c76ed95eb9"
+  },
+  "server_sha256": "a6c8a2c75e84a24e530d040e030cdb3dc7e4c3cc6c511d90164d71d46e2f490a",
+  "environment": "Linux x86_64, CPython 3.11, Arrow 23.0.1",
+  "cross_platform_release_matrix_rerun": false
+}

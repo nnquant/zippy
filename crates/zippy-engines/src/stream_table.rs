@@ -1,102 +1,21 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 
 use arrow::{
-    array::{
-        Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
-        UInt32Array,
-    },
-    compute::take,
-    datatypes::{DataType, Field, Fields, Schema, TimeUnit},
+    array::{Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray},
+    datatypes::{DataType, Fields, TimeUnit},
     record_batch::RecordBatch,
 };
-use parquet::arrow::ArrowWriter;
 use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, ZippyError};
 use zippy_segment_store::{
     compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, PartitionColumnWriter,
-    PartitionHandle, PartitionRowUpdater, PartitionRowWriter, PartitionWriterHandle, ReaderSession,
-    RowSpanView, SealedSegmentHandle, SegmentCellValue, SegmentLease, SegmentStore,
-    SegmentStoreConfig, ZippySegmentStoreError,
+    PartitionHandle, PartitionRowWriter, PartitionWriterHandle, ReaderSession, RowSpanView,
+    SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
 };
-
-use crate::stream_table_shard::{ShardConfig, ShardRouter};
-
-use crate::key_value_state::{KeyValueSnapshotHandle, SnapshotState, BATCH_END, STREAM_ID};
-use crate::latest_state::{LatestColumnarState, LatestUpdateSet};
 
 const STREAM_TABLE_PARTITION: &str = "all";
 pub const DEFAULT_STREAM_TABLE_ROW_CAPACITY: usize = 65_536;
-const DEFAULT_REPLACEMENT_RETAINED_SNAPSHOTS: usize = 8;
-const KEY_VALUE_CHANGELOG_SEQ_FIELD: &str = "_zippy_kv_seq";
-const KEY_VALUE_CHANGELOG_OP_FIELD: &str = "_zippy_kv_op";
-const KEY_VALUE_CHANGELOG_SNAPSHOT_VERSION_FIELD: &str = "_zippy_kv_snapshot_version";
-const KEY_VALUE_SNAPSHOT_VERSION_FIELD: &str = "zippy_kv_snapshot_version";
-const KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD: &str = "zippy_kv_last_changelog_seq";
-const KEY_VALUE_CHANGELOG_STREAM_FIELD: &str = "zippy_kv_changelog_stream";
-const KEY_VALUE_SCHEMA_VERSION_FIELD: &str = "zippy_kv_schema_version";
-const KEY_VALUE_SNAPSHOT_VERSION_PUBLIC_FIELD: &str = "zippy_key_value_snapshot_version";
-const KEY_VALUE_LAST_CHANGELOG_SEQ_PUBLIC_FIELD: &str = "zippy_key_value_last_changelog_seq";
-const KEY_VALUE_CHANGELOG_STREAM_PUBLIC_FIELD: &str = "zippy_key_value_changelog_stream";
-const KEY_VALUE_SCHEMA_VERSION_PUBLIC_FIELD: &str = "zippy_key_value_schema_version";
-const KEY_VALUE_SCHEMA_VERSION: u64 = 1;
 type SegmentIdentity = (u64, u64);
-
-fn stream_table_latency_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_STREAM_TABLE_LATENCY_TRACE") {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-        }
-        Err(_) => false,
-    })
-}
-
-fn write_latency_trace_line(mut line: String) {
-    use std::io::Write;
-
-    line.push('\n');
-    let mut stderr = std::io::stderr().lock();
-    let _ = stderr.write_all(line.as_bytes());
-}
-
-fn instant_delta_us(start: Instant, end: Instant) -> f64 {
-    end.saturating_duration_since(start).as_secs_f64() * 1_000_000.0
-}
-
-fn single_row_table_source_emit_ns(table: &SegmentTableView) -> Option<i64> {
-    if table.num_rows() != 1 {
-        return None;
-    }
-    let column = table.column("source_emit_ns").ok()?;
-    if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
-        if !values.is_null(0) {
-            return Some(values.value(0));
-        }
-        return None;
-    }
-    if let Some(values) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        if !values.is_null(0) {
-            return Some(values.value(0));
-        }
-    }
-    None
-}
-
-fn single_row_segment_source_emit_ns(row_view: &SegmentRowView) -> Option<i64> {
-    if row_view.num_rows() != 1 {
-        return None;
-    }
-    match row_view.row_span().cell_value(0, "source_emit_ns").ok()? {
-        SegmentCellValue::Int64(value) | SegmentCellValue::TimestampNs(value) => Some(value),
-        SegmentCellValue::Null => None,
-        _ => None,
-    }
-}
 
 /// Materializes an input stream into an active segment-backed stream table.
 pub struct StreamTableMaterializer {
@@ -107,19 +26,6 @@ pub struct StreamTableMaterializer {
     store: SegmentStore,
     partition: PartitionHandle,
     sealed_segment_descriptors: VecDeque<RetainedSegmentDescriptor>,
-    replacement_retained_snapshots: VecDeque<Vec<serde_json::Value>>,
-    retention_segments: Option<usize>,
-    replacement_retention_snapshots: usize,
-    persisted_segment_identities: BTreeSet<SegmentIdentity>,
-    descriptor_publisher: Option<Arc<dyn StreamTableDescriptorPublisher>>,
-    descriptor_forwarding: bool,
-    descriptor_forwarding_fallback_warned: bool,
-    forwarded_active_descriptor: Option<serde_json::Value>,
-    forwarded_active_row_span: Option<RowSpanView>,
-    persist_config: Option<StreamTablePersistConfig>,
-    persist_publisher: Option<Arc<dyn StreamTablePersistPublisher>>,
-    retention_guard: Option<Arc<dyn StreamTableRetentionGuard>>,
-    persist_worker: Option<StreamTablePersistWorker>,
 }
 
 /// One server-local shared-memory segment retained by an append materializer.
@@ -165,647 +71,10 @@ impl StreamTableLiveSegment {
     }
 }
 
-/// A shard-level write or lifecycle failure captured by a sharded materializer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardFailure {
-    /// Lifecycle action that produced the failure.
-    pub action: String,
-    /// Zero-based shard index.
-    pub shard_index: usize,
-    /// Physical stream table name for the shard.
-    pub shard_name: String,
-    /// Root error text returned by the shard materializer.
-    pub error: String,
-}
-
-/// Routes logical stream-table batches into per-shard stream table materializers.
-///
-/// Routing and split failures are all-or-fail at the logical batch boundary before any shard is
-/// written. If a shard write commits and a later shard write fails, the failure is recorded and
-/// returned, but this first version does not attempt cross-shard rollback.
-pub struct ShardedStreamTableMaterializer {
-    logical_name: String,
-    input_schema: SchemaRef,
-    router: ShardRouter,
-    shard_names: Vec<String>,
-    shards: Vec<StreamTableMaterializer>,
-    failed_shards: Arc<Mutex<Vec<ShardFailure>>>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum DescriptorForwardingOutcome {
-    Forwarded,
-    Copy,
-    Fallback(DescriptorForwardingFallbackReason),
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum DescriptorForwardingFallbackReason {
-    PublisherMissing,
-    RetentionConfigured,
-    SealedHistoryPresent,
-    TargetAlreadyCommitted,
-    DescriptorUnavailable,
-}
-
-impl DescriptorForwardingFallbackReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::PublisherMissing => "publisher_missing",
-            Self::RetentionConfigured => "retention_configured",
-            Self::SealedHistoryPresent => "sealed_history_present",
-            Self::TargetAlreadyCommitted => "target_already_committed",
-            Self::DescriptorUnavailable => "descriptor_unavailable",
-        }
-    }
-}
-
-/// Maintains queryable keyed state and emits ordered upsert deltas, never implicit full snapshots.
-pub struct KeyValueTableMaterializer {
-    name: String,
-    input_schema: SchemaRef,
-    by: Vec<String>,
-    snapshot: KeyValueSnapshotHandle,
-    table: StreamTableMaterializer,
-    changelog_table: Option<StreamTableMaterializer>,
-    changelog_schema: SchemaRef,
-    descriptor_metadata: Arc<Mutex<KeyValueDescriptorMetadata>>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct KeyValueDescriptorMetadata {
-    snapshot_version: u64,
-    last_changelog_seq: u64,
-    changelog_stream: Option<String>,
-}
-
 /// Keeps a stream table segment pinned for reader-safe retention tests.
 pub struct StreamTableSegmentLease {
     _session: ReaderSession,
     _lease: SegmentLease,
-}
-
-/// Publishes active segment descriptor updates after stream table rollover.
-pub trait StreamTableDescriptorPublisher: Send + Sync {
-    fn publish(&self, descriptor_envelope: Vec<u8>) -> Result<()>;
-}
-
-struct KeyValueSnapshotDescriptorPublisher {
-    inner: Arc<dyn StreamTableDescriptorPublisher>,
-    metadata: Arc<Mutex<KeyValueDescriptorMetadata>>,
-}
-
-impl StreamTableDescriptorPublisher for KeyValueSnapshotDescriptorPublisher {
-    fn publish(&self, descriptor_envelope: Vec<u8>) -> Result<()> {
-        let mut descriptor: serde_json::Value = serde_json::from_slice(&descriptor_envelope)
-            .map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "failed to decode key-value snapshot descriptor error=[{}]",
-                    error
-                ),
-            })?;
-        self.metadata.lock().unwrap().annotate(&mut descriptor);
-        let payload = serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to encode key-value snapshot descriptor error=[{}]",
-                error
-            ),
-        })?;
-        self.inner.publish(payload)
-    }
-}
-
-impl KeyValueDescriptorMetadata {
-    fn annotate(&self, descriptor: &mut serde_json::Value) {
-        descriptor["zippy_kv_protocol_version"] = serde_json::Value::from(2);
-        descriptor[KEY_VALUE_SNAPSHOT_VERSION_FIELD] =
-            serde_json::Value::from(self.snapshot_version);
-        descriptor[KEY_VALUE_SNAPSHOT_VERSION_PUBLIC_FIELD] =
-            serde_json::Value::from(self.snapshot_version);
-        descriptor[KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD] =
-            serde_json::Value::from(self.last_changelog_seq);
-        descriptor[KEY_VALUE_LAST_CHANGELOG_SEQ_PUBLIC_FIELD] =
-            serde_json::Value::from(self.last_changelog_seq);
-        descriptor[KEY_VALUE_SCHEMA_VERSION_FIELD] =
-            serde_json::Value::from(KEY_VALUE_SCHEMA_VERSION);
-        descriptor[KEY_VALUE_SCHEMA_VERSION_PUBLIC_FIELD] =
-            serde_json::Value::from(KEY_VALUE_SCHEMA_VERSION);
-        if let Some(changelog_stream) = &self.changelog_stream {
-            descriptor[KEY_VALUE_CHANGELOG_STREAM_FIELD] =
-                serde_json::Value::from(changelog_stream.clone());
-            descriptor[KEY_VALUE_CHANGELOG_STREAM_PUBLIC_FIELD] =
-                serde_json::Value::from(changelog_stream.clone());
-        }
-    }
-}
-
-/// Checks whether a sealed segment is safe to release from live retention.
-pub trait StreamTableRetentionGuard: Send + Sync {
-    fn can_release(&self, segment_id: u64, generation: u64) -> Result<bool>;
-}
-
-/// Configuration for parquet persistence files written by a stream table.
-#[derive(Debug, Clone)]
-pub struct StreamTablePersistConfig {
-    root: PathBuf,
-    partition_spec: Option<StreamTablePersistPartitionSpec>,
-    max_attempts: usize,
-    retry_delay: Duration,
-}
-
-/// Partitioning configuration for stream table parquet persistence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamTablePersistPartitionSpec {
-    dt_column: Option<String>,
-    id_column: Option<String>,
-    dt_part: Option<StreamTableDateTimePart>,
-}
-
-/// Supported datetime partition formats derived from `dt_column`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamTableDateTimePart {
-    Year,
-    YearMonth,
-    YearMonthDay,
-    YearMonthDayHour,
-}
-
-struct PersistPartitionBatch {
-    values: PersistPartitionValues,
-    batch: RecordBatch,
-}
-
-#[derive(Clone)]
-struct PersistPartitionValues {
-    raw: Vec<(String, String)>,
-    encoded: Vec<(String, String)>,
-}
-
-/// Publishes persisted file metadata after a sealed segment is flushed to parquet.
-pub trait StreamTablePersistPublisher: Send + Sync {
-    fn publish(&self, persisted_file: serde_json::Value) -> Result<()>;
-
-    fn publish_event(&self, _persist_event: serde_json::Value) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct StreamTablePersistTask {
-    rows: StreamTablePersistRows,
-    source_generation: serde_json::Value,
-    writer_epoch: u64,
-    identity: SegmentIdentity,
-}
-
-#[derive(Debug)]
-enum StreamTablePersistRows {
-    Sealed(SealedSegmentHandle),
-    RowSpan(RowSpanView),
-}
-
-impl StreamTablePersistRows {
-    fn segment_id(&self) -> u64 {
-        match self {
-            Self::Sealed(sealed) => sealed.segment_id(),
-            Self::RowSpan(row_span) => row_span
-                .active_descriptor()
-                .map(|descriptor| descriptor.segment_id())
-                .unwrap_or_default(),
-        }
-    }
-
-    fn as_record_batch(&self) -> Result<RecordBatch> {
-        match self {
-            Self::Sealed(sealed) => sealed.as_record_batch().map_err(|error| ZippyError::Io {
-                reason: format!("failed to export sealed segment to arrow error=[{}]", error),
-            }),
-            Self::RowSpan(row_span) => row_span.as_record_batch().map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "failed to export forwarded row span to arrow error=[{}]",
-                    error
-                ),
-            }),
-        }
-    }
-}
-
-struct StreamTablePersistOutcome {
-    attempts: u64,
-    file_count: usize,
-    metadata_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamTablePersistCommitStatus {
-    Pending,
-    Writing,
-    Committed,
-    Failed,
-}
-
-#[derive(Debug, Clone)]
-struct StreamTablePersistCommitRecord {
-    identity: SegmentIdentity,
-    status: StreamTablePersistCommitStatus,
-    attempts: u64,
-    file_count: usize,
-    error: Option<String>,
-    updated_at_millis: u64,
-}
-
-struct StreamTablePersistWorker {
-    sender: Option<mpsc::Sender<StreamTablePersistTask>>,
-    completed: Arc<(Mutex<usize>, Condvar)>,
-    completed_segments: Arc<(Mutex<Vec<SegmentIdentity>>, Condvar)>,
-    failures: Arc<Mutex<Vec<String>>>,
-    commit_state: Arc<Mutex<BTreeMap<SegmentIdentity, StreamTablePersistCommitRecord>>>,
-    join_handle: Option<thread::JoinHandle<()>>,
-}
-
-impl StreamTablePersistConfig {
-    /// Create a parquet persist config rooted at the supplied directory.
-    pub fn new(root: impl AsRef<Path>) -> Self {
-        Self {
-            root: root.as_ref().to_path_buf(),
-            partition_spec: None,
-            max_attempts: 3,
-            retry_delay: Duration::from_millis(50),
-        }
-    }
-
-    /// Return the persist root directory.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// Attach parquet dataset partitioning to this persist config.
-    pub fn with_partition_spec(mut self, partition_spec: StreamTablePersistPartitionSpec) -> Self {
-        self.partition_spec = Some(partition_spec);
-        self
-    }
-
-    /// Set the maximum number of persist attempts for each sealed segment.
-    pub fn with_max_attempts(mut self, max_attempts: usize) -> Result<Self> {
-        if max_attempts == 0 {
-            return Err(ZippyError::InvalidConfig {
-                reason: "stream table persist max_attempts must be greater than zero".to_string(),
-            });
-        }
-        self.max_attempts = max_attempts;
-        Ok(self)
-    }
-
-    /// Set the delay between failed persist attempts.
-    pub fn with_retry_delay(mut self, retry_delay: Duration) -> Self {
-        self.retry_delay = retry_delay;
-        self
-    }
-}
-
-impl StreamTablePersistPartitionSpec {
-    /// Create a partition spec using an optional datetime and identifier column.
-    pub fn new(
-        dt_column: Option<String>,
-        id_column: Option<String>,
-        dt_part: Option<String>,
-    ) -> Result<Self> {
-        let dt_column = normalize_optional_name(dt_column);
-        let id_column = normalize_optional_name(id_column);
-        let dt_part = match normalize_optional_name(dt_part) {
-            Some(value) => Some(StreamTableDateTimePart::parse(&value)?),
-            None => None,
-        };
-        if dt_part.is_some() && dt_column.is_none() {
-            return Err(ZippyError::InvalidConfig {
-                reason: "stream table persist dt_part requires dt_column".to_string(),
-            });
-        }
-        if dt_column.is_some() && dt_part.is_none() {
-            return Err(ZippyError::InvalidConfig {
-                reason: "stream table persist dt_column requires dt_part".to_string(),
-            });
-        }
-        if dt_column.is_none() && id_column.is_none() {
-            return Err(ZippyError::InvalidConfig {
-                reason: "stream table persist partition must set dt_column or id_column"
-                    .to_string(),
-            });
-        }
-        Ok(Self {
-            dt_column,
-            id_column,
-            dt_part,
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.dt_column.is_none() && self.id_column.is_none()
-    }
-}
-
-impl StreamTableDateTimePart {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "%Y" => Ok(Self::Year),
-            "%Y%m" => Ok(Self::YearMonth),
-            "%Y%m%d" => Ok(Self::YearMonthDay),
-            "%Y%m%d%H" => Ok(Self::YearMonthDayHour),
-            _ => Err(ZippyError::InvalidConfig {
-                reason: format!("unsupported stream table persist dt_part value=[{}]", value),
-            }),
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Year => "%Y",
-            Self::YearMonth => "%Y%m",
-            Self::YearMonthDay => "%Y%m%d",
-            Self::YearMonthDayHour => "%Y%m%d%H",
-        }
-    }
-
-    fn format_timestamp_ns(&self, timestamp_ns: i64) -> String {
-        let (year, month, day, hour) = timestamp_ns_to_utc_parts(timestamp_ns);
-        match self {
-            Self::Year => format!("{year:04}"),
-            Self::YearMonth => format!("{year:04}{month:02}"),
-            Self::YearMonthDay => format!("{year:04}{month:02}{day:02}"),
-            Self::YearMonthDayHour => format!("{year:04}{month:02}{day:02}{hour:02}"),
-        }
-    }
-}
-
-impl StreamTablePersistWorker {
-    fn spawn(
-        stream_name: String,
-        config: StreamTablePersistConfig,
-        publisher: Option<Arc<dyn StreamTablePersistPublisher>>,
-    ) -> Result<Self> {
-        let (sender, receiver) = mpsc::channel::<StreamTablePersistTask>();
-        let completed = Arc::new((Mutex::new(0), Condvar::new()));
-        let worker_completed = Arc::clone(&completed);
-        let completed_segments = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-        let worker_completed_segments = Arc::clone(&completed_segments);
-        let failures = Arc::new(Mutex::new(Vec::new()));
-        let worker_failures = Arc::clone(&failures);
-        let commit_state = Arc::new(Mutex::new(BTreeMap::new()));
-        let worker_commit_state = Arc::clone(&commit_state);
-        let join_handle = thread::Builder::new()
-            .name(format!("zippy-stream-table-persist-{stream_name}"))
-            .spawn(move || {
-                while let Ok(task) = receiver.recv() {
-                    let mut last_error = None;
-                    for attempt in 1..=config.max_attempts {
-                        update_persist_commit_state(
-                            &worker_commit_state,
-                            task.identity,
-                            StreamTablePersistCommitStatus::Writing,
-                            |record| {
-                                record.attempts = attempt as u64;
-                                record.error = None;
-                            },
-                        );
-                        match write_and_publish_persisted_files(
-                            &stream_name,
-                            &task,
-                            &config,
-                            publisher.as_deref(),
-                        ) {
-                            Ok(outcome) => {
-                                last_error = None;
-                                update_persist_commit_state(
-                                    &worker_commit_state,
-                                    task.identity,
-                                    StreamTablePersistCommitStatus::Committed,
-                                    |record| {
-                                        record.attempts = outcome.attempts;
-                                        record.file_count = outcome.file_count;
-                                        record.error = outcome.metadata_error.clone();
-                                    },
-                                );
-                                if let (Some(publisher), Some(error)) =
-                                    (&publisher, outcome.metadata_error.as_deref())
-                                {
-                                    let event = persist_metadata_sync_failure_event(
-                                        &stream_name,
-                                        task.identity,
-                                        task.writer_epoch,
-                                        outcome.attempts,
-                                        error,
-                                    );
-                                    let _ = publisher.publish_event(event);
-                                }
-                                let (segments_lock, segments_changed) = &*worker_completed_segments;
-                                segments_lock.lock().unwrap().push(task.identity);
-                                segments_changed.notify_all();
-                                let (lock, changed) = &*worker_completed;
-                                *lock.lock().unwrap() += 1;
-                                changed.notify_all();
-                                break;
-                            }
-                            Err(error) => {
-                                let error = error.to_string();
-                                last_error = Some(error.clone());
-                                if attempt < config.max_attempts {
-                                    update_persist_commit_state(
-                                        &worker_commit_state,
-                                        task.identity,
-                                        StreamTablePersistCommitStatus::Pending,
-                                        |record| {
-                                            record.error = Some(error);
-                                        },
-                                    );
-                                    if !config.retry_delay.is_zero() {
-                                        thread::sleep(config.retry_delay);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(error) = last_error {
-                        worker_failures.lock().unwrap().push(error.clone());
-                        update_persist_commit_state(
-                            &worker_commit_state,
-                            task.identity,
-                            StreamTablePersistCommitStatus::Failed,
-                            |record| {
-                                record.error = Some(error.clone());
-                            },
-                        );
-                        if let Some(publisher) = &publisher {
-                            let event = persist_failure_event(
-                                &stream_name,
-                                task.identity,
-                                task.writer_epoch,
-                                config.max_attempts as u64,
-                                &error,
-                            );
-                            let _ = publisher.publish_event(event);
-                        }
-                    }
-                }
-            })
-            .map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "failed to start stream table persist worker error=[{}]",
-                    error
-                ),
-            })?;
-
-        Ok(Self {
-            sender: Some(sender),
-            completed,
-            completed_segments,
-            failures,
-            commit_state,
-            join_handle: Some(join_handle),
-        })
-    }
-
-    fn enqueue(&self, task: StreamTablePersistTask) -> Result<()> {
-        let Some(sender) = &self.sender else {
-            return Err(ZippyError::Io {
-                reason: "stream table persist worker is stopped".to_string(),
-            });
-        };
-        update_persist_commit_state(
-            &self.commit_state,
-            task.identity,
-            StreamTablePersistCommitStatus::Pending,
-            |_| {},
-        );
-        let identity = task.identity;
-        sender.send(task).map_err(|error| {
-            update_persist_commit_state(
-                &self.commit_state,
-                identity,
-                StreamTablePersistCommitStatus::Failed,
-                |record| {
-                    record.error = Some(error.to_string());
-                },
-            );
-            ZippyError::Io {
-                reason: format!(
-                    "failed to enqueue stream table persist task error=[{}]",
-                    error
-                ),
-            }
-        })
-    }
-
-    fn wait_for_completed_for_test(&self, expected: usize, timeout: Duration) -> Result<()> {
-        let (lock, changed) = &*self.completed;
-        let completed = lock.lock().unwrap();
-        let result = changed
-            .wait_timeout_while(completed, timeout, |count| *count < expected)
-            .map_err(|_| ZippyError::Io {
-                reason: "stream table persist wait lock poisoned".to_string(),
-            })?;
-        if *result.0 >= expected {
-            return Ok(());
-        }
-        Err(ZippyError::Io {
-            reason: format!(
-                "timed out waiting for stream table persisted files expected=[{}] completed=[{}]",
-                expected, *result.0
-            ),
-        })
-    }
-
-    fn failures(&self) -> Vec<String> {
-        self.failures.lock().unwrap().clone()
-    }
-
-    fn failure_summary(&self) -> Option<String> {
-        let failures = self.failures.lock().unwrap();
-        if failures.is_empty() {
-            return None;
-        }
-        Some(failures.join("; "))
-    }
-
-    fn drain_completed_segments(&self) -> Vec<SegmentIdentity> {
-        let (lock, _) = &*self.completed_segments;
-        std::mem::take(&mut *lock.lock().unwrap())
-    }
-
-    fn stop(&mut self) {
-        self.sender.take();
-        if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
-        }
-    }
-
-    fn commit_snapshot(&self) -> Vec<serde_json::Value> {
-        self.commit_state
-            .lock()
-            .unwrap()
-            .values()
-            .map(StreamTablePersistCommitRecord::to_json)
-            .collect()
-    }
-}
-
-impl StreamTablePersistCommitStatus {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Writing => "writing",
-            Self::Committed => "committed",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-impl StreamTablePersistCommitRecord {
-    fn new(identity: SegmentIdentity, status: StreamTablePersistCommitStatus) -> Self {
-        Self {
-            identity,
-            status,
-            attempts: 0,
-            file_count: 0,
-            error: None,
-            updated_at_millis: current_time_millis(),
-        }
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "source_segment_id": self.identity.0,
-            "source_generation": self.identity.1,
-            "status": self.status.as_str(),
-            "attempts": self.attempts,
-            "file_count": self.file_count,
-            "error": self.error,
-            "updated_at": self.updated_at_millis,
-        })
-    }
-}
-
-fn update_persist_commit_state<F>(
-    commit_state: &Arc<Mutex<BTreeMap<SegmentIdentity, StreamTablePersistCommitRecord>>>,
-    identity: SegmentIdentity,
-    status: StreamTablePersistCommitStatus,
-    update: F,
-) where
-    F: FnOnce(&mut StreamTablePersistCommitRecord),
-{
-    let mut state = commit_state.lock().unwrap();
-    let record = state
-        .entry(identity)
-        .or_insert_with(|| StreamTablePersistCommitRecord::new(identity, status));
-    record.status = status;
-    record.updated_at_millis = current_time_millis();
-    update(record);
-}
-
-impl Drop for StreamTablePersistWorker {
-    fn drop(&mut self) {
-        self.stop();
-    }
 }
 
 impl StreamTableMaterializer {
@@ -839,11 +108,36 @@ impl StreamTableMaterializer {
         Self::new_with_row_capacity_and_writer_epoch(name, input_schema, row_capacity, None)
     }
 
+    /// Validates the exact storage layout without creating shared memory or a partition.
+    ///
+    /// :param input_schema: Arrow schema proposed for materialization.
+    /// :returns: Success only when the normal materializer schema compiler accepts it.
+    /// :raises ZippyError: If a type, column layout, or metadata contract is unsupported.
+    pub fn validate_schema(input_schema: &SchemaRef) -> Result<()> {
+        compile_arrow_schema(input_schema).map(|_| ())
+    }
+
     pub fn new_with_row_capacity_and_writer_epoch(
         name: impl Into<String>,
         input_schema: SchemaRef,
         row_capacity: usize,
         writer_epoch: Option<u64>,
+    ) -> Result<Self> {
+        Self::new_with_row_capacity_and_origin(
+            name,
+            input_schema,
+            row_capacity,
+            writer_epoch.map(|epoch| (epoch, 0)),
+        )
+    }
+
+    /// Create storage with an explicit writer epoch and initial segment generation.
+    /// Native recovery seeds generations from its logical next offset to avoid lineage reuse.
+    pub fn new_with_row_capacity_and_origin(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        row_capacity: usize,
+        origin: Option<(u64, u64)>,
     ) -> Result<Self> {
         if row_capacity == 0 {
             return Err(ZippyError::InvalidConfig {
@@ -856,13 +150,15 @@ impl StreamTableMaterializer {
             default_row_capacity: row_capacity,
         })
         .map_err(segment_error)?;
-        let partition = match writer_epoch {
-            Some(writer_epoch) => store.open_partition_with_schema_and_writer_epoch(
-                &name,
-                STREAM_TABLE_PARTITION,
-                compiled_schema,
-                writer_epoch,
-            ),
+        let partition = match origin {
+            Some((writer_epoch, initial_generation)) => store
+                .open_partition_with_schema_and_origin(
+                    &name,
+                    STREAM_TABLE_PARTITION,
+                    compiled_schema,
+                    writer_epoch,
+                    initial_generation,
+                ),
             None => {
                 store.open_partition_with_schema(&name, STREAM_TABLE_PARTITION, compiled_schema)
             }
@@ -877,35 +173,7 @@ impl StreamTableMaterializer {
             store,
             partition,
             sealed_segment_descriptors: VecDeque::new(),
-            replacement_retained_snapshots: VecDeque::new(),
-            retention_segments: None,
-            replacement_retention_snapshots: DEFAULT_REPLACEMENT_RETAINED_SNAPSHOTS,
-            persisted_segment_identities: BTreeSet::new(),
-            descriptor_publisher: None,
-            descriptor_forwarding: false,
-            descriptor_forwarding_fallback_warned: false,
-            forwarded_active_descriptor: None,
-            forwarded_active_row_span: None,
-            persist_config: None,
-            persist_publisher: None,
-            retention_guard: None,
-            persist_worker: None,
         })
-    }
-
-    /// Attach a publisher used when the active segment descriptor changes.
-    pub fn with_descriptor_publisher(
-        mut self,
-        publisher: Arc<dyn StreamTableDescriptorPublisher>,
-    ) -> Self {
-        self.descriptor_publisher = Some(publisher);
-        self
-    }
-
-    /// Allow zero-copy publication of upstream active segment descriptors.
-    pub fn with_descriptor_forwarding(mut self, enabled: bool) -> Self {
-        self.descriptor_forwarding = enabled;
-        self
     }
 
     /// Commit each input batch atomically into its own sealed segment.
@@ -914,44 +182,6 @@ impl StreamTableMaterializer {
     /// does not fit into one segment is rejected instead of being split across segments.
     pub fn with_frame_per_batch(mut self, enabled: bool) -> Self {
         self.frame_per_batch = enabled;
-        self
-    }
-
-    /// Limit how many sealed segments are advertised to readers.
-    pub fn with_retention_segments(mut self, retention_segments: usize) -> Self {
-        self.retention_segments = Some(retention_segments);
-        self
-    }
-
-    /// Limit how many old replacement snapshots are retained for stale readers.
-    pub fn with_replacement_retention_snapshots(mut self, snapshots: usize) -> Result<Self> {
-        if snapshots == 0 {
-            return Err(ZippyError::InvalidConfig {
-                reason: "replacement_retention_snapshots must be greater than zero".to_string(),
-            });
-        }
-        self.replacement_retention_snapshots = snapshots;
-        Ok(self)
-    }
-
-    /// Enable parquet persistence writes for sealed segments.
-    pub fn with_parquet_persist(mut self, config: StreamTablePersistConfig) -> Self {
-        self.persist_config = Some(config);
-        self
-    }
-
-    /// Attach a publisher used when parquet persistence metadata is produced.
-    pub fn with_persist_publisher(
-        mut self,
-        publisher: Arc<dyn StreamTablePersistPublisher>,
-    ) -> Self {
-        self.persist_publisher = Some(publisher);
-        self
-    }
-
-    /// Attach a guard used before live retained segments are released.
-    pub fn with_retention_guard(mut self, guard: Arc<dyn StreamTableRetentionGuard>) -> Self {
-        self.retention_guard = Some(guard);
         self
     }
 
@@ -970,29 +200,13 @@ impl StreamTableMaterializer {
 
     /// Export the active segment descriptor envelope for cross-process readers.
     pub fn active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
-        let mut descriptor = match self.forwarded_active_descriptor.clone() {
-            Some(mut descriptor) => {
-                self.annotate_forwarded_descriptor_control_writer_epoch(&mut descriptor)?;
-                descriptor
-            }
-            None => self.active_descriptor_value()?,
-        };
+        let mut descriptor = self.active_descriptor_value()?;
         descriptor["sealed_segments"] = serde_json::Value::Array(
             self.sealed_segment_descriptors
                 .iter()
                 .map(|retained| retained.envelope.clone())
                 .collect(),
         );
-        let retained_replacements = self
-            .replacement_retained_snapshots
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        if !retained_replacements.is_empty() {
-            descriptor["retained_replacement_segments"] =
-                serde_json::Value::Array(retained_replacements);
-        }
         serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
             reason: error.to_string(),
         })
@@ -1005,22 +219,17 @@ impl StreamTableMaterializer {
             .map_err(segment_error)
     }
 
-    /// Returns every retained append segment in logical row order.
+    /// Returns retained append or frame segments in logical row order.
     ///
-    /// Sealed append segments are full by construction. Frame-per-batch materializers can seal
-    /// partial segments and therefore must use their frame-aware publication path instead.
-    pub fn append_live_segments(&self) -> Result<Vec<StreamTableLiveSegment>> {
-        if self.frame_per_batch {
-            return Err(ZippyError::InvalidState {
-                status: "append live segment publication does not support frame-per-batch mode",
-            });
-        }
+    /// Each immutable sealed descriptor caches its actual committed row count, so partially
+    /// filled frame segments retain their complete business-batch boundaries.
+    pub fn live_segments(&self) -> Result<Vec<StreamTableLiveSegment>> {
         let active = self.partition.active_descriptor();
         let schema = active.schema().clone();
         let layout = active.layout().clone();
+        let active_rows = self.active_committed_row_count();
         let mut segments = Vec::with_capacity(
-            self.sealed_segment_descriptors.len()
-                + usize::from(self.active_committed_row_count() != 0),
+            self.sealed_segment_descriptors.len() + usize::from(active_rows != 0),
         );
         for retained in &self.sealed_segment_descriptors {
             if let Some(segment) = retained.append_segment.get() {
@@ -1055,7 +264,6 @@ impl StreamTableMaterializer {
             let _ = retained.append_segment.set(segment.clone());
             segments.push(segment);
         }
-        let active_rows = self.active_committed_row_count();
         if active_rows != 0 {
             segments.push(StreamTableLiveSegment {
                 descriptor: active,
@@ -1066,27 +274,21 @@ impl StreamTableMaterializer {
         Ok(segments)
     }
 
-    /// Counts retained append segments without decoding or attaching their descriptors.
+    /// Counts retained segments without decoding or attaching their descriptors.
     ///
     /// :returns: Nonempty active segment plus retained sealed segments.
-    /// :raises ZippyError::InvalidState: Frame-per-batch mode is configured.
-    pub fn append_live_segment_count(&self) -> Result<usize> {
-        if self.frame_per_batch {
-            return Err(ZippyError::InvalidState {
-                status: "append live segment publication does not support frame-per-batch mode",
-            });
-        }
+    pub fn live_segment_count(&self) -> Result<usize> {
         Ok(self.sealed_segment_descriptors.len()
             + usize::from(self.active_committed_row_count() != 0))
     }
 
-    /// Retires a durable append prefix without invalidating pinned readers.
+    /// Retires a durable prefix without splitting segments or invalidating pinned readers.
     ///
     /// :param max_rows: Prefix rows already covered by the authoritative manifest.
     /// :returns: Rows actually retired; pinned segments can stop reclamation early.
-    /// :raises ZippyError: Descriptor validation or retention guard failure.
-    pub fn retire_persisted_append_prefix(&mut self, max_rows: usize) -> Result<usize> {
-        let segments = self.append_live_segments()?;
+    /// :raises ZippyError: Descriptor validation failure.
+    pub fn retire_persisted_prefix(&mut self, max_rows: usize) -> Result<usize> {
+        let segments = self.live_segments()?;
         let mut rows = 0_usize;
         let mut count = 0;
         for segment in &segments {
@@ -1095,13 +297,9 @@ impl StreamTableMaterializer {
             }
             rows += segment.row_count;
             count += 1;
-            self.persisted_segment_identities.insert((
-                segment.descriptor.segment_id(),
-                segment.descriptor.generation(),
-            ));
         }
         let before = self.sealed_segment_descriptors.len();
-        self.trim_published_retained_segments(before - count)?;
+        self.trim_durable_retained_segments(before - count);
         let removed = before - self.sealed_segment_descriptors.len();
         Ok(segments[..removed]
             .iter()
@@ -1109,27 +307,15 @@ impl StreamTableMaterializer {
             .sum())
     }
 
-    /// Seals a non-empty append prefix before ownership moves to another writer epoch.
+    /// Seals a non-empty prefix before ownership moves to another writer epoch.
     ///
-    /// The newly allocated empty active segment is intentionally not published. A later writer
+    /// The newly allocated empty active segment is excluded from live segments. A later writer
     /// epoch owns its own materializer, while this instance retains only the sealed history.
     pub fn seal_active_for_writer_handoff(&mut self) -> Result<()> {
-        if self.frame_per_batch {
-            return Err(ZippyError::InvalidState {
-                status: "append writer handoff does not support frame-per-batch mode",
-            });
-        }
         if self.active_committed_row_count() == 0 {
             return Ok(());
         }
-        let sealed_descriptor = self.active_descriptor_value()?;
-        self.partition
-            .writer()
-            .rollover_without_persistence()
-            .map_err(segment_error)?;
-        self.sealed_segment_descriptors
-            .push_back(sealed_descriptor.into());
-        Ok(())
+        self.rollover_active_segment()
     }
 
     /// Keep the owned store observable for future lifecycle integration.
@@ -1152,36 +338,6 @@ impl StreamTableMaterializer {
         })
     }
 
-    /// Wait until at least `expected` persisted files have been published.
-    pub fn wait_for_persisted_files_for_test(
-        &self,
-        expected: usize,
-        timeout: Duration,
-    ) -> Result<()> {
-        let Some(worker) = &self.persist_worker else {
-            return Err(ZippyError::Io {
-                reason: "stream table persist worker is not running".to_string(),
-            });
-        };
-        worker.wait_for_completed_for_test(expected, timeout)
-    }
-
-    /// Return persisted file failures captured by the background worker.
-    pub fn persist_failures_for_test(&self) -> Vec<String> {
-        self.persist_worker
-            .as_ref()
-            .map(StreamTablePersistWorker::failures)
-            .unwrap_or_default()
-    }
-
-    /// Return a point-in-time snapshot of background persist commit states.
-    pub fn persist_commit_snapshot(&self) -> Vec<serde_json::Value> {
-        self.persist_worker
-            .as_ref()
-            .map(StreamTablePersistWorker::commit_snapshot)
-            .unwrap_or_default()
-    }
-
     fn materialize_table(&mut self, table: &SegmentTableView) -> Result<()> {
         if table.num_rows() == 0 {
             return Ok(());
@@ -1189,25 +345,11 @@ impl StreamTableMaterializer {
         if self.frame_per_batch {
             return self.materialize_frame(table);
         }
-        if self.apply_retention()? {
-            self.publish_active_descriptor()?;
-        }
 
-        self.materialize_table_rows(table, true)
+        self.materialize_table_rows(table)
     }
 
     fn materialize_frame(&mut self, table: &SegmentTableView) -> Result<()> {
-        if self.descriptor_forwarding {
-            return Err(ZippyError::InvalidConfig {
-                reason: "stream table frame_per_batch is incompatible with descriptor_forwarding"
-                    .to_string(),
-            });
-        }
-        if self.retention_segments == Some(0) {
-            return Err(ZippyError::InvalidConfig {
-                reason: "stream table frame_per_batch requires retention_segments >= 1".to_string(),
-            });
-        }
         if self.active_committed_row_count() != 0 {
             return Err(ZippyError::InvalidState {
                 status: "frame-per-batch active segment must be empty",
@@ -1223,8 +365,6 @@ impl StreamTableMaterializer {
             });
         }
 
-        self.forwarded_active_descriptor = None;
-        self.forwarded_active_row_span = None;
         let fields = self.input_schema.fields().clone();
         let columns = (0..fields.len())
             .map(|index| table.column_at(index))
@@ -1268,31 +408,14 @@ impl StreamTableMaterializer {
             Err(error) => return Err(segment_error(error)),
         }
 
-        let sealed_descriptor = self.active_descriptor_value()?;
-        let sealed = writer
-            .rollover_without_persistence()
-            .map_err(segment_error)?;
-        self.sealed_segment_descriptors
-            .push_back(sealed_descriptor.clone().into());
-        self.apply_retention()?;
-        self.publish_active_descriptor()?;
-        self.enqueue_persist_task(sealed, &sealed_descriptor)
+        self.rollover_active_segment()
     }
 
-    fn materialize_table_rows(
-        &mut self,
-        table: &SegmentTableView,
-        publish_rollovers: bool,
-    ) -> Result<()> {
-        if table.num_rows() == 0 {
-            return Ok(());
-        }
+    fn materialize_table_rows(&mut self, table: &SegmentTableView) -> Result<()> {
         if let Some(row_view) = table.as_segment_row_view() {
-            return self.materialize_segment_rows(row_view, publish_rollovers);
+            return self.materialize_segment_rows(row_view);
         }
 
-        self.forwarded_active_descriptor = None;
-        self.forwarded_active_row_span = None;
         let fields = self.input_schema.fields().clone();
         let columns = (0..fields.len())
             .map(|index| table.column_at(index))
@@ -1304,7 +427,6 @@ impl StreamTableMaterializer {
                 &fields,
                 &columns,
                 table.num_rows(),
-                publish_rollovers,
             );
         }
 
@@ -1312,21 +434,10 @@ impl StreamTableMaterializer {
             match self.write_materialized_row(&writer, &fields, &columns, row_index) {
                 Ok(()) => {}
                 Err(ZippySegmentStoreError::Writer("segment is full")) => {
-                    let sealed_descriptor = self.active_descriptor_value()?;
-                    let sealed = writer
-                        .rollover_without_persistence()
-                        .map_err(segment_error)?;
-                    self.sealed_segment_descriptors
-                        .push_back(sealed_descriptor.clone().into());
-                    if publish_rollovers {
-                        self.publish_active_descriptor()?;
-                    }
-                    if self.apply_retention()? && publish_rollovers {
-                        self.publish_active_descriptor()?;
-                    }
+                    self.rollover_active_segment()?;
+
                     self.write_materialized_row(&writer, &fields, &columns, row_index)
                         .map_err(segment_error)?;
-                    self.enqueue_persist_task(sealed, &sealed_descriptor)?;
                 }
                 Err(error) => return Err(segment_error(error)),
             }
@@ -1341,7 +452,6 @@ impl StreamTableMaterializer {
         fields: &Fields,
         columns: &[ArrayRef],
         row_count: usize,
-        publish_rollovers: bool,
     ) -> Result<()> {
         let mut copied = 0;
         while copied < row_count {
@@ -1361,19 +471,7 @@ impl StreamTableMaterializer {
                     });
                 }
                 Err(ZippySegmentStoreError::Writer("segment is full")) => {
-                    let sealed_descriptor = self.active_descriptor_value()?;
-                    let sealed = writer
-                        .rollover_without_persistence()
-                        .map_err(segment_error)?;
-                    self.sealed_segment_descriptors
-                        .push_back(sealed_descriptor.clone().into());
-                    if publish_rollovers {
-                        self.publish_active_descriptor()?;
-                    }
-                    if self.apply_retention()? && publish_rollovers {
-                        self.publish_active_descriptor()?;
-                    }
-                    self.enqueue_persist_task(sealed, &sealed_descriptor)?;
+                    self.rollover_active_segment()?;
                 }
                 Err(error) => return Err(segment_error(error)),
             }
@@ -1382,352 +480,24 @@ impl StreamTableMaterializer {
         Ok(())
     }
 
-    fn materialize_segment_rows(
-        &mut self,
-        row_view: &SegmentRowView,
-        publish_rollovers: bool,
-    ) -> Result<()> {
-        let trace_enabled = stream_table_latency_trace_enabled();
-        let segment_started_at = trace_enabled.then(Instant::now);
-        let source_emit_ns = trace_enabled
-            .then(|| single_row_segment_source_emit_ns(row_view))
-            .flatten();
-        let mut append_call_us = 0.0_f64;
-        let mut append_calls = 0_usize;
-        let mut rollover_count = 0_usize;
-        match self.try_forward_segment_descriptor(row_view)? {
-            DescriptorForwardingOutcome::Forwarded => {
-                if let Some(segment_started_at) = segment_started_at {
-                    write_latency_trace_line(format!(
-                        "zippy_stream_table_latency_trace event=[segment_append] rows=[{}] source_emit_ns=[{}] forwarded=[true] append_calls=[0] rollovers=[0] append_row_span_us=[0.000] segment_append_total_us=[{:.3}]",
-                        row_view.num_rows(),
-                        source_emit_ns.unwrap_or_default(),
-                        instant_delta_us(segment_started_at, Instant::now()),
-                    ));
-                }
-                return Ok(());
-            }
-            DescriptorForwardingOutcome::Copy => {}
-            DescriptorForwardingOutcome::Fallback(reason) => {
-                self.warn_descriptor_forwarding_fallback_once(reason);
-            }
-        }
-
-        self.forwarded_active_descriptor = None;
-        self.forwarded_active_row_span = None;
+    fn materialize_segment_rows(&mut self, row_view: &SegmentRowView) -> Result<()> {
         let writer = self.partition.writer();
         let total_rows = row_view.num_rows();
         let mut copied = 0;
         while copied < total_rows {
-            let append_started_at = trace_enabled.then(Instant::now);
             match writer.append_row_span(row_view.row_span(), copied, total_rows - copied) {
-                Ok(rows) if rows > 0 => {
-                    if let Some(append_started_at) = append_started_at {
-                        append_call_us += instant_delta_us(append_started_at, Instant::now());
-                        append_calls += 1;
-                    }
-                    copied += rows;
-                }
+                Ok(rows) if rows > 0 => copied += rows,
                 Ok(_) => {
                     return Err(ZippyError::Io {
                         reason: "stream table segment append made no progress".to_string(),
-                    });
+                    })
                 }
                 Err(ZippySegmentStoreError::Writer("segment is full")) => {
-                    if let Some(append_started_at) = append_started_at {
-                        append_call_us += instant_delta_us(append_started_at, Instant::now());
-                        append_calls += 1;
-                    }
-                    rollover_count += 1;
-                    let sealed_descriptor = self.active_descriptor_value()?;
-                    let sealed = writer
-                        .rollover_without_persistence()
-                        .map_err(segment_error)?;
-                    self.sealed_segment_descriptors
-                        .push_back(sealed_descriptor.clone().into());
-                    if publish_rollovers {
-                        self.publish_active_descriptor()?;
-                    }
-                    if self.apply_retention()? && publish_rollovers {
-                        self.publish_active_descriptor()?;
-                    }
-                    self.enqueue_persist_task(sealed, &sealed_descriptor)?;
+                    self.rollover_active_segment()?;
                 }
                 Err(error) => return Err(segment_error(error)),
             }
         }
-
-        if let Some(segment_started_at) = segment_started_at {
-            write_latency_trace_line(format!(
-                "zippy_stream_table_latency_trace event=[segment_append] rows=[{}] source_emit_ns=[{}] forwarded=[false] append_calls=[{}] rollovers=[{}] append_row_span_us=[{:.3}] segment_append_total_us=[{:.3}]",
-                total_rows,
-                source_emit_ns.unwrap_or_default(),
-                append_calls,
-                rollover_count,
-                append_call_us,
-                instant_delta_us(segment_started_at, Instant::now()),
-            ));
-        }
-        Ok(())
-    }
-
-    fn try_forward_segment_descriptor(
-        &mut self,
-        row_view: &SegmentRowView,
-    ) -> Result<DescriptorForwardingOutcome> {
-        if !self.descriptor_forwarding {
-            return Ok(DescriptorForwardingOutcome::Copy);
-        }
-        if self.descriptor_publisher.is_none() {
-            return Ok(DescriptorForwardingOutcome::Fallback(
-                DescriptorForwardingFallbackReason::PublisherMissing,
-            ));
-        }
-        if self.retention_segments.is_some() {
-            return Ok(DescriptorForwardingOutcome::Fallback(
-                DescriptorForwardingFallbackReason::RetentionConfigured,
-            ));
-        }
-        if !self.sealed_segment_descriptors.is_empty() {
-            return Ok(DescriptorForwardingOutcome::Fallback(
-                DescriptorForwardingFallbackReason::SealedHistoryPresent,
-            ));
-        }
-        if self.active_committed_row_count() != 0 {
-            return Ok(DescriptorForwardingOutcome::Fallback(
-                DescriptorForwardingFallbackReason::TargetAlreadyCommitted,
-            ));
-        }
-
-        let trace_enabled = stream_table_latency_trace_enabled();
-        let total_started_at = trace_enabled.then(Instant::now);
-        let active_envelope_started_at = trace_enabled.then(Instant::now);
-        let Some(envelope) = row_view
-            .row_span()
-            .active_descriptor_envelope_bytes()
-            .map_err(|reason| ZippyError::Io {
-                reason: reason.to_string(),
-            })?
-        else {
-            return Ok(DescriptorForwardingOutcome::Fallback(
-                DescriptorForwardingFallbackReason::DescriptorUnavailable,
-            ));
-        };
-        let active_envelope_us = active_envelope_started_at
-            .map(|started_at| instant_delta_us(started_at, Instant::now()))
-            .unwrap_or_default();
-        let json_decode_started_at = trace_enabled.then(Instant::now);
-        let mut descriptor: serde_json::Value =
-            serde_json::from_slice(&envelope).map_err(|error| ZippyError::Io {
-                reason: error.to_string(),
-            })?;
-        let json_decode_us = json_decode_started_at
-            .map(|started_at| instant_delta_us(started_at, Instant::now()))
-            .unwrap_or_default();
-        let annotate_started_at = trace_enabled.then(Instant::now);
-        self.annotate_forwarded_descriptor_control_writer_epoch(&mut descriptor)?;
-        let annotate_us = annotate_started_at
-            .map(|started_at| instant_delta_us(started_at, Instant::now()))
-            .unwrap_or_default();
-        descriptor["sealed_segments"] = serde_json::Value::Array(Vec::new());
-        let source_span_started_at = trace_enabled.then(Instant::now);
-        let source_row_span = self.forwarded_source_row_span(row_view)?;
-        let source_span_us = source_span_started_at
-            .map(|started_at| instant_delta_us(started_at, Instant::now()))
-            .unwrap_or_default();
-
-        if self
-            .forwarded_active_descriptor
-            .as_ref()
-            .is_some_and(|current| current == &descriptor)
-        {
-            self.forwarded_active_row_span = source_row_span;
-            return Ok(DescriptorForwardingOutcome::Forwarded);
-        }
-        let previous_persist_started_at = trace_enabled.then(Instant::now);
-        if let Some(previous_row_span) = self.forwarded_active_row_span.take() {
-            self.enqueue_persist_row_span_task(previous_row_span)?;
-        }
-        let previous_persist_us = previous_persist_started_at
-            .map(|started_at| instant_delta_us(started_at, Instant::now()))
-            .unwrap_or_default();
-
-        let encode_started_at = trace_enabled.then(Instant::now);
-        let payload = serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
-            reason: error.to_string(),
-        })?;
-        let encode_us = encode_started_at
-            .map(|started_at| instant_delta_us(started_at, Instant::now()))
-            .unwrap_or_default();
-        let publish_started_at = trace_enabled.then(Instant::now);
-        if let Some(publisher) = &self.descriptor_publisher {
-            publisher.publish(payload)?;
-        }
-        let publish_us = publish_started_at
-            .map(|started_at| instant_delta_us(started_at, Instant::now()))
-            .unwrap_or_default();
-        self.forwarded_active_descriptor = Some(descriptor);
-        self.forwarded_active_row_span = source_row_span;
-        if let Some(total_started_at) = total_started_at {
-            write_latency_trace_line(format!(
-                "zippy_stream_table_latency_trace event=[descriptor_forward] rows=[{}] active_envelope_us=[{:.3}] json_decode_us=[{:.3}] annotate_us=[{:.3}] source_span_us=[{:.3}] previous_persist_us=[{:.3}] encode_us=[{:.3}] publish_us=[{:.3}] total_us=[{:.3}]",
-                row_view.num_rows(),
-                active_envelope_us,
-                json_decode_us,
-                annotate_us,
-                source_span_us,
-                previous_persist_us,
-                encode_us,
-                publish_us,
-                instant_delta_us(total_started_at, Instant::now()),
-            ));
-        }
-        Ok(DescriptorForwardingOutcome::Forwarded)
-    }
-
-    fn forwarded_source_row_span(&self, row_view: &SegmentRowView) -> Result<Option<RowSpanView>> {
-        if self.persist_config.is_none() {
-            return Ok(None);
-        }
-        let span = row_view.row_span();
-        let Some(descriptor) = span.active_descriptor().cloned() else {
-            return Ok(None);
-        };
-        RowSpanView::from_active_descriptor(descriptor, 0, span.end_row())
-            .map(Some)
-            .map_err(|reason| ZippyError::Io {
-                reason: format!("failed to retain forwarded source row span reason=[{reason}]"),
-            })
-    }
-
-    fn warn_descriptor_forwarding_fallback_once(
-        &mut self,
-        reason: DescriptorForwardingFallbackReason,
-    ) {
-        if self.descriptor_forwarding_fallback_warned {
-            return;
-        }
-
-        self.descriptor_forwarding_fallback_warned = true;
-        tracing::warn!(
-            event = "descriptor_forwarding_fallback",
-            stream = %self.name,
-            fallback = "copy",
-            reason = reason.as_str(),
-            "descriptor_forwarding_fallback"
-        );
-    }
-
-    fn replace_with_table(&mut self, table: &SegmentTableView) -> Result<()> {
-        self.ensure_persist_healthy()?;
-        if table.schema().as_ref() != self.input_schema.as_ref() {
-            return Err(ZippyError::SchemaMismatch {
-                reason: format!(
-                    "input batch schema does not match stream table input schema engine=[{}]",
-                    self.name
-                ),
-            });
-        }
-
-        let old_descriptor = self.active_descriptor_value()?;
-        let mut old_snapshot = Vec::with_capacity(self.sealed_segment_descriptors.len() + 1);
-        old_snapshot.extend(
-            self.sealed_segment_descriptors
-                .iter()
-                .map(|retained| retained.envelope.clone()),
-        );
-        old_snapshot.push(old_descriptor);
-        let writer = self.partition.writer();
-        let _sealed = writer
-            .rollover_without_persistence()
-            .map_err(segment_error)?;
-        self.forwarded_active_descriptor = None;
-        self.forwarded_active_row_span = None;
-        self.replacement_retained_snapshots.push_back(old_snapshot);
-        self.sealed_segment_descriptors.clear();
-        self.persisted_segment_identities.clear();
-
-        self.materialize_table_rows(table, false)?;
-        self.publish_active_descriptor()?;
-        if self.apply_retention()? {
-            self.publish_active_descriptor()?;
-        }
-        Ok(())
-    }
-
-    fn try_rewrite_active_with_table(&mut self, table: &SegmentTableView) -> Result<bool> {
-        self.ensure_persist_healthy()?;
-        if table.schema().as_ref() != self.input_schema.as_ref() {
-            return Err(ZippyError::SchemaMismatch {
-                reason: format!(
-                    "input batch schema does not match stream table input schema engine=[{}]",
-                    self.name
-                ),
-            });
-        }
-        if !self.sealed_segment_descriptors.is_empty() {
-            return Ok(false);
-        }
-
-        self.forwarded_active_descriptor = None;
-        self.forwarded_active_row_span = None;
-        let fields = self.input_schema.fields().clone();
-        let columns = (0..fields.len())
-            .map(|index| table.column_at(index))
-            .collect::<Result<Vec<_>>>()?;
-        let writer = self.partition.writer();
-        match writer.rewrite_rows(table.num_rows(), |row, row_index| {
-            Self::write_materialized_row_fields(row, &fields, &columns, row_index)
-        }) {
-            Ok(_) => {
-                self.publish_active_descriptor()?;
-                Ok(true)
-            }
-            Err(ZippySegmentStoreError::Writer("segment is full")) => Ok(false),
-            Err(error) => Err(segment_error(error)),
-        }
-    }
-
-    fn update_rows_in_place(
-        &mut self,
-        batch: &RecordBatch,
-        target_rows: &[usize],
-        skip_columns: &BTreeSet<String>,
-    ) -> Result<()> {
-        self.ensure_persist_healthy()?;
-        if batch.schema().as_ref() != self.input_schema.as_ref() {
-            return Err(ZippyError::SchemaMismatch {
-                reason: format!(
-                    "input batch schema does not match stream table input schema engine=[{}]",
-                    self.name
-                ),
-            });
-        }
-        if batch.num_rows() != target_rows.len() {
-            return Err(ZippyError::InvalidState {
-                status: "in-place row update target length mismatch",
-            });
-        }
-
-        let fields = self.input_schema.fields().clone();
-        let columns = (0..fields.len())
-            .map(|index| batch.column(index).clone())
-            .collect::<Vec<_>>();
-        let writer = self.partition.writer();
-        writer
-            .update_rows_at(target_rows, |row, update_index| {
-                Self::update_materialized_row_fields(
-                    row,
-                    &fields,
-                    &columns,
-                    update_index,
-                    skip_columns,
-                )
-            })
-            .map_err(segment_error)?;
-        self.forwarded_active_descriptor = None;
-        self.forwarded_active_row_span = None;
-        self.publish_active_descriptor()?;
         Ok(())
     }
 
@@ -1739,66 +509,6 @@ impl StreamTableMaterializer {
         row_index: usize,
     ) -> std::result::Result<(), ZippySegmentStoreError> {
         writer.write_row(|row| Self::write_materialized_row_fields(row, fields, columns, row_index))
-    }
-
-    fn update_materialized_row_fields(
-        row: &mut PartitionRowUpdater<'_>,
-        fields: &Fields,
-        columns: &[ArrayRef],
-        row_index: usize,
-        skip_columns: &BTreeSet<String>,
-    ) -> std::result::Result<(), ZippySegmentStoreError> {
-        for (field_index, field) in fields.iter().enumerate() {
-            if skip_columns.contains(field.name().as_str()) {
-                continue;
-            }
-
-            let array = columns[field_index].as_ref();
-            if array.is_null(row_index) {
-                if field.is_nullable() {
-                    row.write_null(field.name())?;
-                    continue;
-                }
-                return Err(ZippySegmentStoreError::Schema(
-                    "non-nullable stream table column received null",
-                ));
-            }
-
-            match field.data_type() {
-                DataType::Int64 => {
-                    let values = array.as_any().downcast_ref::<Int64Array>().ok_or(
-                        ZippySegmentStoreError::Schema("int64 column downcast failed"),
-                    )?;
-                    row.write_i64(field.name(), values.value(row_index))?;
-                }
-                DataType::Float64 => {
-                    let values = array.as_any().downcast_ref::<Float64Array>().ok_or(
-                        ZippySegmentStoreError::Schema("float64 column downcast failed"),
-                    )?;
-                    row.write_f64(field.name(), values.value(row_index))?;
-                }
-                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                    let values = array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .ok_or(ZippySegmentStoreError::Schema(
-                            "timestamp[ns] column downcast failed",
-                        ))?;
-                    row.write_i64(field.name(), values.value(row_index))?;
-                }
-                DataType::Utf8 => {
-                    return Err(ZippySegmentStoreError::Schema(
-                        "utf8 column cannot be updated in place",
-                    ));
-                }
-                _ => {
-                    return Err(ZippySegmentStoreError::Schema(
-                        "unsupported stream table column type",
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 
     fn write_materialized_row_fields(
@@ -1934,12 +644,13 @@ impl StreamTableMaterializer {
         Ok(())
     }
 
-    fn publish_active_descriptor(&self) -> Result<()> {
-        let Some(publisher) = &self.descriptor_publisher else {
-            return Ok(());
-        };
-        let descriptor = self.active_descriptor_envelope_bytes()?;
-        publisher.publish(descriptor)
+    /// Seals the active segment into retained history and opens a fresh active segment.
+    fn rollover_active_segment(&mut self) -> Result<()> {
+        let sealed_descriptor = self.active_descriptor_value()?;
+        self.partition.writer().rollover().map_err(segment_error)?;
+        self.sealed_segment_descriptors
+            .push_back(sealed_descriptor.into());
+        Ok(())
     }
 
     fn active_descriptor_value(&self) -> Result<serde_json::Value> {
@@ -1952,103 +663,13 @@ impl StreamTableMaterializer {
         })
     }
 
-    fn annotate_forwarded_descriptor_control_writer_epoch(
-        &self,
-        descriptor: &mut serde_json::Value,
-    ) -> Result<()> {
-        let writer_epoch = self
-            .active_descriptor_value()?
-            .get("writer_epoch")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| ZippyError::Io {
-                reason: "stream table active descriptor missing writer_epoch".to_string(),
-            })?;
-        descriptor["control_writer_epoch"] = serde_json::Value::from(writer_epoch);
-        Ok(())
-    }
-
-    fn enqueue_persist_task(
-        &mut self,
-        sealed: SealedSegmentHandle,
-        sealed_descriptor: &serde_json::Value,
-    ) -> Result<()> {
-        if self.persist_config.is_none() {
-            return Ok(());
-        }
-        self.ensure_persist_worker()?;
-        let Some(worker) = &self.persist_worker else {
-            return Ok(());
-        };
-        let source_generation = sealed_descriptor
-            .get("generation")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let writer_epoch = sealed_descriptor
-            .get("writer_epoch")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or_default();
-        let identity = descriptor_segment_identity(sealed_descriptor).unwrap_or((
-            sealed.segment_id(),
-            source_generation.as_u64().unwrap_or_default(),
-        ));
-        worker.enqueue(StreamTablePersistTask {
-            rows: StreamTablePersistRows::Sealed(sealed),
-            source_generation,
-            writer_epoch,
-            identity,
-        })
-    }
-
-    fn enqueue_persist_row_span_task(&mut self, row_span: RowSpanView) -> Result<()> {
-        if self.persist_config.is_none() || row_span.row_count() == 0 {
-            return Ok(());
-        }
-        let Some(descriptor) = row_span.active_descriptor() else {
-            return Ok(());
-        };
-        let segment_id = descriptor.segment_id();
-        let generation = descriptor.generation();
-        let writer_epoch = descriptor.writer_epoch();
-        let identity = (segment_id, generation);
-        if self.persisted_segment_identities.contains(&identity) {
-            return Ok(());
-        }
-        self.ensure_persist_worker()?;
-        let Some(worker) = &self.persist_worker else {
-            return Ok(());
-        };
-        worker.enqueue(StreamTablePersistTask {
-            source_generation: serde_json::Value::from(generation),
-            writer_epoch,
-            identity,
-            rows: StreamTablePersistRows::RowSpan(row_span),
-        })
-    }
-
-    fn apply_retention(&mut self) -> Result<bool> {
-        self.drain_persist_completions();
-        let published_changed = if let Some(retention_segments) = self.retention_segments {
-            self.trim_published_retained_segments(retention_segments)?
-        } else {
-            false
-        };
-        self.trim_replacement_retained_segments()?;
-        Ok(published_changed)
-    }
-
-    fn trim_published_retained_segments(&mut self, retention_segments: usize) -> Result<bool> {
-        let mut published_changed = false;
+    fn trim_durable_retained_segments(&mut self, retention_segments: usize) {
         while self.sealed_segment_descriptors.len() > retention_segments {
             let Some(identity) = descriptor_segment_identity(
                 &self.sealed_segment_descriptors.front().unwrap().envelope,
             ) else {
                 break;
             };
-            if self.persist_config.is_some()
-                && !self.persisted_segment_identities.contains(&identity)
-            {
-                break;
-            }
             if self
                 .store
                 .pin_count_for_segment(&self.partition, identity.0, identity.1)
@@ -2056,1338 +677,11 @@ impl StreamTableMaterializer {
             {
                 break;
             }
-            if let Some(guard) = &self.retention_guard {
-                if !guard.can_release(identity.0, identity.1)? {
-                    break;
-                }
-            }
             self.sealed_segment_descriptors.pop_front();
-            self.persisted_segment_identities.remove(&identity);
             self.partition
                 .release_retired_segment(identity.0, identity.1);
-            published_changed = true;
-        }
-        Ok(published_changed)
-    }
-
-    fn trim_replacement_retained_segments(&mut self) -> Result<()> {
-        while self.replacement_retained_snapshots.len() > self.replacement_retention_snapshots {
-            let snapshot = self.replacement_retained_snapshots.front().unwrap();
-            let identities = snapshot
-                .iter()
-                .map(descriptor_segment_identity)
-                .collect::<Option<Vec<_>>>();
-            let Some(identities) = identities else {
-                break;
-            };
-            let has_pinned_segment = identities.iter().any(|identity| {
-                self.store
-                    .pin_count_for_segment(&self.partition, identity.0, identity.1)
-                    > 0
-            });
-            if has_pinned_segment {
-                break;
-            }
-            if let Some(guard) = &self.retention_guard {
-                for identity in &identities {
-                    if !guard.can_release(identity.0, identity.1)? {
-                        return Ok(());
-                    }
-                }
-            }
-
-            self.replacement_retained_snapshots.pop_front();
-            for identity in identities {
-                self.partition
-                    .release_retired_segment(identity.0, identity.1);
-            }
-        }
-        Ok(())
-    }
-
-    fn drain_persist_completions(&mut self) {
-        let Some(worker) = &self.persist_worker else {
-            return;
-        };
-        for identity in worker.drain_completed_segments() {
-            self.persisted_segment_identities.insert(identity);
         }
     }
-
-    fn ensure_persist_worker(&mut self) -> Result<()> {
-        if self.persist_worker.is_some() {
-            return Ok(());
-        }
-        let Some(config) = self.persist_config.clone() else {
-            return Ok(());
-        };
-        let worker = StreamTablePersistWorker::spawn(
-            self.name.clone(),
-            config,
-            self.persist_publisher.clone(),
-        )?;
-        self.persist_worker = Some(worker);
-        Ok(())
-    }
-
-    fn ensure_persist_healthy(&self) -> Result<()> {
-        let Some(worker) = &self.persist_worker else {
-            return Ok(());
-        };
-        if let Some(summary) = worker.failure_summary() {
-            return Err(ZippyError::Io {
-                reason: format!("stream table persist failed error=[{}]", summary),
-            });
-        }
-        Ok(())
-    }
-
-    fn seal_active_for_persist_on_stop(&mut self) -> Result<bool> {
-        if let Some(row_span) = self.forwarded_active_row_span.take() {
-            self.enqueue_persist_row_span_task(row_span)?;
-            return Ok(true);
-        }
-        if self.persist_config.is_none() || self.active_committed_row_count() == 0 {
-            return Ok(false);
-        }
-
-        let sealed_descriptor = self.active_descriptor_value()?;
-        let writer = self.partition.writer();
-        let sealed = writer
-            .rollover_without_persistence()
-            .map_err(segment_error)?;
-        self.forwarded_active_descriptor = None;
-        self.forwarded_active_row_span = None;
-        self.sealed_segment_descriptors
-            .push_back(sealed_descriptor.clone().into());
-        self.enqueue_persist_task(sealed, &sealed_descriptor)?;
-        Ok(true)
-    }
-
-    fn stop_persist_worker(&mut self) -> Result<()> {
-        if let Some(worker) = self.persist_worker.as_mut() {
-            worker.stop();
-        }
-        self.drain_persist_completions();
-        self.ensure_persist_healthy()
-    }
-}
-
-impl ShardedStreamTableMaterializer {
-    /// Create a sharded stream table materializer with the default row capacity.
-    ///
-    /// :param logical_name: Logical stream table name exposed to downstream engines.
-    /// :type logical_name: impl Into<String>
-    /// :param input_schema: Input schema consumed by every shard.
-    /// :type input_schema: SchemaRef
-    /// :param config: Deterministic shard routing configuration.
-    /// :type config: ShardConfig
-    /// :returns: Initialized sharded materializer.
-    /// :rtype: Result<ShardedStreamTableMaterializer>
-    pub fn new(
-        logical_name: impl Into<String>,
-        input_schema: SchemaRef,
-        config: ShardConfig,
-    ) -> Result<Self> {
-        Self::new_with_row_capacity(
-            logical_name,
-            input_schema,
-            config,
-            DEFAULT_STREAM_TABLE_ROW_CAPACITY,
-        )
-    }
-
-    /// Create a sharded stream table materializer with an explicit row capacity.
-    ///
-    /// :param logical_name: Logical stream table name exposed to downstream engines.
-    /// :type logical_name: impl Into<String>
-    /// :param input_schema: Input schema consumed by every shard.
-    /// :type input_schema: SchemaRef
-    /// :param config: Deterministic shard routing configuration.
-    /// :type config: ShardConfig
-    /// :param row_capacity: Active segment row capacity for each shard.
-    /// :type row_capacity: usize
-    /// :returns: Initialized sharded materializer.
-    /// :rtype: Result<ShardedStreamTableMaterializer>
-    pub fn new_with_row_capacity(
-        logical_name: impl Into<String>,
-        input_schema: SchemaRef,
-        config: ShardConfig,
-        row_capacity: usize,
-    ) -> Result<Self> {
-        Self::new_with_row_capacity_and_writer_epochs(
-            logical_name,
-            input_schema,
-            config,
-            row_capacity,
-            None,
-        )
-    }
-
-    pub fn new_with_row_capacity_and_writer_epochs(
-        logical_name: impl Into<String>,
-        input_schema: SchemaRef,
-        config: ShardConfig,
-        row_capacity: usize,
-        shard_writer_epochs: Option<Vec<u64>>,
-    ) -> Result<Self> {
-        let logical_name = logical_name.into();
-        let shard_count = config.shard_nums();
-        if let Some(writer_epochs) = shard_writer_epochs.as_ref() {
-            if writer_epochs.len() != shard_count {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "shard_writer_epochs length mismatch logical=[{}] expected=[{}] actual=[{}]",
-                        logical_name,
-                        shard_count,
-                        writer_epochs.len()
-                    ),
-                });
-            }
-        }
-        let router = ShardRouter::try_new(Arc::clone(&input_schema), config)?;
-        let shard_names = (0..shard_count)
-            .map(|shard_index| Self::shard_stream_name(&logical_name, shard_index))
-            .collect::<Vec<_>>();
-        let shards = shard_names
-            .iter()
-            .enumerate()
-            .map(|(shard_index, shard_name)| {
-                let writer_epoch = shard_writer_epochs
-                    .as_ref()
-                    .and_then(|epochs| epochs.get(shard_index).copied());
-                StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
-                    shard_name.clone(),
-                    Arc::clone(&input_schema),
-                    row_capacity,
-                    writer_epoch,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            logical_name,
-            input_schema,
-            router,
-            shard_names,
-            shards,
-            failed_shards: Arc::new(Mutex::new(Vec::new())),
-        })
-    }
-
-    /// Return the deterministic physical stream name for a logical shard.
-    pub fn shard_stream_name(logical_name: &str, shard_index: usize) -> String {
-        format!("{}.__shard_{:04}", logical_name, shard_index)
-    }
-
-    /// Return all physical shard stream names.
-    pub fn shard_names(&self) -> &[String] {
-        &self.shard_names
-    }
-
-    /// Export one shard's active segment descriptor envelope.
-    pub fn active_descriptor_envelope_bytes(&self, shard_index: usize) -> Result<Vec<u8>> {
-        self.shard(shard_index)?.active_descriptor_envelope_bytes()
-    }
-
-    /// Export every shard's active segment descriptor envelope.
-    pub fn active_descriptors_envelope_bytes(&self) -> Result<Vec<Vec<u8>>> {
-        self.shards
-            .iter()
-            .map(StreamTableMaterializer::active_descriptor_envelope_bytes)
-            .collect()
-    }
-
-    /// Return a debug Arrow snapshot of one shard's active segment.
-    pub fn shard_active_record_batch(&self, shard_index: usize) -> Result<RecordBatch> {
-        self.shard(shard_index)?.active_record_batch()
-    }
-
-    /// Return committed active row counts for all shards.
-    pub fn shard_row_counts(&self) -> Vec<usize> {
-        self.shards
-            .iter()
-            .map(StreamTableMaterializer::active_committed_row_count)
-            .collect()
-    }
-
-    /// Return shard write or lifecycle failures observed by this wrapper.
-    pub fn failed_shards(&self) -> Vec<ShardFailure> {
-        self.failed_shards.lock().unwrap().clone()
-    }
-
-    /// Return a shared failure-state handle for observers outside the engine runtime.
-    pub fn failed_shards_handle(&self) -> Arc<Mutex<Vec<ShardFailure>>> {
-        Arc::clone(&self.failed_shards)
-    }
-
-    fn shard(&self, shard_index: usize) -> Result<&StreamTableMaterializer> {
-        self.shards
-            .get(shard_index)
-            .ok_or_else(|| self.shard_index_error(shard_index))
-    }
-
-    fn shard_index_error(&self, shard_index: usize) -> ZippyError {
-        ZippyError::InvalidConfig {
-            reason: format!(
-                "stream table shard index out of bounds logical=[{}] shard_index=[{}] shard_count=[{}]",
-                self.logical_name,
-                shard_index,
-                self.shards.len()
-            ),
-        }
-    }
-
-    fn route_error(&self, action: &str, error: ZippyError) -> ZippyError {
-        ZippyError::Io {
-            reason: format!(
-                "sharded stream table materializer failed action=[{}] logical=[{}] error=[{}]",
-                action, self.logical_name, error
-            ),
-        }
-    }
-
-    fn record_shard_failure(
-        &mut self,
-        action: &str,
-        shard_index: usize,
-        error: ZippyError,
-    ) -> ZippyError {
-        let shard_name = self.shard_names[shard_index].clone();
-        let root_error = error.to_string();
-        {
-            let mut failed_shards = self.failed_shards.lock().unwrap();
-            if let Some(failure) = failed_shards
-                .iter_mut()
-                .find(|failure| failure.action == action && failure.shard_index == shard_index)
-            {
-                failure.shard_name.clone_from(&shard_name);
-                failure.error.clone_from(&root_error);
-            } else {
-                failed_shards.push(ShardFailure {
-                    action: action.to_string(),
-                    shard_index,
-                    shard_name: shard_name.clone(),
-                    error: root_error.clone(),
-                });
-            }
-        }
-        ZippyError::Io {
-            reason: format!(
-                "sharded stream table materializer failed action=[{}] logical=[{}] shard_index=[{}] shard_name=[{}] error=[{}]",
-                action, self.logical_name, shard_index, shard_name, root_error
-            ),
-        }
-    }
-}
-
-impl KeyValueTableMaterializer {
-    /// Create a new key-value table materializer.
-    ///
-    /// :param name: Stream table name.
-    /// :type name: impl Into<String>
-    /// :param input_schema: Input schema consumed and materialized by the table.
-    /// :type input_schema: SchemaRef
-    /// :param by: UTF8 key columns identifying rows to replace.
-    /// :type by: Vec<impl Into<String>>
-    /// :returns: Initialized key-value table materializer.
-    /// :rtype: Result<KeyValueTableMaterializer>
-    pub fn new(
-        name: impl Into<String>,
-        input_schema: SchemaRef,
-        by: Vec<impl Into<String>>,
-    ) -> Result<Self> {
-        Self::new_with_row_capacity(name, input_schema, by, DEFAULT_STREAM_TABLE_ROW_CAPACITY)
-    }
-
-    /// Create a new key-value table materializer with explicit row capacity.
-    ///
-    /// :param name: Stream table name.
-    /// :type name: impl Into<String>
-    /// :param input_schema: Input schema consumed and materialized by the table.
-    /// :type input_schema: SchemaRef
-    /// :param by: UTF8 key columns identifying rows to replace.
-    /// :type by: Vec<impl Into<String>>
-    /// :param row_capacity: Active segment row capacity before rollover.
-    /// :type row_capacity: usize
-    /// :returns: Initialized key-value table materializer.
-    /// :rtype: Result<KeyValueTableMaterializer>
-    pub fn new_with_row_capacity(
-        name: impl Into<String>,
-        input_schema: SchemaRef,
-        by: Vec<impl Into<String>>,
-        row_capacity: usize,
-    ) -> Result<Self> {
-        Self::new_with_row_capacity_and_writer_epoch(name, input_schema, by, row_capacity, None)
-    }
-
-    pub fn new_with_row_capacity_and_writer_epoch(
-        name: impl Into<String>,
-        input_schema: SchemaRef,
-        by: Vec<impl Into<String>>,
-        row_capacity: usize,
-        writer_epoch: Option<u64>,
-    ) -> Result<Self> {
-        let name = name.into();
-        let by = by.into_iter().map(Into::into).collect::<Vec<_>>();
-        validate_latest_by_columns(input_schema.as_ref(), &by)?;
-        if input_schema
-            .fields()
-            .iter()
-            .any(|field| field.name().starts_with("_zippy_kv_"))
-        {
-            return Err(ZippyError::InvalidConfig {
-                reason: "reserved key-value protocol column prefix".into(),
-            });
-        }
-        let latest_state = LatestColumnarState::new(Arc::clone(&input_schema), by.clone())?;
-        let table = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
-            name.clone(),
-            Arc::clone(&input_schema),
-            row_capacity,
-            writer_epoch,
-        )?;
-
-        let descriptor = table.active_descriptor_value()?;
-        let allocation = descriptor["shm_os_id"]
-            .as_str()
-            .ok_or(ZippyError::InvalidState {
-                status: "key-value producer allocation identity missing",
-            })?;
-        let stream_id = format!("{:x}", md5::compute(allocation.as_bytes()));
-        let snapshot = KeyValueSnapshotHandle(Arc::new(Mutex::new(SnapshotState {
-            latest: latest_state,
-            sequence: 0,
-            version: 0,
-            stream_id,
-            healthy: true,
-        })));
-        Ok(Self {
-            name,
-            changelog_schema: key_value_changelog_schema(Arc::clone(&input_schema)),
-            input_schema,
-            by,
-            snapshot,
-            table,
-            changelog_table: None,
-            descriptor_metadata: Arc::new(Mutex::new(KeyValueDescriptorMetadata::default())),
-        })
-    }
-
-    /// Attach an internal append-only changelog table.
-    pub fn with_changelog(
-        mut self,
-        changelog_name: impl Into<String>,
-        row_capacity: usize,
-        writer_epoch: Option<u64>,
-    ) -> Result<Self> {
-        let changelog_name = changelog_name.into();
-        let changelog_schema = key_value_changelog_schema(Arc::clone(&self.input_schema));
-        let changelog_table = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
-            changelog_name.clone(),
-            Arc::clone(&changelog_schema),
-            row_capacity,
-            writer_epoch,
-        )?;
-        self.descriptor_metadata.lock().unwrap().changelog_stream = Some(changelog_name);
-        self.changelog_schema = changelog_schema;
-        self.changelog_table = Some(changelog_table);
-        Ok(self)
-    }
-
-    /// Attach a publisher used when the internal changelog descriptor changes.
-    pub fn with_changelog_descriptor_publisher(
-        mut self,
-        publisher: Arc<dyn StreamTableDescriptorPublisher>,
-    ) -> Self {
-        if let Some(changelog_table) = self.changelog_table.take() {
-            self.changelog_table = Some(changelog_table.with_descriptor_publisher(publisher));
-        }
-        self
-    }
-
-    /// Attach a publisher used when the active snapshot descriptor changes.
-    pub fn with_descriptor_publisher(
-        mut self,
-        publisher: Arc<dyn StreamTableDescriptorPublisher>,
-    ) -> Self {
-        self.table =
-            self.table
-                .with_descriptor_publisher(Arc::new(KeyValueSnapshotDescriptorPublisher {
-                    inner: publisher,
-                    metadata: Arc::clone(&self.descriptor_metadata),
-                }));
-        self
-    }
-
-    /// Attach a guard used before releasing old replacement snapshots.
-    pub fn with_retention_guard(mut self, guard: Arc<dyn StreamTableRetentionGuard>) -> Self {
-        self.table = self.table.with_retention_guard(guard);
-        self
-    }
-
-    /// Limit how many old replacement snapshots are retained for stale readers.
-    pub fn with_replacement_retention_snapshots(mut self, snapshots: usize) -> Result<Self> {
-        self.table = self.table.with_replacement_retention_snapshots(snapshots)?;
-        Ok(self)
-    }
-
-    /// Return the grouping columns used to identify latest rows.
-    pub fn by(&self) -> &[String] {
-        &self.by
-    }
-
-    /// Return the active segment committed row count.
-    pub fn active_committed_row_count(&self) -> usize {
-        self.table.active_committed_row_count()
-    }
-
-    /// Export the active segment descriptor envelope for cross-process readers.
-    pub fn active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
-        let mut descriptor = self.table.active_descriptor_value()?;
-        self.descriptor_metadata
-            .lock()
-            .unwrap()
-            .annotate(&mut descriptor);
-        serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to encode key-value snapshot descriptor error=[{}]",
-                error
-            ),
-        })
-    }
-
-    /// Export the active changelog segment descriptor envelope for cross-process readers.
-    pub fn changelog_active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
-        let Some(changelog_table) = self.changelog_table.as_ref() else {
-            return Err(ZippyError::InvalidState {
-                status: "key-value changelog table is not configured",
-            });
-        };
-        changelog_table.active_descriptor_envelope_bytes()
-    }
-
-    /// Return a debug Arrow snapshot of the active key-value table segment.
-    pub fn active_record_batch(&self) -> Result<RecordBatch> {
-        self.table.active_record_batch()
-    }
-
-    /// Return a debug Arrow snapshot of the active changelog segment.
-    pub fn changelog_record_batch(&self) -> Result<RecordBatch> {
-        let Some(changelog_table) = self.changelog_table.as_ref() else {
-            return Err(ZippyError::InvalidState {
-                status: "key-value changelog table is not configured",
-            });
-        };
-        changelog_table.active_record_batch()
-    }
-
-    /// Returns an independent capability for atomic, explicit snapshot requests.
-    pub fn snapshot_handle(&self) -> KeyValueSnapshotHandle {
-        self.snapshot.clone()
-    }
-
-    fn build_changelog_batch(
-        &self,
-        update: &RecordBatch,
-        snapshot_version: u64,
-        first_seq: u64,
-        stream_id: &str,
-    ) -> Result<RecordBatch> {
-        let changelog_schema = &self.changelog_schema;
-        let rows = update.num_rows();
-        let mut seq_values = Vec::with_capacity(rows);
-        let mut version_values = Vec::with_capacity(rows);
-        for row_index in 0..rows {
-            seq_values.push(i64::try_from(first_seq + row_index as u64).map_err(|_| {
-                ZippyError::InvalidState {
-                    status: "key-value changelog sequence exceeds i64 range",
-                }
-            })?);
-            version_values.push(i64::try_from(snapshot_version).map_err(|_| {
-                ZippyError::InvalidState {
-                    status: "key-value snapshot version exceeds i64 range",
-                }
-            })?);
-        }
-        let mut columns = Vec::with_capacity(update.num_columns() + 5);
-        columns.push(Arc::new(Int64Array::from(seq_values)) as ArrayRef);
-        columns.push(Arc::new(StringArray::from(vec!["upsert"; rows])) as ArrayRef);
-        columns.push(Arc::new(Int64Array::from(version_values)) as ArrayRef);
-        columns.push(Arc::new(Int64Array::from(vec![
-            (first_seq + rows as u64 - 1) as i64;
-            rows
-        ])) as ArrayRef);
-        columns.push(Arc::new(StringArray::from(vec![stream_id; rows])) as ArrayRef);
-        columns.extend(update.columns().iter().cloned());
-        RecordBatch::try_new(Arc::clone(changelog_schema), columns).map_err(|error| {
-            ZippyError::Io {
-                reason: format!(
-                    "failed to build key-value changelog batch error=[{}]",
-                    error
-                ),
-            }
-        })
-    }
-
-    fn update_descriptor_metadata(&mut self, state: &SnapshotState) {
-        let mut metadata = self.descriptor_metadata.lock().unwrap();
-        metadata.snapshot_version = state.version;
-        metadata.last_changelog_seq = state.sequence;
-    }
-
-    fn in_place_snapshot_rows(
-        &self,
-        update: &LatestUpdateSet,
-        state: &SnapshotState,
-    ) -> Option<Vec<usize>> {
-        if state.version == 0 || update.has_new_slots() {
-            return None;
-        }
-        if self.table.active_committed_row_count() != state.latest.len() {
-            return None;
-        }
-        if self.input_schema.fields().iter().any(|field| {
-            field.data_type() == &DataType::Utf8 && !self.by.iter().any(|key| key == field.name())
-        }) {
-            return None;
-        }
-
-        let rows = state.latest.snapshot_rows_for_slots(update.slots());
-        if rows.len() != update.slots().len() {
-            return None;
-        }
-        if rows
-            .iter()
-            .any(|row| *row >= self.table.active_committed_row_count())
-        {
-            return None;
-        }
-        Some(rows)
-    }
-
-    fn update_snapshot_storage(
-        &mut self,
-        update: &LatestUpdateSet,
-        update_batch: &RecordBatch,
-        state: &SnapshotState,
-    ) -> Result<()> {
-        if let Some(rows) = self.in_place_snapshot_rows(update, state) {
-            let skip_columns = self.by.iter().cloned().collect::<BTreeSet<_>>();
-            self.table
-                .update_rows_in_place(update_batch, &rows, &skip_columns)?;
-        } else {
-            let view = SegmentTableView::from_record_batch(state.latest.materialize_snapshot()?);
-            if !self.table.try_rewrite_active_with_table(&view)? {
-                self.table.replace_with_table(&view)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Engine for KeyValueTableMaterializer {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn input_schema(&self) -> SchemaRef {
-        Arc::clone(&self.input_schema)
-    }
-
-    fn output_schema(&self) -> SchemaRef {
-        Arc::clone(&self.changelog_schema)
-    }
-
-    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
-        if table.schema().as_ref() != self.input_schema.as_ref() {
-            return Err(ZippyError::SchemaMismatch {
-                reason: format!(
-                    "input batch schema does not match key-value table input schema engine=[{}]",
-                    self.name
-                ),
-            });
-        }
-        if table.num_rows() == 0 {
-            return Ok(vec![]);
-        }
-
-        let handle = self.snapshot.clone();
-        let mut state = handle.0.lock().unwrap();
-        if !state.healthy {
-            return Err(ZippyError::InvalidState {
-                status: "key-value producer requires restart after failed publication",
-            });
-        }
-        if state.version >= i64::MAX as u64
-            || table.num_rows() as u64 > (i64::MAX as u64).saturating_sub(state.sequence)
-        {
-            return Err(ZippyError::InvalidState {
-                status: "key-value protocol cursor exhausted",
-            });
-        }
-        let update = state.latest.apply_batch(&table)?;
-        if update.is_empty() {
-            return Ok(vec![]);
-        }
-        state.healthy = false;
-        let update_batch = state.latest.materialize_update(&update)?;
-        let next_snapshot_version = state.version + 1;
-        let first_seq = state.sequence + 1;
-        let changelog_batch = self.build_changelog_batch(
-            &update_batch,
-            next_snapshot_version,
-            first_seq,
-            &state.stream_id,
-        )?;
-        let last_seq = first_seq
-            .checked_add(changelog_batch.num_rows() as u64 - 1)
-            .ok_or(ZippyError::InvalidState {
-                status: "key-value changelog sequence exhausted",
-            })?;
-        if let Some(changelog_table) = self.changelog_table.as_mut() {
-            changelog_table
-                .on_data(SegmentTableView::from_record_batch(changelog_batch.clone()))?;
-        }
-        state.sequence = last_seq;
-        state.version = next_snapshot_version;
-        self.update_descriptor_metadata(&state);
-        self.update_snapshot_storage(&update, &update_batch, &state)?;
-        state.healthy = true;
-        Ok(vec![SegmentTableView::from_record_batch(changelog_batch)])
-    }
-
-    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
-        if let Some(changelog_table) = self.changelog_table.as_mut() {
-            changelog_table.on_flush()?;
-        }
-        self.table.on_flush()?;
-        Ok(vec![])
-    }
-
-    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
-        if let Some(changelog_table) = self.changelog_table.as_mut() {
-            changelog_table.on_stop()?;
-        }
-        self.table.on_stop()?;
-        Ok(vec![])
-    }
-}
-
-fn key_value_changelog_schema(input_schema: SchemaRef) -> SchemaRef {
-    let mut fields = vec![
-        Arc::new(Field::new(
-            KEY_VALUE_CHANGELOG_SEQ_FIELD,
-            DataType::Int64,
-            false,
-        )),
-        Arc::new(Field::new(
-            KEY_VALUE_CHANGELOG_OP_FIELD,
-            DataType::Utf8,
-            false,
-        )),
-        Arc::new(Field::new(
-            KEY_VALUE_CHANGELOG_SNAPSHOT_VERSION_FIELD,
-            DataType::Int64,
-            false,
-        )),
-        Arc::new(Field::new(BATCH_END, DataType::Int64, false)),
-        Arc::new(Field::new(STREAM_ID, DataType::Utf8, false)),
-    ];
-    fields.extend(input_schema.fields().iter().cloned());
-    Arc::new(Schema::new(fields))
-}
-
-fn validate_latest_by_columns(schema: &Schema, by: &[String]) -> Result<()> {
-    if by.is_empty() {
-        return Err(ZippyError::InvalidConfig {
-            reason: "key-value table materializer requires at least one by column".to_string(),
-        });
-    }
-
-    let mut seen = BTreeSet::new();
-    for field_name in by {
-        if !seen.insert(field_name) {
-            return Err(ZippyError::InvalidConfig {
-                reason: format!("duplicate key-value table by column field=[{}]", field_name),
-            });
-        }
-        let field = schema
-            .field_with_name(field_name)
-            .map_err(|_| ZippyError::SchemaMismatch {
-                reason: format!("missing key-value table by field field=[{}]", field_name),
-            })?;
-        if field.data_type() != &DataType::Utf8 {
-            return Err(ZippyError::SchemaMismatch {
-                reason: format!(
-                    "key-value table by field must be utf8 field=[{}]",
-                    field_name
-                ),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn write_persist_rows_parquet(
-    stream_name: &str,
-    rows: &StreamTablePersistRows,
-    source_generation: serde_json::Value,
-    writer_epoch: u64,
-    config: &StreamTablePersistConfig,
-) -> Result<Vec<serde_json::Value>> {
-    let batch = rows.as_record_batch()?;
-    let partitions = partition_record_batch(&batch, config.partition_spec.as_ref())?;
-    let generation = source_generation.as_u64().unwrap_or_default();
-    let segment_id = rows.segment_id();
-    let mut files = Vec::with_capacity(partitions.len());
-    for (part_index, partition) in partitions.into_iter().enumerate() {
-        let target_dir = persist_partition_dir(config.root(), &partition.values);
-        fs::create_dir_all(&target_dir).map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to create stream table persist directory path=[{}] error=[{}]",
-                target_dir.display(),
-                error
-            ),
-        })?;
-
-        let file_name = format!(
-            concat!(
-                "{}-segment-{:020}-generation-{:020}-writer-epoch-{:020}",
-                "-part-{:05}.parquet"
-            ),
-            sanitize_persist_file_component(stream_name),
-            segment_id,
-            generation,
-            writer_epoch,
-            part_index
-        );
-        let target_path = target_dir.join(file_name);
-        write_record_batch_parquet(&target_path, &partition.batch)?;
-
-        files.push(serde_json::json!({
-            "stream_name": stream_name,
-            "persist_file_id": persist_file_id(
-                stream_name,
-                segment_id,
-                generation,
-                writer_epoch,
-                part_index,
-            ),
-            "file_path": target_path.to_string_lossy().to_string(),
-            "row_count": partition.batch.num_rows(),
-            "source_segment_id": segment_id,
-            "source_generation": source_generation.clone(),
-            "writer_epoch": writer_epoch,
-            "partition": partition_values_json(&partition.values.raw),
-            "partition_path": partition_values_json(&partition.values.encoded),
-            "partition_spec": partition_spec_json(config.partition_spec.as_ref()),
-            "persist_status": "committed",
-        }));
-    }
-
-    Ok(files)
-}
-
-fn write_and_publish_persisted_files(
-    stream_name: &str,
-    task: &StreamTablePersistTask,
-    config: &StreamTablePersistConfig,
-    publisher: Option<&dyn StreamTablePersistPublisher>,
-) -> Result<StreamTablePersistOutcome> {
-    let persisted_files = write_persist_rows_parquet(
-        stream_name,
-        &task.rows,
-        task.source_generation.clone(),
-        task.writer_epoch,
-        config,
-    )?;
-    write_persist_metadata_sidecars(config.root(), &persisted_files)?;
-    let file_count = persisted_files.len();
-    let mut attempts = 1_u64;
-    let mut metadata_error = None;
-    if let Some(publisher) = publisher {
-        metadata_error = Some("persisted metadata publisher was not attempted".to_string());
-        for attempt in 1..=config.max_attempts {
-            attempts = attempt as u64;
-            match publish_persisted_files(publisher, &persisted_files) {
-                Ok(()) => {
-                    metadata_error = None;
-                    break;
-                }
-                Err(error) => {
-                    metadata_error = Some(error.to_string());
-                    if attempt < config.max_attempts && !config.retry_delay.is_zero() {
-                        thread::sleep(config.retry_delay);
-                    }
-                }
-            }
-        }
-    }
-    Ok(StreamTablePersistOutcome {
-        attempts,
-        file_count,
-        metadata_error,
-    })
-}
-
-fn publish_persisted_files(
-    publisher: &dyn StreamTablePersistPublisher,
-    persisted_files: &[serde_json::Value],
-) -> Result<()> {
-    for persisted_file in persisted_files {
-        publisher.publish(persisted_file.clone())?;
-    }
-    Ok(())
-}
-
-fn persist_file_id(
-    stream_name: &str,
-    segment_id: u64,
-    generation: u64,
-    writer_epoch: u64,
-    part_index: usize,
-) -> String {
-    format!("{stream_name}:{segment_id}:{generation}:{writer_epoch}:{part_index}")
-}
-
-fn persist_failure_event(
-    stream_name: &str,
-    identity: SegmentIdentity,
-    writer_epoch: u64,
-    attempts: u64,
-    error: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "stream_name": stream_name,
-        "persist_event_id": format!(
-            "{}:{}:{}:{}:failed",
-            stream_name, identity.0, identity.1, writer_epoch,
-        ),
-        "persist_event_type": "persist_failed",
-        "source_segment_id": identity.0,
-        "source_generation": identity.1,
-        "writer_epoch": writer_epoch,
-        "attempts": attempts,
-        "error": error,
-        "created_at": current_time_millis(),
-    })
-}
-
-fn persist_metadata_sync_failure_event(
-    stream_name: &str,
-    identity: SegmentIdentity,
-    writer_epoch: u64,
-    attempts: u64,
-    error: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "stream_name": stream_name,
-        "persist_event_id": format!(
-            "{}:{}:{}:{}:metadata_sync_failed",
-            stream_name, identity.0, identity.1, writer_epoch,
-        ),
-        "persist_event_type": "persist_metadata_sync_failed",
-        "source_segment_id": identity.0,
-        "source_generation": identity.1,
-        "writer_epoch": writer_epoch,
-        "attempts": attempts,
-        "error": error,
-        "created_at": current_time_millis(),
-    })
-}
-
-fn write_persist_metadata_sidecars(
-    root: &Path,
-    persisted_files: &[serde_json::Value],
-) -> Result<()> {
-    let metadata_dir = root.join("_zippy_persist_metadata");
-    fs::create_dir_all(&metadata_dir).map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to create stream table persist metadata directory path=[{}] error=[{}]",
-            metadata_dir.display(),
-            error
-        ),
-    })?;
-    for persisted_file in persisted_files {
-        let persist_file_id = persisted_file
-            .get("persist_file_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("persisted-file");
-        let file_name = format!("{}.json", sanitize_persist_file_component(persist_file_id));
-        let target_path = metadata_dir.join(file_name);
-        let temp_path = temp_parquet_path_for_target(&target_path);
-        let bytes = serde_json::to_vec_pretty(persisted_file).map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to encode stream table persist metadata error=[{}]",
-                error
-            ),
-        })?;
-        fs::write(&temp_path, bytes).map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to write stream table persist metadata path=[{}] error=[{}]",
-                temp_path.display(),
-                error
-            ),
-        })?;
-        fs::rename(&temp_path, &target_path).map_err(|error| {
-            let _ = fs::remove_file(&temp_path);
-            ZippyError::Io {
-                reason: format!(
-                    "failed to commit stream table persist metadata path=[{}] error=[{}]",
-                    target_path.display(),
-                    error
-                ),
-            }
-        })?;
-    }
-    Ok(())
-}
-
-fn write_record_batch_parquet(target_path: &Path, batch: &RecordBatch) -> Result<()> {
-    let temp_path = temp_parquet_path_for_target(target_path);
-    let file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to create stream table persist file path=[{}] error=[{}]",
-                temp_path.display(),
-                error
-            ),
-        })?;
-    let write_result = (|| {
-        let mut writer =
-            ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "failed to create stream table persist writer error=[{}]",
-                    error
-                ),
-            })?;
-        writer.write(batch).map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to write stream table persist batch error=[{}]",
-                error
-            ),
-        })?;
-        writer.close().map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to close stream table persist writer error=[{}]",
-                error
-            ),
-        })?;
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    commit_parquet_without_replace(&temp_path, target_path)?;
-    Ok(())
-}
-
-fn commit_parquet_without_replace(temp_path: &Path, target_path: &Path) -> Result<()> {
-    match fs::hard_link(temp_path, target_path) {
-        Ok(()) => {
-            if let Err(error) = fs::remove_file(temp_path) {
-                tracing::warn!(
-                    event = "stream_table_persist_temp_cleanup_failed",
-                    path = %temp_path.display(),
-                    error = %error,
-                    "stream_table_persist_temp_cleanup_failed"
-                );
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::remove_file(temp_path);
-            let reason = if error.kind() == std::io::ErrorKind::AlreadyExists {
-                format!(
-                    "refusing to overwrite existing stream table persist file path=[{}]",
-                    target_path.display()
-                )
-            } else {
-                format!(
-                    "failed to commit stream table persist file without replacement path=[{}] error=[{}]",
-                    target_path.display(),
-                    error
-                )
-            };
-            Err(ZippyError::Io { reason })
-        }
-    }
-}
-
-fn temp_parquet_path_for_target(target_path: &Path) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let file_name = target_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("segment.parquet");
-    target_path.with_file_name(format!("{file_name}.tmp-{}-{suffix}", std::process::id()))
-}
-
-fn current_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
-}
-
-fn sanitize_persist_file_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
-            _ => '_',
-        })
-        .collect()
-}
-
-fn partition_record_batch(
-    batch: &RecordBatch,
-    partition_spec: Option<&StreamTablePersistPartitionSpec>,
-) -> Result<Vec<PersistPartitionBatch>> {
-    let Some(partition_spec) = partition_spec else {
-        return Ok(vec![PersistPartitionBatch {
-            values: PersistPartitionValues {
-                raw: Vec::new(),
-                encoded: Vec::new(),
-            },
-            batch: batch.clone(),
-        }]);
-    };
-    if partition_spec.is_empty() {
-        return Ok(vec![PersistPartitionBatch {
-            values: PersistPartitionValues {
-                raw: Vec::new(),
-                encoded: Vec::new(),
-            },
-            batch: batch.clone(),
-        }]);
-    }
-
-    let dt_array = match &partition_spec.dt_column {
-        Some(dt_column) => Some(timestamp_partition_array(batch, dt_column)?),
-        None => None,
-    };
-    let id_array = match &partition_spec.id_column {
-        Some(id_column) => Some(string_partition_array(batch, id_column)?),
-        None => None,
-    };
-
-    let mut groups: BTreeMap<String, (PersistPartitionValues, Vec<u32>)> = BTreeMap::new();
-    for row_index in 0..batch.num_rows() {
-        let mut raw = Vec::new();
-        let mut encoded = Vec::new();
-        if let (Some(dt_column), Some(dt_part), Some(array)) =
-            (&partition_spec.dt_column, partition_spec.dt_part, dt_array)
-        {
-            if array.is_null(row_index) {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "stream table persist dt column contains null field=[{}]",
-                        dt_column
-                    ),
-                });
-            }
-            let value = dt_part.format_timestamp_ns(array.value(row_index));
-            raw.push(("dt_part".to_string(), value.clone()));
-            encoded.push(("dt_part".to_string(), percent_encode_path_component(&value)));
-        }
-        if let (Some(id_column), Some(array)) = (&partition_spec.id_column, id_array) {
-            if array.is_null(row_index) {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "stream table persist id column contains null field=[{}]",
-                        id_column
-                    ),
-                });
-            }
-            let value = array.value(row_index).to_string();
-            raw.push((id_column.clone(), value.clone()));
-            encoded.push((id_column.clone(), percent_encode_path_component(&value)));
-        }
-        let key = encoded
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("/");
-        groups
-            .entry(key)
-            .or_insert_with(|| (PersistPartitionValues { raw, encoded }, Vec::new()))
-            .1
-            .push(row_index as u32);
-    }
-
-    groups
-        .into_values()
-        .map(|(values, row_indices)| {
-            let indices = UInt32Array::from(row_indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .map(|column| {
-                    take(column.as_ref(), &indices, None).map_err(|error| ZippyError::Io {
-                        reason: format!(
-                            "failed to partition stream table persist batch error=[{}]",
-                            error
-                        ),
-                    })
-                })
-                .collect::<Result<Vec<ArrayRef>>>()?;
-            let batch =
-                RecordBatch::try_new(batch.schema(), columns).map_err(|error| ZippyError::Io {
-                    reason: format!(
-                        "failed to build partitioned stream table persist batch error=[{}]",
-                        error
-                    ),
-                })?;
-            Ok(PersistPartitionBatch { values, batch })
-        })
-        .collect()
-}
-
-fn timestamp_partition_array<'a>(
-    batch: &'a RecordBatch,
-    column: &str,
-) -> Result<&'a TimestampNanosecondArray> {
-    let index = batch
-        .schema()
-        .index_of(column)
-        .map_err(|_| ZippyError::InvalidConfig {
-            reason: format!("missing stream table persist dt column field=[{}]", column),
-        })?;
-    match batch.schema().field(index).data_type() {
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {}
-        data_type => {
-            return Err(ZippyError::InvalidConfig {
-                reason: format!(
-                    "stream table persist dt column must be timestamp[ns] field=[{}] data_type=[{:?}]",
-                    column, data_type
-                ),
-            });
-        }
-    }
-    batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .ok_or_else(|| ZippyError::InvalidConfig {
-            reason: format!(
-                "stream table persist dt column downcast failed field=[{}]",
-                column
-            ),
-        })
-}
-
-fn string_partition_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StringArray> {
-    let index = batch
-        .schema()
-        .index_of(column)
-        .map_err(|_| ZippyError::InvalidConfig {
-            reason: format!("missing stream table persist id column field=[{}]", column),
-        })?;
-    if batch.schema().field(index).data_type() != &DataType::Utf8 {
-        return Err(ZippyError::InvalidConfig {
-            reason: format!(
-                "stream table persist id column must be utf8 field=[{}]",
-                column
-            ),
-        });
-    }
-    batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ZippyError::InvalidConfig {
-            reason: format!(
-                "stream table persist id column downcast failed field=[{}]",
-                column
-            ),
-        })
-}
-
-fn persist_partition_dir(root: &Path, values: &PersistPartitionValues) -> PathBuf {
-    values
-        .encoded
-        .iter()
-        .fold(root.to_path_buf(), |path, (name, value)| {
-            path.join(format!("{name}={value}"))
-        })
-}
-
-fn partition_values_json(values: &[(String, String)]) -> serde_json::Value {
-    values
-        .iter()
-        .map(|(name, value)| (name.clone(), serde_json::Value::String(value.clone())))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
-}
-
-fn partition_spec_json(
-    partition_spec: Option<&StreamTablePersistPartitionSpec>,
-) -> serde_json::Value {
-    let Some(partition_spec) = partition_spec else {
-        return serde_json::Value::Null;
-    };
-    serde_json::json!({
-        "dt_column": partition_spec.dt_column,
-        "id_column": partition_spec.id_column,
-        "dt_part": partition_spec.dt_part.map(|value| value.as_str()),
-    })
-}
-
-fn percent_encode_path_component(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(*byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-fn normalize_optional_name(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let value = value.trim().to_string();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    })
-}
-
-fn timestamp_ns_to_utc_parts(timestamp_ns: i64) -> (i64, u32, u32, u32) {
-    let seconds = timestamp_ns.div_euclid(1_000_000_000);
-    let days = seconds.div_euclid(86_400);
-    let seconds_of_day = seconds.rem_euclid(86_400);
-    let hour = (seconds_of_day / 3_600) as u32;
-    let (year, month, day) = civil_from_days(days);
-    (year, month, day, hour)
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
-    (year, month as u32, day as u32)
 }
 
 fn descriptor_segment_identity(descriptor: &serde_json::Value) -> Option<SegmentIdentity> {
@@ -3410,16 +704,6 @@ impl Engine for StreamTableMaterializer {
     }
 
     fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
-        let trace_enabled = stream_table_latency_trace_enabled();
-        let on_data_started_at = trace_enabled.then(Instant::now);
-        let source_emit_ns = trace_enabled
-            .then(|| single_row_table_source_emit_ns(&table))
-            .flatten();
-        let rows = table.num_rows();
-        let ensure_started_at = trace_enabled.then(Instant::now);
-        self.ensure_persist_healthy()?;
-        let ensure_done_at = trace_enabled.then(Instant::now);
-        let schema_check_started_at = trace_enabled.then(Instant::now);
         if table.schema().as_ref() != self.input_schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
                 reason: format!(
@@ -3428,130 +712,8 @@ impl Engine for StreamTableMaterializer {
                 ),
             });
         }
-        let schema_check_done_at = trace_enabled.then(Instant::now);
-
-        let materialize_started_at = trace_enabled.then(Instant::now);
         self.materialize_table(&table)?;
-        let materialize_done_at = trace_enabled.then(Instant::now);
-        if let (
-            Some(on_data_started_at),
-            Some(ensure_started_at),
-            Some(ensure_done_at),
-            Some(schema_check_started_at),
-            Some(schema_check_done_at),
-            Some(materialize_started_at),
-            Some(materialize_done_at),
-        ) = (
-            on_data_started_at,
-            ensure_started_at,
-            ensure_done_at,
-            schema_check_started_at,
-            schema_check_done_at,
-            materialize_started_at,
-            materialize_done_at,
-        ) {
-            write_latency_trace_line(format!(
-                "zippy_stream_table_latency_trace event=[on_data] rows=[{}] source_emit_ns=[{}] ensure_persist_us=[{:.3}] schema_check_us=[{:.3}] materialize_us=[{:.3}] on_data_total_us=[{:.3}]",
-                rows,
-                source_emit_ns.unwrap_or_default(),
-                instant_delta_us(ensure_started_at, ensure_done_at),
-                instant_delta_us(schema_check_started_at, schema_check_done_at),
-                instant_delta_us(materialize_started_at, materialize_done_at),
-                instant_delta_us(on_data_started_at, materialize_done_at),
-            ));
-        }
         Ok(vec![table])
-    }
-
-    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
-        self.ensure_persist_healthy()?;
-        if self.apply_retention()? {
-            self.publish_active_descriptor()?;
-        }
-        Ok(vec![])
-    }
-
-    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
-        self.ensure_persist_healthy()?;
-        let sealed_active = self.seal_active_for_persist_on_stop()?;
-        self.stop_persist_worker()?;
-        if self.apply_retention()? || sealed_active {
-            self.publish_active_descriptor()?;
-        }
-        Ok(vec![])
-    }
-}
-
-impl Engine for ShardedStreamTableMaterializer {
-    fn name(&self) -> &str {
-        &self.logical_name
-    }
-
-    fn input_schema(&self) -> SchemaRef {
-        Arc::clone(&self.input_schema)
-    }
-
-    fn output_schema(&self) -> SchemaRef {
-        Arc::clone(&self.input_schema)
-    }
-
-    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
-        // Split the whole logical batch before writing any shard. Later shard write failures are
-        // reported and recorded without cross-shard rollback.
-        let batch = table
-            .to_record_batch()
-            .map_err(|error| self.route_error("prepare_batch", error))?;
-        let split_batches = self
-            .router
-            .split_batch(&batch)
-            .map_err(|error| self.route_error("split_batch", error))?;
-
-        for (shard_index, split_batch) in split_batches.into_iter().enumerate() {
-            let Some(split_batch) = split_batch else {
-                continue;
-            };
-            let result =
-                self.shards[shard_index].on_data(SegmentTableView::from_record_batch(split_batch));
-            if let Err(error) = result {
-                return Err(self.record_shard_failure("write", shard_index, error));
-            }
-        }
-
-        Ok(vec![table])
-    }
-
-    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
-        let mut first_error = None;
-        for shard_index in 0..self.shards.len() {
-            let result = self.shards[shard_index].on_flush();
-            if let Err(error) = result {
-                let wrapped = self.record_shard_failure("flush", shard_index, error);
-                if first_error.is_none() {
-                    first_error = Some(wrapped);
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(vec![])
-    }
-
-    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
-        let mut first_error = None;
-        for shard_index in 0..self.shards.len() {
-            let result = self.shards[shard_index].on_stop();
-            if let Err(error) = result {
-                let wrapped = self.record_shard_failure("stop", shard_index, error);
-                if first_error.is_none() {
-                    first_error = Some(wrapped);
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(vec![])
     }
 }
 
@@ -3590,9 +752,11 @@ fn compile_arrow_schema(schema: &SchemaRef) -> Result<zippy_segment_store::Compi
         })
         .collect::<Result<Vec<_>>>()?;
 
-    compile_schema(&columns).map_err(|reason| ZippyError::SchemaMismatch {
-        reason: format!("failed to compile stream table schema reason=[{}]", reason),
-    })
+    compile_schema(&columns)
+        .and_then(|compiled| compiled.with_arrow_metadata(schema))
+        .map_err(|reason| ZippyError::SchemaMismatch {
+            reason: format!("failed to compile stream table schema reason=[{}]", reason),
+        })
 }
 
 fn segment_error(error: ZippySegmentStoreError) -> ZippyError {
@@ -3602,8 +766,12 @@ fn segment_error(error: ZippySegmentStoreError) -> ZippyError {
 }
 
 #[cfg(test)]
-mod sharded_materializer_tests {
-    use super::*;
+mod native_materializer_tests {
+    use super::{descriptor_segment_identity, StreamTableLiveSegment, StreamTableMaterializer};
+    use super::{Arc, ArrayRef, DataType, Engine, Int64Array, RecordBatch, SegmentTableView};
+    use arrow::datatypes::{Field, Schema};
+    use std::collections::BTreeSet;
+    use std::time::Instant;
 
     #[test]
     #[ignore = "manual release benchmark for retained append descriptor publication"]
@@ -3620,11 +788,11 @@ mod sharded_materializer_tests {
             materializer
                 .on_data(SegmentTableView::from_record_batch(batch))
                 .unwrap();
-            materializer.append_live_segments().unwrap();
+            materializer.live_segments().unwrap();
             let iterations = 500;
             let start = Instant::now();
             for _ in 0..iterations {
-                std::hint::black_box(materializer.append_live_segments().unwrap());
+                std::hint::black_box(materializer.live_segments().unwrap());
             }
             eprintln!(
                 "sealed=[{sealed}] publication_us=[{:.2}]",
@@ -3634,7 +802,7 @@ mod sharded_materializer_tests {
     }
 
     #[test]
-    fn retention_releases_completed_identities_with_their_segments() {
+    fn native_manifest_prefix_retires_only_complete_durable_segments() {
         let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -3652,9 +820,9 @@ mod sharded_materializer_tests {
             .map(|descriptor| descriptor_segment_identity(&descriptor.envelope).unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(identities.len(), 8);
-        assert_eq!(materializer.append_live_segment_count().unwrap(), 9);
+        assert_eq!(materializer.live_segment_count().unwrap(), 9);
         for _ in 0..2 {
-            let segments = materializer.append_live_segments().unwrap();
+            let segments = materializer.live_segments().unwrap();
             assert_eq!(
                 segments
                     .iter()
@@ -3665,26 +833,13 @@ mod sharded_materializer_tests {
             assert!(segments[..8].iter().all(StreamTableLiveSegment::is_sealed));
         }
 
-        // Simulate the completion queue after a backlog drains. No persistence
-        // worker is needed to exercise the retention bookkeeping itself.
-        materializer.persisted_segment_identities = identities;
-        assert!(materializer.trim_published_retained_segments(1).unwrap());
-        let retained = descriptor_segment_identity(
-            &materializer
-                .sealed_segment_descriptors
-                .front()
-                .unwrap()
-                .envelope,
-        )
-        .unwrap();
-        assert_eq!(
-            materializer.persisted_segment_identities,
-            BTreeSet::from([retained])
-        );
-        assert!(!materializer.trim_published_retained_segments(1).unwrap());
-        assert_eq!(materializer.append_live_segment_count().unwrap(), 2);
+        // Only the native manifest authority supplies the durable prefix. A partial
+        // next segment cannot be reclaimed, even if its rows are already visible.
+        assert_eq!(materializer.retire_persisted_prefix(15).unwrap(), 14);
+        assert_eq!(materializer.retire_persisted_prefix(1).unwrap(), 0);
+        assert_eq!(materializer.live_segment_count().unwrap(), 2);
         assert_eq!(materializer.sealed_segment_descriptors.len(), 1);
-        let segments = materializer.append_live_segments().unwrap();
+        let segments = materializer.live_segments().unwrap();
         assert_eq!(
             segments
                 .iter()
@@ -3693,80 +848,11 @@ mod sharded_materializer_tests {
             vec![2, 1]
         );
         materializer.seal_active_for_writer_handoff().unwrap();
-        assert_eq!(materializer.append_live_segment_count().unwrap(), 2);
+        assert_eq!(materializer.live_segment_count().unwrap(), 2);
         assert!(materializer
-            .append_live_segments()
+            .live_segments()
             .unwrap()
             .iter()
             .all(StreamTableLiveSegment::is_sealed));
-    }
-
-    fn test_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Arc::new(Field::new("instrument_id", DataType::Utf8, false)),
-            Arc::new(Field::new("last_price", DataType::Float64, false)),
-        ]))
-    }
-
-    #[test]
-    fn sharded_materializer_replaces_repeated_failure_for_same_action_and_shard() {
-        let config = ShardConfig::new(vec!["instrument_id".to_string()], 2, 1).unwrap();
-        let mut materializer =
-            ShardedStreamTableMaterializer::new("ticks", test_schema(), config).unwrap();
-
-        let _ = materializer.record_shard_failure(
-            "flush",
-            0,
-            ZippyError::Io {
-                reason: "first failure".to_string(),
-            },
-        );
-        let _ = materializer.record_shard_failure(
-            "flush",
-            0,
-            ZippyError::Io {
-                reason: "second failure".to_string(),
-            },
-        );
-
-        assert_eq!(materializer.failed_shards().len(), 1);
-        assert_eq!(materializer.failed_shards()[0].action, "flush");
-        assert_eq!(materializer.failed_shards()[0].shard_index, 0);
-        assert!(materializer.failed_shards()[0]
-            .error
-            .contains("second failure"));
-
-        let _ = materializer.record_shard_failure(
-            "stop",
-            0,
-            ZippyError::Io {
-                reason: "stop failure".to_string(),
-            },
-        );
-
-        assert_eq!(materializer.failed_shards().len(), 2);
-    }
-
-    #[test]
-    fn sharded_materializer_failure_state_is_shared_after_move() {
-        let config = ShardConfig::new(vec!["instrument_id".to_string()], 2, 1).unwrap();
-        let materializer =
-            ShardedStreamTableMaterializer::new("ticks", test_schema(), config).unwrap();
-        let failure_state = materializer.failed_shards_handle();
-
-        let mut materializer = materializer;
-        let _ = materializer.record_shard_failure(
-            "flush",
-            1,
-            ZippyError::Io {
-                reason: "shared failure".to_string(),
-            },
-        );
-
-        let failures = failure_state.lock().unwrap();
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].action, "flush");
-        assert_eq!(failures[0].shard_index, 1);
-        assert!(failures[0].error.contains("shared failure"));
     }
 }

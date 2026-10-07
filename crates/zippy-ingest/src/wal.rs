@@ -36,7 +36,6 @@ const MUTATION_KEY_VALUE_UPSERT: u8 = 3;
 const MUTATION_KEY_VALUE_DELETE: u8 = 4;
 const WATERMARK_EMPTY: u8 = 0;
 const WATERMARK_KNOWN: u8 = 1;
-const WATERMARK_LEGACY_UNKNOWN: u8 = 2;
 const OFFSETS_NONE: u8 = 0;
 const OFFSETS_PRESENT: u8 = 1;
 const DEFAULT_MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
@@ -387,6 +386,9 @@ impl IngestWalWriter {
         let table_directory = table_wal_directory(wal_root, identity.table_id);
         fs::create_dir_all(&table_directory)
             .map_err(|error| wal_io_error("create table WAL directory", &table_directory, error))?;
+        // A file fsync and a table-directory fsync do not persist the table
+        // directory's own entry in wal_root.
+        sync_directory(wal_root)?;
         let path = table_directory.join(wal_file_name(identity.producer_epoch, segment));
         let file = OpenOptions::new()
             .create_new(true)
@@ -1404,7 +1406,6 @@ fn encode_watermark(header: &mut [u8; WAL_HEADER_LEN], watermark: OffsetWatermar
     let (state, value) = match watermark {
         OffsetWatermark::Empty => (WATERMARK_EMPTY, 0),
         OffsetWatermark::Known(offset) => (WATERMARK_KNOWN, offset.get()),
-        OffsetWatermark::LegacyUnknown => (WATERMARK_LEGACY_UNKNOWN, 0),
     };
     header[18] = state;
     put_u64(header, 112, value);
@@ -1419,7 +1420,6 @@ fn decode_watermark(
     match (state, value) {
         (WATERMARK_EMPTY, 0) => Ok(OffsetWatermark::Empty),
         (WATERMARK_KNOWN, value) => Ok(OffsetWatermark::Known(LogOffset::new(value))),
-        (WATERMARK_LEGACY_UNKNOWN, 0) => Ok(OffsetWatermark::LegacyUnknown),
         _ => Err(wal_corruption(
             table_id,
             path,
@@ -1775,6 +1775,16 @@ mod tests {
         RequestId::from_u128(value).unwrap()
     }
 
+    #[test]
+    fn wal_watermark_rejects_removed_legacy_tag() {
+        for payload in [0, 1, u64::MAX] {
+            let error = super::decode_watermark(Path::new("test.wal"), table_id(1), 2, payload)
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::DataCorruption);
+            assert!(!error.retryable());
+        }
+    }
+
     fn batch(values: &[i64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -1807,7 +1817,6 @@ mod tests {
             let first = match previous {
                 OffsetWatermark::Empty => LogOffset::new(0),
                 OffsetWatermark::Known(offset) => offset.checked_next().unwrap(),
-                OffsetWatermark::LegacyUnknown => panic!("test does not use legacy offsets"),
             };
             Some(
                 OffsetRange::new(

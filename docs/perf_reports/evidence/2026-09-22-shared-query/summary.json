@@ -1,0 +1,250 @@
+{
+  "date": "2026-09-22",
+  "batch": 25,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F14",
+    "F22",
+    "F29"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "removed_implementations": [
+    "main _QueryExpr class",
+    "main _TemporalInstantLiteral class",
+    "main _NativeSqlCompiler/_NativeSqlRelation/_NativeSqlPlan",
+    "main SQL expression/literal rendering and identifier helpers"
+  ],
+  "shared_contracts": [
+    "Expr and timestamp literal",
+    "FlightSqlCompiler with SqlSource resolver",
+    "right/full join keys",
+    "replacement column order",
+    "duplicate output rejection",
+    "cyclic joins",
+    "ordered shard UNION ALL",
+    "explicit bounded is_between comparisons"
+  ],
+  "server_admission": {
+    "planning_format_version": 12,
+    "output_format_version": 3,
+    "derived_projection_substitution_pre_admitted": true,
+    "derived_wildcard_computed_columns_charged": true,
+    "exponential_projection_rejected_before_optimizer": true,
+    "builtin_function_implementation_types_checked": true,
+    "coalesce_temporaries_charged": true,
+    "lateral_and_column_list_aliases_still_rejected": true,
+    "production_default_memory_bytes_unchanged": 536870912,
+    "nested_join_observed_reservation_bytes": 2513600484,
+    "test_process_memory_budget_bytes": 4294967296,
+    "one_gib_override_rejected": true,
+    "conservative_budget_is_not_measured_heap_usage": true
+  },
+  "verification": {
+    "rust_workspace": {
+      "passed": 1766,
+      "ignored": 10,
+      "result_blocks": 114,
+      "exit_code": 0,
+      "note": "aggregated output includes nested subprocess test blocks"
+    },
+    "query_crate": "55 passed",
+    "python_rebuilt_extension": "790 passed / 1 skipped",
+    "full_client": "165 passed / 84.46% coverage",
+    "isolated_client": {
+      "23.0.1": "160 passed / 1 skipped / 80.41% coverage",
+      "25.0.1": "160 passed / 1 skipped / 80.41% coverage"
+    },
+    "native_matrix_string_keys": {
+      "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+      "shared_sql_query_budget_bytes": 4294967296,
+      "shared_sql_one_gib_join_budget_rejected": true,
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_six_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "native_matrix_integer_keys": "passed; see native-int log",
+    "configured_mypy": "root 15 / client 27 / script 1 passed",
+    "extended_mypy": "978 errors / 12 files / 88 checked; failed; F29 open",
+    "extended_mypy_command": "mypy python pytests clients/python scripts examples",
+    "clippy": "workspace all-targets all-features -D warnings passed",
+    "black": "89 files passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "diff": "passed",
+    "full_package_isolated_distribution_rerun": false,
+    "platform": "Linux x86_64 / Python 3.11",
+    "cross_platform_ci_executed": false
+  },
+  "remaining_boundaries": [
+    "legacy query/residual and control transports remain",
+    "temporal range parsing remains duplicated",
+    "native fixed cross-query snapshot missing",
+    "KV compute input and compute output session recovery incomplete",
+    "deep derived planning reservations conservative; default-budget coverage incomplete",
+    "full typecheck and remote OS/Python matrix incomplete"
+  ],
+  "logs": {
+    "workspace": {
+      "path": "/tmp/zippy-shared-sql-workspace.log",
+      "bytes": 163537,
+      "sha256": "78b785e86eeb1d9d4998144f38dd9a98887fc471a753e9957ea76d224a6a77f3"
+    },
+    "rust-query": {
+      "path": "/tmp/zippy-shared-sql-rust-query.log",
+      "bytes": 5371,
+      "sha256": "1642e23a3cd17ea7de7b33a42b18c2bde1c429c16f7005f5f391b6fec5aca77d"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-shared-sql-clippy.log",
+      "bytes": 2580,
+      "sha256": "27db6766d0e319ed7cf720da2cea5512791a4c40f4b15619f74b0185b3f322e6"
+    },
+    "build-server": {
+      "path": "/tmp/zippy-shared-sql-build-server.log",
+      "bytes": 237,
+      "sha256": "76a792503b204adff9be954068cec0845a784bf3a5633f7d2f9722ce9b0aa55c"
+    },
+    "extension": {
+      "path": "/tmp/zippy-shared-sql-extension.log",
+      "bytes": 2961,
+      "sha256": "78edfeeb2ca51b7b4c30486a9d5780bb32c5b11a35cf6a72aa8277761b65f2ce"
+    },
+    "python-final": {
+      "path": "/tmp/zippy-shared-sql-python-final.log",
+      "bytes": 922,
+      "sha256": "6fccfe008879c97aba4a705ba1f587b6ef26e7a834f21f36d5ed5496fee5b852"
+    },
+    "client": {
+      "path": "/tmp/zippy-shared-sql-client.log",
+      "bytes": 4195,
+      "sha256": "33fd351d08ced35c83374b8e2a190d41f45a8e0c4118f2fb700db73ce19cf544"
+    },
+    "isolated-23": {
+      "path": "/tmp/zippy-shared-sql-isolated-23.log",
+      "bytes": 16287,
+      "sha256": "c711e20bc192cbb6f1b1cdd5ccdad26f3152c7525f0f9deaf996ccb5cf26d73a"
+    },
+    "isolated-25": {
+      "path": "/tmp/zippy-shared-sql-isolated-25.log",
+      "bytes": 16286,
+      "sha256": "e03490a5fc223f746627c2cbdc70f9b80652da10b51e30777eb064a9a7de96e0"
+    },
+    "native": {
+      "path": "/tmp/zippy-shared-sql-native.log",
+      "bytes": 22969,
+      "sha256": "41e24cd837b84e46fea057a1205feacb291b0036ada91793670f1a7709fbf2f5"
+    },
+    "native-int": {
+      "path": "/tmp/zippy-shared-sql-native-int.log",
+      "bytes": 22972,
+      "sha256": "befeb9b2bbf1fd9166dbf34aee97e25667298ea46ff7836bf605bf38e076cb24"
+    },
+    "native-first": {
+      "path": "/tmp/zippy-shared-sql-native-first.log",
+      "bytes": 6129,
+      "sha256": "0bebdd34a4289ab80aa773fc97372667678e0623a853a60ba37616b6d96c265a"
+    },
+    "native-budget": {
+      "path": "/tmp/zippy-shared-sql-native-budget.log",
+      "bytes": 6119,
+      "sha256": "51403a83ce895d8424c9208a0d8738a8b5e9d2ab3d40612d037f300c2b2061ba"
+    },
+    "black": {
+      "path": "/tmp/zippy-shared-sql-black.log",
+      "bytes": 57,
+      "sha256": "093f58285abd61858579d66dd1cbf24994ba595a12ccc6ddc48b75af5617ef78"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-shared-sql-ruff.log",
+      "bytes": 19,
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "mypy-root": {
+      "path": "/tmp/zippy-shared-sql-mypy-root.log",
+      "bytes": 44,
+      "sha256": "fc409d91e6c781eb25a1ec1310b7fcb0086b74ed3aa2c415bcd73f884f23f07a"
+    },
+    "mypy-client": {
+      "path": "/tmp/zippy-shared-sql-mypy-client.log",
+      "bytes": 44,
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f"
+    },
+    "mypy-script": {
+      "path": "/tmp/zippy-shared-sql-mypy-script.log",
+      "bytes": 42,
+      "sha256": "5d4b6d285b77932e3d08212c3b4974d0a803f98ec60408ac6ccf6a063fa6c19e"
+    },
+    "mypy-full": {
+      "path": "/tmp/zippy-shared-sql-mypy-full.log",
+      "bytes": 161267,
+      "sha256": "30c78243bfd3e694ab16246861e2289d212b4aa07283573898b838f3e1042255"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-shared-sql-rustfmt.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff": {
+      "path": "/tmp/zippy-shared-sql-diff.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}

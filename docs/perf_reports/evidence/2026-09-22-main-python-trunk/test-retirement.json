@@ -1,0 +1,2758 @@
+{
+  "scope": "retirement required by removal of old APIs, not a count-based coverage replacement",
+  "groups": {
+    "query": {
+      "reason": "old Table, Python residual, shard fan-out, persisted file scanning and Gateway query implementation removed",
+      "evidence": [
+        "clients/python/tests/test_flight_transport.py",
+        "clients/python/tests/test_expressions_protocol.py",
+        "scripts/check_native_client.py:verify_shared_sql",
+        "scripts/check_native_fixed_snapshot.py"
+      ]
+    },
+    "subscription": {
+      "reason": "module-level SHM/Gateway subscription and legacy descriptors removed; explicit Client callbacks retain original capabilities",
+      "evidence": [
+        "clients/python/tests/test_flight_subscriber.py",
+        "clients/python/tests/test_log_reader.py",
+        "pytests/test_native_state_subscription.py",
+        "scripts/check_native_client.py:verify_native_callbacks",
+        "scripts/check_public_examples.py"
+      ]
+    },
+    "compute": {
+      "reason": "Session/Pipeline implicit materializers removed; native processor plus identity-fenced ComputePipeline is the publication path",
+      "evidence": [
+        "pytests/test_native_compute.py",
+        "pytests/test_native_chain.py",
+        "pytests/test_native_source_input.py",
+        "scripts/check_compute_recovery.py",
+        "scripts/check_compute_plugin.py",
+        "scripts/check_public_examples.py"
+      ]
+    },
+    "registry_ops": {
+      "reason": "old registry metadata, legacy compaction and logical shard descriptor API retired; no compatibility promise for these APIs",
+      "evidence": [
+        "pytests/test_native_table_cli.py",
+        "pytests/test_native_webui.py",
+        "scripts/check_table_cli.py",
+        "scripts/check_native_webui.py"
+      ],
+      "not_equivalent": [
+        "legacy filesystem compaction helper and logical shard descriptors are deleted, not reimplemented; server-native compaction/old-authority retirement remains in open items"
+      ]
+    },
+    "connection": {
+      "reason": "implicit master/global heartbeat/old remote framing and startup wrappers removed",
+      "evidence": [
+        "clients/python/tests/test_endpoints_router.py",
+        "clients/python/tests/test_flight_transport.py",
+        "scripts/check_public_examples.py",
+        "pytests/test_native_package_boundary.py"
+      ]
+    }
+  },
+  "removed_api_test_functions": [
+    {
+      "name": "test_reactive_latest_engine_infers_schema_from_named_segment_source",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_session_engine_factory_defaults_target_and_returns_session",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_engine_factory_injects_master_for_named_source",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_named_source_materializes_default_output_table",
+      "removed_symbols": [
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_stop_unregisters_materializer_source",
+      "removed_symbols": [
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_engine_output_overrides_default_output_table_name",
+      "removed_symbols": [
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_stream_table_materializes_last_engine_output",
+      "removed_symbols": [
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_descriptor_publisher_prefers_envelope_publish_fast_path",
+      "removed_symbols": [
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_descriptor_publisher_drains_before_unregister_and_restarts",
+      "removed_symbols": [
+        "Pipeline",
+        "Session"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_session_publish_append_table_sets_append_table_kind",
+      "removed_symbols": [
+        "Session",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_append_table_publish_sets_append_table_kind",
+      "removed_symbols": [
+        "Session",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_cross_section_frame_table_publish_sets_complete_frame_protocol",
+      "removed_symbols": [
+        "Session",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_frame_table_signature_keeps_boundary_explicit",
+      "removed_symbols": [
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_frame_table_rejects_invalid_by",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_frame_table_by_must_match_engine_dt_column",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_frame_table_rejects_non_cross_sectional_engine",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_append_table_publish_uses_stream_status_for_writer_epoch",
+      "removed_symbols": [
+        "Session",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_append_table_publish_error_mentions_current_api",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_source_key_value_table_publish_error_mentions_current_api",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_publish_key_value_table_sets_key_value_table_kind",
+      "removed_symbols": [
+        "Session",
+        "_KeyValueTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_key_value_table_publish_sets_key_value_table_kind",
+      "removed_symbols": [
+        "Session",
+        "_KeyValueTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_publish_append_table_rejects_reactive_latest_output",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_removed_table_publish_aliases_are_absent",
+      "removed_symbols": [
+        "Session",
+        "_SessionSourceBinding"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_key_value_subscription_detection_prefers_table_kind_metadata",
+      "removed_symbols": [
+        "_key_value_changelog_subscription_source"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_session_source_key_value_table_requires_explicit_tail_until_replay_exists",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_source_key_value_table_publish_replay_error_uses_current_api_name",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_source_publish_key_value_table_tail_registers_materializer",
+      "removed_symbols": [
+        "Session",
+        "_KeyValueTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_source_key_value_table_publish_uses_stream_status_for_source_kind",
+      "removed_symbols": [
+        "Session",
+        "_KeyValueTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_source_key_value_table_publish_tail_registers_materializer",
+      "removed_symbols": [
+        "Session",
+        "_KeyValueTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_engine_rejects_explicit_target",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_engine_rejects_legacy_output_parameter",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_engine_persist_false_disables_default_output_persistence",
+      "removed_symbols": [
+        "Session",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_engine_persist_true_materializes_parquet_output",
+      "removed_symbols": [
+        "Session",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_run_starts_and_stop_stops_owned_engines",
+      "removed_symbols": [
+        "MasterClient",
+        "Session"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_run_keeps_session_alive_until_stop",
+      "removed_symbols": [
+        "MasterClient",
+        "Session",
+        "_ACTIVE_SESSIONS"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stop_unregisters_registered_source",
+      "removed_symbols": [
+        "Pipeline"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_removed_sink_apis_are_absent",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_master_server_start_raises_when_socket_is_already_active",
+      "removed_symbols": [
+        "MasterServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_master_server_start_waits_for_configured_ready_timeout",
+      "removed_symbols": [
+        "MasterServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_master_server_start_expands_user_path_and_creates_parent_dir",
+      "removed_symbols": [
+        "MasterServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_reactive_engine_can_consume_segment_stream_source",
+      "removed_symbols": [
+        "MasterClient",
+        "MasterServer",
+        "SegmentStreamSource"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_cross_sectional_frame_subscription_delivers_rapid_buckets_without_fragmentation",
+      "removed_symbols": [
+        "MasterClient",
+        "Session",
+        "subscribe_frames"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_timeseries_engine_accepts_named_segment_source",
+      "removed_symbols": [
+        "MasterClient",
+        "_reset_default_master_for_test"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_cross_sectional_engine_accepts_named_segment_source",
+      "removed_symbols": [
+        "MasterClient",
+        "_reset_default_master_for_test"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_legacy_bus_ring_api_is_not_exported",
+      "removed_symbols": [
+        "MasterClient",
+        "__all__",
+        "__file__"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_master_client_type_stub_exposes_stream_status_lookup",
+      "removed_symbols": [
+        "__file__"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_master_client_lists_streams",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_master_client_gets_stream",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_top_level_table_observability_uses_default_master",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_low_frequency_table_ops_are_not_top_level_exports",
+      "removed_symbols": [
+        "__all__"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_ops_namespace_exposes_table_observability_methods",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_drop_table_shard_fake_master_drops_physical_shards_before_logical",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_drop_table_shard_fake_master_rejects_direct_internal_drop",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_drop_table_shard_fake_master_uses_source_config_metadata_fallback",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_drop_table_shard_fake_master_rejects_invalid_shard_metadata",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_drop_table_shard_fake_master_rejects_foreign_shard_name",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_drop_table_shard_fake_master_propagates_get_stream_runtime_error",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_ops_compact_tables_discovers_persisted_tables",
+      "removed_symbols": [
+        "_compact_table",
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_ops_compact_table_sorts_compacted_partition_by_dt",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_table_object_exposes_low_frequency_observability_methods",
+      "removed_symbols": [
+        "Table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_table_health_reports_ok_for_active_stream",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_table_health_reports_warning_for_stream_without_active_descriptor",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_table_health_reports_ok_for_persisted_only_stream",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_table_health_reports_error_for_failed_active_segment_preflight",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_table_info_exposes_segment_row_capacity_separately_from_bus_buffer",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_wait_for_table_ready_times_out_on_failed_active_segment_preflight",
+      "removed_symbols": [
+        "_wait_for_table_ready"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_table_health_reports_error_for_stale_stream_and_persist_failure",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_read_table_waits_for_late_producer_stream",
+      "removed_symbols": [
+        "MasterClient",
+        "Pipeline",
+        "Table",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_wait_times_out_when_stream_never_appears",
+      "removed_symbols": [
+        "MasterClient",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_subscribe_waits_for_late_producer_stream",
+      "removed_symbols": [
+        "MasterClient",
+        "Pipeline",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_waits_for_late_producer_stream",
+      "removed_symbols": [
+        "MasterClient",
+        "Pipeline",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_frames_requires_protocol_metadata_and_delegates_to_tail_table_subscribe",
+      "removed_symbols": [
+        "subscribe_frames",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_frames_rejects_plain_append_stream",
+      "removed_symbols": [
+        "subscribe_frames"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_frames_rejects_append_kind_with_frame_protocol_metadata",
+      "removed_symbols": [
+        "subscribe_frames"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_resumes_when_started_without_active_descriptor",
+      "removed_symbols": [
+        "MasterClient",
+        "Pipeline",
+        "subscribe",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_wait_times_out_when_stream_never_appears",
+      "removed_symbols": [
+        "MasterClient",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_table_perf_probe_summarizes_latency_samples",
+      "removed_symbols": [
+        "retired example or implicit subscription"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_table_perf_probe_measures_private_scan_live_throughput",
+      "removed_symbols": [
+        "retired example or implicit subscription"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_subscribe_latency_probe_summarizes_latency_samples",
+      "removed_symbols": [
+        "retired example or implicit subscription"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_latency_probe_runs_against_temp_master",
+      "removed_symbols": [
+        "_reset_default_master_for_test"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_master_client_drop_table_removes_stream_and_persisted_files",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_master_client_drop_table_shard_roundtrip_lists_and_drops_logical_table",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_ops_drop_table_with_native_master_drops_source_config_shards",
+      "removed_symbols": [
+        "MasterClient",
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_read_table_collects_persisted_only_stream_without_active_descriptor",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_non_overlapping_persisted_files_ignores_stale_sealed_without_active_descriptor",
+      "removed_symbols": [
+        "_non_overlapping_persisted_files"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_master_client_publishes_and_gets_segment_descriptor",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_query_tail_reads_latest_available_active_segment_rows",
+      "removed_symbols": [
+        "MasterClient",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_tail_reads_retained_sealed_segments_before_active_rows",
+      "removed_symbols": [
+        "MasterServer",
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_scan_live_returns_reader_over_retained_sealed_and_active_rows",
+      "removed_symbols": [
+        "MasterServer",
+        "Pipeline",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_snapshot_collect_reuses_fixed_live_boundary",
+      "removed_symbols": [
+        "MasterServer",
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_stream_table_e2e_ingest_rollover_persist_and_query",
+      "removed_symbols": [
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "ops",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_stream_table_e2e_persist_failure_is_queryable_and_blocks_retention",
+      "removed_symbols": [
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "ops",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_stream_table_e2e_writer_expiration_marks_stream_stale_and_blocks_live_reads",
+      "removed_symbols": [
+        "MasterClient",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_query_snapshot_includes_published_files",
+      "removed_symbols": [
+        "MasterServer",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_function_returns_table_object",
+      "removed_symbols": [
+        "Table",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_connect_sets_default_master_and_init_is_removed",
+      "removed_symbols": [
+        "MasterClient",
+        "_reset_default_master_for_test",
+        "connect",
+        "master"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_default_heartbeat_interval_avoids_hot_control_plane_polling",
+      "removed_symbols": [
+        "_DEFAULT_HEARTBEAT_INTERVAL_SEC"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_config_returns_master_runtime_config",
+      "removed_symbols": [
+        "config"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_connect_without_uri_uses_default_logical_endpoint",
+      "removed_symbols": [
+        "MasterClient",
+        "_reset_default_master_for_test",
+        "connect"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_resolve_uri_maps_logical_names_and_explicit_paths",
+      "removed_symbols": [
+        "_resolve_uri"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_master_server_accepts_uri_keyword_for_logical_endpoint",
+      "removed_symbols": [
+        "MasterServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_connect_starts_background_heartbeat_for_registered_process",
+      "removed_symbols": [
+        "MasterClient",
+        "_ControlAgent",
+        "_DEFAULT_CONTROL_AGENT",
+        "_reset_default_master_for_test",
+        "connect"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_control_agent_registers_app_and_unregisters_on_stop",
+      "removed_symbols": [
+        "_ControlAgent"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_heartbeat_shutdown_request_runs_hooks_and_unregisters_process",
+      "removed_symbols": [
+        "_ControlAgent",
+        "_SHUTDOWN_HOOKS",
+        "_SHUTDOWN_HOOKS_LOCK",
+        "_register_shutdown_hook"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_heartbeat_connection_loss_runs_hooks_without_unregistering_process",
+      "removed_symbols": [
+        "_ControlAgent",
+        "_SHUTDOWN_HOOKS",
+        "_SHUTDOWN_HOOKS_LOCK",
+        "_register_shutdown_hook"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_shutdown_watch_runs_hooks_without_waiting_for_heartbeat",
+      "removed_symbols": [
+        "_ControlAgent",
+        "_SHUTDOWN_HOOKS",
+        "_SHUTDOWN_HOOKS_LOCK",
+        "_register_shutdown_hook"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_connect_without_app_validates_master_connection",
+      "removed_symbols": [
+        "MasterClient",
+        "_reset_default_master_for_test",
+        "connect",
+        "master"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_drop_table_uses_default_master",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "_set_default_master",
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_drop_table_accepts_explicit_master_and_drop_persisted_flag",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_ops_compact_table_replaces_small_partition_files",
+      "removed_symbols": [
+        "_collect_persisted_rows",
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_ops_compact_table_rejects_unsafe_source_deletion",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_master_client_replace_persisted_files_updates_stream_metadata",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_query_error_includes_source_and_master_uri",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_registers_default_master_process_before_native_query",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_reset_default_master_for_test",
+        "_set_default_master",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_pipeline_process_registration_starts_default_heartbeat",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer",
+        "_reset_default_master_for_test",
+        "_set_default_master"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_subscribe_row_mode_delegates_row_creation_to_native",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_stream_subscriber_forwards_start_from_tail_to_native",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_row_mode_passes_instrument_filter_to_native",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_row_mode_accepts_col_instrument_filter",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_passes_instrument_filter_to_stream_subscriber",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_passes_idle_spin_checks_to_native",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_row_mode_defaults_to_low_latency_poll_interval",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_keeps_batch_friendly_default_poll_interval",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_logical_sharded_subscribe_is_rejected",
+      "removed_symbols": [
+        "retired example or implicit subscription"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_logical_sharded_subscribe_uses_source_config_fallback",
+      "removed_symbols": [
+        "retired example or implicit subscription"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_internal_shard_stream_can_be_subscribed_explicitly",
+      "removed_symbols": [
+        "_NativeStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_filters_batches_and_limits_latest_count",
+      "removed_symbols": [
+        "_NativeStreamSubscriber",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_throttle_ms_flushes_pending_rows",
+      "removed_symbols": [
+        "_NativeStreamSubscriber",
+        "subscribe_table",
+        "time"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_table_subscription_callback_flushes_only_when_deadline_is_due",
+      "removed_symbols": [
+        "_TableSubscriptionCallback",
+        "time"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_table_subscription_callback_preserves_reentrant_flush_deadline",
+      "removed_symbols": [
+        "_TableSubscriptionCallback",
+        "time"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_registers_default_master_process_before_native_subscriber",
+      "removed_symbols": [
+        "StreamSubscriber",
+        "_NativeStreamSubscriber",
+        "_reset_default_master_for_test",
+        "_set_default_master"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_query_object_exposes_schema_stream_info_and_snapshot",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_tail_backfills_from_persisted_without_duplicate_live_segments",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_tail_reads_partitioned_persisted_files_with_same_column_name",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_tail_is_lazy_and_collect_backfills_from_persisted",
+      "removed_symbols": [
+        "Table",
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_shape_operations_are_lazy_and_execute_in_call_order",
+      "removed_symbols": [
+        "Table",
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_query_collect_and_reader_merge_persisted_and_live_without_duplicates",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_collect_keeps_persisted_file_when_writer_epoch_differs_from_live",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_conversion_helpers_use_collect",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_query_expr_plan_filters_projects_and_computes_with_polars_backend",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_temporal_string_filter_formats_use_resolution_ranges",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_temporal_string_filter_comparison_boundaries",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_temporal_string_filter_skips_non_matching_persisted_files",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_file",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_temporal_looking_string_on_string_column_remains_string_filter",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_invalid_temporal_string_on_timestamp_column_raises_clear_error",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_python_datetime_date_and_optional_pandas_timestamp_temporal_filters",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_native_table_plan_pushes_join_sort_and_tail_to_server",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_native_table_tail_without_sort_fails_without_legacy_fallback",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_gateway_writer_batches_rows_to_gateway",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_gateway_writer_write_batch_sends_arrow_table_immediately",
+      "removed_symbols": [
+        "RemoteGatewayWriter"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_gateway_writer_write_batch_rejects_scalar_row_dict",
+      "removed_symbols": [
+        "RemoteGatewayWriter"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_gateway_writer_close_detaches_master_writer",
+      "removed_symbols": [
+        "MasterClient",
+        "RemoteGatewayWriter"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_gateway_server_stop_detaches_open_master_writers",
+      "removed_symbols": [
+        "MasterClient",
+        "RemoteGatewayWriter"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_gateway_server_requires_token_and_reports_metrics",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_gateway_server_rejects_write_batch_above_row_limit",
+      "removed_symbols": [
+        "RemoteGatewayWriter"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_read_table_collect_sends_plan_to_gateway",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_read_table_collect_uses_gateway_discovered_from_master_config",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_connect_tcp_master_defaults_to_local_data_path",
+      "removed_symbols": [
+        "MasterClient",
+        "RemoteGatewayWriter",
+        "_LocalGatewayWriter",
+        "_NativeQuery",
+        "_RemoteQuery",
+        "_reset_default_master_for_test",
+        "connect",
+        "get_writer",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_connect_tcp_master_local_false_uses_gateway_data_path",
+      "removed_symbols": [
+        "MasterClient",
+        "RemoteMasterClient",
+        "_reset_default_master_for_test",
+        "connect",
+        "get_writer",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_gateway_unspecified_host_uses_master_host",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "_set_master_local_data_path",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_get_writer_uses_gateway_token_discovered_from_master_config",
+      "removed_symbols": [
+        "RemoteMasterClient",
+        "get_writer",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_subscribe_table_receives_gateway_table_callback",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_table_batches_gateway_rows_across_writes",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_receives_gateway_row_callback",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_table_filters_at_gateway",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_filters_rows_at_gateway",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_rejects_non_instrument_filter_before_gateway_request",
+      "removed_symbols": [
+        "RemoteStreamSubscriber",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_table_rejects_complex_filter_before_gateway_request",
+      "removed_symbols": [
+        "RemoteStreamSubscriber",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_table_rejects_non_positive_controls_before_gateway_request",
+      "removed_symbols": [
+        "RemoteStreamSubscriber",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_stream_subscriber_rejects_table_instrument_ids",
+      "removed_symbols": [
+        "RemoteStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_rejects_non_tail_start_from_before_gateway_request",
+      "removed_symbols": [
+        "RemoteStreamSubscriber",
+        "subscribe",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_wait_timeout_runs_before_gateway_request",
+      "removed_symbols": [
+        "RemoteStreamSubscriber",
+        "subscribe",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_waits_for_late_gateway_stream",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "RemoteMasterClient",
+        "subscribe",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_subscribe_resumes_when_started_during_stale_stream",
+      "removed_symbols": [
+        "MasterClient",
+        "RemoteMasterClient",
+        "subscribe",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_uses_gateway_token_discovered_from_master_config",
+      "removed_symbols": [
+        "RemoteGatewayWriter",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_stream_subscriber_reconnects_until_gateway_starts",
+      "removed_symbols": [
+        "GatewayServer",
+        "MasterClient",
+        "MasterServer",
+        "RemoteGatewayWriter",
+        "RemoteStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_master_client_caches_full_config_for_gateway_limits",
+      "removed_symbols": [
+        "GatewayServer",
+        "RemoteMasterClient",
+        "_NativeGatewayServer",
+        "_remote_master_get_config"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_direct_remote_master_client_keeps_gateway_only_config_fallback",
+      "removed_symbols": [
+        "RemoteMasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_gateway_server_forwards_resource_limits_to_native",
+      "removed_symbols": [
+        "GatewayServer",
+        "_NativeGatewayServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_gateway_server_uses_canonical_cpu_limit_from_config_and_env",
+      "removed_symbols": [
+        "GatewayServer",
+        "_NativeGatewayServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_gateway_server_rejects_removed_runtime_cpu_alias",
+      "removed_symbols": [
+        "GatewayServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_gateway_server_rejects_removed_cpu_environment",
+      "removed_symbols": [
+        "GatewayServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_gateway_server_query_parallelism_inherits_global_limit",
+      "removed_symbols": [
+        "GatewayServer",
+        "_NativeGatewayServer"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_gateway_server_uses_query_buffer_budgets_from_config_and_env",
+      "removed_symbols": [
+        "GatewayServer",
+        "_NativeGatewayServer"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_gateway_server_rejects_query_buffer_budget_above_global_limit",
+      "removed_symbols": [
+        "GatewayServer"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_gateway_server_rejects_invalid_query_buffer_budget_env",
+      "removed_symbols": [
+        "GatewayServer"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_gateway_server_rejects_query_parallelism_above_global_limit",
+      "removed_symbols": [
+        "GatewayServer"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_gateway_server_rejects_invalid_query_parallelism_env",
+      "removed_symbols": [
+        "GatewayServer"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_gateway_server_rejects_non_positive_resource_limits",
+      "removed_symbols": [
+        "GatewayServer"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_gateway_e2e_through_tcp_master_config",
+      "removed_symbols": [
+        "GatewayServer",
+        "MasterClient",
+        "MasterServer",
+        "_reset_default_master_for_test",
+        "connect",
+        "get_writer",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_read_table_snapshot_policy_controls_collect_boundary",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_collect_fans_out_in_shard_order",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_stream_table_and_shard_table_constructor_collect_fans_out",
+      "removed_symbols": [
+        "Table"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_read_table_and_shard_head_applies_after_concat",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_filter_select_pushes_safe_prefix_to_each_shard",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_safe_prefix_keeps_projected_schema_when_empty",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_collects_physical_shards_concurrently",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_collect_honors_configured_parallelism",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_collect_persisted_rows_uses_configured_parallelism_and_preserves_order",
+      "removed_symbols": [
+        "_collect_persisted_rows",
+        "_read_persisted_parquet_file",
+        "_validated_persisted_file_path"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_uses_source_config_metadata_fallback",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_profile_marks_sharded",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_explain_marks_global_execution",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_physical_stream_does_not_fan_out",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_invalid_metadata_raises_runtime_error",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_missing_metadata_raises_runtime_error",
+      "removed_symbols": [
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_and_shard_snapshot_reuses_per_shard_boundaries",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_lazy_table_api_supports_filter_select_join_with_columns_and_lit",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_table_plan_pushes_projection_and_simple_predicate_to_persisted_reader",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_file",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_plan_projection_tracks_renamed_source_column",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_validated_persisted_file_path_accepts_file_inside_root",
+      "removed_symbols": [
+        "_validated_persisted_file_path"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_validated_persisted_file_path_rejects_file_outside_root",
+      "removed_symbols": [
+        "_validated_persisted_file_path"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_validated_persisted_file_path_rejects_missing_root",
+      "removed_symbols": [
+        "_validated_persisted_file_path"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_scan_persisted_rejects_metadata_without_root",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_compact_table_rejects_source_metadata_without_root",
+      "removed_symbols": [
+        "ops"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_table_plan_splits_pushdownable_and_residual_predicates",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_file",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_plan_prunes_persisted_files_by_partition_metadata",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_file",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_plan_prunes_persisted_files_by_event_time_metadata",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_file",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_persisted_range_pruning_preserves_nanosecond_integer_precision",
+      "removed_symbols": [
+        "_range_may_match_filter"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_persisted_partition_pruning_handles_mixed_scalar_encodings_conservatively",
+      "removed_symbols": [
+        "_TemporalInstantLiteral",
+        "_partition_value_matches_filter"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_persisted_file_order_keeps_writer_epochs_contiguous",
+      "removed_symbols": [
+        "_persisted_file_order_key"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_head_pushdown_skips_later_persisted_files",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_row_range",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_profile_reports_scan_metrics_for_head_pushdown",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_row_range",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_persisted_row_range_reads_only_overlapping_row_group",
+      "removed_symbols": [
+        "_read_persisted_parquet_row_range"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_select_tail_pushdown_reads_only_required_last_row_group",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_table_slice_pushdown_skips_non_overlapping_persisted_files",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_read_persisted_parquet_row_range",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_explain_reports_optimized_plan_and_scan_pushdown",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_explain_reports_gateway_residual_plan",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_explain_reorders_projection_before_tail_for_gateway_pushdown",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_explain_reports_join_as_gateway_residual_plan",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_collect_sends_optimized_plan",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_collect_stream_true_opts_into_streaming_protocol",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_collect_stream_raises_on_collect_error",
+      "removed_symbols": [
+        "_recv_remote_frame",
+        "_remote_collect_stream_request",
+        "_send_remote_frame",
+        "socket"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_collect_sends_temporal_string_filter_as_typed_boundaries",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_collect_reuses_pinned_snapshot",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_query_sends_snapshot_id_and_releases_snapshot",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "_remote_request"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_query_collect_plan_stream_true_uses_stream_request",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "_remote_collect_stream_request",
+        "_remote_request"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_collect_applies_filter_after_head_locally",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_collect_applies_filter_after_slice_locally",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_remote_gateway_request_timeout_reports_request_phase",
+      "removed_symbols": [
+        "_remote_request",
+        "socket"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_remote_profile_merges_gateway_collect_metrics",
+      "removed_symbols": [
+        "_RemoteQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_table_scan_apis_are_private_to_avoid_query_semantics_confusion",
+      "removed_symbols": [
+        "_NativeQuery",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_read_table_replaces_query_api",
+      "removed_symbols": [
+        "Table",
+        "_NativeQuery",
+        "__all__",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_stream_table_engine_is_not_a_top_level_user_api",
+      "removed_symbols": [
+        "__all__"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_archive_compatibility_aliases_are_removed",
+      "removed_symbols": [
+        "MasterClient",
+        "Table",
+        "__all__"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_bar_profile_normalizes_to_native_spec",
+      "removed_symbols": [
+        "__all__"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_connect_sets_default_master_for_query_tail",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_subscribe_uses_default_master_and_invokes_callback_with_live_row",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_start_from_tail_skips_existing_active_segment_rows",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_start_from_explicit_offset_reads_from_that_row",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_resumes_after_writer_process_restart",
+      "removed_symbols": [
+        "MasterClient",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscriber_metrics_expose_hybrid_mmap_wait_counters",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_switches_from_sealed_segment_when_descriptor_arrives",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_with_instrument_filter_rebinds_after_rollover",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_metrics_exposes_background_descriptor_error",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_filters_instrument_ids_before_row_callback",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_uses_default_master_and_invokes_callback_with_live_table",
+      "removed_symbols": [
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_flushes_silent_partial_batch_at_throttle_deadline",
+      "removed_symbols": [
+        "_TableSubscriptionCallback",
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_table_deadline_callback_error_stops_subscriber",
+      "removed_symbols": [
+        "MasterServer",
+        "_TableSubscriptionCallback",
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_pipeline_stream_table_publishes_descriptor_for_query_tail",
+      "removed_symbols": [
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_reactive_latest_stream_table_tail_returns_key_value_snapshot",
+      "removed_symbols": [
+        "Session",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "query"
+    },
+    {
+      "name": "test_subscribe_table_applies_key_value_deltas_to_explicit_state",
+      "removed_symbols": [
+        "Session",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe_table"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_subscribe_key_value_rows_preserve_control_fields",
+      "removed_symbols": [
+        "Session",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_remote_stream_subscriber_metrics_use_live_health_contract",
+      "removed_symbols": [
+        "RemoteStreamSubscriber"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_live_health_preserves_subscriber_descriptor_diagnostics",
+      "removed_symbols": [
+        "live_health"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_session_status_metrics_and_health_aggregate_runtime_engines",
+      "removed_symbols": [
+        "MasterClient",
+        "Session",
+        "needs_rebuild",
+        "raise_if_failed",
+        "wait_healthy"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_native_engine_metrics_and_health_use_live_contract",
+      "removed_symbols": [
+        "live_health"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_session_lifespan_emits_connect_and_error_without_auto_restart",
+      "removed_symbols": [
+        "MasterClient",
+        "Session",
+        "SessionContext"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_lifespan_context_can_stop_session_on_error",
+      "removed_symbols": [
+        "MasterClient",
+        "Session",
+        "SessionContext"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_lifespan_named_hooks_receive_context",
+      "removed_symbols": [
+        "MasterClient",
+        "Session",
+        "SessionContext"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_subscribe_reactive_latest_routes_to_changelog_rows",
+      "removed_symbols": [
+        "Session",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table",
+        "subscribe"
+      ],
+      "group": "subscription"
+    },
+    {
+      "name": "test_session_reactive_latest_passes_replacement_retention_snapshots",
+      "removed_symbols": [
+        "Session",
+        "_KeyValueTableMaterializer",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_materializer_source_registration_is_idempotent",
+      "removed_symbols": [
+        "Session",
+        "_DEFAULT_MASTER",
+        "_KeyValueTableMaterializer",
+        "_StreamTableMaterializer",
+        "_reset_default_master_for_test",
+        "connect"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_reactive_latest_tail_stays_non_empty_during_snapshot_replace",
+      "removed_symbols": [
+        "Session",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_reactive_latest_named_segment_source_starts_from_live_tail",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_session_timeseries_named_segment_source_materializes_output_table",
+      "removed_symbols": [
+        "Pipeline",
+        "Session",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_session_cross_sectional_named_segment_source_materializes_output_table",
+      "removed_symbols": [
+        "Pipeline",
+        "Session",
+        "_DEFAULT_MASTER",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_source_stream_table_lifecycle_feeds_query_tail",
+      "removed_symbols": [
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "read_table"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_source_sharded_stream_table_e2e",
+      "removed_symbols": [
+        "MasterClient",
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "ops",
+        "read_table"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_infers_schema_from_python_source",
+      "removed_symbols": [
+        "Pipeline",
+        "_reset_default_master_for_test",
+        "connect",
+        "master"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_run_forever_stops_pipeline_on_keyboard_interrupt",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer",
+        "time"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_source_uses_python_source_control_plane_metadata",
+      "removed_symbols": [
+        "Pipeline"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_rejects_invalid_sharding_arguments",
+      "removed_symbols": [
+        "Pipeline"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_sharding_rejects_shard_key_missing_from_schema",
+      "removed_symbols": [
+        "Pipeline"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_without_sharding_uses_single_materializer",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_shard_auto_registers_logical_and_physical_streams",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer",
+        "os"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_stream_table_shard_auto_honors_runtime_max_parallelism",
+      "removed_symbols": [
+        "_resolve_stream_table_shard_nums",
+        "os"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_shard_unregisters_source_after_late_failure",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_unregister_registered_sources_is_best_effort",
+      "removed_symbols": [
+        "Pipeline"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_shard_rejects_source_registration_failure_without_unregister",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_shard_rejects_master_default_persist_and_allows_persist_none",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_shard_rejects_retention_segments",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_persist_publishes_master_metadata",
+      "removed_symbols": [
+        "ParquetPersist",
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_append_table_publish_uses_stream_table_options",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_persist_keeps_descriptor_forwarding_enabled",
+      "removed_symbols": [
+        "ParquetPersist",
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_persist_falls_back_to_live_persist_with_retention",
+      "removed_symbols": [
+        "ParquetPersist",
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_uses_master_config_defaults",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_explicit_persist_none_overrides_master_default",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_disables_default_descriptor_forwarding_on_windows",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer",
+        "os"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_rejects_legacy_partition_dt_part_format",
+      "removed_symbols": [
+        "Pipeline"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_passes_retention_segments_to_engine",
+      "removed_symbols": [
+        "Pipeline",
+        "_StreamTableMaterializer"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_pipeline_stream_table_persist_writes_parquet_and_master_metadata",
+      "removed_symbols": [
+        "MasterClient",
+        "ParquetPersist",
+        "Pipeline"
+      ],
+      "group": "compute"
+    },
+    {
+      "name": "test_master_client_heartbeat_keeps_registered_process_alive",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_master_client_registers_control_plane_entities_and_updates_status",
+      "removed_symbols": [
+        "MasterClient"
+      ],
+      "group": "registry_ops"
+    },
+    {
+      "name": "test_reactive_engine_can_consume_segment_stream_source_and_publish_to_zmq",
+      "removed_symbols": [
+        "MasterClient",
+        "SegmentStreamSource"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_reactive_engine_segment_stream_source_start_from_tail_skips_existing_rows",
+      "removed_symbols": [
+        "MasterClient",
+        "SegmentStreamSource"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_stream_table_engine_accepts_segment_stream_source",
+      "removed_symbols": [
+        "MasterClient",
+        "SegmentStreamSource"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_stream_table_engine_consumes_segment_stream_source_live_cross_process",
+      "removed_symbols": [
+        "MasterClient",
+        "SegmentStreamSource"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_stream_table_engine_rejects_segment_stream_source_schema_mismatch",
+      "removed_symbols": [
+        "MasterClient",
+        "SegmentStreamSource"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_segment_stream_source_recovers_when_descriptor_is_published_after_engine_start",
+      "removed_symbols": [
+        "MasterClient",
+        "SegmentStreamSource"
+      ],
+      "group": "connection"
+    },
+    {
+      "name": "test_main_native_query_uses_shared_expressions_and_sql_rules",
+      "removed_symbols": [
+        "_NativeQuery",
+        "_compile_native_table_sql",
+        "read_table"
+      ],
+      "group": "query"
+    }
+  ],
+  "other_removed_test_functions": [
+    {
+      "file": "test_control_uri.py",
+      "name": "test_connect_app_unhandled_exception_exits_without_native_fatal",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    },
+    {
+      "file": "test_control_uri.py",
+      "name": "test_native_master_client_roundtrips_localhost_remote_zippy_uri",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    },
+    {
+      "file": "test_control_uri.py",
+      "name": "test_native_master_client_roundtrips_remote_zippy_uri",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    },
+    {
+      "file": "test_control_uri.py",
+      "name": "test_native_master_client_roundtrips_tcp_uri",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    },
+    {
+      "file": "test_control_uri.py",
+      "name": "test_process_exit_cleanup_stops_default_control_agent",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    },
+    {
+      "file": "test_golden_contracts.py",
+      "name": "test_persisted_file_v1_preserves_query_overlap_and_ordering_contract",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    },
+    {
+      "file": "test_golden_contracts.py",
+      "name": "test_table_semantics_v2_freezes_public_parameter_names",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    },
+    {
+      "file": "test_golden_contracts.py",
+      "name": "test_table_semantics_v2_matches_publish_query_and_subscribe_contracts",
+      "reason": "legacy public/control or old descriptor fixture; native public contracts cover current behaviors"
+    }
+  ],
+  "retained_api_test_functions": [
+    "test_expr_factory_replaces_expr",
+    "test_expression_factor_exposes_native_attributes",
+    "test_reactive_engine_accepts_polars_and_flushes",
+    "test_reactive_engine_accepts_pyarrow_record_batch",
+    "test_reactive_engine_accepts_pyarrow_table",
+    "test_reactive_latest_engine_accepts_single_and_multi_by",
+    "test_reactive_latest_engine_named_source_requires_master",
+    "test_parquet_replay_source_emits_parquet_batches",
+    "test_parquet_replay_engine_table_callback_matches_row_callback_order",
+    "test_parquet_replay_engine_callback_errors_propagate",
+    "test_compare_replay_sorts_by_keys_and_reports_equal",
+    "test_reactive_engine_accepts_columnar_dict_input",
+    "test_reactive_engine_accepts_scalar_dict_input",
+    "test_reactive_factor_uses_its_own_id_column",
+    "test_reactive_engine_accepts_row_oriented_input",
+    "test_write_after_stop_raises_runtime_error",
+    "test_reactive_engine_exposes_output_schema_before_and_after_start",
+    "test_python_package_release_version_and_build_revision",
+    "test_setup_log_returns_snapshot_and_log_path",
+    "test_setup_log_file_contains_runtime_message",
+    "test_timeseries_engine_accepts_polars_and_exposes_output_schema",
+    "test_timeseries_engine_accepts_duration_window_api",
+    "test_timeseries_engine_rejects_string_policy_arguments",
+    "test_engines_reject_wrong_policy_constant_categories",
+    "test_reactive_engine_accepts_all_v1_operators_via_design_helpers",
+    "test_reactive_engine_accepts_expression_factor_helper",
+    "test_reactive_engine_expr_supports_ts_nodes",
+    "test_expression_factor_rejects_unknown_identifier",
+    "test_expression_factor_rejects_unsupported_function",
+    "test_timeseries_engine_accepts_all_v1_aggregation_operators_via_design_helpers",
+    "test_timeseries_engine_accepts_pre_and_post_expression_factors",
+    "test_timeseries_engine_rejects_non_expression_phase_factors",
+    "test_timeseries_engine_rejects_post_factors_referencing_raw_input_columns",
+    "test_timeseries_engine_pre_factors_reject_ts_expr_nodes",
+    "test_timeseries_engine_post_factors_reject_ts_expr_nodes",
+    "test_timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors",
+    "test_timeseries_engine_flush_runs_post_factors",
+    "test_timeseries_engine_accepts_reactive_source_pipeline",
+    "test_timeseries_engine_rejects_source_schema_mismatch_at_construction",
+    "test_source_write_requires_downstream_started",
+    "test_downstream_stop_requires_source_stopped",
+    "test_reactive_engine_accepts_target_list",
+    "test_reactive_engine_accepts_zmq_target",
+    "test_zmq_subscriber_receives_record_batch_from_engine",
+    "test_zippy_io_does_not_export_removed_parquet_sink_api",
+    "test_engine_constructor_signatures_hide_removed_sink_archive_parameters",
+    "test_engine_parquet_sink_keyword_is_rejected",
+    "test_engine_rejects_invalid_runtime_config_keywords",
+    "test_reactive_engine_exposes_status_metrics_and_config_lifecycle",
+    "test_reactive_engine_config_exposes_runtime_xfast",
+    "test_reactive_engine_accepts_rollback_state_failure_policy",
+    "test_reactive_engine_rejects_invalid_state_failure_policy",
+    "test_reactive_engine_id_filter_filters_rows_and_updates_config_and_metrics",
+    "test_reactive_engine_rejects_empty_id_filter",
+    "test_reactive_engine_rejects_blank_id_filter_values",
+    "test_reactive_engine_rejects_non_string_id_filter_elements",
+    "test_timeseries_engine_config_and_lifecycle_roundtrip",
+    "test_stream_table_engine_runtime_xfast_defaults_false",
+    "test_timeseries_engine_config_exposes_runtime_xfast",
+    "test_timeseries_engine_id_filter_filters_rows_and_updates_config_and_metrics",
+    "test_timeseries_engine_rejects_empty_id_filter",
+    "test_timeseries_engine_rejects_blank_id_filter_values",
+    "test_timeseries_engine_rejects_non_string_id_filter_elements",
+    "test_timeseries_engine_metrics_report_late_rows",
+    "test_reactive_engine_legacy_parquet_sink_is_rejected",
+    "test_stream_table_engine_exposes_input_schema_as_output_schema",
+    "test_stream_table_engine_supports_source_and_target_config",
+    "test_stream_table_engine_rejects_removed_sink_keyword",
+    "test_stream_table_engine_rejects_legacy_parquet_sink",
+    "test_stream_table_engine_passthrough_publishes_remote_stream",
+    "test_stream_table_engine_can_drive_timeseries_downstream_pipeline",
+    "test_stream_table_engine_can_publish_to_zmq",
+    "test_run_server_daemon_expands_user_path_and_creates_parent_dir",
+    "test_cross_sectional_engine_accepts_duration_trigger_interval_and_exposes_output_schema",
+    "test_cross_sectional_engine_emits_bucketed_output_over_zmq",
+    "test_cross_sectional_engine_config_exposes_runtime_xfast",
+    "test_cross_sectional_engine_rejects_unsupported_late_data_policy",
+    "test_cross_sectional_engine_rejects_non_cross_sectional_factor_specs",
+    "test_cross_sectional_engine_rejects_reactive_source",
+    "test_cross_sectional_engine_accepts_timeseries_source_pipeline",
+    "test_source_mode_constants_and_zmq_source_are_exposed",
+    "test_zmq_source_pipeline_can_drive_cross_sectional_engine",
+    "test_timeseries_engine_accepts_zmq_stream_target_for_remote_pipeline",
+    "test_timeseries_engine_filters_remote_zmq_source_rows_by_id_filter",
+    "test_zmq_source_consumer_mode_ignores_upstream_flush_until_local_flush",
+    "test_timeseries_engine_rejects_remote_source_schema_mismatch",
+    "test_reactive_engine_processes_remote_zmq_source",
+    "test_reactive_engine_filters_remote_zmq_source_rows_by_id_filter",
+    "test_cross_sectional_engine_config_and_lifecycle",
+    "test_cross_sectional_engine_start_can_retry_after_publisher_failure",
+    "test_stream_table_engine_can_publish_to_zmq_direct_reader",
+    "test_row_reuses_exact_dict_values_without_copy",
+    "test_bar_engine_accepts_plugin_profile_protocol",
+    "test_key_value_table_materializer_uses_materializer_name",
+    "test_stream_table_source_stop_can_reenter_engine_status",
+    "test_stream_table_engine_persists_rollover_parquet_without_master"
+  ],
+  "old_engine_binding_tests": "direct native engine and internal materializer tests remain while Rust adapter retirement is pending",
+  "gates": "new package absence checks, real native examples/restart matrix and retained core tests are required together"
+}

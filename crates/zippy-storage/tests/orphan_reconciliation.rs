@@ -1,3 +1,6 @@
+#[path = "support/fake_persistence_catalog.rs"]
+mod fake_persistence_catalog;
+
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -10,9 +13,10 @@ use tempfile::TempDir;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::OwnedDataDirectory;
 use zippy_storage::{
-    CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, CommitDataFilesIntent,
-    ParquetCandidateSpec, ParquetCandidateWriter, ReconciledFileDisposition,
-    ReconciliationIssueKind, StartupOrphanReconciler, StartupOrphanReconcilerConfig,
+    CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, ParquetCandidateSpec,
+    ParquetCandidateWriter, PersistCandidateInput, PersistController, PersistControllerConfig,
+    PersistRequest, ReconciledFileDisposition, ReconciliationIssueKind, StartupOrphanReconciler,
+    StartupOrphanReconcilerConfig,
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1,
@@ -121,6 +125,46 @@ fn write_candidate(
             vec![batch(schema, values)],
         )
         .expect("write durable candidate")
+}
+
+fn persist_input(file: u128, first: u64, values: Vec<i64>) -> PersistCandidateInput {
+    let last = first + u64::try_from(values.len()).expect("small row count") - 1;
+    let schema = schema();
+    PersistCandidateInput::new(
+        ParquetCandidateSpec {
+            file_id: file_id(file),
+            table_id: table_id(TABLE),
+            schema_version: 1,
+            schema: Arc::clone(&schema),
+            provenance: provenance(first, last),
+            partition: MetadataMap::new(),
+            metadata: MetadataMap::new(),
+            created_at_ns: 1_752_492_600_000_000_000 + file as u64,
+        },
+        vec![batch(schema, values)],
+    )
+    .expect("valid native persist input")
+}
+
+async fn terminal_persist_controller(
+    owned: Arc<OwnedDataDirectory>,
+    catalog: Arc<SqliteCatalog>,
+) -> PersistController {
+    let coordinator = CatalogCommitCoordinator::start(
+        CatalogCommitCoordinatorConfig::default(),
+        Arc::clone(&owned),
+        fake_persistence_catalog::with_existing_sqlite(Arc::new(TerminalCatalog), catalog),
+        server_actor(),
+    )
+    .await
+    .expect("start terminal test coordinator");
+    PersistController::start(
+        PersistControllerConfig::new(),
+        ParquetCandidateWriter::new(owned),
+        coordinator,
+    )
+    .await
+    .expect("start native persist controller")
 }
 
 fn server_actor() -> CatalogActor {
@@ -413,28 +457,19 @@ async fn reports_verified_orphan_then_exact_catalog_reference_without_deleting()
         "read-only scan must retain the orphan"
     );
 
-    let coordinator = CatalogCommitCoordinator::start(
-        CatalogCommitCoordinatorConfig::default(),
-        Arc::clone(&owned),
-        catalog.clone(),
-        server_actor(),
-    )
-    .await
-    .expect("start commit coordinator");
-    coordinator
-        .commit(
-            CommitDataFilesIntent::new(
-                request_id(3),
-                table_id(TABLE),
-                1,
-                vec![candidate],
-                OffsetWatermark::Known(LogOffset::new(1)),
-            )
-            .expect("valid commit intent"),
-        )
+    catalog
+        .command(command(
+            3,
+            Some(2),
+            CatalogCommandV1::CommitDataFiles(CommitDataFilesCommand {
+                table_id: table_id(TABLE),
+                expected_snapshot_version: 1,
+                files: vec![candidate.pending().clone()],
+                committed_log_offset: OffsetWatermark::Known(LogOffset::new(1)),
+            }),
+        ))
         .await
         .expect("commit candidate");
-    coordinator.drain().await.expect("drain coordinator");
 
     let report = StartupOrphanReconciler::new(Arc::clone(&owned), catalog.clone())
         .reconcile()
@@ -466,28 +501,19 @@ async fn startup_cleanup_removes_only_verified_orphans_before_admission() {
     let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
     let committed = write_candidate(&writer, 20, 0, vec![100]);
     let committed_path = committed.path().to_path_buf();
-    let coordinator = CatalogCommitCoordinator::start(
-        CatalogCommitCoordinatorConfig::default(),
-        Arc::clone(&owned),
-        catalog.clone(),
-        server_actor(),
-    )
-    .await
-    .expect("start commit coordinator");
-    coordinator
-        .commit(
-            CommitDataFilesIntent::new(
-                request_id(3),
-                table_id(TABLE),
-                1,
-                vec![committed],
-                OffsetWatermark::Known(LogOffset::new(0)),
-            )
-            .expect("valid committed intent"),
-        )
+    catalog
+        .command(command(
+            3,
+            Some(2),
+            CatalogCommandV1::CommitDataFiles(CommitDataFilesCommand {
+                table_id: table_id(TABLE),
+                expected_snapshot_version: 1,
+                files: vec![committed.pending().clone()],
+                committed_log_offset: OffsetWatermark::Known(LogOffset::new(0)),
+            }),
+        ))
         .await
         .expect("commit protected candidate");
-    coordinator.drain().await.expect("drain coordinator");
 
     let orphan = write_candidate(&writer, 21, 1, vec![101]);
     let orphan_path = orphan.path().to_path_buf();
@@ -586,35 +612,25 @@ async fn retained_terminal_intent_protects_uncommitted_candidate() {
         SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open sqlite catalog"),
     );
     create_append_table(&catalog, schema().as_ref()).await;
-    let candidate = write_candidate(
-        &ParquetCandidateWriter::new(Arc::clone(&owned)),
-        20,
+    let controller = terminal_persist_controller(Arc::clone(&owned), Arc::clone(&catalog)).await;
+    let request = PersistRequest::new(
+        request_id(3),
+        table_id(TABLE),
+        1,
         0,
-        vec![1, 2],
-    );
-    let coordinator = CatalogCommitCoordinator::start(
-        CatalogCommitCoordinatorConfig::default(),
-        Arc::clone(&owned),
-        Arc::new(TerminalCatalog),
-        server_actor(),
+        vec![persist_input(20, 0, vec![1, 2])],
+        OffsetWatermark::Known(LogOffset::new(1)),
     )
-    .await
-    .expect("start terminal coordinator");
-    let error = coordinator
-        .commit(
-            CommitDataFilesIntent::new(
-                request_id(3),
-                table_id(TABLE),
-                1,
-                vec![candidate],
-                OffsetWatermark::Known(LogOffset::new(1)),
-            )
-            .expect("valid commit intent"),
-        )
+    .expect("valid native persist request");
+    let error = controller
+        .handle()
+        .submit(request)
+        .expect("admit native persist")
+        .wait()
         .await
         .expect_err("terminal Catalog error must retain intent");
     assert_eq!(error.code(), ErrorCode::DataCorruption);
-    assert!(coordinator.drain().await.is_err());
+    assert!(controller.drain().await.is_err());
 
     let report = StartupOrphanReconciler::new(Arc::clone(&owned), catalog.clone())
         .reconcile()
@@ -651,33 +667,27 @@ async fn retained_multi_file_intent_is_reported_as_one_atomic_pending_group() {
         SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open sqlite catalog"),
     );
     create_append_table(&catalog, schema().as_ref()).await;
-    let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
-    let candidates = vec![
-        write_candidate(&writer, 20, 0, vec![1, 2]),
-        write_candidate(&writer, 21, 2, vec![3, 4]),
-    ];
-    let coordinator = CatalogCommitCoordinator::start(
-        CatalogCommitCoordinatorConfig::default(),
-        Arc::clone(&owned),
-        Arc::new(TerminalCatalog),
-        server_actor(),
+    let controller = terminal_persist_controller(Arc::clone(&owned), Arc::clone(&catalog)).await;
+    let request = PersistRequest::new(
+        request_id(3),
+        table_id(TABLE),
+        1,
+        0,
+        vec![
+            persist_input(20, 0, vec![1, 2]),
+            persist_input(21, 2, vec![3, 4]),
+        ],
+        OffsetWatermark::Known(LogOffset::new(3)),
     )
-    .await
-    .expect("start terminal coordinator");
-    coordinator
-        .commit(
-            CommitDataFilesIntent::new(
-                request_id(3),
-                table_id(TABLE),
-                1,
-                candidates,
-                OffsetWatermark::Known(LogOffset::new(3)),
-            )
-            .expect("valid multi-file commit intent"),
-        )
+    .expect("valid multi-file native persist request");
+    controller
+        .handle()
+        .submit(request)
+        .expect("admit native persist")
+        .wait()
         .await
         .expect_err("terminal Catalog error must retain the group");
-    assert!(coordinator.drain().await.is_err());
+    assert!(controller.drain().await.is_err());
 
     let report = StartupOrphanReconciler::new(Arc::clone(&owned), catalog.clone())
         .reconcile()
@@ -712,32 +722,42 @@ async fn partially_committed_multi_file_intent_fails_closed() {
         SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open sqlite catalog"),
     );
     create_append_table(&catalog, schema().as_ref()).await;
-    let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
-    let first = write_candidate(&writer, 20, 0, vec![1, 2]);
-    let first_pending = first.pending().clone();
-    let second = write_candidate(&writer, 21, 2, vec![3, 4]);
-    let coordinator = CatalogCommitCoordinator::start(
-        CatalogCommitCoordinatorConfig::default(),
-        Arc::clone(&owned),
-        Arc::new(TerminalCatalog),
-        server_actor(),
+    let controller = terminal_persist_controller(Arc::clone(&owned), Arc::clone(&catalog)).await;
+    let request = PersistRequest::new(
+        request_id(3),
+        table_id(TABLE),
+        1,
+        0,
+        vec![
+            persist_input(20, 0, vec![1, 2]),
+            persist_input(21, 2, vec![3, 4]),
+        ],
+        OffsetWatermark::Known(LogOffset::new(3)),
     )
-    .await
-    .expect("start terminal coordinator");
-    coordinator
-        .commit(
-            CommitDataFilesIntent::new(
-                request_id(3),
-                table_id(TABLE),
-                1,
-                vec![first, second],
-                OffsetWatermark::Known(LogOffset::new(3)),
-            )
-            .expect("valid multi-file commit intent"),
-        )
+    .expect("valid multi-file native persist request");
+    controller
+        .handle()
+        .submit(request)
+        .expect("admit native persist")
+        .wait()
         .await
         .expect_err("terminal Catalog error must retain the group");
-    assert!(coordinator.drain().await.is_err());
+    assert!(controller.drain().await.is_err());
+
+    let retained = StartupOrphanReconciler::new(Arc::clone(&owned), catalog.clone())
+        .reconcile()
+        .await
+        .expect("inspect retained native intent");
+    let first_pending = retained
+        .files
+        .iter()
+        .find_map(|file| {
+            file.verified_candidate
+                .as_ref()
+                .filter(|candidate| candidate.file_id == file_id(20))
+                .cloned()
+        })
+        .expect("verify first member of retained native intent");
 
     catalog
         .command(command(

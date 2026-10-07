@@ -42,6 +42,8 @@ pub struct SegmentReadSnapshotDescriptor {
     pub committed_rows: u64,
     /// The greatest logical offset visible in this segment prefix.
     pub committed_log_offset: OffsetWatermark,
+    /// Proven maximum UTF-8 cell bytes in this pinned prefix; absent when not measured.
+    pub max_utf8_value_bytes: Option<u64>,
 }
 
 impl From<&SegmentDescriptor> for SegmentReadSnapshotDescriptor {
@@ -51,6 +53,7 @@ impl From<&SegmentDescriptor> for SegmentReadSnapshotDescriptor {
             schema_version: segment.schema_version,
             committed_rows: segment.committed_rows,
             committed_log_offset: segment.committed_log_offset,
+            max_utf8_value_bytes: None,
         }
     }
 }
@@ -394,6 +397,12 @@ pub struct CatalogSnapshotMemoryLease {
 }
 
 impl CatalogSnapshotMemoryLease {
+    /// Compares private issuer capabilities without exposing or recreating either authority.
+    #[must_use]
+    pub fn has_same_issuer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.authority, &other.authority)
+    }
+
     /// Returns the copyable accounting descriptor bound at issuance.
     #[must_use]
     pub const fn descriptor(&self) -> CatalogSnapshotMemoryLeaseDescriptor {

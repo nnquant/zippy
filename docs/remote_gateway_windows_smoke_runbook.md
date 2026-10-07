@@ -1,5 +1,11 @@
 # Zippy Remote Gateway Windows Smoke Runbook
 
+> 2026-09-22：本文涉及的 Gateway CLI 与 `08_remote_gateway` 脚本已删除。当前操作见
+> [原生远端客户端](native-remote-client.md)，以下仅保留历史验收记录。
+
+> 历史设计/验收说明：以下描述对应文中日期，不作为新版本安装和 API 指南。
+> 当前入口见[客户端使用指南](../clients/python/README.md)与[能力表](current-capabilities-2026-09-21.md)。
+
 > 日期：2026-05-05
 >
 > 目标：在 Windows 原生 Python 进程中验证 `zippy://host:port/default` 远程连接，
@@ -97,7 +103,7 @@ port = 17690
 配置自动启动，不需要再单独启动第二个程序：
 
 ```bash
-uv run zippy master run tcp://0.0.0.0:17690 --config /tmp/zippy-gateway-smoke.toml
+uv run zippy server run --foreground tcp://0.0.0.0:17690 --config /tmp/zippy-gateway-smoke.toml
 ```
 
 如果 master 或 Gateway 端口被占用，可以换端口，但要同步修改：
@@ -142,30 +148,23 @@ python examples\08_remote_gateway\04_standalone_windows_smoke_client.py `
 standalone smoke 通过后，只能说明跨平台协议和 Gateway 数据面可达；完整用户 API
 验收仍然需要安装 Windows 版 zippy 后运行 `zippy gateway smoke-client`。
 
-如果 Windows 侧暂时不能构建 native `_internal` 扩展，但可以拿到 `python/zippy`
-源码目录，也可以用 pure Python remote fallback 验证高层 API。这个模式只支持
-remote Gateway 路径，本地 segment、Engine、master server 等 native 能力会明确报错：
+远端应用安装独立 `zippy-client`，通过显式 `Client` 连接；主包的纯 Python 降级已删除。
+以下代码保存为 `smoke.py` 后在 Windows 原生 Python 中运行：
 
-```powershell
-$env:PYTHONPATH = "C:\path\to\zippy\python"
-$env:ZIPPY_FORCE_PURE_PYTHON = "1"
-python - <<'PY'
-import json
+```python
 import pyarrow as pa
-import zippy as zp
+from zippy_client import Client
 
-schema = pa.schema([
-    ("instrument_id", pa.string()),
-    ("last_price", pa.float64()),
-])
-zp.connect("zippy://<wsl-host>:17690/default", app="windows_pure_remote")
-writer = zp.get_writer("windows_pure_ticks", schema=schema, batch_size=1)
-writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
-writer.close()
-table = zp.read_table("windows_pure_ticks").collect()
-print(json.dumps({"rows": table.num_rows, "data": table.to_pydict()}))
-PY
+schema = pa.schema([("instrument_id", pa.string()), ("last_price", pa.float64())])
+with Client("zippy://<wsl-host>:17690/default") as client:
+    with client.get_writer(
+        "windows_ticks", schema=schema, batch_size=1, durability="memory"
+    ) as writer:
+        writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
+    print(client.read_table("windows_ticks").collect().to_pydict())
 ```
+
+这里明确选择 Gateway 的 memory 确认；要求 WAL 时应配置 Flight 并使用默认 WAL writer。
 
 ## 5. Windows 侧 smoke
 

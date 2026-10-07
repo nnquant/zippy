@@ -53,10 +53,6 @@ fn unix_endpoint_state_directories_include_the_socket_name() {
         PathBuf::from("/tmp/zippy/b.sock.zippy-state")
     );
     assert_ne!(first.snapshot_dir(), second.snapshot_dir());
-    assert_eq!(
-        first.legacy_snapshot_path(),
-        PathBuf::from("/tmp/zippy/master-registry.json")
-    );
 }
 
 #[test]
@@ -82,6 +78,18 @@ fn resolves_remote_zippy_uri_to_tcp_endpoint() {
 }
 
 #[test]
+fn rejects_remote_zippy_uri_with_ignored_profile() {
+    for uri in [
+        "zippy://127.0.0.1:17777/other",
+        "zippy://127.0.0.1:17777/",
+        "zippy://127.0.0.1:17777/default?mode=other",
+    ] {
+        let error = resolve_control_endpoint(uri).unwrap_err();
+        assert!(error.to_string().contains("only /default profile"));
+    }
+}
+
+#[test]
 fn resolves_localhost_remote_zippy_uri_to_tcp_endpoint() {
     let endpoint = resolve_control_endpoint("zippy://localhost:17777").unwrap();
 
@@ -97,16 +105,34 @@ fn resolves_localhost_remote_zippy_uri_to_tcp_endpoint() {
 fn rejects_tcp_endpoint_without_port() {
     let error = resolve_control_endpoint("tcp://127.0.0.1").unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("invalid tcp control endpoint uri=[tcp://127.0.0.1]"));
+    assert!(error.to_string().contains("invalid tcp control endpoint"));
+}
+
+#[test]
+fn rejects_tcp_endpoint_with_non_address_components() {
+    for uri in [
+        "tcp://127.0.0.1:17777/other",
+        "tcp://user@127.0.0.1:17777",
+        "tcp://127.0.0.1:17777?profile=other",
+        "tcp://127.0.0.1:17777#other",
+    ] {
+        let error = resolve_control_endpoint(uri).unwrap_err();
+        assert!(error.to_string().contains("invalid tcp control endpoint"));
+    }
+}
+
+#[test]
+fn rejected_tcp_endpoint_does_not_echo_credentials() {
+    let error = resolve_control_endpoint("tcp://user:secret@127.0.0.1:17777").unwrap_err();
+
+    assert!(!error.to_string().contains("secret"));
 }
 
 #[test]
 fn rejects_legacy_remote_gateway_uri() {
     let error = resolve_control_endpoint("zippy+tcp://127.0.0.1:17666/default").unwrap_err();
 
-    assert!(error.to_string().contains("zippy://host:port/profile"));
+    assert!(error.to_string().contains("zippy://host:port/default"));
 }
 
 #[test]

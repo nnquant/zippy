@@ -1,211 +1,77 @@
-# Zippy 示例指南
+# Zippy 原生示例指南
 
-这组示例按使用场景组织，目标是让 Python 用户先掌握高层 API，再按需理解底层组件。
+所有表操作都使用显式 `Client`，经 Flight 访问同一个原生 Catalog。主包只承载服务器、本地
+计算和回放；不再提供 `connect/master/ops/Table/Session/Pipeline` 或模块级读写订阅函数。
+旧示例已删除，不支持旧 API、旧配置名称和 Gateway 数据路径。
 
-## 环境准备
+## 服务与认证
 
-大多数跨进程示例都需要先启动本地 `zippy-master`：
+先按[Flight 服务配置](../docs/flight-query-service.md)启用 native storage、SQLite Catalog、
+native query 和 Flight ingest，再用 `uv run zippy server run --config <config.toml>` 启动。
+当前服务器默认权威尚未收敛，不能省略原生配置后假定示例可用。
+读取使用 read 凭据，建表使用 administrator 凭据，写入使用 writer 凭据；远端还需要 TLS。
+独立客户端从相应 `ZIPPY_FLIGHT_AUTH_*` 环境变量读取凭据，不写入示例源码。
+
+创建专用命名空间，保存其 UUID；后续 `--namespace` 与 `--namespace-id` 必须对应：
+
+```python
+import uuid
+from zippy_client import Client
+
+namespace_id, request_id = uuid.uuid4(), uuid.uuid4()
+with Client("zippy://default") as client:
+    client.create_namespace("market", namespace_id=namespace_id, request_id=request_id)
+print(namespace_id)
+```
+
+这些示例使用新表名，遇到同名表明确失败，不会删除或覆盖既有数据。管理请求重试需复用原
+UUID 和原参数；重新运行脚本会生成新请求，不等于请求级幂等重试。
+
+## 运行顺序
+
+将下列 `<namespace-uuid>` 替换为上一步结果；默认控制端点为 `zippy://default`，可用 `--uri`
+覆盖。默认 namespace 为 `market`，输入时间均为明确的 UTC epoch 纳秒。
 
 ```bash
-uv run zippy master run default
+uv run examples/01_quickstart/01_create_write_read.py --namespace-id <namespace-uuid>
+uv run examples/03_query/01_fixed_query.py --table demo_ticks
+uv run examples/04_subscribe/01_native_callbacks.py --table demo_ticks --mode rows --rows 4
+uv run examples/04_subscribe/01_native_callbacks.py --table demo_ticks --mode tables --rows 4
+uv run examples/02_stream_table/01_native_state_tables.py --namespace-id <namespace-uuid>
+uv run examples/05_engines/01_native_local_chain.py
+uv run examples/05_engines/02_native_table_compute.py --namespace-id <namespace-uuid> \
+  --source demo_ticks --output demo_latest --kind latest --through-offset 4
+uv run examples/05_engines/02_native_table_compute.py --namespace-id <namespace-uuid> \
+  --source demo_ticks --output demo_bars --kind timeseries --window-ns 2 --through-offset 4
+uv run examples/05_engines/02_native_table_compute.py --namespace-id <namespace-uuid> \
+  --source demo_ticks --output demo_ranks --kind cross_sectional --window-ns 2 --through-offset 4
+uv run examples/07_ops/01_wait_for_table.py --table demo_ticks --timeout 10
 ```
 
-`default` 会解析到 `~/.zippy/control_endpoints/default/master.sock`。如果你使用其他 master，
-运行示例时传入 `--uri <name-or-path>`，例如：
+- quickstart 有限写入 4 行，使用 persisted 确认；查询显式按 dt 排序。
+- 查询示例使用 `snapshot=True`，重复 collect 保持固定快照；普通 `read_table` 默认每次查询
+  使用新边界。需要跨表一致性时使用 `Client.open_snapshot`。
+- 回调示例明确选择 earliest/latest。rows 模式用于 append，tables 模式保持完整 frame/KV
+  mutation；目标行数是最低值，不切片破坏原子交付。超时和后台异常退出失败。
+- 状态表示例写两帧、upsert 后 delete，并读取逻辑 KV 当前状态；KV 日志增量不等于状态快照。
+- 原生本地 chain 不需要服务器。表驱动计算通过 `ComputePipeline` 写 append/frame/KV，输出
+  绑定不可变表 UUID，停止时刷出窗口尾部。时序示例将整数 volume 显式转为 float64 后聚合。
+- `--through-offset` 是原生日志的绝对游标阈值，处理到至少该位置后停止；完整批次可能超过
+  阈值。输入应是专用有限数据，不能把该参数当作精确截断工具。不指定时持续处理直到信号退出。
+- 计算进程状态尚无持久算子 checkpoint；重启计算进程需要显式重放重建，不能把持久 ACK
+  或输出恢复误当作内核状态自动恢复。
+- 等待示例只承诺表已创建，不承诺已有行；可先启动它，再由另一个进程创建目标表。
 
-```bash
-uv run python examples/01_quickstart/01_connect_and_read_table.py --uri default
-```
+## 回放、远端与运维
 
-查看 master 当前注册的表：
+`06_replay/` 提供有限 Parquet 源、同一固定快照内的回放结果比较，以及日志驱动 latest 计算。
+`compare_replay` 只接收已经 collect 的 Arrow Table；排序键由调用方指定，不再隐式连接表名。
+`08_remote_flight/` 仅依赖 `zippy-client`，见[远端指南](../docs/native-remote-client.md)。
 
-```bash
-uv run zippy stream ls --uri default
-```
+表列表、元数据、schema 和删除统一使用 `zippy table`，预览使用原生 WebUI。删除必须携带
+不可变 table ID、观测到的 snapshot version 和稳定 request ID；不再使用旧 `drop_persisted`
+开关。旧 SHM 私有扫描吞吐、Gateway 指标及 registry 健康推断示例已退出；服务真实故障必须
+根据当前组件状态和请求错误判断，不能从表存在推断写入健康。
 
-### 运行时并行度
-
-进程级并行度上限由 zippy 配置统一管理，默认是 `4`：
-
-```toml
-[runtime]
-max_cpu_cores = 4
-max_query_buffer_bytes = 536870912
-
-# 可选：单查询预算默认继承 runtime.max_cpu_cores
-[query]
-parallelism = 2
-max_buffered_bytes = 134217728
-plan_ttl_ms = 30000
-
-[query.resources]
-max_concurrent_queries = 64
-max_active_tasks = 16
-max_memory_bytes = 536870912
-
-# 仅供 zippy server 内部 persisted-only 灰度验证，默认关闭
-[query.canary]
-enabled = false
-max_rows = 1000000
-max_batches = 4096
-max_output_bytes = 268435456
-# operator_memory_bytes = 67108864
-```
-
-也可以用环境变量临时覆盖：
-
-```bash
-ZIPPY_MAX_CPU_CORES=8 \
-ZIPPY_QUERY_PARALLELISM=4 \
-ZIPPY_MAX_QUERY_BUFFER_BYTES=536870912 \
-ZIPPY_QUERY_MAX_BUFFERED_BYTES=134217728 \
-ZIPPY_QUERY_PLAN_TTL_MS=30000 \
-ZIPPY_QUERY_MAX_CONCURRENT_QUERIES=64 \
-ZIPPY_QUERY_MAX_ACTIVE_TASKS=32 \
-ZIPPY_QUERY_MAX_MEMORY_BYTES=536870912 \
-uv run zippy master run default
-```
-
-`ZIPPY_MAX_CPU_CORES` 覆盖 `[runtime].max_cpu_cores`；`ZIPPY_QUERY_PARALLELISM`
-覆盖 `[query].parallelism`。两者有效范围都是 `1..=256`，查询覆盖值不得超过全局上限。
-未配置查询覆盖时，查询预算继承全局值。全局上限还约束 Gateway Tokio worker 和
-`shard_nums="auto"`；查询预算限制本地 persisted Parquet 文件读取、逻辑分片查询
-fan-out 和 native Gateway persisted 文件扫描。
-
-旧的 `[runtime].max_parallelism` 和 `ZIPPY_MAX_PARALLELISM` 保留一个兼容周期。同一 TOML
-或环境变量层同时提供新旧名称时，两者必须相等；环境变量层仍整体覆盖 TOML。该 CPU 值目前
-是组件配置上限，不代表所有独立线程池已经共享一个进程级硬 semaphore。
-
-`query.plan_ttl_ms` / `ZIPPY_QUERY_PLAN_TTL_MS` 控制未执行计划持有 snapshot 的最长时间，默认
-30 秒，可配置 1 毫秒到 24 小时；Legacy/Gateway 与 native QueryService 使用同一值，查询 planner
-不能自行改变。
-
-persisted streaming 的进程级 Arrow 缓冲预算默认是 `512 MiB`，单查询默认是 `128 MiB`。
-单查询额度从全局额度中 admission，随后均分给活跃文件扫描槽位；默认并行度 4 时每槽约
-`32 MiB`。这两个值限制 buffered Arrow batches，不包括 Parquet decoder 正在构造的一个临时
-batch，也不包括已经编码的网络 payload。
-
-`query.max_buffered_bytes` 是单次查询上限；同一 Gateway 进程内的并发查询共享
-`runtime.max_query_buffer_bytes`，不同进程各自拥有一份全局预算。仍需结合 Gateway 的
-`max_blocking_requests` 和实际磁盘能力控制总负载。
-
-`query.resources.max_memory_bytes` 是 native query task admission 的独立内存预算，不是
-Gateway Arrow buffer。`max_concurrent_queries` 默认 `64`、上限 `4096`；
-省略 `max_active_tasks` 时按最终有效 `query.parallelism * 4` 派生，默认 CPU 配置下为
-`16`，显式值不得低于有效查询并行度。
-
-`[query.canary]` 只在 `[server].native_storage_enabled = true` 时可启用，用于 Server 内部对落盘
-数据执行 native golden 查询；它不会开放 Gateway SQL capability。`operator_memory_bytes` 省略时取
-`min(64 MiB, query.resources.max_memory_bytes / 2)`。行数、batch 数以及累计 Arrow charge 加 canonical
-bytes 都有硬上限；首版 golden 摘要只接受 flat scalar 结果列。对应环境变量以
-`ZIPPY_QUERY_CANARY_` 开头。完整用法见
-[`docs/native-query-canary.md`](../docs/native-query-canary.md)。
-
-多文件历史查询和逻辑分片查询通常能从更高并行度获益；单文件的 `head()`、`tail()`、
-`slice()` 主要依赖 row-group 和列裁剪，通常保留默认值即可。修改配置后需要重启 master；
-仅修改客户端环境变量时，需要重新创建 `Table` 或 `GatewayServer` 对象。
-
-## 目录结构
-
-- `01_quickstart/`：连接 master、创建最小 StreamTable、读取最新数据。
-- `02_stream_table/`：StreamTable 的持久化、分区和删除。
-- `03_query/`：`read_table()`、`tail()`、`collect()`、表达式查询和 DataFrame 转换。
-- `04_subscribe/`：行级订阅和表级批量订阅。
-- `05_engines/`：`Session` 编排、`ReactiveLatestEngine`、时序和截面引擎。
-- `06_replay/`：从 persisted table / Parquet 回放到 StreamTable，并驱动下游 Engine。
-- `07_ops/`：运行时表状态、master 元数据和运维观察入口。
-- `08_remote_gateway/`：Windows/远端客户端通过 GatewayServer 写入、订阅和查询 WSL/Linux
-  中的 named stream。
-
-## 推荐学习顺序
-
-1. 运行 `01_quickstart/02_create_stream_table_with_pipeline.py` 创建一张示例表。
-2. 运行 `01_quickstart/01_connect_and_read_table.py` 读取这张表的最新数据。
-3. 运行 `01_quickstart/03_run_pipeline_forever.py` 观察持续运行的 source 如何交给
-   `Pipeline.run_forever()` 管理生命周期。
-4. 运行 `03_query/02_query_expressions_and_dataframe.py` 熟悉表达式过滤和格式转换。
-5. 用 `04_subscribe/` 里的脚本观察实时增量回调。
-6. 用 `05_engines/01_reactive_latest_session.py` 把上游表聚合成最新快照表。
-7. 用 `05_engines/03_named_stream_timeseries_session.py` 从 named StreamTable 直接生成 1m bar。
-8. 用 `05_engines/04_named_stream_cross_sectional_session.py` 从 named StreamTable 直接计算截面排名。
-9. 用 `06_replay/01_parquet_replay_to_stream_table.py` 做不开盘环境下的回放测试。
-10. 用 `06_replay/02_replay_parity_check.py` 比较 live persisted 数据和 replay 输出。
-11. 用 `06_replay/03_replay_to_reactive_latest_engine.py` 验证 replay stream 驱动下游 Engine。
-12. 用 `07_ops/01_table_observability.py` 查看 master 中的表状态。
-13. 用 `07_ops/02_table_perf_probe.py` 记录 `tail(n).collect()` 延迟、底层表读取吞吐和可选 replay 吞吐。
-14. 用 `07_ops/03_subscribe_latency_probe.py` 记录 append、subscriber 行级和 rollover 延迟。
-15. 用 `07_ops/04_consumer_wait_for_table.py` 验证 consumer 先启动、producer 后注册表的场景。
-16. 用 `07_ops/05_table_health_check.py` 检查 stale stream、persist 失败等健康告警。
-17. 在 WSL/Linux 侧通过 master config 启用 `[gateway] enabled = true`，然后启动
-    `zippy master run tcp://0.0.0.0:17690 --config <config.toml>`。master 会自动管理
-    native GatewayServer；`zippy gateway run` 和
-    `08_remote_gateway/01_start_gateway_server.py` 只作为高级调试入口保留。
-18. 用 `08_remote_gateway/02_remote_writer.py` 模拟 Windows 侧行情源逐行写入。
-19. 用 `08_remote_gateway/03_remote_subscribe_and_query.py` 模拟 Windows 侧策略订阅和主动查询。
-20. 用 `zippy gateway smoke --master-uri tcp://127.0.0.1:28690 --gateway-endpoint 127.0.0.1:28666`
-    跑跨进程远端写入和查询 smoke。
-21. 在 Windows 侧用
-    `zippy gateway smoke-client --uri zippy://<wsl-host>:17690/default --stream windows_smoke_ticks`
-    验证只作为远端客户端访问 WSL/Linux Gateway 的路径。完整联调步骤见
-    `docs/remote_gateway_windows_smoke_runbook.md`。
-22. 如果 Windows 侧还没有 zippy wheel，可先用
-    `08_remote_gateway/04_standalone_windows_smoke_client.py` 验证 Windows 到 WSL/Linux
-    master/Gateway 的纯 Python wire protocol。
-23. 如果 Windows 侧还不能构建 native `_internal` 扩展，但能访问 `python/zippy`
-    源码目录，可设置 `ZIPPY_FORCE_PURE_PYTHON=1` 先验证 remote-only 的
-    `connect()` / `get_writer()` / `read_table().collect()` 高层 API。
-24. 对已经运行的 LDC/TGW 生产流执行只读验收时，运行
-    `08_remote_gateway/07_ldc_tgw_read_acceptance.py`。它覆盖远程查询下推、流式
-    collect、快照语义、Arrow 批回调、CTA 逐行回调和 writer epoch 连续性；完整的
-    Windows 操作步骤与边界见 `docs/ldc_tgw_windows_manual_acceptance.md`。
-
-## API 分层
-
-日常 Python 用户优先使用这几类接口：
-
-- `zp.connect(uri="default", app="...")`：建立默认 master 连接并维护进程租约。
-- `zp.Pipeline(...).source(...).stream_table(...).run_forever()`：长期运行 source 到
-  StreamTable 的推荐入口，Ctrl-C 后统一停止 source 和 engine。
-- `zp.Pipeline(...).stream_table(...)`：一次性写入或测试时，可以手动
-  `start()` / `write()` / `flush()` / `stop()`。
-- `zp.Session(...).engine(...).append_table(...).publish().run()`：编排下游 Engine，并把 append 输出注册成可查询表。
-- `zp.Session(...).engine(...).key_value_table(...).publish().run()`：把 latest/key-value 输出注册成可查询表。
-- `zp.read_table("table_name")`：读取表，底层会拼接 persisted、sealed 和 active segment。
-  若监控或策略进程需要先于 producer 启动，可用
-  `zp.read_table("table_name", wait=True, timeout="30s")` 等待表注册。
-  对 `select()` / `drop()` / `rename()` / `with_columns()` 后紧接的 `head()`、`tail()`、
-  非负 `slice()`，执行器会先做安全的行范围读取，再执行投影，避免为少量结果全表扫描。
-- `zp.read_table("table_name").info()` / `.health()` / `.alerts()`：查看单张表的低频诊断信息。
-- `zp.ops.list_tables()` / `zp.ops.table_info("table_name")`：查看 master 中的表状态和元数据。
-- `zp.ops.table_health("table_name")` / `zp.ops.table_alerts("table_name")`：基于 master
-  元数据汇总表健康状态和告警。
-- `zp.subscribe(...)`：按行接收 `zp.Row`。
-- `zp.subscribe_table(...)`：按批接收 `pyarrow.Table`。
-  这两个订阅接口也支持 `wait=True`，用于 consumer 先启动、producer 后注册 stream 的场景。
-- `zp.replay(...)`：把已持久化的 Zippy 表回放到 callback 或 named StreamTable。
-  可用 `start` / `end` / `time_column` 做闭区间回放，用 `replay_rate` 指定固定
-  rows/sec；下游需要先订阅时，使用 `zp.TableReplayEngine(...).init()` 建立输出流后再
-  `run()`。
-- `zp.compare_replay(...)`：把 live persisted 数据和 replay 输出按 key 对齐比较。
-- `zp.ops.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
-- `zp.ops.compact_table(...)`：低频合并 persisted parquet 小文件，按 partition 分组
-  生成 compacted parquet，并替换 master 中的 persisted metadata。源文件默认保留；
-  当前不支持 `delete_sources=True`，物理清理由后续 snapshot-aware GC 负责。
-- `zp.ops.compact_tables(...)`：批量执行低频 compaction；周期 compaction 由 master
-  根据 `[table.persist.compaction]` 配置统一调度，不在 Python 侧单独启动后台 worker。
-- `zp.GatewayServer(...)`：native Rust 跨平台数据面服务。日常由 master 根据
-  `[gateway]` 配置自动启动和管理；Python 侧这个类只保留为调试/测试胶水。Windows
-  侧继续使用 `connect()`、`get_writer()`、`subscribe_table()` 和 `read_table()`，
-  不需要直接接触 mmap/segment。
-
-`ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、
-`SegmentStreamSource` 等底层对象仍然可以使用；StreamTable 物化器保留在内部层，
-示例默认不直接暴露这些细节。
-
-## 运行约定
-
-- 示例中的时间列使用 UTC 时间戳，字段名使用小写 snake_case。
-- 会写数据的示例默认使用 `/tmp/zippy-examples`，避免污染工作目录。
-- 持久化示例使用 `persist="parquet"`；不需要落盘时传 `persist=None` 或使用高层
-  `Session.append_table(...).publish(persist=False)` / `Session.key_value_table(...).publish()`。
-- 多数脚本提供 `--drop-existing`，便于重复运行。生产环境不要随意使用这个参数。
+`scripts/check_native_client.py` 实际运行上述示例，并在每次服务重启后核对数据、三类计算
+结果与回调。仓库测试仍保留原生内核细节验证。Linux 本机验收不替代跨平台实机结果。

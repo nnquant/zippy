@@ -16,7 +16,6 @@ const U64_ENCODED_LEN: usize = size_of::<u64>();
 const TAGGED_U64_ENCODED_LEN: usize = 1 + U64_ENCODED_LEN;
 const TAG_NONE_OR_EMPTY: u8 = 0;
 const TAG_SOME_OR_KNOWN: u8 = 1;
-const TAG_LEGACY_UNKNOWN: u8 = 2;
 
 /// Encodes an unsigned integer as exactly eight big-endian bytes.
 #[must_use]
@@ -58,7 +57,6 @@ pub(crate) fn encode_offset_watermark(value: OffsetWatermark) -> [u8; TAGGED_U64
     match value {
         OffsetWatermark::Empty => encode_tagged_u64(TAG_NONE_OR_EMPTY, 0),
         OffsetWatermark::Known(offset) => encode_tagged_u64(TAG_SOME_OR_KNOWN, offset.get()),
-        OffsetWatermark::LegacyUnknown => encode_tagged_u64(TAG_LEGACY_UNKNOWN, 0),
     }
 }
 
@@ -71,10 +69,6 @@ pub(crate) fn decode_offset_watermark(encoded: &[u8]) -> Result<OffsetWatermark>
             Ok(OffsetWatermark::Empty)
         }
         TAG_SOME_OR_KNOWN => Ok(OffsetWatermark::Known(LogOffset::new(payload))),
-        TAG_LEGACY_UNKNOWN => {
-            require_zero_payload(payload, "offset watermark legacy unknown")?;
-            Ok(OffsetWatermark::LegacyUnknown)
-        }
         _ => Err(invalid_tag("offset watermark", tag)),
     }
 }
@@ -224,10 +218,10 @@ mod tests {
 
     #[test]
     fn offset_watermark_round_trips_every_state_and_boundary() {
-        for state in [OffsetWatermark::Empty, OffsetWatermark::LegacyUnknown] {
-            let encoded = encode_offset_watermark(state);
-            assert_eq!(decode_offset_watermark(&encoded).unwrap(), state);
-        }
+        assert_eq!(
+            decode_offset_watermark(&encode_offset_watermark(OffsetWatermark::Empty)).unwrap(),
+            OffsetWatermark::Empty
+        );
         for value in BOUNDARY_VALUES {
             let state = OffsetWatermark::Known(LogOffset::new(value));
             assert_eq!(
@@ -294,6 +288,7 @@ mod tests {
 
         let mut noncanonical_legacy_unknown = [0_u8; TAGGED_U64_ENCODED_LEN];
         noncanonical_legacy_unknown[0] = 2;
+        assert_data_corruption(decode_offset_watermark(&noncanonical_legacy_unknown).unwrap_err());
         noncanonical_legacy_unknown[TAGGED_U64_ENCODED_LEN - 1] = 1;
         assert_data_corruption(decode_offset_watermark(&noncanonical_legacy_unknown).unwrap_err());
     }

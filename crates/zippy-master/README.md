@@ -1,70 +1,20 @@
 # zippy-master
 
-`zippy-master` is the legacy in-process control plane retained while the native Catalog and
-runtime services become authoritative. New product code should depend on the typed adapters rather
-than mutate `Registry` directly.
+2026-09-22 更新。此 crate 只承载原生 Server 的控制监听器、配置发现和进程租约。
+表、schema、写入、持久文件、订阅和消费位点由 SQLite/native storage/Flight 负责。
 
-## Legacy Catalog commit events
+控制协议只接受 RegisterProcess、Heartbeat、UnregisterProcess、GetConfig 和 Watch；
+Watch 只接受 Process/Shutdown。旧表与 source/engine 注册、文件发布、段描述符与读者租约请求
+已经删除，不能通过控制监听器建立第二份表目录或修改持久文件。
 
-`legacy_catalog_commit` provides bounded observation for migration shadow workers:
+ProcessRuntimeRegistry 与进程 lease 共用一把锁和启动身份，保留 CAS revision、状态转换、
+ABA 防护、停服 admission 与进程过期回收。没有旧表/source/engine/connection 镜像。
+请求大小、绝对读取期限、连接限额和有界停服继续有效。
 
-1. Create `LegacyCatalogCommitPublisher::bounded(nonzero_capacity)`.
-2. Retain its metrics handle and receiver in the shadow worker.
-3. Install the publisher with `MasterServer::install_legacy_catalog_commit_publisher` before the
-   Unix or TCP listener starts.
-4. Drain events asynchronously. Never perform SQLite, filesystem, logging, or schema conversion on
-   the Master request thread.
+Master 持久快照、旧 Catalog/query adapter、compaction、shadow 和迁移功能均已删除。
+托管目录出现 `catalog/legacy-master-registry.json` 时明确拒绝且保留原字节，不导入或改写。
+旧 `[table]`、`master.token`、`ZIPPY_TABLE*` 和 `ZIPPY_MASTER_TOKEN` 配置明确拒绝；
+Flight 独立的读、写和管理员凭据不受影响。
 
-Each event is a fixed-capacity `Copy` value containing only the previous/committed legacy Catalog
-revision range, mutation kind, stable table ID, and a bounded diagnostic stream-name prefix. It
-never clones a schema or persisted-file list.
-
-Publication uses `SyncSender::try_send`. A full queue or disconnected receiver cannot delay or fail
-the legacy primary response. Either condition permanently sets `continuity_lost`, increments
-`continuity_loss_epoch`, and records `last_lost_revision`. The consumer must complete a full
-revision-stable reconciliation before trusting incremental events again; reading or logging these
-metrics belongs off the primary path.
-
-Installation captures `baseline_revision` while holding the same snapshot and Registry locks used
-by commits. Server-owned shutdown is deliberately split into stages:
-
-1. `drain_registered_processes_for_shutdown` notifies producers and waits for their normal
-   unregister/persist cleanup while the Master remains readable.
-2. `seal_legacy_catalog_commit_events` atomically closes Catalog-mutation admission, waits for
-   already admitted mutations, records `final_revision`, and drops the shared sender.
-3. The shadow worker drains to receiver disconnection, captures the final stable migration view,
-   and completes reconciliation before native Catalog shutdown.
-4. `MasterServer::shutdown` stops the listener after shadow reconciliation no longer needs the
-   legacy adapter.
-
-Mutation admission uses an atomic in-flight counter. It does not add a mutex or channel wait to
-the Master request hot path. Compaction acquires its permit before physical output is written, so
-publisher sealing cannot leave a successfully generated but uncommitted compaction file merely
-because admission closed between those phases. Standalone listener cleanup still seals the
-publisher defensively.
-
-Events are emitted after the legacy Registry mutation and successful JSON snapshot write, but
-before releasing the existing `snapshot_lock` and Registry lock. This preserves commit order and
-ensures snapshot-write rollback emits no event. An absent snapshot path is the legacy in-memory
-durability mode and still counts as a successful primary commit.
-
-Observed Catalog mutations are:
-
-- new stream registration, including its immutable schema;
-- source registration or re-registration only when the Catalog revision changes;
-- source removal;
-- persisted-file publication and full manifest replacement;
-- persisted-event history as a representable watermark-only event;
-- table drop;
-- background compaction manifest replacement.
-
-Process registration, heartbeat, process/source/engine status, reader leases, and engine
-registration are runtime-only and do not emit Catalog commit events. The first
-`PublishSegmentDescriptor` can initialize a zero writer epoch without a JSON snapshot. That legacy
-edge does not emit a false commit event; it explicitly latches continuity loss so the shadow worker
-must reconcile.
-
-The event is a wake-up/ordering signal, not the shadow mutation payload. A consumer resolves the
-stable table identity against a detached legacy snapshot and then builds one immutable typed
-Catalog command outside Master locks. File-list loss or queue overflow always falls back to full
-reconciliation.
+原生功能与验收状态见[当前能力](../../docs/current-capabilities-2026-09-21.md)，
+运行顺序见[单节点运行时](../../docs/single-node-server-runtime.md)。

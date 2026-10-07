@@ -155,13 +155,6 @@ fn connect_control_endpoint_inner(
     }
 }
 
-pub fn send_control_line_request(
-    endpoint: &ControlEndpoint,
-    request: ControlRequest,
-) -> Result<ControlResponse> {
-    send_control_line_request_inner(endpoint, request, RequestBudget::unbounded())
-}
-
 /// Sends one control request under one monotonic timeout budget.
 ///
 /// TCP connection setup and all connected socket reads and writes share the same deadline. A Unix
@@ -324,30 +317,42 @@ fn retryable_io(error: &std::io::Error) -> bool {
 
 /// Converts a decoded control response into the corresponding typed client result.
 ///
-/// Legacy servers do not include an error code. Their responses retain the historical
-/// [`ZippyError::Io`] fallback, while coded responses preserve the semantic class used by
-/// callers and service adapters.
+/// Every error requires a stable code and explicit retryability. Unstructured legacy
+/// responses fail deserialization instead of being downgraded to an IO error.
 pub fn control_response_result(response: ControlResponse) -> Result<ControlResponse> {
     match response {
-        ControlResponse::Error { code, reason } => Err(control_error(code, reason)),
+        ControlResponse::Error {
+            code,
+            reason,
+            retryable,
+        } => Err(control_error(code, reason, retryable)),
         other => Ok(other),
     }
 }
 
-fn control_error(code: Option<ErrorCode>, reason: String) -> ZippyError {
+fn control_error(code: ErrorCode, reason: String, retryable: bool) -> ZippyError {
+    if retryable != code.retryable_by_default() {
+        return ZippyError::Service {
+            code,
+            reason,
+            retryable,
+        };
+    }
     match code {
-        Some(ErrorCode::InvalidArgument) => ZippyError::InvalidConfig { reason },
-        Some(ErrorCode::ResourceExhausted) => ZippyError::ResourceExhausted { reason },
-        Some(ErrorCode::NotFound) => ZippyError::NotFound { reason },
-        Some(ErrorCode::Conflict) => ZippyError::Conflict { reason },
-        Some(ErrorCode::DataCorruption) => ZippyError::DataCorruption { reason },
-        Some(ErrorCode::SchemaMismatch) => ZippyError::SchemaMismatch { reason },
-        Some(ErrorCode::Cancelled) => ZippyError::Cancelled { reason },
-        Some(ErrorCode::DeadlineExceeded) => ZippyError::DeadlineExceeded { reason },
-        Some(code) => ZippyError::Io {
-            reason: format!("control error code=[{}] reason=[{}]", code, reason),
+        ErrorCode::Unauthenticated => ZippyError::Unauthenticated { reason },
+        ErrorCode::InvalidArgument => ZippyError::InvalidConfig { reason },
+        ErrorCode::ResourceExhausted => ZippyError::ResourceExhausted { reason },
+        ErrorCode::NotFound => ZippyError::NotFound { reason },
+        ErrorCode::Conflict => ZippyError::Conflict { reason },
+        ErrorCode::DataCorruption => ZippyError::DataCorruption { reason },
+        ErrorCode::SchemaMismatch => ZippyError::SchemaMismatch { reason },
+        ErrorCode::Cancelled => ZippyError::Cancelled { reason },
+        ErrorCode::DeadlineExceeded => ZippyError::DeadlineExceeded { reason },
+        code => ZippyError::Service {
+            code,
+            reason,
+            retryable,
         },
-        None => ZippyError::Io { reason },
     }
 }
 

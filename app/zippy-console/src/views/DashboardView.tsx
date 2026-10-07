@@ -1,14 +1,12 @@
 import {
   ChevronRight,
   ListChecks,
-  PenLine,
+  Folder,
   Server,
   Table2,
-  UsersRound,
 } from "lucide-react";
 
-import type { DashboardPayload, LogEntry, TableSummary, TaskInfo } from "../api/client";
-import { MessageCell } from "../components/MessageCell";
+import { tableKey, type DashboardPayload, type LogEntry, type TableSummary, type TaskInfo } from "../api/client";
 import { MetricCard } from "../components/MetricCard";
 import { displayNumber, displayValue, StatusBadge, statusTone } from "../components/status";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -23,23 +21,19 @@ export function DashboardView({
   data,
   onSelectTable,
 }: DashboardViewProps): JSX.Element {
-  const writers = new Set(data.tables.map((table) => table.writer_process_id).filter(Boolean)).size;
-  const overallStatus = data.overall_status || data.master.status || "unknown";
-  const overallTone = statusTone(overallStatus);
-  const overallHealthy = overallTone === "ok";
+  const overallStatus = data.catalog.status;
 
   return (
     <div className="dashboard-stack">
       <div className="metric-grid">
         <MetricCard
           icon={Server}
-          label="Status"
+          label="Catalog access"
           tone={statusTone(overallStatus)}
-          value={statusMetricValue(data, overallStatus, overallHealthy)}
+          value={displayValue(overallStatus)}
         />
         <MetricCard icon={Table2} label="Tables" value={displayNumber(data.totals.tables)} />
-        <MetricCard icon={UsersRound} label="Readers" value={displayNumber(data.totals.readers)} />
-        <MetricCard icon={PenLine} label="Writers" value={displayNumber(writers)} />
+        <MetricCard icon={Folder} label="Namespaces" value={displayNumber(data.totals.namespaces)} />
         <MetricCard icon={ListChecks} label="Processes" value={displayNumber(data.totals.tasks)} />
       </div>
 
@@ -53,24 +47,20 @@ export function DashboardView({
               <thead>
                 <tr>
                   <th className="table-column">Table</th>
-                  <th className="status-column">Status</th>
-                  <th className="message-column">Message</th>
-                  <th className="writer-column">Writer</th>
-                  <th className="epoch-column">Writer Epoch</th>
-                  <th className="numeric-column">Readers</th>
-                  <th className="numeric-column">Sealed</th>
-                  <th className="numeric-column">Persisted</th>
+                  <th>Namespace</th>
+                  <th>Catalog</th>
+                  <th>Object type</th>
                   <th className="action-column" aria-label="Open table detail" />
                 </tr>
               </thead>
               <tbody>
                 {data.tables.length ? (
                   data.tables.map((table) => (
-                    <TableRow key={table.stream_name} onSelectTable={onSelectTable} table={table} />
+                    <TableRow key={tableKey(table)} onSelectTable={onSelectTable} table={table} />
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={9}>
+                    <td colSpan={5}>
                       <EmptyState title="No tables" />
                     </td>
                   </tr>
@@ -153,21 +143,11 @@ function TableRow({
   table: TableSummary;
 }): JSX.Element {
   return (
-    <tr className="clickable" onClick={() => onSelectTable(table.stream_name)}>
-      <td className="strong table-name-cell" title={table.stream_name}>
-        {table.stream_name}
-      </td>
-      <td>
-        <StatusBadge value={table.health_status || table.status} />
-      </td>
-      <td className="table-message-cell">
-        <MessageCell table={table} />
-      </td>
-      <td title={displayValue(table.writer_process_id)}>{displayValue(table.writer_process_id)}</td>
-      <td className="numeric-cell">{displayValue(table.writer_epoch)}</td>
-      <td className="numeric-cell">{displayNumber(table.reader_count)}</td>
-      <td className="numeric-cell">{displayNumber(table.sealed_count)}</td>
-      <td className="numeric-cell">{displayNumber(table.persisted_count)}</td>
+    <tr className="clickable" onClick={() => onSelectTable(tableKey(table))}>
+      <td className="strong table-name-cell" title={table.name}>{table.name}</td>
+      <td>{table.namespace}</td>
+      <td>{table.catalog}</td>
+      <td>{table.table_type}</td>
       <td className="action-column">
         <ChevronRight className="row-action-icon" size={16} />
       </td>
@@ -232,18 +212,6 @@ function parseLogLine(line: string): LogEntry {
 
 function isAlertLevel(level: unknown): boolean {
   return ["warning", "warn", "error", "critical", "fatal"].includes(String(level || "").toLowerCase());
-}
-
-function statusMetricValue(
-  data: DashboardPayload,
-  overallStatus: string,
-  overallHealthy: boolean,
-): string {
-  const issueCount = data.stale_error_tables.length || data.totals.alerts || 0;
-  if (overallHealthy) {
-    return "0 warning";
-  }
-  return `${displayNumber(issueCount || 1)} ${displayValue(overallStatus)}`;
 }
 
 export function EmptyState({ title }: { title: string }): JSX.Element {

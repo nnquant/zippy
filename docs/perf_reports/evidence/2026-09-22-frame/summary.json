@@ -1,0 +1,91 @@
+{
+  "date": "2026-09-22",
+  "batch": 5,
+  "overall_complete": false,
+  "audit_closed_total": 20,
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F09",
+    "F10",
+    "F12"
+  ],
+  "new_fixed_findings": [
+    "F38"
+  ],
+  "native_features": [
+    "online frame creation",
+    "whole-frame Flight writes",
+    "frame WAL replay and manifest recovery",
+    "exact persisted receipt replay",
+    "shared table-management action with explicit definition"
+  ],
+  "validation": {
+    "rust_workspace_passed": 1714,
+    "rust_workspace_ignored": 10,
+    "client_passed": 93,
+    "client_coverage_percent": 81.22,
+    "client_mypy_checked_files": 25,
+    "clippy": "passed",
+    "cross_language": "passed",
+    "pyarrow_version": "23.0.1",
+    "full_repository_mypy": "not rerun; previous 982 errors remain open"
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-frame-workspace-final.log",
+      "sha256": "d38c2995bf9a9fb688bbfe94e3975966eb32392b7a5c140298f2dd5a29a2ed57"
+    },
+    "rust_initial_failure": {
+      "path": "/tmp/zippy-frame-workspace.log",
+      "sha256": "e0469152556186cbd696c4ef390d58f4b0dd4c062b3a0bcd2c506c21351bd3a6"
+    },
+    "catalog_lock_test": {
+      "path": "/tmp/zippy-frame-catalog-lock.log",
+      "sha256": "68bc1a77e8467d3c2092d73af81c33a46332905934c10d4ae105049098c61c02"
+    },
+    "client": {
+      "path": "/tmp/zippy-frame-client.log",
+      "sha256": "16ce07a1597d0ed7e69774117f9433e057eeaf5e608f3e1fb461b70b947b9907"
+    },
+    "client_mypy": {
+      "path": "/tmp/zippy-frame-mypy-final.log",
+      "sha256": "521e53066a363ec69a3862127d20de642114463485e6923ba593c38250537f8d"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-frame-clippy.log",
+      "sha256": "6c3b3621bd7d5a12b9cb2c612211faee887262d4dc4ee53c64004e53aea49082"
+    },
+    "black": {
+      "path": "/tmp/zippy-frame-black.log",
+      "sha256": "26a5fd9505f2b5608a20c4fed4b4c4795e0783d03b72ade02a6af34dae8ad086"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-frame-ruff-final.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "protocol": {
+      "path": "/tmp/zippy-frame-protocol-check.log",
+      "sha256": "cccf0631c0c26c349ca1d58bbd370b6e09e89e93d83ee04c9f649ff63476700e"
+    },
+    "cross_language": {
+      "path": "/tmp/zippy-frame-native-client-final.log",
+      "sha256": "f46d23198b9397d77f36a7e5849d650a4d25a56fd50c171c35b8c4a65b09d30c"
+    }
+  }
+}

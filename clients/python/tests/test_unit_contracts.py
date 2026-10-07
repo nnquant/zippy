@@ -4,51 +4,38 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from pathlib import Path
-import socket
-import struct
-from typing import Any
 
 import pyarrow as pa
 import pytest
 
 from zippy_client.client import (
-    Client,
     _capabilities,
     _int_config,
     _parse_timeout,
-    _validate_subscriber_wait,
 )
 from zippy_client.endpoints import (
     ControlEndpoint,
-    connectable_gateway_endpoint,
-    gateway_is_local,
+    connectable_data_endpoint,
+    data_endpoint_is_local,
     normalize_tcp_address,
     resolve_control_endpoint,
     split_host_port,
 )
-from zippy_client.errors import ContinuityError, ProtocolError, TransportUnavailableError
+from zippy_client.errors import TransportUnavailableError
 from zippy_client.expressions import (
     Expr,
     col,
-    expression_supported_by_gateway,
     expression_to_json,
     lit,
     normalize_expressions,
     normalize_temporal_filter,
 )
 from zippy_client.models import Operation, Transport
-from zippy_client.protocol import (
+from zippy_client.arrow_values import (
     is_scalar_row,
-    receive_frame,
-    schema_from_ipc,
-    send_frame,
-    table_from_ipc,
-    table_to_ipc,
     value_to_table,
 )
 from zippy_client.router import TransportRouter
-from zippy_client.subscriber import _next_retained_descriptor
-from zippy_client.writer import GatewayWriter
 
 
 def test_expression_ast_serializes_supported_variants() -> None:
@@ -89,17 +76,11 @@ def test_expression_ast_serializes_supported_variants() -> None:
         expression_to_json(Expr("unknown"))
 
 
-def test_expression_normalization_and_gateway_support_contract() -> None:
+def test_expression_normalization_contract() -> None:
     normalized = normalize_expressions((["a", "b"],), {"renamed": col("c")})
 
     assert normalized[:2] == ["a", "b"]
     assert expression_to_json(normalized[2])["kind"] == "alias"
-    assert expression_supported_by_gateway(col("a").is_in({1, 2}))
-    assert expression_supported_by_gateway((col("a") == 1) & (col("b") >= 2))
-    assert not expression_supported_by_gateway("a")
-    assert not expression_supported_by_gateway(col("a").is_null())
-    assert not expression_supported_by_gateway(col("a") + 1)
-    assert not expression_supported_by_gateway(Expr("is_in", None, (lit(1), [1])))
     with pytest.raises(TypeError, match="is_in values"):
         expression_to_json(col("a").is_in(1))
 
@@ -142,15 +123,11 @@ def test_temporal_normalization_handles_date_fields_and_invalid_values() -> None
         normalize_temporal_filter(col("trading_day") == "not-a-date", date_schema)
 
 
-def test_arrow_ipc_and_writer_value_normalization_round_trip() -> None:
+def test_writer_value_normalization() -> None:
     schema = pa.schema([("sequence", pa.int64())])
     table = pa.table({"sequence": [1, 2]})
     batch = table.to_batches()[0]
 
-    payload = table_to_ipc(table)
-
-    assert table_from_ipc(payload).equals(table)
-    assert schema_from_ipc(payload).equals(table.schema)
     assert value_to_table(table) is table
     assert value_to_table(batch).equals(table)
     assert value_to_table({"sequence": 1}, schema).to_pydict() == {"sequence": [1]}
@@ -167,58 +144,6 @@ def test_arrow_ipc_and_writer_value_normalization_round_trip() -> None:
     assert not is_scalar_row(1)
     with pytest.raises(TypeError, match="writer value"):
         value_to_table(object())
-
-
-def test_frame_codec_rejects_bad_headers_and_client_budgets(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    left, right = socket.socketpair()
-    try:
-        monkeypatch.setenv("ZIPPY_CLIENT_MAX_FRAME_HEADER_BYTES", "1")
-        with pytest.raises(ProtocolError, match="request header exceeds"):
-            send_frame(left, {"kind": "ping"})
-        monkeypatch.setenv("ZIPPY_CLIENT_MAX_FRAME_HEADER_BYTES", "1024")
-        monkeypatch.setenv("ZIPPY_CLIENT_MAX_FRAME_PAYLOAD_BYTES", "1")
-        with pytest.raises(ProtocolError, match="request payload exceeds"):
-            send_frame(left, {}, b"ab")
-    finally:
-        left.close()
-        right.close()
-
-    for raw_header, match in ((b"{", "not valid"), (b"[]", "must be a JSON object")):
-        left, right = socket.socketpair()
-        try:
-            left.sendall(struct.pack("!IQ", len(raw_header), 0) + raw_header)
-            with pytest.raises(ProtocolError, match=match):
-                receive_frame(right)
-        finally:
-            left.close()
-            right.close()
-
-
-@pytest.mark.parametrize("value", ["invalid", "0", "-1"])
-def test_frame_budget_environment_must_be_positive_integer(
-    monkeypatch: pytest.MonkeyPatch,
-    value: str,
-) -> None:
-    monkeypatch.setenv("ZIPPY_CLIENT_MAX_FRAME_HEADER_BYTES", value)
-    left, right = socket.socketpair()
-    try:
-        with pytest.raises(ValueError, match="environment value"):
-            send_frame(left, {})
-    finally:
-        left.close()
-        right.close()
-
-
-def test_receive_frame_reports_early_peer_close() -> None:
-    left, right = socket.socketpair()
-    left.close()
-    try:
-        with pytest.raises(ProtocolError, match="connection closed"):
-            receive_frame(right)
-    finally:
-        right.close()
 
 
 def test_endpoint_resolution_covers_uri_and_wildcard_forms(
@@ -248,126 +173,25 @@ def test_endpoint_resolution_covers_uri_and_wildcard_forms(
         "192.0.2.10:17690",
         "zippy://192.0.2.10:17690/default",
     )
-    assert connectable_gateway_endpoint("0.0.0.0:17666", unix_control) == "127.0.0.1:17666"
-    assert connectable_gateway_endpoint("0.0.0.0:17666", tcp_control) == "192.0.2.10:17666"
-    assert connectable_gateway_endpoint("localhost:17666", tcp_control) == "localhost:17666"
-    assert gateway_is_local("127.0.0.1:17666", tcp_control)
-    assert gateway_is_local("192.0.2.11:17666", unix_control)
-    assert not gateway_is_local("192.0.2.11:17666", tcp_control)
+    assert connectable_data_endpoint("0.0.0.0:17666", unix_control) == "127.0.0.1:17666"
+    assert connectable_data_endpoint("0.0.0.0:17666", tcp_control) == "192.0.2.10:17666"
+    assert connectable_data_endpoint("localhost:17666", tcp_control) == "localhost:17666"
+    assert data_endpoint_is_local("127.0.0.1:17666", tcp_control)
+    assert data_endpoint_is_local("192.0.2.11:17666", unix_control)
+    assert not data_endpoint_is_local("192.0.2.11:17666", tcp_control)
 
 
 def test_transport_parsing_and_explicit_router_failures() -> None:
-    assert Transport.parse(Transport.SHM) is Transport.SHM
-    assert Transport.parse("gateway_remote") is Transport.GATEWAY_REMOTE
-    with pytest.raises(ValueError, match="unsupported transport"):
-        Transport.parse("invalid")
-
+    assert Transport.parse(Transport.FLIGHT_LOCAL) is Transport.FLIGHT_LOCAL
+    assert Transport.parse("flight_remote") is Transport.FLIGHT_REMOTE
+    for invalid in ("invalid", "gateway_local", "gateway_remote", "shm"):
+        with pytest.raises(ValueError, match="unsupported transport"):
+            Transport.parse(invalid)
     local = ControlEndpoint("unix", "/tmp/master.sock", "zippy://default")
-    remote = ControlEndpoint("tcp", "192.0.2.10:17690", "zippy://192.0.2.10:17690/default")
-    no_gateway = TransportRouter(local, None, lambda: True)
     with pytest.raises(TransportUnavailableError, match="does not advertise"):
-        no_gateway.select(Operation.QUERY, Transport.AUTO)
-    with pytest.raises(TransportUnavailableError, match="same IPC namespace"):
-        TransportRouter(remote, "192.0.2.10:17666", lambda: True).select(
-            Operation.SUBSCRIBE,
-            Transport.SHM,
-        )
-    with pytest.raises(TransportUnavailableError, match="unavailable"):
-        TransportRouter(local, "127.0.0.1:17666", lambda: False).select(
-            Operation.SUBSCRIBE,
-            Transport.SHM,
-        )
-    with pytest.raises(TransportUnavailableError, match="does not expose"):
-        TransportRouter(local, "127.0.0.1:17666", lambda: True).select(
-            Operation.SUBSCRIBE,
-            Transport.SHM,
-            stream_info={"data_path": "historical"},
-        )
+        TransportRouter(local).select(Operation.QUERY, Transport.AUTO)
     with pytest.raises(TransportUnavailableError, match="scope does not match"):
-        TransportRouter(local, "127.0.0.1:17666", lambda: True).select(
-            Operation.QUERY,
-            Transport.GATEWAY_REMOTE,
-        )
-
-
-def test_retained_descriptor_selection_never_skips_a_sealed_successor() -> None:
-    first: dict[str, object] = {"segment_id": 1, "generation": 0, "writer_epoch": 1}
-    second: dict[str, object] = {"segment_id": 2, "generation": 0, "writer_epoch": 1}
-    third: dict[str, object] = {"segment_id": 3, "generation": 0, "writer_epoch": 1}
-
-    assert (
-        _next_retained_descriptor(
-            {"stream_name": "ticks", "sealed_segments": [first, second]},
-            first,
-        )
-        == second
-    )
-    assert (
-        _next_retained_descriptor(
-            {
-                "stream_name": "ticks",
-                "sealed_segments": [first, second],
-                "active_segment_descriptor": third,
-            },
-            second,
-        )
-        == third
-    )
-    with pytest.raises(ContinuityError, match="cannot be proven"):
-        _next_retained_descriptor(
-            {"stream_name": "ticks", "sealed_segments": [second]},
-            first,
-        )
-    with pytest.raises(ProtocolError, match="must be a list"):
-        _next_retained_descriptor(
-            {"stream_name": "ticks", "sealed_segments": {}},
-            first,
-        )
-
-
-class _RecordingGateway:
-    def __init__(self) -> None:
-        self.requests: list[tuple[dict[str, object], bytes]] = []
-        self.fail_next = False
-
-    def request(
-        self,
-        header: dict[str, object],
-        payload: bytes = b"",
-    ) -> tuple[dict[str, Any], bytes]:
-        if self.fail_next:
-            self.fail_next = False
-            raise RuntimeError("injected write failure")
-        self.requests.append((header, payload))
-        return {"status": "ok"}, b""
-
-
-def test_gateway_writer_buffers_batches_retries_and_closes() -> None:
-    gateway = _RecordingGateway()
-    schema = pa.schema([("sequence", pa.int64())])
-    writer = GatewayWriter("ticks", gateway, schema=schema, batch_size=2)
-
-    writer.write({"sequence": 1})
-    assert gateway.requests == []
-    gateway.fail_next = True
-    with pytest.raises(RuntimeError, match="injected write failure"):
-        writer.write({"sequence": 2})
-    assert writer._rows == [{"sequence": 1}, {"sequence": 2}]
-
-    writer.flush()
-    writer.write_batch(pa.table({"sequence": [3]}))
-    writer.close()
-
-    assert [request[0]["kind"] for request in gateway.requests] == [
-        "write_batch",
-        "write_batch",
-        "close_writer",
-    ]
-    writer.close()
-    with pytest.raises(RuntimeError, match="closed"):
-        writer.write({"sequence": 4})
-    with pytest.raises(TypeError, match="requires a batched value"):
-        GatewayWriter("other", gateway, schema=schema).write_batch({"sequence": 1})
+        TransportRouter(local, "127.0.0.1:17667").select(Operation.QUERY, Transport.FLIGHT_REMOTE)
 
 
 def test_client_configuration_helpers_validate_boundaries() -> None:
@@ -383,39 +207,33 @@ def test_client_configuration_helpers_validate_boundaries() -> None:
     assert _int_config("8", 4) == 8
     with pytest.raises(TypeError, match="must be an integer"):
         _int_config(True, 4)
-    _validate_subscriber_wait(0, True, 0)
-    with pytest.raises(ValueError, match="unless xfast"):
-        _validate_subscriber_wait(0, False, 0)
-    with pytest.raises(ValueError, match="idle_spin_checks"):
-        _validate_subscriber_wait(1, False, -1)
+    from zippy_client.transports.flight import FlightCapabilities
 
-    capabilities = _capabilities(
-        {"server": {"capabilities": {"query_sql": True}}},
-        {"enabled": True, "endpoint": "127.0.0.1:17666", "protocol_version": "1"},
+    native = FlightCapabilities(
+        protocol_version=1,
+        server_version="test",
+        names=frozenset(
+            {
+                "subscription.log_fragments.v1",
+                "ingest.append.wal.v1",
+                "query.get_flight_info_do_get.v1",
+            }
+        ),
+        max_message_bytes=1024,
+        max_pending_tickets=2,
+        authentication_required=True,
+        session_ttl_ms=1000,
+        writer_authentication_enabled=True,
+        ingest_enabled=True,
+        ingest_max_concurrent_puts=1,
+        ingest_max_batches_per_put=2,
+        ingest_max_rows_per_batch=10,
+        ingest_max_rows_per_put=20,
+        ingest_max_batch_bytes=1024,
+        ingest_max_bytes_per_put=2048,
+        ingest_max_rows_per_frame=10,
     )
-    assert capabilities.gateway
-    assert capabilities.query_sql
-    assert capabilities.gateway_protocol_version == 1
-
-
-def test_key_value_delta_routing_requires_explicit_changelog_metadata(monkeypatch):
-    client = object.__new__(Client)
-    metadata = {
-        "active_segment_descriptor": {
-            "zippy_table_kind": "key_value_table",
-            "zippy_kv_protocol_version": 2,
-            "zippy_key_value_changelog_stream": "quotes.__kv_changelog",
-        }
-    }
-    monkeypatch.setattr(
-        client, "_subscription_stream_info", lambda source, requested: {"stream_name": source}
-    )
-    source, descriptor, keyed = client._delta_subscription_source("quotes", "gateway", metadata)
-    assert source == "quotes.__kv_changelog"
-    assert descriptor["stream_name"] == source
-    assert keyed
-    pending = {"source_configs": [metadata["active_segment_descriptor"]]}
-    assert client._delta_subscription_source("quotes", "gateway", pending)[0] == source
-    del metadata["active_segment_descriptor"]["zippy_key_value_changelog_stream"]
-    with pytest.raises(ProtocolError, match="v2"):
-        client._delta_subscription_source("quotes", "gateway", metadata)
+    capabilities = _capabilities(native)
+    assert capabilities.flight and capabilities.flight_ingest and capabilities.query_sql
+    assert capabilities.resume_cursor
+    assert capabilities.flight_protocol_version == 1

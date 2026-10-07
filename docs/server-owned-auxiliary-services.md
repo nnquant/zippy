@@ -1,5 +1,9 @@
 # Server-owned WebUI 与维护服务生命周期设计
 
+> 历史设计草案：下文“当前版本”对应起草时的状态，不能作为新版本运行指南。
+> Gateway、LegacyServerRuntime 和旧 compaction worker 均已退出；当前服务生命周期见
+> [单节点运行时](single-node-server-runtime.md)，WebUI 现状见[原生 WebUI](native-webui.md)。
+
 ## 1. 文档状态与本轮边界
 
 本文档定义单机 `zippy-server` 对 WebUI、maintenance 和 compaction 的目标所有权、配置及
@@ -43,13 +47,14 @@ admission，再停止 Gateway，最后停止 master，并共享一个绝对关�
 ### 2.2 Python WebUI 现状
 
 现有 `python/zippy/webui.py` 是 FastAPI/Uvicorn 应用，主要提供 dashboard、表详情和表数据预览。
-它还存在多条不适合作为成熟 server 管理接口的旁路：
+2026-09-22 已将表列表、详情、预览转为原生 Flight/Catalog，并删除 registry JSON、pgrep 与
+Gateway 读取。详情和预览各自使用固定快照；共享客户端提供 Flight deadline，服务端查询执行
+负责既有资源预算。见[当前 WebUI 契约](native-webui.md)。以下目标能力仍未实现：
 
-- dashboard 直接读取 JSONL 日志和 `master-registry.json`。
-- 通过 `pgrep` 猜测 master 进程，通过 `zippy-rspm` JSON-RPC读取 PM 任务。
-- HTTP query 参数可以覆盖 master URI，服务端可向另一个地址发起连接。
-- 表预览在 WebUI 进程内创建普通查询客户端，没有会话级 deadline、内存预留或并发 admission。
-- 没有认证、授权、CSRF/CORS 策略或专用 liveness/readiness endpoint。
+- JSONL 日志仍来自本机，PM 仍通过 `zippy-rspm` JSON-RPC 读取，不是远端 server 管理状态。
+- HTTP query 参数仍可覆盖发现 URI，尚未提供专用的 scoped Admin API。
+- WebUI 没有独立于既有查询执行层的并发 admission 或专用预览内存配置。
+- 没有 HTTP 认证、授权或专用 liveness/readiness endpoint。
 
 当前 CLI 的默认 host 是 `127.0.0.1`，但 `--host` 可以覆盖为任意监听地址，应用本身也没有认证
 middleware；因此它只是“默认 loopback”，并非强制 loopback-only。当前版本不得在不受信网络上绑定
@@ -184,7 +189,7 @@ profile = "trading"
 - `heartbeat_interval_ms` 必须小于 `lease_ttl_ms / 3`；lease 使用 server 单调时钟判断本次 boot
   的活性，Catalog 中的 UTC expiry 只用于跨重启恢复。
 - 组件 CPU 额度必须是全局 `[runtime].max_cpu_cores` / `ZIPPY_MAX_CPU_CORES` 上限的子集。
-  `max_parallelism` 旧名称仅保留一个兼容周期，同层新旧值不一致时配置失败。当前全局值是各
+  旧名称 `max_parallelism` / `ZIPPY_MAX_PARALLELISM` 一律拒绝。当前全局值是各
   组件共同遵守的配置上限；多个独立线程池尚未统一接入一个进程级硬 CPU semaphore。
 - maintenance memory、IO、temp 和 open-file budget 是 admission 上限，不是事后观测阈值。
 

@@ -9,14 +9,13 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transact
 use zippy_types::catalog::{CatalogQuerySnapshot, CatalogSnapshotSelector, CatalogTableSnapshot};
 use zippy_types::table::{
     DataFileDescriptor, DataFileLocation, DataFileProvenance, DataFileState, DataFiles,
-    ExternalDataPath, ManagedDataPath, MetadataMap, MetadataScalar, NativeDataFileProvenance,
-    PendingDataFile, SchemaCompatibility, SchemaDescriptor, SchemaIpcPayload, SnapshotOperation,
-    SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages, TableDescriptor,
-    TableSnapshot,
+    ManagedDataPath, MetadataMap, NativeDataFileProvenance, PendingDataFile, SchemaCompatibility,
+    SchemaDescriptor, SchemaIpcPayload, SnapshotOperation, SourceSegmentIdentity,
+    SourceSegmentLineage, SourceSegmentLineages, TableDescriptor, TableSnapshot,
 };
 use zippy_types::{ErrorCode, FileId, LogOffset, OffsetRange, Result, ServerError, TableId};
 
-use crate::encoding::{decode_offset_watermark, decode_optional_u64, decode_u64, encode_u64};
+use crate::encoding::{decode_offset_watermark, decode_optional_u64, decode_u64};
 use crate::storage_codec::{
     decode_data_file_metadata_blob, decode_data_file_partition_blob,
     decode_data_file_statistics_blob, decode_persisted_schema, decode_snapshot_summary_blob,
@@ -57,13 +56,13 @@ const GET_VISIBLE_FILES_SQL: &str =
             length(CAST(location_kind AS BLOB)), length(CAST(file_path AS BLOB)), \
             length(file_size_bytes), length(row_count), \
             length(CAST(provenance_kind AS BLOB)), length(min_log_offset), \
-            length(max_log_offset), 1, length(legacy_discovery_order), \
+            length(max_log_offset), \
             length(partition_blob), length(statistics_blob), length(metadata_blob), \
             length(CAST(checksum AS BLOB)), length(added_snapshot_version), \
             length(removed_snapshot_version), length(CAST(state AS BLOB)), \
             length(created_at_ns), file_id, table_id, schema_version, location_kind, \
             file_path, file_size_bytes, row_count, provenance_kind, min_log_offset, \
-            max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+            max_log_offset, \
             partition_blob, statistics_blob, metadata_blob, checksum, \
             added_snapshot_version, removed_snapshot_version, state, created_at_ns \
        FROM data_files INDEXED BY data_files_visible_by_table \
@@ -76,13 +75,13 @@ const GET_FILES_BY_IDS_SQL_PREFIX: &str =
             length(CAST(location_kind AS BLOB)), length(CAST(file_path AS BLOB)), \
             length(file_size_bytes), length(row_count), \
             length(CAST(provenance_kind AS BLOB)), length(min_log_offset), \
-            length(max_log_offset), 1, length(legacy_discovery_order), \
+            length(max_log_offset), \
             length(partition_blob), length(statistics_blob), length(metadata_blob), \
             length(CAST(checksum AS BLOB)), length(added_snapshot_version), \
             length(removed_snapshot_version), length(CAST(state AS BLOB)), \
             length(created_at_ns), file_id, table_id, schema_version, location_kind, \
             file_path, file_size_bytes, row_count, provenance_kind, min_log_offset, \
-            max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+            max_log_offset, \
             partition_blob, statistics_blob, metadata_blob, checksum, \
             added_snapshot_version, removed_snapshot_version, state, created_at_ns \
        FROM data_files";
@@ -400,17 +399,6 @@ struct PendingTableSnapshot {
     files: Vec<PendingVisibleFile>,
 }
 
-enum PendingFileProvenance {
-    Native {
-        offsets: OffsetRange,
-    },
-    Legacy {
-        offsets: Option<OffsetRange>,
-        preserve_discovery_order: bool,
-        discovery_order: Option<u64>,
-    },
-}
-
 struct PendingVisibleFile {
     file_id: FileId,
     table_id: TableId,
@@ -418,7 +406,7 @@ struct PendingVisibleFile {
     location: DataFileLocation,
     file_size_bytes: u64,
     row_count: NonZeroU64,
-    provenance: PendingFileProvenance,
+    offsets: OffsetRange,
     partition: MetadataMap,
     statistics: MetadataMap,
     metadata: MetadataMap,
@@ -589,9 +577,7 @@ pub(crate) fn read_snapshot_at_with_limits(
         )?;
         let snapshot = read_snapshot(&transaction, selector, catalog_revision, &mut budget)?;
         ensure_snapshot_files_readable(&transaction, selector)?;
-        let mut files = read_visible_files(&transaction, selector, &mut budget)?;
-        apply_explicit_legacy_snapshot_order(&transaction, selector, &mut files, &mut budget)?;
-        validate_legacy_discovery_orders(&files, &snapshot)?;
+        let files = read_visible_files(&transaction, selector, &mut budget)?;
         if snapshot.operation == SnapshotOperation::Create && !files.is_empty() {
             return Err(corruption(
                 "initial create snapshot must not contain visible data files",
@@ -726,6 +712,24 @@ fn validate_selector_bounds(
         ));
     }
     Ok(())
+}
+
+/// Reads one immutable schema using the same bounds and validation as snapshot reads.
+pub(crate) fn read_schema_in_transaction(
+    connection: &Connection,
+    table_id: TableId,
+    schema_version: u64,
+) -> Result<SchemaDescriptor> {
+    let mut budget = SnapshotReadBudget {
+        raw_bytes: 0,
+        files: 0,
+        lineage_rows: 0,
+        limits: SqliteCatalogSnapshotReadLimits {
+            max_raw_response_bytes: DEFAULT_SCHEMA_RAW_RESPONSE_BYTES,
+            ..SqliteCatalogSnapshotReadLimits::default()
+        },
+    };
+    read_schema(connection, table_id, schema_version, &mut budget)
 }
 
 fn read_schema(
@@ -945,7 +949,7 @@ fn read_visible_files(
         .next()
         .map_err(|error| crate::map_sqlite_error("read visible catalog file", error))?
     {
-        budget.charge_file(row_lengths(row, 0, 20, "data file")?)?;
+        budget.charge_file(row_lengths(row, 0, 18, "data file")?)?;
         let file = decode_file_row(row, DataFileState::Committed)?;
         if file.table_id != selector.table_id {
             return Err(corruption(
@@ -955,93 +959,6 @@ fn read_visible_files(
         files.push(file);
     }
     Ok(files)
-}
-
-fn apply_explicit_legacy_snapshot_order(
-    connection: &Connection,
-    selector: &CatalogSnapshotSelector,
-    files: &mut [PendingVisibleFile],
-    budget: &mut SnapshotReadBudget,
-) -> Result<()> {
-    let table_id = selector.table_id.into_bytes();
-    let snapshot_version = encode_u64(selector.snapshot_version);
-    let has_mapping = connection
-        .query_row(
-            "SELECT 1 FROM legacy_file_view_mappings \
-              WHERE table_id = ?1 AND native_snapshot_version = ?2",
-            [table_id.as_slice(), snapshot_version.as_slice()],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| crate::map_sqlite_error("check explicit legacy snapshot mapping", error))?
-        .is_some();
-    let mut statement = connection
-        .prepare_cached(
-            "SELECT file_id, discovery_order FROM legacy_reconcile_snapshot_files \
-              WHERE table_id = ?1 AND snapshot_version = ?2 ORDER BY file_id",
-        )
-        .map_err(|error| {
-            crate::map_sqlite_error("prepare explicit legacy snapshot order", error)
-        })?;
-    let mut rows = statement
-        .query([table_id.as_slice(), snapshot_version.as_slice()])
-        .map_err(|error| crate::map_sqlite_error("query explicit legacy snapshot order", error))?;
-    let mut orders = HashMap::with_capacity(files.len());
-    while let Some(row) = rows
-        .next()
-        .map_err(|error| crate::map_sqlite_error("read explicit legacy snapshot order", error))?
-    {
-        let file_id: Vec<u8> = row
-            .get(0)
-            .map_err(|error| crate::map_sqlite_error("decode explicit legacy file id", error))?;
-        let discovery_order: Vec<u8> = row.get(1).map_err(|error| {
-            crate::map_sqlite_error("decode explicit legacy discovery order", error)
-        })?;
-        budget.charge_bytes(file_id.len().saturating_add(discovery_order.len()))?;
-        let file_id = decode_file_id(file_id)?;
-        let discovery_order = decode_u64(&discovery_order)?;
-        if orders.insert(file_id, discovery_order).is_some() {
-            return Err(corruption(
-                "explicit legacy snapshot order contains a duplicate file id",
-            ));
-        }
-    }
-    if !has_mapping {
-        if orders.is_empty() {
-            return Ok(());
-        }
-        return Err(corruption(
-            "legacy snapshot order exists without a revision mapping",
-        ));
-    }
-    if orders.len() != files.len() {
-        return Err(corruption(
-            "explicit legacy snapshot order is not a complete visible manifest",
-        ));
-    }
-    for file in files {
-        let order = orders.remove(&file.file_id).ok_or_else(|| {
-            corruption("explicit legacy snapshot order is missing a visible file")
-        })?;
-        match &mut file.provenance {
-            PendingFileProvenance::Legacy {
-                offsets: None,
-                preserve_discovery_order: true,
-                discovery_order,
-            } => *discovery_order = Some(order),
-            _ => {
-                return Err(corruption(
-                    "explicit legacy snapshot order references a non-legacy file",
-                ));
-            }
-        }
-    }
-    if !orders.is_empty() {
-        return Err(corruption(
-            "explicit legacy snapshot order contains a non-visible file",
-        ));
-    }
-    Ok(())
 }
 
 /// Rebuilds complete deleting descriptors for an exact, strictly ordered set.
@@ -1086,7 +1003,7 @@ pub(crate) fn read_deleting_file_descriptors(
         while let Some(row) = rows.next().map_err(|error| {
             crate::map_sqlite_error("read deleting catalog file descriptor", error)
         })? {
-            budget.charge_file(row_lengths(row, 0, 20, "deleting data file")?)?;
+            budget.charge_file(row_lengths(row, 0, 18, "deleting data file")?)?;
             let file = decode_file_row(row, DataFileState::Deleting)?;
             if file.table_id != table_id {
                 return Err(corruption(
@@ -1126,14 +1043,14 @@ fn decode_file_row(
     row: &rusqlite::Row<'_>,
     expected_state: DataFileState,
 ) -> Result<PendingVisibleFile> {
-    let file_id = decode_file_id(row_value(row, 20, "decode catalog file id")?)?;
+    let file_id = decode_file_id(row_value(row, 18, "decode catalog file id")?)?;
     let table_id = decode_table_id(
-        row_value(row, 21, "decode catalog file table id")?,
+        row_value(row, 19, "decode catalog file table id")?,
         "catalog file table id",
     )?;
     let schema_version = decode_u64(&row_value::<Vec<u8>>(
         row,
-        22,
+        20,
         "decode catalog file schema version",
     )?)?;
     if schema_version == 0 {
@@ -1141,20 +1058,13 @@ fn decode_file_row(
             "catalog data file schema version must be nonzero",
         ));
     }
-    let location_kind: String = row_value(row, 23, "decode catalog file location kind")?;
-    let file_path: String = row_value(row, 24, "decode catalog file path")?;
+    let location_kind: String = row_value(row, 21, "decode catalog file location kind")?;
+    let file_path: String = row_value(row, 22, "decode catalog file path")?;
     let location = match location_kind.as_str() {
         "managed" => {
             DataFileLocation::Managed(ManagedDataPath::new(file_path).map_err(|error| {
                 corruption(format!(
                     "catalog managed data path is invalid error=[{error}]"
-                ))
-            })?)
-        }
-        "external_legacy" => {
-            DataFileLocation::ExternalLegacy(ExternalDataPath::new(file_path).map_err(|error| {
-                corruption(format!(
-                    "catalog external data path is invalid error=[{error}]"
                 ))
             })?)
         }
@@ -1164,58 +1074,40 @@ fn decode_file_row(
             )));
         }
     };
-    let file_size_bytes = decode_u64(&row_value::<Vec<u8>>(row, 25, "decode catalog file size")?)?;
+    let file_size_bytes = decode_u64(&row_value::<Vec<u8>>(row, 23, "decode catalog file size")?)?;
     let row_count = decode_u64(&row_value::<Vec<u8>>(
         row,
-        26,
+        24,
         "decode catalog file row count",
     )?)?;
     let row_count = NonZeroU64::new(row_count)
         .ok_or_else(|| corruption("catalog data file row count must be nonzero"))?;
-    let provenance_kind: String = row_value(row, 27, "decode catalog file provenance kind")?;
+    let provenance_kind: String = row_value(row, 25, "decode catalog file provenance kind")?;
     let min_log_offset = decode_optional_u64(&row_value::<Vec<u8>>(
         row,
-        28,
+        26,
         "decode catalog file minimum offset",
     )?)?;
     let max_log_offset = decode_optional_u64(&row_value::<Vec<u8>>(
         row,
-        29,
+        27,
         "decode catalog file maximum offset",
     )?)?;
-    let preserve_discovery_order: i64 =
-        row_value(row, 30, "decode catalog legacy discovery policy")?;
-    let preserve_discovery_order = match preserve_discovery_order {
-        0 => false,
-        1 => true,
-        value => {
-            return Err(corruption(format!(
-                "catalog legacy discovery policy is invalid value=[{value}]"
-            )));
-        }
-    };
-    let legacy_discovery_order = decode_optional_u64(&row_value::<Vec<u8>>(
-        row,
-        31,
-        "decode catalog legacy discovery order",
-    )?)?;
-    let provenance = decode_file_provenance(
-        &provenance_kind,
-        min_log_offset,
-        max_log_offset,
-        preserve_discovery_order,
-        legacy_discovery_order,
-    )?;
-    let partition_blob: Vec<u8> = row_value(row, 32, "decode catalog file partition")?;
-    let statistics_blob: Vec<u8> = row_value(row, 33, "decode catalog file statistics")?;
-    let metadata_blob: Vec<u8> = row_value(row, 34, "decode catalog file metadata")?;
-    let checksum: String = row_value(row, 35, "decode catalog file checksum")?;
+    if provenance_kind != "native" {
+        return Err(corruption("catalog file provenance must be native"));
+    }
+    let offsets = offset_range(min_log_offset, max_log_offset, "native data file")?
+        .ok_or_else(|| corruption("native catalog data file lacks logical offsets"))?;
+    let partition_blob: Vec<u8> = row_value(row, 28, "decode catalog file partition")?;
+    let statistics_blob: Vec<u8> = row_value(row, 29, "decode catalog file statistics")?;
+    let metadata_blob: Vec<u8> = row_value(row, 30, "decode catalog file metadata")?;
+    let checksum: String = row_value(row, 31, "decode catalog file checksum")?;
     if checksum.is_empty() || checksum != checksum.to_lowercase() {
         return Err(corruption("catalog data file checksum is not canonical"));
     }
     let added_snapshot_version = decode_u64(&row_value::<Vec<u8>>(
         row,
-        36,
+        32,
         "decode catalog file added snapshot",
     )?)?;
     if added_snapshot_version == 0 {
@@ -1225,10 +1117,10 @@ fn decode_file_row(
     }
     let removed_snapshot_version = decode_optional_u64(&row_value::<Vec<u8>>(
         row,
-        37,
+        33,
         "decode catalog file removed snapshot",
     )?)?;
-    let state: String = row_value(row, 38, "decode catalog file state")?;
+    let state: String = row_value(row, 34, "decode catalog file state")?;
     let state = match state.as_str() {
         "committed" => DataFileState::Committed,
         "deleting" => DataFileState::Deleting,
@@ -1246,7 +1138,7 @@ fn decode_file_row(
     }
     let created_at_ns = decode_u64(&row_value::<Vec<u8>>(
         row,
-        39,
+        35,
         "decode catalog file timestamp",
     )?)?;
     Ok(PendingVisibleFile {
@@ -1256,7 +1148,7 @@ fn decode_file_row(
         location,
         file_size_bytes,
         row_count,
-        provenance,
+        offsets,
         partition: decode_data_file_partition_blob(&partition_blob)?,
         statistics: decode_data_file_statistics_blob(&statistics_blob)?,
         metadata: decode_data_file_metadata_blob(&metadata_blob)?,
@@ -1266,149 +1158,6 @@ fn decode_file_row(
         removed_snapshot_version,
         state,
     })
-}
-
-fn decode_file_provenance(
-    kind: &str,
-    min_log_offset: Option<u64>,
-    max_log_offset: Option<u64>,
-    preserve_discovery_order: bool,
-    legacy_discovery_order: Option<u64>,
-) -> Result<PendingFileProvenance> {
-    match kind {
-        "native" => {
-            if preserve_discovery_order || legacy_discovery_order.is_some() {
-                return Err(corruption(
-                    "native catalog data file contains legacy discovery metadata",
-                ));
-            }
-            let offsets = offset_range(min_log_offset, max_log_offset, "native data file")?
-                .ok_or_else(|| corruption("native catalog data file lacks logical offsets"))?;
-            Ok(PendingFileProvenance::Native { offsets })
-        }
-        "legacy" => {
-            if preserve_discovery_order != legacy_discovery_order.is_some() {
-                return Err(corruption(
-                    "legacy catalog discovery policy does not match its order value",
-                ));
-            }
-            Ok(PendingFileProvenance::Legacy {
-                offsets: offset_range(min_log_offset, max_log_offset, "legacy data file")?,
-                preserve_discovery_order,
-                discovery_order: legacy_discovery_order,
-            })
-        }
-        _ => Err(corruption(format!(
-            "catalog data file provenance kind is invalid value=[{kind}]"
-        ))),
-    }
-}
-
-fn validate_legacy_discovery_orders(
-    files: &[PendingVisibleFile],
-    snapshot: &TableSnapshot,
-) -> Result<()> {
-    let mut orders = files
-        .iter()
-        .filter_map(|file| match &file.provenance {
-            PendingFileProvenance::Legacy {
-                preserve_discovery_order: true,
-                discovery_order,
-                ..
-            } => *discovery_order,
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    orders.sort_unstable();
-    if orders.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(corruption(
-            "catalog legacy discovery order contains a duplicate position",
-        ));
-    }
-    if snapshot.operation == SnapshotOperation::Import {
-        let ordered_external_legacy = orders.len() == files.len()
-            && files.iter().all(|file| {
-                matches!(&file.location, DataFileLocation::ExternalLegacy(_))
-                    && matches!(
-                        &file.provenance,
-                        PendingFileProvenance::Legacy {
-                            offsets: None,
-                            preserve_discovery_order: true,
-                            discovery_order: Some(_),
-                        }
-                    )
-            })
-            && orders
-                .iter()
-                .enumerate()
-                .all(|(index, order)| u64::try_from(index) == Ok(*order));
-        let complete_import_manifest = if snapshot.snapshot_version == 2 {
-            snapshot.parent_snapshot_version == Some(1)
-                && !files.is_empty()
-                && files.iter().all(|file| file.schema_version == 1)
-                && ordered_external_legacy
-        } else {
-            snapshot.snapshot_version > 2
-                && snapshot.parent_snapshot_version == snapshot.snapshot_version.checked_sub(1)
-                && ordered_external_legacy
-                && validate_reconcile_summary(files, snapshot)
-        };
-        if !complete_import_manifest {
-            return Err(corruption(
-                "catalog import snapshot is not a complete ordered external legacy manifest",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_reconcile_summary(files: &[PendingVisibleFile], snapshot: &TableSnapshot) -> bool {
-    let value = |key: &str| match snapshot.summary.get(key) {
-        Some(MetadataScalar::UInt64(value)) => Some(*value),
-        _ => None,
-    };
-    let Some(target_files) = value("target_files") else {
-        return false;
-    };
-    let Some(target_rows) = value("target_rows") else {
-        return false;
-    };
-    let Some(target_bytes) = value("target_bytes") else {
-        return false;
-    };
-    let Some(retained_files) = value("retained_files") else {
-        return false;
-    };
-    let Some(added_files) = value("added_files") else {
-        return false;
-    };
-    let Some(removed_files) = value("removed_files") else {
-        return false;
-    };
-    let Some(previous_revision) = value("previous_legacy_files_revision") else {
-        return false;
-    };
-    let Some(legacy_revision) = value("legacy_files_revision") else {
-        return false;
-    };
-    let Some(continuity_gap) = value("continuity_gap") else {
-        return false;
-    };
-    let actual_files = u64::try_from(files.len()).ok();
-    let actual_rows = files
-        .iter()
-        .try_fold(0_u64, |total, file| total.checked_add(file.row_count.get()));
-    let actual_bytes = files
-        .iter()
-        .try_fold(0_u64, |total, file| total.checked_add(file.file_size_bytes));
-    snapshot.summary.len() == 9
-        && actual_files == Some(target_files)
-        && actual_rows == Some(target_rows)
-        && actual_bytes == Some(target_bytes)
-        && retained_files.checked_add(added_files) == Some(target_files)
-        && removed_files <= u64::try_from(MAX_VISIBLE_FILES).expect("file bound fits u64")
-        && legacy_revision > previous_revision
-        && continuity_gap == u64::from(previous_revision.checked_add(1) != Some(legacy_revision))
 }
 
 fn offset_range(
@@ -1523,46 +1272,18 @@ impl PendingVisibleFile {
         self,
         source_lineage: Vec<SourceSegmentLineage>,
     ) -> Result<DataFileDescriptor> {
-        let (provenance, legacy_discovery_order) = match self.provenance {
-            PendingFileProvenance::Native { offsets } => {
-                let source_lineage =
-                    SourceSegmentLineages::new(source_lineage).map_err(|error| {
-                        corruption(format!(
-                            "catalog native source lineage is invalid error=[{error}]"
-                        ))
-                    })?;
-                (
-                    DataFileProvenance::Native(
-                        NativeDataFileProvenance::new(offsets, source_lineage).map_err(
-                            |error| {
-                                corruption(format!(
-                                    "catalog native file provenance is invalid error=[{error}]"
-                                ))
-                            },
-                        )?,
-                    ),
-                    None,
-                )
-            }
-            PendingFileProvenance::Legacy {
-                offsets,
-                preserve_discovery_order,
-                discovery_order,
-            } => {
-                if !source_lineage.is_empty() {
-                    return Err(corruption(
-                        "legacy catalog data file contains native source lineage",
-                    ));
-                }
-                (
-                    DataFileProvenance::Legacy {
-                        offsets,
-                        preserve_discovery_order,
-                    },
-                    discovery_order,
-                )
-            }
-        };
+        let source_lineage = SourceSegmentLineages::new(source_lineage).map_err(|error| {
+            corruption(format!(
+                "catalog native source lineage is invalid error=[{error}]"
+            ))
+        })?;
+        let provenance = DataFileProvenance::Native(
+            NativeDataFileProvenance::new(self.offsets, source_lineage).map_err(|error| {
+                corruption(format!(
+                    "catalog native file provenance is invalid error=[{error}]"
+                ))
+            })?,
+        );
         let descriptor = DataFileDescriptor {
             file: PendingDataFile {
                 file_id: self.file_id,
@@ -1578,7 +1299,6 @@ impl PendingVisibleFile {
                 checksum: self.checksum,
                 created_at_ns: self.created_at_ns,
             },
-            legacy_discovery_order,
             added_snapshot_version: self.added_snapshot_version,
             removed_snapshot_version: self.removed_snapshot_version,
             state: self.state,
@@ -1630,7 +1350,6 @@ fn decode_snapshot_operation(value: &str) -> Result<SnapshotOperation> {
         "create" => Ok(SnapshotOperation::Create),
         "persist" => Ok(SnapshotOperation::Persist),
         "compaction" => Ok(SnapshotOperation::Compaction),
-        "import" => Ok(SnapshotOperation::Import),
         "retention" => Ok(SnapshotOperation::Retention),
         _ => Err(corruption(format!(
             "catalog snapshot operation is invalid value=[{value}]"
@@ -1721,6 +1440,7 @@ fn corruption(message: impl Into<String>) -> ServerError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use zippy_types::table::MetadataScalar;
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
@@ -1730,8 +1450,8 @@ mod tests {
         CatalogSnapshotSelector, CreateNamespaceCommand, CreateTableCommand,
     };
     use zippy_types::table::{
-        AppendTableDefinition, CatalogName, DataFileProvenance, MetadataMap, MetadataScalar,
-        SchemaIpcPayload, TableDefinition,
+        AppendTableDefinition, CatalogName, DataFileProvenance, MetadataMap, SchemaIpcPayload,
+        TableDefinition,
     };
     use zippy_types::{
         ErrorCode, FileId, LogOffset, NamespaceId, OffsetWatermark, RequestId, TableId,
@@ -1752,7 +1472,6 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TestFileKind {
         Native,
-        Legacy,
     }
 
     fn selector(table_id: u128) -> CatalogSnapshotSelector {
@@ -1786,7 +1505,7 @@ mod tests {
 
     fn migrated_catalog() -> (Connection, CatalogSnapshotSelector) {
         let mut connection = Connection::open_in_memory().expect("open in-memory catalog");
-        crate::migration::migrate(&mut connection).expect("migrate in-memory catalog");
+        crate::layout::initialize(&mut connection).expect("migrate in-memory catalog");
         let namespace_id = NamespaceId::from_u128(1).expect("nonzero namespace id");
         let create_namespace = CatalogCommandEnvelopeV1::new(
             RequestId::from_u128(1).expect("nonzero request id"),
@@ -1861,34 +1580,22 @@ mod tests {
     ) {
         let id = file_id(value).into_bytes();
         let table_id = selector(1).table_id.into_bytes();
-        let (location_kind, path, provenance_kind, preserve_order, discovery_order) = match kind {
-            TestFileKind::Native => (
-                "managed",
-                format!("tables/1/{value}.parquet"),
-                "native",
-                0_i64,
-                None,
-            ),
-            TestFileKind::Legacy => (
-                "external_legacy",
-                format!("/legacy/{value}.parquet"),
-                "legacy",
-                0_i64,
-                None,
-            ),
-        };
+        let TestFileKind::Native = kind;
+        let location_kind = "managed";
+        let path = format!("tables/1/{value}.parquet");
+        let provenance_kind = "native";
         let row_count = offsets.map(|(first, last)| last - first + 1).unwrap_or(1);
         connection
             .execute(
                 "INSERT INTO data_files(\
                      file_id, table_id, schema_version, location_kind, file_path, \
                      file_size_bytes, row_count, provenance_kind, min_log_offset, \
-                     max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+                     max_log_offset, \
                      partition_blob, statistics_blob, metadata_blob, checksum, \
                      added_snapshot_version, removed_snapshot_version, state, created_at_ns\
                  ) VALUES (\
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                     ?15, ?16, ?17, ?18, 'committed', ?19\
+                     ?15, ?16, 'committed', ?17\
                  )",
                 params![
                     id.as_slice(),
@@ -1901,8 +1608,6 @@ mod tests {
                     provenance_kind,
                     encode_optional_u64(offsets.map(|value| value.0)).as_slice(),
                     encode_optional_u64(offsets.map(|value| value.1)).as_slice(),
-                    preserve_order,
-                    encode_optional_u64(discovery_order).as_slice(),
                     encode_data_file_partition_blob(&MetadataMap::new())
                         .expect("encode file partition"),
                     encode_data_file_statistics_blob(&MetadataMap::new())
@@ -2105,9 +1810,7 @@ mod tests {
             file.file.metadata.get("file"),
             Some(&MetadataScalar::UInt64(10))
         );
-        let DataFileProvenance::Native(native) = &file.file.provenance else {
-            panic!("modern file must retain native provenance");
-        };
+        let DataFileProvenance::Native(native) = &file.file.provenance;
         assert_eq!(
             native
                 .source_lineage()
@@ -2121,24 +1824,6 @@ mod tests {
             native.offsets(),
             zippy_types::OffsetRange::new(LogOffset::new(0), LogOffset::new(2))
                 .expect("valid expected offset range")
-        );
-
-        let (mut legacy_connection, _) = migrated_catalog();
-        let selected = add_second_snapshot(&legacy_connection);
-        insert_file(
-            &legacy_connection,
-            20,
-            2,
-            TestFileKind::Legacy,
-            None,
-            encoded_metadata(20),
-        );
-        insert_lineage(&legacy_connection, 20, &[(1, 0, 0)]);
-        assert_eq!(
-            read_snapshot_at(&mut legacy_connection, &[selected])
-                .expect_err("legacy file with native lineage must fail")
-                .code(),
-            ErrorCode::DataCorruption
         );
 
         let (mut missing_connection, _) = migrated_catalog();

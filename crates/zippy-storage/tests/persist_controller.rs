@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -206,6 +206,7 @@ fn persist_request_for_table(
         request_id(request),
         table_id(table),
         expected_snapshot_version,
+        0,
         vec![candidate_input_for_table(table, file, first, values)],
         OffsetWatermark::Known(LogOffset::new(last)),
     )
@@ -265,7 +266,11 @@ fn candidate_temporary_count(root: &tempfile::TempDir, table: u128) -> usize {
 
 struct FakeCatalog {
     blocked: bool,
+    unavailable_once: bool,
+    conflict_once: bool,
+    mismatched_response: bool,
     calls: AtomicUsize,
+    commands: Mutex<Vec<VersionedCatalogCommand>>,
     started: Semaphore,
     release: Semaphore,
     publication_gate: Arc<Semaphore>,
@@ -280,7 +285,11 @@ impl FakeCatalog {
     fn success() -> Self {
         Self {
             blocked: false,
+            unavailable_once: false,
+            conflict_once: false,
+            mismatched_response: false,
             calls: AtomicUsize::new(0),
+            commands: Mutex::new(Vec::new()),
             started: Semaphore::new(0),
             release: Semaphore::new(0),
             publication_gate: Arc::new(Semaphore::new(FAKE_PUBLICATION_GATE_CAPACITY as usize)),
@@ -290,7 +299,11 @@ impl FakeCatalog {
     fn blocked() -> Self {
         Self {
             blocked: true,
+            unavailable_once: false,
+            conflict_once: false,
+            mismatched_response: false,
             calls: AtomicUsize::new(0),
+            commands: Mutex::new(Vec::new()),
             started: Semaphore::new(0),
             release: Semaphore::new(0),
             publication_gate: Arc::new(Semaphore::new(FAKE_PUBLICATION_GATE_CAPACITY as usize)),
@@ -299,6 +312,31 @@ impl FakeCatalog {
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::Acquire)
+    }
+
+    fn unavailable_once() -> Self {
+        Self {
+            unavailable_once: true,
+            ..Self::success()
+        }
+    }
+
+    fn mismatched_response() -> Self {
+        Self {
+            mismatched_response: true,
+            ..Self::success()
+        }
+    }
+
+    fn conflict_once() -> Self {
+        Self {
+            conflict_once: true,
+            ..Self::success()
+        }
+    }
+
+    fn commands(&self) -> Vec<VersionedCatalogCommand> {
+        self.commands.lock().expect("lock fake commands").clone()
     }
 
     async fn wait_started(&self) {
@@ -314,8 +352,28 @@ impl FakeCatalog {
     }
 
     async fn execute(&self, command: VersionedCatalogCommand) -> Result<VersionedCatalogResponse> {
-        self.calls.fetch_add(1, Ordering::AcqRel);
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        self.commands
+            .lock()
+            .expect("lock fake commands")
+            .push(command.clone());
         self.started.add_permits(1);
+        if self.unavailable_once && call == 0 {
+            let VersionedCatalogCommand::V1(envelope) = &command;
+            return Err(
+                ServerError::new(ErrorCode::Unavailable, "lost fake Catalog response")
+                    .with_request_id(envelope.request_id),
+            );
+        }
+        if self.conflict_once && call == 0 {
+            let VersionedCatalogCommand::V1(envelope) = &command;
+            return Err(ServerError::new(
+                ErrorCode::Conflict,
+                "injected definitive Catalog replay rejection",
+            )
+            .with_request_id(envelope.request_id)
+            .with_retryable(false));
+        }
         if self.blocked {
             self.release
                 .acquire()
@@ -323,7 +381,12 @@ impl FakeCatalog {
                 .expect("fake catalog release")
                 .forget();
         }
-        Ok(success_response(&command))
+        let mut response = success_response(&command);
+        if self.mismatched_response {
+            let VersionedCatalogResponse::V1(envelope) = &mut response;
+            envelope.request_id = request_id(999);
+        }
+        Ok(response)
     }
 }
 
@@ -652,7 +715,7 @@ async fn start_controller(
     catalog: Arc<FakeCatalog>,
     config: PersistControllerConfig,
 ) -> PersistController {
-    let coordinator = CatalogCommitCoordinator::start_with_persistence(
+    let coordinator = CatalogCommitCoordinator::start(
         CatalogCommitCoordinatorConfig::new(),
         Arc::clone(&owned),
         catalog as Arc<dyn CatalogPersistence>,
@@ -685,7 +748,7 @@ async fn start_controller_with_persistence(
     config: PersistControllerConfig,
     coordinator_config: CatalogCommitCoordinatorConfig,
 ) -> PersistController {
-    let coordinator = CatalogCommitCoordinator::start_with_persistence(
+    let coordinator = CatalogCommitCoordinator::start(
         coordinator_config,
         Arc::clone(&owned),
         catalog,
@@ -721,6 +784,7 @@ fn config_and_request_validation_rejects_work_before_startup() {
         request_id(1),
         table_id(TABLE),
         1,
+        0,
         vec![candidate_input_for_table(TABLE + 1, 20, 0, vec![1])],
         OffsetWatermark::Known(LogOffset::new(0)),
     )
@@ -731,6 +795,7 @@ fn config_and_request_validation_rejects_work_before_startup() {
         request_id(2),
         table_id(TABLE),
         1,
+        0,
         vec![
             candidate_input(20, 0, vec![1]),
             candidate_input(21, 2, vec![2]),
@@ -744,6 +809,7 @@ fn config_and_request_validation_rejects_work_before_startup() {
         request_id(3),
         table_id(TABLE),
         1,
+        0,
         vec![candidate_input(22, 0, vec![1])],
         OffsetWatermark::Known(LogOffset::new(1)),
     )
@@ -756,6 +822,7 @@ fn config_and_request_validation_rejects_work_before_startup() {
         request_id(4),
         table_id(TABLE),
         1,
+        0,
         vec![
             candidate_input(22, 0, vec![1]),
             PersistCandidateInput::new(second_schema_spec, second_schema_batches).unwrap(),
@@ -767,18 +834,19 @@ fn config_and_request_validation_rejects_work_before_startup() {
 
     let (mut second_epoch_spec, second_epoch_batches) = candidate_parts(TABLE, 24, 1, vec![2]);
     second_epoch_spec.provenance = provenance_with_epoch(1, 1, 1);
-    let mixed_epoch = PersistRequest::new(
+    let future_epoch = PersistRequest::new(
         request_id(5),
         table_id(TABLE),
         1,
+        0,
         vec![
             candidate_input(23, 0, vec![1]),
             PersistCandidateInput::new(second_epoch_spec, second_epoch_batches).unwrap(),
         ],
         OffsetWatermark::Known(LogOffset::new(1)),
     )
-    .expect_err("one persist request cannot mix writer epochs");
-    assert_eq!(mixed_epoch.code(), ErrorCode::InvalidArgument);
+    .expect_err("source epochs cannot exceed the submitting authority");
+    assert_eq!(future_epoch.code(), ErrorCode::InvalidArgument);
 
     let (mut second_arrow_spec, _) = candidate_parts(TABLE, 25, 1, vec![2]);
     let second_arrow_schema = Arc::new(Schema::new(vec![Field::new(
@@ -796,6 +864,7 @@ fn config_and_request_validation_rejects_work_before_startup() {
         request_id(6),
         table_id(TABLE),
         1,
+        0,
         vec![
             candidate_input(24, 0, vec![1]),
             PersistCandidateInput::new(second_arrow_spec, second_arrow_batches).unwrap(),
@@ -804,34 +873,6 @@ fn config_and_request_validation_rejects_work_before_startup() {
     )
     .expect_err("one persist request cannot mix Arrow schemas under the same version");
     assert_eq!(mixed_arrow_schema.code(), ErrorCode::SchemaMismatch);
-}
-
-#[tokio::test]
-async fn controller_rejects_a_coordinator_without_publication_control() {
-    let root = tempfile::TempDir::new().expect("create test root");
-    let owned = owned_directory(&root);
-    let catalog = Arc::new(FakeCatalog::success());
-    let coordinator = CatalogCommitCoordinator::start(
-        CatalogCommitCoordinatorConfig::new(),
-        Arc::clone(&owned),
-        catalog as Arc<dyn CatalogWrite>,
-        server_actor(),
-    )
-    .await
-    .expect("start compatibility coordinator");
-
-    let result = PersistController::start(
-        PersistControllerConfig::new(),
-        ParquetCandidateWriter::new(owned),
-        coordinator,
-    )
-    .await;
-    let error = result
-        .err()
-        .expect("native controller must require publication control");
-
-    assert_eq!(error.code(), ErrorCode::UnsupportedPlan);
-    assert!(!error.retryable());
 }
 
 #[test]
@@ -873,6 +914,7 @@ async fn metadata_only_payload_cannot_bypass_input_budget() {
         request_id(4),
         table_id(TABLE),
         1,
+        0,
         vec![candidate],
         OffsetWatermark::Known(LogOffset::new(0)),
     )
@@ -1158,6 +1200,128 @@ async fn first_writer_error_closes_admission_but_drains_already_accepted_jobs() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_commit_unknown_replays_the_identical_catalog_envelope() {
+    let root = tempfile::TempDir::new().expect("create test root");
+    let catalog = Arc::new(FakeCatalog::unavailable_once());
+    let controller = start_controller(
+        owned_directory(&root),
+        Arc::clone(&catalog),
+        PersistControllerConfig::new(),
+    )
+    .await;
+
+    controller
+        .handle()
+        .submit(persist_request(100, 120, 0, vec![42], 1))
+        .expect("admit native persist")
+        .wait()
+        .await
+        .expect("identical retry resolves unknown Catalog response");
+    assert_eq!(catalog.calls(), 2);
+    let commands = catalog.commands();
+    assert_eq!(commands[0], commands[1]);
+    controller.drain().await.expect("drain native controller");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_mismatched_catalog_response_retains_intent_and_fails_closed() {
+    let root = tempfile::TempDir::new().expect("create test root");
+    let catalog = Arc::new(FakeCatalog::mismatched_response());
+    let controller = start_controller(
+        owned_directory(&root),
+        Arc::clone(&catalog),
+        PersistControllerConfig::new(),
+    )
+    .await;
+
+    let error = controller
+        .handle()
+        .submit(persist_request(101, 121, 0, vec![43], 1))
+        .expect("admit native persist")
+        .wait()
+        .await
+        .expect_err("mismatched Catalog response must fail closed");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+    assert_eq!(catalog.calls(), 1);
+    assert_eq!(intent_files(&root).len(), 1);
+    assert!(controller.drain().await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_replay_rejects_tampered_retained_candidate_before_catalog() {
+    let root = tempfile::TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let bad_catalog = Arc::new(FakeCatalog::mismatched_response());
+    let controller = start_controller(
+        Arc::clone(&owned),
+        bad_catalog,
+        PersistControllerConfig::new(),
+    )
+    .await;
+    controller
+        .handle()
+        .submit(persist_request(102, 122, 0, vec![44], 1))
+        .expect("admit native persist")
+        .wait()
+        .await
+        .expect_err("retain failed publication intent");
+    assert!(controller.drain().await.is_err());
+    assert_eq!(intent_files(&root).len(), 1);
+
+    std::fs::write(candidate_path(&root, 122), b"tampered")
+        .expect("tamper retained physical candidate");
+    let recovered_catalog = Arc::new(FakeCatalog::success());
+    let error = CatalogCommitCoordinator::start(
+        CatalogCommitCoordinatorConfig::new(),
+        owned,
+        Arc::clone(&recovered_catalog) as Arc<dyn CatalogPersistence>,
+        server_actor(),
+    )
+    .await
+    .err()
+    .expect("tampered retained candidate must fail startup");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+    assert_eq!(recovered_catalog.calls(), 0);
+    assert_eq!(intent_files(&root).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_startup_discards_definitively_rejected_intent_and_accepts_new_work() {
+    let root = tempfile::TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let failed = start_controller(
+        Arc::clone(&owned),
+        Arc::new(FakeCatalog::mismatched_response()),
+        PersistControllerConfig::new(),
+    )
+    .await;
+    failed
+        .handle()
+        .submit(persist_request(103, 123, 0, vec![45], 1))
+        .expect("admit first native persist")
+        .wait()
+        .await
+        .expect_err("retain first intent");
+    assert!(failed.drain().await.is_err());
+    assert_eq!(intent_files(&root).len(), 1);
+
+    let catalog = Arc::new(FakeCatalog::conflict_once());
+    let recovered =
+        start_controller(owned, Arc::clone(&catalog), PersistControllerConfig::new()).await;
+    assert_eq!(catalog.calls(), 1);
+    assert!(intent_files(&root).is_empty());
+    recovered
+        .handle()
+        .submit(persist_request(104, 124, 0, vec![46], 1))
+        .expect("admit new native persist")
+        .wait()
+        .await
+        .expect("new work succeeds after rejected replay");
+    assert_eq!(catalog.calls(), 2);
+    recovered.drain().await.expect("drain recovered controller");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_probe_resolves_before_any_candidate_publication() {
     let root = tempfile::TempDir::new().expect("create test root");
     let owned = owned_directory(&root);
@@ -1368,4 +1532,68 @@ async fn exact_replay_bypasses_a_lowered_commit_budget() {
         .drain()
         .await
         .expect("drain replay controller");
+}
+
+#[test]
+fn persist_authority_covers_historical_source_epochs() {
+    let (mut second_spec, second_batches) = candidate_parts(TABLE, 31, 1, vec![2]);
+    second_spec.provenance = provenance_with_epoch(1, 1, 1);
+    let request = PersistRequest::new(
+        request_id(30),
+        table_id(TABLE),
+        1,
+        2,
+        vec![
+            candidate_input(30, 0, vec![1]),
+            PersistCandidateInput::new(second_spec, second_batches).unwrap(),
+        ],
+        OffsetWatermark::Known(LogOffset::new(1)),
+    )
+    .unwrap();
+    assert_eq!(request.writer_epoch(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_startup_removes_partial_intent_and_rejects_symlink_directory() {
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = tempfile::TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let intent_directory = root.path().join("data/wal/catalog-commit-intents");
+    fs::create_dir(&intent_directory).expect("create intent directory");
+    fs::set_permissions(&intent_directory, fs::Permissions::from_mode(0o700))
+        .expect("secure intent directory");
+    let temporary = intent_directory.join(format!(
+        ".00000000000000000001-{}.json.tmp-crash",
+        request_id(10)
+    ));
+    fs::write(&temporary, b"incomplete").expect("write partial intent");
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .expect("secure partial intent");
+    let catalog = Arc::new(FakeCatalog::success());
+    let controller = start_controller(
+        Arc::clone(&owned),
+        Arc::clone(&catalog),
+        PersistControllerConfig::new(),
+    )
+    .await;
+    assert!(!temporary.exists());
+    controller.drain().await.expect("drain native controller");
+
+    fs::remove_dir(&intent_directory).expect("remove empty intent directory");
+    let external = root.path().join("external-intents");
+    fs::create_dir(&external).expect("create external directory");
+    symlink(&external, &intent_directory).expect("replace intent directory with symlink");
+    let error = CatalogCommitCoordinator::start(
+        CatalogCommitCoordinatorConfig::new(),
+        owned,
+        catalog as Arc<dyn CatalogPersistence>,
+        server_actor(),
+    )
+    .await
+    .err()
+    .expect("symlink intent directory must fail startup");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
 }

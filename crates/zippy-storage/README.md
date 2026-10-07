@@ -1,38 +1,13 @@
 # zippy-storage
 
-`zippy-storage` owns the new server-side durable data-file boundary. It does not make legacy
-`persisted_files` authoritative.
+`zippy-storage` owns the server-side durable data-file boundary. SQLite Catalog is the sole
+authority for committed file visibility.
 
-## Legacy import verification
+## 当前文件边界
 
-`verify_legacy_parquet_import()` is a trusted startup-only migration helper, not an RPC boundary.
-It opens an absolute legacy file below its optional canonical root descriptor component by
-component with `NOFOLLOW|NONBLOCK`, verifies regular-file identity, Parquet footer, logical Arrow
-Schema, row count, and full `sha256-v1` content, then derives a stable file ID. The resulting DTO is
-accepted only through the Catalog's non-cloneable, instance-bound startup import session.
-The verifier computes the Catalog canonical hash from the same Arrow Schema compared with the
-Parquet footer and writes a reserved proof field; the Catalog transaction requires that proof to
-match the table command. `CatalogActor` remains audit metadata and is not authorization. Before
-verification, Server planning must sort files by the legacy Gateway key
-`(writer_epoch, source_segment_id, source_generation, created_at, file_path)` and assign the
-resulting contiguous position to `discovery_order`; the original Registry index is retained only
-for audit diagnostics.
-
-The Server V2 planner/executor is wired to this verifier. It first performs the Catalog's bounded
-request-ID replay probe. A committed probe result is only a hint: because it contains no physical
-file fingerprint, the Server must compare every plan-derivable response identity, revision,
-table/snapshot shape, file count, legacy revision, and known row count before classifying it as a
-replay. Only `Missing` at the plan's expected Catalog revision is allowed to scan and hash the
-physical files and submit the import transaction. Consequently the initial commit pays the full
-legacy-file scan, while an exact replay does not repeat migration I/O.
-
-The verifier cannot make an externally owned pathname immutable after it returns. Startup
-orchestration must keep legacy roots quiescent/read-only until the Catalog transaction terminates,
-and query execution reopens and rechecks the recorded checksum for every external reader. This is
-still a mutable-file/TOCTOU boundary, not an immutable storage guarantee. Authority cutover must
-remain blocked until external files are copied or reflinked into managed immutable storage and
-opened through the managed capability. The current helper does not make SQLite or Gateway
-authoritative by itself.
+旧 `verify_legacy_parquet_import()` 和导入 DTO 已删除。原生启动只读取托管文件；
+外部旧文件类型、导入快照和 unknown 位点已从共享契约中删除；旧标签在解码边界拒绝，
+不自动复制或迁移外部目录。当前布局为 v11，参见[当前能力](../../docs/current-capabilities-2026-09-21.md)。
 
 ## Candidate protocol
 
@@ -48,8 +23,11 @@ temporary-file token. Final no-clobber publication and parent-directory fsync ha
 Catalog idempotency probe authorizes a new advance and the FIFO coordinator owns a shared Catalog
 publication permit. A post-rename directory-sync failure is classified separately from an
 unpublished failure, so the controller retains cleanup authority for the final directory entry.
-The public `write_candidate()` compatibility API still publishes directly, but does not transfer
-controller cleanup authority. Only the Catalog may create committed visibility.
+The low-level `write_candidate()` fixture is used by storage verification and fault-injection
+tests to construct physical files, including deliberate orphans and corruption. It does not
+transfer controller cleanup authority or make a file query-visible. Production writes use
+`PersistController` and the staged publication protocol above. Only the Catalog may create
+committed visibility.
 
 ## Commit protocol
 
@@ -78,7 +56,7 @@ cancel/deadline responses, internal failures, and data corruption are never infe
 business rejections. Failure to remove a definitively rejected intent remains fatal and retains the
 recovery boundary.
 
-`PersistController` accepts only a coordinator created with `start_with_persistence()`. Publication
+`CatalogCommitCoordinator::start()` requires the complete `CatalogPersistence` boundary. Publication
 permits are acquired by the single FIFO worker only after it dequeues the current staged candidate
 set, immediately before physical publication. Later queued jobs hold only affine temporary-file
 tokens, so they cannot deadlock an earlier rejected job's exclusive cleanup. The current permit then
@@ -155,37 +133,25 @@ scans physical files toward the Catalog.
 
 After replay and final reconciliation, `StartupCatalogFileVerifier` performs the reverse startup
 gate. It lists active tables in 512-table pages, reads current snapshots in batches of 512 at one
-stable Catalog revision, and fully verifies every currently visible managed or external legacy
-file. Managed paths remain descriptor-relative to the retained data-root. External absolute paths
-are traversed one component at a time with `O_NOFOLLOW`; verification retains one file descriptor,
-checks regular-file type and Catalog size, SHA-256, bounded Parquet footer, exact snapshot Schema,
-row count, and the descriptor identity before and after content reads. External paths are never
-included in startup errors. Missing files, symlink substitutions, identity changes, and corrupted
-content fail the readiness gate. For an `Import` snapshot, the visible manifest's aggregate file,
-row, and byte counts must exactly match the strictly typed `added_files`, `added_rows`, and
-`added_bytes` summary entries; `legacy_files_revision` must be the only fourth entry and nonzero.
-The Catalog reader separately requires a frozen V2 import to be snapshot 2 with parent 1 and a
-complete `0..file_count` order of schema-v1 ExternalLegacy descriptors, so startup never verifies a
-partially reconstructed or mixed import manifest.
-This full check runs on every native startup, including a startup whose migration path accepted a
-Catalog replay without rescanning files. The replay optimization therefore never turns readiness
-into a metadata-only check.
-The default pass admits at most 65,536 active tables, 65,536 current files across both location
-classes, 8 GiB of checksummed content, and 128 MiB of retained runtime metadata plus schema data.
-The verification report exposes managed, external legacy, and aggregate file counts separately.
+stable Catalog revision, and fully verifies every currently visible managed file. Paths remain
+relative to the retained data-root descriptor. External legacy locations are rejected before
+physical reads. This complete check runs on every native startup, including after commit replay.
+The default pass admits at most 65,536 active tables, 65,536 current files, 8 GiB of checksummed
+content, and 128 MiB of retained runtime metadata plus schema data. The report counts only managed files; the external-legacy count and the obsolete managed-file
+limit alias have been removed.
 `verify_with_bootstrap()` returns one atomic result containing the verification report and every
 active table's `TableDescriptor`, current `SchemaDescriptor`, and current `TableSnapshot`, ordered
 by table ID. Its metadata budget charges JSON-encoded table/snapshot/schema fields plus raw schema
 IPC bytes. During server bootstrap, every decoded Arrow schema adds a conservative retained-memory
 charge against that same 128 MiB limit before its table runtime is published. Visible file
 descriptors remain batch-local and are not retained in the bootstrap result. Pagination, snapshot
-alignment, import-summary validation, physical verification, decoded-schema charging, budget
+alignment, physical verification, decoded-schema charging, budget
 enforcement, or the final Catalog revision guard failing discards the entire result. The existing
 `verify()` API remains a compatibility wrapper that returns only the verification report.
 Historical files removed from the current snapshot remain outside this startup gate; maintenance
 verification remains responsible for historical/deep audits.
 
-Logical drop, snapshot leases, safe GC, compaction, and public native write admission remain later
-refactor steps. Native `TableActor`s now own the per-table persist
-state machine and Catalog-backed receipt replay, but the legacy Gateway remains write authority
-until the explicit cutover.
+原生 Flight 写入由 `TableActor`、WAL 和 Catalog 回执共同确认；公开建表、schema 变更、
+逻辑删除、固定快照及三类表重启恢复已经接通。SQLite 模式拒绝启用 Gateway。
+默认 Legacy 模式、旧 registry、Gateway 与旧 compaction 仍待删除；这些剩余路径不能
+用于描述原生运行时的写入权威。历史文件回收仍须遵守 snapshot lease 与安全 GC 边界。

@@ -36,7 +36,7 @@ pub struct SegmentControlSnapshot {
     pub capacity_rows: usize,
     pub row_count: usize,
     pub committed_row_count: usize,
-    pub payload_version: Option<u64>,
+    pub payload_version: u64,
     pub notify_seq: u32,
     pub waiter_count: u32,
     pub sealed: bool,
@@ -67,7 +67,6 @@ pub(crate) struct SealedUtf8Column {
 #[derive(Debug)]
 pub(crate) struct SealedSegmentData {
     pub(crate) schema: CompiledSchema,
-    pub(crate) persistence_key: String,
     pub(crate) segment_id: u64,
     pub(crate) _generation: u64,
     pub(crate) row_count: usize,
@@ -91,7 +90,7 @@ pub struct ActiveSegmentDescriptor {
     pub(crate) shm_os_id: String,
     pub(crate) payload_offset: usize,
     pub(crate) committed_row_count_offset: usize,
-    pub(crate) payload_version_offset: Option<usize>,
+    pub(crate) payload_version_offset: usize,
     pub(crate) segment_id: u64,
     pub(crate) generation: u64,
     pub(crate) writer_epoch: u64,
@@ -125,7 +124,7 @@ impl ActiveSegmentDescriptor {
     }
 
     /// 返回 payload version 在 shm header 中的偏移。
-    pub fn payload_version_offset(&self) -> Option<usize> {
+    pub fn payload_version_offset(&self) -> usize {
         self.payload_version_offset
     }
 
@@ -162,7 +161,7 @@ impl ActiveSegmentDescriptor {
     }
 
     /// 返回篡改 payload version offset 后的描述符，仅用于测试。
-    pub fn with_payload_version_offset_for_test(mut self, offset: Option<usize>) -> Self {
+    pub fn with_payload_version_offset_for_test(mut self, offset: usize) -> Self {
         self.payload_version_offset = offset;
         self
     }
@@ -199,9 +198,5 @@ impl SealedSegmentHandle {
 
     pub(crate) fn schema(&self) -> &CompiledSchema {
         &self.inner.schema
-    }
-
-    pub(crate) fn persistence_key(&self) -> &str {
-        &self.inner.persistence_key
     }
 }

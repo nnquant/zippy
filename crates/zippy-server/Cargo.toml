@@ -7,6 +7,7 @@ edition.workspace = true
 arrow.workspace = true
 datafusion.workspace = true
 futures.workspace = true
+parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -16,7 +17,6 @@ tokio.workspace = true
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-catalog = { path = "../zippy-catalog" }
-zippy-gateway = { path = "../zippy-gateway" }
 zippy-ingest = { path = "../zippy-ingest" }
 zippy-master = { path = "../zippy-master" }
 zippy-query = { path = "../zippy-query" }
@@ -27,7 +27,6 @@ zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
 arrow-flight.workspace = true
-parquet.workspace = true
 prost.workspace = true
 rcgen = "0.12.1"
 tempfile = "3"

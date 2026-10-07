@@ -1,0 +1,119 @@
+{
+  "batch": 57,
+  "date": "2026-09-23",
+  "closed_original_findings": 33,
+  "original_findings": 34,
+  "deferred_by_user": [
+    "F28 Windows/macOS physical acceptance"
+  ],
+  "linux_runtime_test_observation": {
+    "cargo_test_workspace_offline_exit_code": 0,
+    "cargo_clippy_workspace_all_targets_all_features_denied_warnings_exit_code": 0,
+    "python_pytest_all_passed": 543,
+    "cargo_fmt_all_check_exit_code": 0,
+    "git_diff_check_exit_code": 0
+  },
+  "native_matrix": {
+    "catalog_v11_native_files_watermarks_and_request_versions": true,
+    "shared_sql_join_keys_column_order_range_and_time_after_restart": true,
+    "native_table_cli_three_kinds_metadata_drop_and_restart": true,
+    "native_webui_http_namespaces_three_kinds_preview_and_restart": true,
+    "sdk_only_flight_examples_write_query_callbacks_and_restart": true,
+    "flight_short_session_snapshot_cleanup_capacity_reuse": true,
+    "public_examples_three_kinds_compute_and_restart_without_legacy_api": true,
+    "main_package_explicit_client_sql_aggregate_after_restart": true,
+    "flight_only_buffered_writer_lazy_plan_and_restart": true,
+    "independent_client_native_child_without_main_import": true,
+    "server_launch": "repository_binary",
+    "shared_temporal_strict_literals_and_exact_native_row_timestamps": true,
+    "shared_sql_query_budget_bytes": 4294967296,
+    "shared_sql_one_gib_join_budget_rejected": true,
+    "native_fixed_snapshots_three_kinds_schema_drop_and_restart": true,
+    "native_fixed_snapshot_scope_clones_and_session_refresh": true,
+    "native_fixed_snapshot_expiry_roles_and_capacity": true,
+    "empty_directory_create": true,
+    "default_native_storage_query_and_flight_without_feature_switches": true,
+    "native_restart_never_creates_legacy_registry": true,
+    "native_recovery_without_old_table_configuration_or_external_persist_root": true,
+    "native_compute_three_kinds_and_output_restart_recovery": true,
+    "native_compute_same_kernel_writer_epoch_and_lost_receipt_recovery": true,
+    "native_compute_kv_changelog_delete_reinsert_and_restart": true,
+    "native_compute_empty_source_schema_guard": true,
+    "native_compute_parquet_plugin_three_native_output_kinds": true,
+    "native_compute_chain_and_plain_producer_after_restart": true,
+    "native_finite_replay_examples_presubscription_and_output_after_stop": true,
+    "native_compute_rejects_same_name_replacement": true,
+    "native_callbacks_ack_restart_all_three_kinds": true,
+    "native_callbacks_reconnect_real_cancelled_transport": true,
+    "native_callback_same_handle_survives_server_restart": true,
+    "native_callback_rows_filter_latest_without_gateway": true,
+    "durable_ack_atomic_replay_all_three_kinds": true,
+    "durable_ack_lost_response_recovers_from_catalog": true,
+    "durable_group_single_member_and_restart": true,
+    "public_three_kind_drop_after_restart": true,
+    "drop_replay_after_restart": true,
+    "same_name_new_identity_recovers_after_restart": true,
+    "old_requests_and_cursors_cannot_attach_to_replacement": true,
+    "drop_rejects_read_role_and_stale_snapshot": true,
+    "drop_terminates_continuous_logs": true,
+    "flight_atomic_frames_and_mutations": true,
+    "flight_identity_bound_resume_after_delivery": true,
+    "flight_logs_across_repeated_server_starts": true,
+    "server_issued_local_read_sessions": true,
+    "legacy_session_header_rejected": true,
+    "native_state_recovery_across_server_restart": true,
+    "public_schema_evolution_all_three_kinds": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "native_matrix_boolean_true": 49,
+  "native_matrix_log_sha256": "8096a7541b190976bdbd5e5968d88b84cac917169e7cc224e89386436486ad53",
+  "platform": {
+    "system": "Linux",
+    "architecture": "x86_64",
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "python": "3.11.14",
+    "arrow": "23.0.1"
+  },
+  "source_sha256": {
+    "crates/zippy-master/src/server.rs": "4a3bb5fd8aff968e49292d5f7cb6b963dd9feb0e45a29422064d8c6fa5f3e55d",
+    "crates/zippy-master/src/registry.rs": "eb0080125f5e214339b2c9748f00ff936159eb3b009c8b377c4902e92a1e13ad",
+    "crates/zippy-master/tests/master_server.rs": "13056b418faf1d7abc433d5bde0cbd32708c98205a6403afa47928bcd32b93f9",
+    "docs/convergence-control-registry-bounds-2026-09-23.md": "f9b9dee6a5161544a8ac092445396b28b410144792e1915caac7e1155c688a5c",
+    "docs/single-node-server-runtime.md": "959e27295bc03ef2650a10ac5d3ccf9f300e091037a9bc408857df44845298ce"
+  },
+  "binaries": {
+    "server": {
+      "path": "target/debug/zippy-server",
+      "sha256": "8793b7d2f0410a61e9d11dcf8bd22978745d7ab4e73c99cb8c9a288d0ae2e568"
+    },
+    "python_extension": {
+      "path": "python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+      "sha256": "b6fd49eb2e98289bd8dbeeaa5165d100702be715fd2bd478f4e4d376a5437b2a"
+    }
+  },
+  "source_snapshot_note": "current-capabilities is a living guide; its later edits are excluded from this batch source digest"
+}

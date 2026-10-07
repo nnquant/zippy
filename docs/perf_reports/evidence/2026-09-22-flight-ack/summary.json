@@ -1,0 +1,271 @@
+{
+  "date": "2026-09-22",
+  "batch": 21,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F11"
+  ],
+  "new_findings_fixed": [
+    "F50",
+    "F51"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "catalog_directory_version": 9,
+  "validation": {
+    "rust_workspace": {
+      "passed": 1758,
+      "failed": 0,
+      "ignored": 10,
+      "result_blocks": 113,
+      "counting_note": "sum of complete stdout test-result lines; logging subprocess result blocks vary across runs; cargo exit status is authoritative"
+    },
+    "clippy": "workspace all-targets all-features -D warnings; passed",
+    "python": {
+      "passed": 734,
+      "skipped": 1,
+      "extension_rebuilt": true
+    },
+    "client_coverage": {
+      "passed": 124,
+      "percentage": 81.51,
+      "minimum": 80
+    },
+    "black": "86 files unchanged; passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "protocol_codegen": "--check; passed",
+    "mypy_configured": "root 14 and client 26 source files; passed",
+    "mypy_full": "Found 991 errors in 12 files (checked 85 source files); FAILED; F29 remains open",
+    "rust_initial_failure": "old server_binary_starts_native_gateway_when_enabled registration timed out after 5 seconds; isolated recheck and final workspace passed; exact transient cause unproven",
+    "arrow_versions": [
+      "23.0.1",
+      "25.0.1"
+    ],
+    "platform": "Linux x86_64 CPython 3.11; no new Windows/macOS acceptance",
+    "packaging": "standalone server and editable extension rebuilt; optional patchelf warning; no new clean sdist/wheel validation"
+  },
+  "acceptance": {
+    "public_flight_durable_log_capability": true,
+    "explicit_python_ack_api": true,
+    "catalog_only_committed_start": true,
+    "transport_rejects_forged_or_incomplete_delivery_ack": true,
+    "durable_sequence_and_boundary_survive_encoder_splitting": true,
+    "single_active_group_member": true,
+    "lost_real_commit_response_is_ambiguous_then_recovers_from_catalog": true,
+    "three_kinds_unacknowledged_delivery_replays_after_restart": true,
+    "recovered_wal_prefix_checkpoint_without_producer_reconnect": true,
+    "reversible_actor_quiescence_waits_for_rollback_or_precise_retirement_reason": true,
+    "schema_change_while_waiting_for_ack_is_explicit": true,
+    "new_schema_reopen_delivers_nullable_historical_columns_and_acknowledges": true,
+    "duplicate_wire_ack_while_idle_does_not_deadlock": true,
+    "structured_ack_rejection_on_request_writer_is_preserved": true,
+    "legacy_callback_migration": false,
+    "complete_unified_subscription_contract": false,
+    "key_value_subscription_throughput_accepted": false,
+    "native_local_compute_output": false
+  },
+  "native_client_matrix": {
+    "23.0.1": {
+      "empty_directory_create": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_six_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "23.0.1"
+    },
+    "25.0.1": {
+      "empty_directory_create": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_six_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "25.0.1"
+    }
+  },
+  "evidence": {
+    "workspace": {
+      "path": "/tmp/zippy-flight-ack-workspace.log",
+      "sha256": "16e496206d809c05e95db07afe24e03940d678f0e5a9d907968874df6e61388f"
+    },
+    "workspace-first-failure": {
+      "path": "/tmp/zippy-flight-ack-workspace-first-failure.log",
+      "sha256": "710963cf6ed32d178479104695982b7edcd995c7051e70a0cc62add9190441fc"
+    },
+    "gateway-recheck": {
+      "path": "/tmp/zippy-flight-ack-gateway-recheck.log",
+      "sha256": "de5a017081e5cc6a5e48f91ab5198e9746b8780df2387484f383b529334b1f11"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-flight-ack-clippy.log",
+      "sha256": "3036948ce30b15ef1eb95db5efc35e81f8f03ed3d502bbea9cb4f862de2e5c1b"
+    },
+    "maturin": {
+      "path": "/tmp/zippy-flight-ack-maturin.log",
+      "sha256": "40819ba307521ddb81198bfbd614be457b5101d4475fe7d1658e2e28f323c9d8"
+    },
+    "build": {
+      "path": "/tmp/zippy-flight-ack-build.log",
+      "sha256": "4030e547abd1735198834e8c14a235b1af18a2384d5d7701fb8d8950cbc53d96"
+    },
+    "native-client": {
+      "path": "/tmp/zippy-flight-ack-native-client.log",
+      "sha256": "8c251e960e00dae9c51b1667d1939df53955c881c23014cea8435d7ddae05676"
+    },
+    "arrow25": {
+      "path": "/tmp/zippy-flight-ack-arrow25.log",
+      "sha256": "cc6307a4b4c2f4d23762c332000aa5f9daeb9d8660a109df8c3d82bb78c3c189"
+    },
+    "python": {
+      "path": "/tmp/zippy-flight-ack-python.log",
+      "sha256": "42892a545bfd6af3b2d6b2e2351e18382270095c2dcf20bac102af25927515b3"
+    },
+    "client-coverage": {
+      "path": "/tmp/zippy-flight-ack-client-coverage.log",
+      "sha256": "e891025503d24abd78b1c18b4602483534be53f1235668d991a64fa93dfcaaa8"
+    },
+    "black": {
+      "path": "/tmp/zippy-flight-ack-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-flight-ack-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "mypy-configured": {
+      "path": "/tmp/zippy-flight-ack-mypy-configured.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "client-mypy": {
+      "path": "/tmp/zippy-flight-ack-client-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "mypy-full": {
+      "path": "/tmp/zippy-flight-ack-mypy-full.log",
+      "sha256": "53e95f51c2318a499c2e60f932178a876addd3daa3f543e1619f82e770c277a0"
+    },
+    "fmt": {
+      "path": "/tmp/zippy-flight-ack-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff": {
+      "path": "/tmp/zippy-flight-ack-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "codegen-check": {
+      "path": "/tmp/zippy-flight-ack-codegen-check.log",
+      "sha256": "8c9c53601a201d28e0798a33c44f86f8d39caa61d2b8074ee0436ad1fa2a1b89"
+    }
+  },
+  "server_binary_sha256": "440fbca8307d6b63d7f9d7d851df5ce54a71395e4b3c09aba2bfc7757dd4ef99",
+  "source_sha256": {
+    "crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto": "2abf04a0b72567b8d9063f16c26b5568b25f582513be9137db2ec8661b21923c",
+    "crates/zippy-protocol/src/log.rs": "528274e93cfd6aae33ce8bddb6fc72e35e68491a3c7ffe02d8f67317504b1e1b",
+    "crates/zippy-protocol/src/server.rs": "56ae8910b6ca7a094acfef7af38679f64993fa9ed92dacfd75e7c15f91f21930",
+    "crates/zippy-ingest/src/native.rs": "57563c3ef68681845a240ea7271440da17d8094fedab28b33ae63113ec469bf9",
+    "crates/zippy-ingest/src/actor.rs": "38c7e2f465d844c535685feea4df4ab99b7836b0bea6942ed0c79f7da2b8b92b",
+    "crates/zippy-server/src/consumer_log.rs": "9d8e7aa491404311652a1befaf73e5e04a798b82f96e16534d9ddec4050cefec",
+    "crates/zippy-server/src/native_log.rs": "6a191b8257d0ffe4c66925abf888dde53a5e335092441d1d42ab598fe361f8b6",
+    "crates/zippy-server/src/flight_query.rs": "a4adc56ae742c2ac90f2f09096f708673de3253bba2260dd728dd5188f8e2273",
+    "crates/zippy-server/src/runtime.rs": "498fe3b4cab3a4ab3a9102f2fa28ff6ad4bf82ea7f4a0e30493f3148b8bd7886",
+    "crates/zippy-server/src/query_service.rs": "62a34e82ea6a46c208ad9458b3db7d5a03064dac2a20d60c249d656d24696131",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "b9e22b9e3e52ef55f1da8148ca97398b5cac9db85b4b77c08f4815200dc2f9ab",
+    "clients/python/src/zippy_client/log_reader.py": "afc4a87e4155e8ba31ef032bf00bf557a1e63274563268330b4d7ca72224cc47",
+    "clients/python/src/zippy_client/client.py": "9a9b1a2859655b3d52b104e66bf5fcb8f2f635e58100e37c41db4d24904249af",
+    "clients/python/src/zippy_client/errors.py": "617a39351cb96dce2e4178febcab2e6564d9ec365f6462df3ed5fece2ac6f040",
+    "clients/python/src/zippy_client/__init__.py": "286e2f96bee781df0b19e0289fb5d9c497f1fbdf88c4773397ccc269ab8f1fb3",
+    "clients/python/src/zippy_client/transports/flight.py": "acaca00a71efa03a0be203bd319392271f1a80b42dc64a9c3a03db9589fc1ae7",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.py": "ee812b61d9479468dabac6d6a1116ab71f3184d4efa5fe868d6e4eef63ad1c10",
+    "clients/python/src/zippy_client/_generated/protocol_pb2.pyi": "f3f1a1c614e2169882a18f2e3780c64eb0f52772677ed73d3475836e783509d2",
+    "clients/python/tests/test_log_reader.py": "01a64fe26da5c50ce0b29e8678022915b383586414ec99a86b70d347daede7f0",
+    "clients/python/README.md": "453124e8431e85e719bf257cb1cca215a6480194dfe87eba0545bce5a99397e3",
+    "scripts/check_native_client.py": "991b160c07c53b671d3f9bffb8d0d21ed7e1548c77af00b66bb91e17780a92e3",
+    "docs/convergence-flight-ack-2026-09-22.md": "59863fc935f7284d0f096ef08fc4652a5d2a89577215fa04990f2f1ac284e775",
+    "docs/current-capabilities-2026-09-21.md": "558a80f7db40a57937a4de1addb5cd4caf7fd5cda0042914020ac7d328737aad",
+    "docs/architecture-convergence-audit-2026-09-18.md": "9b323d8cca8663fad3acc6840d203b541d9979943feadffce93c5ffcd27aba9e"
+  }
+}

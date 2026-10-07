@@ -1,14 +1,9 @@
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{
-    spawn_engine, Engine, EngineConfig, EngineMetricsSnapshot, LateDataPolicy, OverflowPolicy,
-    SegmentTableView, ZippyError,
-};
+use zippy_core::{Engine, SegmentTableView, ZippyError};
 use zippy_engines::{ReactiveInvalidValuePolicy, ReactiveStateEngine, ReactiveStateFailurePolicy};
 use zippy_operators::{
     CastSpec, ExpressionSpec, ReactiveFactor, ReactiveFactorContext, TsDiffSpec, TsEmaSpec,
@@ -640,33 +635,10 @@ fn reactive_engine_never_calls_factors_for_filtered_rows() {
     );
 }
 
-fn wait_for_filtered_rows(
-    handle: &zippy_core::EngineHandle,
-    expected: u64,
-) -> EngineMetricsSnapshot {
-    let deadline = Instant::now() + Duration::from_secs(1);
-
-    loop {
-        let metrics = handle.metrics();
-        if metrics.filtered_rows_total == expected {
-            return metrics;
-        }
-
-        if Instant::now() >= deadline {
-            panic!(
-                "filtered rows total did not reach expected value expected=[{}] actual=[{}]",
-                expected, metrics.filtered_rows_total
-            );
-        }
-
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
 #[test]
-fn reactive_engine_runtime_metrics_include_filtered_rows_total() {
+fn reactive_engine_kernel_metrics_include_filtered_rows_total() {
     let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
-    let engine = ReactiveStateEngine::new_with_id_filter(
+    let mut engine = ReactiveStateEngine::new_with_id_filter(
         "reactive",
         input_schema(),
         factors,
@@ -674,27 +646,18 @@ fn reactive_engine_runtime_metrics_include_filtered_rows_total() {
         Some(vec!["A".to_string()]),
     )
     .unwrap();
-    let mut handle = spawn_engine(
-        engine,
-        EngineConfig {
-            name: "reactive".to_string(),
-            buffer_capacity: 16,
-            overflow_policy: OverflowPolicy::Block,
-            late_data_policy: LateDataPolicy::Reject,
-            xfast: false,
-        },
-    )
-    .unwrap();
-
-    handle
-        .write(record_batch(vec!["A", "B"], vec![10.0, 20.0]))
+    engine
+        .on_data(SegmentTableView::from_record_batch(record_batch(
+            vec!["A", "B"],
+            vec![10.0, 20.0],
+        )))
         .unwrap();
-    let metrics = wait_for_filtered_rows(&handle, 1);
+    let metrics = engine.drain_metrics();
 
     assert_eq!(metrics.filtered_rows_total, 1);
-    assert_eq!(metrics.processed_rows_total, 2);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 0);
 
-    handle.stop().unwrap();
+    engine.on_flush().unwrap();
 }
 
 #[test]
@@ -741,10 +704,12 @@ impl zippy_operators::ReactiveFactor for PanicOnUnexpectedIdFactor {
         Field::new("guard", DataType::Float64, false)
     }
 
-    fn evaluate(&mut self, batch: &RecordBatch) -> zippy_core::Result<ArrayRef> {
-        let index = batch.schema().index_of(&self.id_field).unwrap();
-        let ids = batch
-            .column(index)
+    fn evaluate_with_context(
+        &mut self,
+        ctx: &ReactiveFactorContext<'_>,
+    ) -> zippy_core::Result<ArrayRef> {
+        let ids = ctx
+            .column_by_name(&self.id_field)?
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
@@ -763,7 +728,7 @@ impl zippy_operators::ReactiveFactor for PanicOnUnexpectedIdFactor {
 
         self.seen_ids.lock().unwrap().push(seen);
 
-        Ok(Arc::new(Float64Array::from(vec![0.0; batch.num_rows()])) as ArrayRef)
+        Ok(Arc::new(Float64Array::from(vec![0.0; ctx.num_rows()])) as ArrayRef)
     }
 }
 
@@ -774,7 +739,10 @@ impl ReactiveFactor for WrongLengthFactor {
         Field::new("bad_length", DataType::Float64, false)
     }
 
-    fn evaluate(&mut self, batch: &RecordBatch) -> zippy_core::Result<ArrayRef> {
-        Ok(Arc::new(Float64Array::from(vec![1.0; batch.num_rows() + 1])) as ArrayRef)
+    fn evaluate_with_context(
+        &mut self,
+        ctx: &ReactiveFactorContext<'_>,
+    ) -> zippy_core::Result<ArrayRef> {
+        Ok(Arc::new(Float64Array::from(vec![1.0; ctx.num_rows() + 1])) as ArrayRef)
     }
 }

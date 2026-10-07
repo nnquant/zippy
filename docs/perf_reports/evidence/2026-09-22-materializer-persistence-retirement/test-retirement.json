@@ -1,0 +1,134 @@
+{
+  "retired_or_migrated": [
+    {
+      "file": "crates/zippy-engines/src/stream_table.rs",
+      "test": "retention_releases_completed_identities_with_their_segments",
+      "action": "migrated",
+      "replacement": "native_manifest_prefix_retires_only_complete_durable_segments",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_does_not_block_on_persist_publisher_after_rollover",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_forwards_descriptor_and_persists_source_rows",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_partitions_persisted_parquet_by_dt_part_and_id",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_persists_sealed_segment_and_publishes_metadata",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_metadata_publish_failure_keeps_local_persist_committed",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_metadata_publish_failure_publishes_queryable_error_event",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_persist_collision_fails_without_replacing_existing_parquet",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_persist_commit_snapshot_tracks_pending_writing_and_committed_segments",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_persist_metadata_carries_writer_epoch",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_persist_partition_rejects_legacy_dt_part_format",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_persist_retries_transient_publish_failure_before_commit",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_retention_waits_for_persist_commit_before_trimming_sealed_segments",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_stop_persists_active_segment_and_publishes_metadata",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_stop_persists_active_segment_when_descriptor_publish_fails",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_writer_restart_keeps_both_epochs_physical_and_queryable",
+      "action": "retired",
+      "replacement": "native WAL, PersistController, TableActor and SQLite manifest recovery",
+      "reason": "retire obsolete worker-specific persistence contract while retaining native durability and mmap ownership"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-engines/src/stream_table.rs",
+      "test": "native_manifest_prefix_retires_only_complete_durable_segments"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "native_durable_prefix_waits_for_pinned_reader_before_reclaiming_segment"
+    }
+  ],
+  "retired_test_names": 15,
+  "migrated_test_names": 1,
+  "retained_boundaries": [
+    "native manifest prefix retires only complete segments",
+    "pinned readers delay physical reclamation",
+    "atomic nullable frame and oversize rejection remain tested",
+    "native three-kind WAL/Persisted writes, subscriptions and compute survive restart"
+  ]
+}

@@ -20,9 +20,8 @@ pub const CURRENT_LOGICAL_PLAN_FORMAT_VERSION: u32 = 1;
 
 /// A versioned, non-empty Zippy logical-plan payload.
 ///
-/// Format version 1 is reserved for the native Zippy protobuf plan. Migration
-/// adapters may allocate a distinct version for a compatibility codec; an
-/// engine must reject every version it does not explicitly implement.
+/// Format version 1 is the native Zippy protobuf plan. Engines reject every
+/// version they do not explicitly implement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LogicalPlanEnvelope {
     format_version: u32,

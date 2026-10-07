@@ -191,7 +191,7 @@ fn cross_sectional_context_ranks_match_existing_tie_policy() {
 }
 
 #[test]
-fn cross_sectional_context_evaluation_matches_legacy_evaluate() {
+fn cross_sectional_context_evaluation_preserves_nulls_and_ranks() {
     let input = nullable_batch(vec![Some(1.0), None, Some(3.0)]);
     let mut context = CrossSectionalFactorContext::new(&input);
     let mut rank = CSRankSpec::new("ret_1m", "ret_rank").build().unwrap();
@@ -202,20 +202,13 @@ fn cross_sectional_context_evaluation_matches_legacy_evaluate() {
     let zscore_context = zscore.evaluate_with_context(&mut context).unwrap();
     let demean_context = demean.evaluate_with_context(&mut context).unwrap();
 
-    let mut legacy_rank = CSRankSpec::new("ret_1m", "ret_rank").build().unwrap();
-    let mut legacy_zscore = CSZscoreSpec::new("ret_1m", "ret_z").build().unwrap();
-    let mut legacy_demean = CSDemeanSpec::new("ret_1m", "ret_dm").build().unwrap();
-
-    assert_float_options_eq(
-        &float_values(&rank_context),
-        &float_values(&legacy_rank.evaluate(&input).unwrap()),
-    );
+    assert_float_options_eq(&float_values(&rank_context), &[Some(1.0), None, Some(2.0)]);
     assert_float_options_eq(
         &float_values(&zscore_context),
-        &float_values(&legacy_zscore.evaluate(&input).unwrap()),
+        &[Some(-1.0), None, Some(1.0)],
     );
     assert_float_options_eq(
         &float_values(&demean_context),
-        &float_values(&legacy_demean.evaluate(&input).unwrap()),
+        &[Some(-1.0), None, Some(1.0)],
     );
 }

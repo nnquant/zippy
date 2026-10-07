@@ -1,4 +1,4 @@
-"""Pure-Python Master control client used for discovery and SHM leases."""
+"""Pure-Python control discovery and process lease client."""
 
 from __future__ import annotations
 
@@ -10,7 +10,13 @@ from typing import Any
 from loguru import logger
 
 from .endpoints import ControlEndpoint, split_host_port
-from .errors import ProtocolError, ZippyConnectionError, ZippyClientError
+from .errors import (
+    AuthenticationError,
+    ProtocolError,
+    ServerError,
+    ZippyConnectionError,
+    ZippyClientError,
+)
 
 _MAX_CONTROL_RESPONSE_BYTES = 64 * 1024 * 1024
 
@@ -63,19 +69,6 @@ class ControlClient:
         response = self._request("GetConfig", {})
         return dict(self._expect(response, "ConfigFetched").get("config", {}))
 
-    def list_streams(self, *, status: bool = False) -> list[dict[str, Any]]:
-        """Return stream metadata known by Master."""
-        verb = "ListStreamStatuses" if status else "ListStreams"
-        response = self._request(verb, {})
-        payload = self._expect(response, "StreamsListed")
-        return [dict(item) for item in payload.get("streams", [])]
-
-    def get_stream(self, source: str, *, status: bool = True) -> dict[str, Any]:
-        """Return metadata for one stream."""
-        verb = "GetStreamStatus" if status else "GetStream"
-        response = self._request(verb, {"stream_name": str(source)})
-        return dict(self._expect(response, "StreamFetched").get("stream", {}))
-
     def ensure_registered(self, app: str = "zippy_client") -> str:
         """Create a process lease and start its heartbeat thread if needed."""
         with self._registration_lock:
@@ -102,44 +95,6 @@ class ControlClient:
             {"process_id": process_id, "process_token": process_token},
         )
         self._expect(response, "HeartbeatAccepted")
-
-    def acquire_segment_reader_lease(
-        self,
-        source: str,
-        segment_id: int,
-        generation: int,
-    ) -> str:
-        """Acquire a Master-owned lease protecting one SHM segment."""
-        process_id, process_token = self._require_process()
-        response = self._request(
-            "AcquireSegmentReaderLease",
-            {
-                "stream_name": str(source),
-                "process_id": process_id,
-                "process_token": process_token,
-                "source_segment_id": int(segment_id),
-                "source_generation": int(generation),
-            },
-        )
-        payload = self._expect(response, "SegmentReaderLeaseAcquired")
-        lease_id = str(payload.get("lease_id", ""))
-        if not lease_id:
-            raise ProtocolError("master segment reader lease response is missing lease_id")
-        return lease_id
-
-    def release_segment_reader_lease(self, source: str, lease_id: str) -> None:
-        """Release one previously acquired SHM reader lease."""
-        process_id, process_token = self._require_process()
-        response = self._request(
-            "ReleaseSegmentReaderLease",
-            {
-                "stream_name": str(source),
-                "process_id": process_id,
-                "process_token": process_token,
-                "lease_id": str(lease_id),
-            },
-        )
-        self._expect(response, "SegmentReaderLeaseReleased")
 
     def close(self) -> None:
         """Stop heartbeats and release the active process lease."""
@@ -188,12 +143,18 @@ class ControlClient:
             raise ProtocolError("master control response must be a JSON object")
         if "Error" in response:
             error_payload = response["Error"]
-            reason = (
-                error_payload.get("reason", "master control request failed")
-                if isinstance(error_payload, dict)
-                else str(error_payload)
-            )
-            raise ZippyClientError(f"master control request failed verb=[{verb}] reason=[{reason}]")
+            if not isinstance(error_payload, dict):
+                raise ProtocolError("control error must be a structured object")
+            code = error_payload.get("code")
+            retryable = error_payload.get("retryable")
+            reason = error_payload.get("reason")
+            if not isinstance(code, str) or not code or not isinstance(retryable, bool):
+                raise ProtocolError("control error requires a code and explicit retryable flag")
+            if not isinstance(reason, str):
+                raise ProtocolError("control error requires a diagnostic reason")
+            if code in {"UNAUTHENTICATED", "PERMISSION_DENIED"}:
+                raise AuthenticationError(reason)
+            raise ServerError(code, reason, retryable=retryable)
         return response
 
     def _connect(self) -> socket.socket:

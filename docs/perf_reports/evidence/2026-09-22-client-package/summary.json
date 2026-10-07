@@ -1,0 +1,251 @@
+{
+  "date": "2026-09-22",
+  "batch": 24,
+  "overall_complete": false,
+  "audit_closed_total": 25,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F22",
+    "F28"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "removed_files": [
+    "crates/zippy-client-py/Cargo.toml",
+    "crates/zippy-client-py/build.rs",
+    "crates/zippy-client-py/src/lib.rs",
+    "clients/python/src/zippy_client/_shm.pyi"
+  ],
+  "acceptance": {
+    "standalone_client_has_no_rust_build_or_runtime_extension": true,
+    "source_and_wheel_archives_exclude_retired_native_artifacts": true,
+    "typed_protocol_files_retained": true,
+    "isolated_client_import_without_zippy_or_shm": true,
+    "independent_installed_client_suite_preserves_80_percent_gate": true,
+    "real_tcp_discovery_and_flight_query_contract_without_zippy": true,
+    "full_distribution_native_server_matrix": {
+      "empty_directory_create": true,
+      "native_compute_three_kinds_and_output_restart_recovery": true,
+      "native_compute_rejects_same_name_replacement": true,
+      "native_callbacks_ack_restart_all_three_kinds": true,
+      "native_callbacks_reconnect_real_cancelled_transport": true,
+      "native_callback_same_handle_survives_server_restart": true,
+      "native_callback_rows_filter_latest_without_gateway": true,
+      "durable_ack_atomic_replay_all_three_kinds": true,
+      "durable_ack_lost_response_recovers_from_catalog": true,
+      "durable_group_single_member_and_restart": true,
+      "public_three_kind_drop_after_restart": true,
+      "drop_replay_after_restart": true,
+      "same_name_new_identity_recovers_after_restart": true,
+      "old_requests_and_cursors_cannot_attach_to_replacement": true,
+      "drop_rejects_read_role_and_stale_snapshot": true,
+      "drop_terminates_continuous_logs": true,
+      "flight_atomic_frames_and_mutations": true,
+      "flight_identity_bound_resume_after_delivery": true,
+      "flight_logs_across_six_starts": true,
+      "server_issued_local_read_sessions": true,
+      "legacy_session_header_rejected": true,
+      "native_state_recovery_across_server_restart": true,
+      "public_schema_evolution_all_three_kinds": true,
+      "atomic_key_value_snapshot_cursor": true,
+      "key_value_recovered": {
+        "symbol": [],
+        "price": []
+      },
+      "deleted_state_cursor_recovered": {
+        "sequence": 10,
+        "version": 6
+      },
+      "frame_rows_recovered": [
+        10,
+        null,
+        12
+      ],
+      "namespace": "market",
+      "durabilities": [
+        "wal",
+        "persisted"
+      ],
+      "recovered_values": [
+        42,
+        43
+      ],
+      "idempotent_after_restart": true,
+      "arrow_version": "25.0.1"
+    },
+    "ci_os_python_arrow_matrix_configured": true,
+    "windows_macos_python314_executed_here": false,
+    "master_gateway_and_main_package_retirement_complete": false
+  },
+  "validation": {
+    "rust_workspace": {
+      "passed": 1760,
+      "failed": 0,
+      "ignored": 10,
+      "result_blocks": 110,
+      "counting_note": "stdout includes nested processes; cargo exit 0 is authoritative"
+    },
+    "python": {
+      "passed": 788,
+      "skipped": 1
+    },
+    "isolated_client_matrix": {
+      "23.0.1": {
+        "passed": 159,
+        "skipped": 1,
+        "coverage_percentage": 80.3,
+        "skip_reason": "full-package Master/Gateway integration module requires zippy"
+      },
+      "25.0.1": {
+        "passed": 159,
+        "skipped": 1,
+        "coverage_percentage": 80.3,
+        "skip_reason": "full-package Master/Gateway integration module requires zippy"
+      }
+    },
+    "clippy": "workspace all-targets all-features -D warnings passed",
+    "black": "89 files passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "uv_lock_check": "offline --check passed",
+    "diff_check": "passed",
+    "mypy_configured": "root 15/client 27/script 1 files passed",
+    "mypy_full": "Found 991 errors in 12 files (checked 88 source files); FAILED; F29 open",
+    "build_backends": {
+      "zippy": "maturin==1.12.6",
+      "zippy-client": "setuptools==83.0.0"
+    },
+    "platform_executed": "Linux x86_64 CPython 3.11.14"
+  },
+  "test_race_repairs": {
+    "gateway": "10ms budget also applied to Master RPC setup; changed test to bounded 250ms and retained socket timeout/release assertions; original response error was not captured, so exact failure code unproven",
+    "zmq": "replace fixed sleep readiness assumption with distinguishable stateless probes; business batch published once; failure cleanup always runs"
+  },
+  "evidence": {
+    "workspace": {
+      "path": "/tmp/zippy-client-package-workspace.log",
+      "sha256": "057a7f668b10317da1bbf9b14f48bb08cd3ccef4fca4b3a4eeaf19da36627614"
+    },
+    "workspace-first": {
+      "path": "/tmp/zippy-client-package-workspace-first.log",
+      "sha256": "f856c374a2a4d4cef9dfe545adbe6979eedf9968f280de7a9ca96f5abf0fcdf9"
+    },
+    "python": {
+      "path": "/tmp/zippy-client-package-python.log",
+      "sha256": "f8cf9e2dbbf22aa924c47b491e32e5178eccb28b4e51ed6f818ecec99dab5b84"
+    },
+    "python-first": {
+      "path": "/tmp/zippy-client-package-python-first.log",
+      "sha256": "b448438aac441cfc9e89a4ce1f4079e3feee9caf020fdb721b13c91293159b00"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-client-package-clippy.log",
+      "sha256": "8a9e5c476938711b84ec1e23ef7b0d1b38a31f190a52f4b3f5330a0d019f1d77"
+    },
+    "cargo-check": {
+      "path": "/tmp/zippy-client-package-cargo-check.log",
+      "sha256": "5ad8c590f29fa00b6f436d848c32819476695f167697f632be307a7df28d3a54"
+    },
+    "only23-accepted": {
+      "path": "/tmp/zippy-client-package-only23-accepted.log",
+      "sha256": "c1bd9db4c6c8747ff13e4bf6c2d575e965dda62c7e017c1e76fcf29425ed3543"
+    },
+    "only25-accepted": {
+      "path": "/tmp/zippy-client-package-only25-accepted.log",
+      "sha256": "05f201ba93555fd4a3b0e26d686756c4a744c301a31e99cf2fd5052ad287c0b0"
+    },
+    "distributions-accepted": {
+      "path": "/tmp/zippy-client-package-distributions-accepted.log",
+      "sha256": "e53c3fa5e43b13f026e0b3bb69330f28c900e1fe104663fef6fd6501e4cfe50d"
+    },
+    "query-unit": {
+      "path": "/tmp/zippy-client-package-query-unit.log",
+      "sha256": "45e2eca47832f37e1109b2170e3ead3e774952828927850b6c549a3c0c2f22c4"
+    },
+    "gateway-regression": {
+      "path": "/tmp/zippy-client-package-gateway-regression.log",
+      "sha256": "e6241bc181e6850705b09fcbe469560dab7da68c6c970779094718468646e8d3"
+    },
+    "zmq-regression": {
+      "path": "/tmp/zippy-client-package-zmq-regression.log",
+      "sha256": "829214ea2aebf4eb898c3168621357f5a2e504b0c1ccbe07fd0d73964e3e76eb"
+    },
+    "mypy-full": {
+      "path": "/tmp/zippy-client-package-mypy-full.log",
+      "sha256": "b9039aafd3dfb3fd2c868affb84810a8d05012087614c51c58314260032ed17c"
+    },
+    "mypy-configured": {
+      "path": "/tmp/zippy-client-package-mypy-configured.log",
+      "sha256": "fc409d91e6c781eb25a1ec1310b7fcb0086b74ed3aa2c415bcd73f884f23f07a"
+    },
+    "client-mypy": {
+      "path": "/tmp/zippy-client-package-client-mypy.log",
+      "sha256": "843649a0230c7553c8b57e66c604afb1635f102a7f73c9dd914713d9f01fff0f"
+    },
+    "script-mypy": {
+      "path": "/tmp/zippy-client-package-script-mypy.log",
+      "sha256": "5d4b6d285b77932e3d08212c3b4974d0a803f98ec60408ac6ccf6a063fa6c19e"
+    },
+    "black": {
+      "path": "/tmp/zippy-client-package-black.log",
+      "sha256": "093f58285abd61858579d66dd1cbf24994ba595a12ccc6ddc48b75af5617ef78"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-client-package-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "fmt": {
+      "path": "/tmp/zippy-client-package-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff": {
+      "path": "/tmp/zippy-client-package-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "uv-check": {
+      "path": "/tmp/zippy-client-package-uv-check.log",
+      "sha256": "c05b0b86b1ec887cc29ba5945156dfba23a11eaff07562ddc4b71ef45182813b"
+    }
+  },
+  "artifacts": {
+    "/tmp/zippy-client-pure-distributions-accepted/server/zippy-0.5.0.tar.gz": {
+      "bytes": 1767227,
+      "sha256": "53215334b926ca0f9b943d56e094d1c5f822fccebe5ae57964ce5bc2ca5e6398"
+    },
+    "/tmp/zippy-client-pure-distributions-accepted/client/zippy_client-0.1.0.tar.gz": {
+      "bytes": 119316,
+      "sha256": "ab71a5f6cbfae9a26d0bc17bc93cc4d72e6a28876f70e84f7dabc9af66fd96ca"
+    },
+    "/tmp/zippy-client-pure-distributions-accepted/wheels/zippy-0.5.0-cp311-cp311-linux_x86_64.whl": {
+      "bytes": 39232512,
+      "sha256": "4453ba22d05209860560606a7b15d3ba4b18017feb71ab75830b1e14731252fb"
+    },
+    "/tmp/zippy-client-pure-distributions-accepted/wheels/zippy_client-0.1.0-py3-none-any.whl": {
+      "bytes": 86924,
+      "sha256": "01e6f6fe2a95257297f37b04882bc906bfd55a86fcc161e30d875cc547232cfb"
+    }
+  },
+  "source_sha256": {
+    "Cargo.toml": "84649eb61141d5aa076b3ab74a8561ccac3dea0e822414fb8b51674fed44c3f0",
+    "Cargo.lock": "68ee99d0624d10ece8402d569f02b8ece108e5cf79e0a6e985758d720c0ce017",
+    "pyproject.toml": "2124b9c1d85885f04a9ffb03257546d017a693754a688e0d59c22dfee3e5a71e",
+    "uv.lock": "827e149efcb6664404169e7bfe1f29eeb0232c3b3216ca665b956c147ee01735",
+    ".github/workflows/ci.yml": "04082b9fe6356d926e0b145e337fd692a918afbd7d33cf0af705df06f6150c38",
+    ".gitignore": "001d7b3edb3a22ea3d20134bb974463c2d883781b57d9637ed46e798fbe8f496",
+    "clients/python/pyproject.toml": "d01c746360fc0f2c65baf064c5b4ed26ccc11b0535ae9bb8805598b36cd0bfe0",
+    "clients/python/src/zippy_client/control.py": "1274c9c7c7c944ea8a5d8c33a18ab320967517b3d4a320b87807ff2b31da0283",
+    "clients/python/tests/test_flight_transport.py": "05b59b4540995231a0ae8c0c8e25c4a7728e10e108a9bef74da4b892d195af8c",
+    "scripts/check_distributions.py": "a9b5e1e881517cdf4faae12d22af90752746befb505bd47bb749518a78f54271",
+    "crates/zippy-gateway/tests/native_gateway.rs": "0f266ca3b2cacf078280d97a495d616d620976757e3cae5c7766a42b75a14947",
+    "pytests/test_python_api.py": "4f264469c23f9ed3b55eddbe3636fa4ec3f5187bda1839afa868038981593cc7"
+  }
+}

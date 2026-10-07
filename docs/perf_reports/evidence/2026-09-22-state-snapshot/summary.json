@@ -1,0 +1,165 @@
+{
+  "date": "2026-09-22",
+  "batch": 7,
+  "overall_complete": false,
+  "audit_closed_total": 21,
+  "closed_this_batch": [
+    "F12"
+  ],
+  "advanced_this_batch": [
+    "F16"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "closure_basis": {
+    "F12": "All three native table kinds now implement creation, mutation, pinned single-query snapshots, persistence and restart recovery; native key-value state plus cursor has a public Flight RPC."
+  },
+  "validation": {
+    "rust_workspace": "passed; verified process exit 0",
+    "rust_test_count": "not aggregated: logging subprocess result lines interleave",
+    "snapshot_and_result_ownership_test": "passed; final source after field-drop-order review",
+    "main_python_passed": 605,
+    "main_python_skipped": 1,
+    "client_passed": 95,
+    "client_coverage_percent": 81.11,
+    "client_mypy_checked_files": 25,
+    "clippy": "passed",
+    "rustfmt": "passed",
+    "ruff": "passed",
+    "black": "passed",
+    "protocol_generation": "passed",
+    "full_repository_mypy": "not rerun; unresolved debt remains",
+    "platform": "Linux x86_64, CPython 3.11, Arrow 23.0.1"
+  },
+  "acceptance": {
+    "empty_directory_create": true,
+    "atomic_key_value_snapshot_cursor": true,
+    "key_value_recovered": {
+      "symbol": [],
+      "price": []
+    },
+    "deleted_state_cursor_recovered": {
+      "sequence": 10,
+      "version": 6
+    },
+    "frame_rows_recovered": [
+      10,
+      null,
+      12
+    ],
+    "namespace": "market",
+    "durabilities": [
+      "wal",
+      "persisted"
+    ],
+    "recovered_values": [
+      42,
+      43
+    ],
+    "idempotent_after_restart": true,
+    "arrow_version": "23.0.1"
+  },
+  "evidence": {
+    "rust_workspace": {
+      "path": "/tmp/zippy-state-workspace.log",
+      "sha256": "6a0f101cde150443c89716312eaf80501308489ac3bc39c3e916eae2123ec8c7"
+    },
+    "native_snapshot_and_owner_supplement": {
+      "path": "/tmp/zippy-state-native-test-final.log",
+      "sha256": "7c4b6ced296cabfe8e0078a7a99d141ce1db9d1ef8abe63294b9d5ca3734590d"
+    },
+    "rust_clippy": {
+      "path": "/tmp/zippy-state-clippy.log",
+      "sha256": "d2b8f7b005183533bdd7056ce9914fd4c398df4e1d5bd3ce9b42269d7b46f108"
+    },
+    "rust_server_clippy_supplement": {
+      "path": "/tmp/zippy-state-server-clippy-final.log",
+      "sha256": "f436a5746e0e222533ea0f7ea84faeec07263de810f068fcabd50bc6b03b04fa"
+    },
+    "client": {
+      "path": "/tmp/zippy-state-client.log",
+      "sha256": "5f5eee4b141e15df90cf8a642e5f784a2249691104cd087ba368abea442a666e"
+    },
+    "main_python": {
+      "path": "/tmp/zippy-state-main-suite.log",
+      "sha256": "98acc2380581724d5ea519ac081283423eb3ad22cd83558d6ee530a963bc208f"
+    },
+    "client_mypy": {
+      "path": "/tmp/zippy-state-mypy.log",
+      "sha256": "521e53066a363ec69a3862127d20de642114463485e6923ba593c38250537f8d"
+    },
+    "python_ruff": {
+      "path": "/tmp/zippy-state-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "python_black": {
+      "path": "/tmp/zippy-state-black.log",
+      "sha256": "6978d2c2b7bbc1394f3127357ad3a17d705f93407f73eac732501d044134c9e8"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-state-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_whitespace": {
+      "path": "/tmp/zippy-state-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "protocol_generation": {
+      "path": "/tmp/zippy-state-protocol-check.log",
+      "sha256": "d95768f13aa7a2ff1c328bc31b9f342ba668010085859d1597b5f7c2b4aa8174"
+    },
+    "main_extension_build": {
+      "path": "/tmp/zippy-state-main-build.log",
+      "sha256": "cef84735787223a156afb08a405b48c7aa1e8152a50982639d8a95ddf5a6f699"
+    },
+    "server_build": {
+      "path": "/tmp/zippy-state-server-build-final.log",
+      "sha256": "a41051563a4cb5fc1b1bcdd9aa0ba28ca80f7736d629d90cc138218756e8e3a9"
+    },
+    "real_four_start_acceptance": {
+      "path": "/tmp/zippy-state-native-client-final.log",
+      "sha256": "bef6fdeae7df44a628d45709c4e8e44011136653bfcef7738d862df2e02158fe"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-protocol/proto/zippy/flight/v1/protocol.proto": "6d345f971096fc09dc0aae390a1a18f41c4ce9be4827122484f99cd51dabe498",
+    "crates/zippy-protocol/src/query.rs": "46dca3656137d031626b0aa5ebf143538bee3bcb2bf02cdfb6e94b2550763e38",
+    "crates/zippy-protocol/src/server.rs": "edccef1d0300b45536410c3c2ef98e86e47e2f1186b6f37b6c869e69ce2dd7f5",
+    "crates/zippy-server/src/native_query.rs": "3235ca8182ec72f9bfad5488974031b5a64e5e410e443eff6dd3b7081c853388",
+    "crates/zippy-server/src/query_snapshot.rs": "278c130e0066c7da8c2c4b497b4fa32a50b657593a3c575af63c87fd5eb9b2eb",
+    "crates/zippy-server/src/flight_query.rs": "27fe1722b89dffebea75fa37ada379162ed856edc4957166a10c262a797995c1",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "c196df7a70f16df176a688be0bbc5d8fccfc053b6ce3a8d9ac419567aa8d383c",
+    "crates/zippy-types/src/key_value.rs": "8e3ba82d45f5bf929f7c5371398c7d19321bdefd0666156eaee3cda49d3f558f",
+    "crates/zippy-engines/src/key_value_state.rs": "0cfe5bbd26f94dd535571e5dabe77b943ddb2b4524879a14793491fa38651d59",
+    "clients/python/src/zippy_client/client.py": "e3402329f9c1b40ba60b0bba31e08577005b1a90fdda5f17eaf696614817bd67",
+    "clients/python/src/zippy_client/transports/flight.py": "eee4650ad0c1805eff20b21b27ae9ea24e9b63f316a3c165cac3131c46a1ed6e",
+    "clients/python/tests/test_flight_transport.py": "419bf93fcae82ac3893e9213e73d84e931f47923dc59e5cf77536878e315d8c1",
+    "pytests/test_key_value_state.py": "0c6b0dd6bb1bd05a511807ce551ea143d9d320b835971893c24c96b117218d85",
+    "scripts/check_native_client.py": "9a8669fc1c9ad543a7b977c0a155425a1acd8b1010d3ecacedb30456b1ef1626"
+  },
+  "still_open": [
+    "native Flight continuous subscription and gap recovery",
+    "StateSubscription integration",
+    "native compaction",
+    "alter/drop",
+    "local compute engine integration",
+    "cross-query snapshot leases",
+    "single authoritative Catalog and new data root",
+    "legacy path removal",
+    "full Python type checks",
+    "platform matrix"
+  ]
+}

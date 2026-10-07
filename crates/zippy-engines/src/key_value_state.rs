@@ -1,7 +1,6 @@
 //! Atomic, explicitly requested keyed snapshots and incremental consumer state.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::compute::concat_batches;
@@ -11,14 +10,10 @@ use zippy_core::{Result, SegmentTableView, ZippyError};
 
 use crate::latest_state::LatestColumnarState;
 
-pub(crate) const SEQ: &str = "_zippy_kv_seq";
-pub(crate) const OP: &str = "_zippy_kv_op";
-pub(crate) const VERSION: &str = "_zippy_kv_snapshot_version";
-pub(crate) const BATCH_END: &str = "_zippy_kv_batch_last_seq";
-pub(crate) const STREAM_ID: &str = "_zippy_kv_stream_id";
+use zippy_types::key_value::{BATCH_END, OPERATION as OP, SEQUENCE as SEQ, STREAM_ID, VERSION};
 const PROTOCOL: &str = "2";
 
-pub(crate) struct SnapshotState {
+struct SnapshotState {
     pub latest: LatestColumnarState,
     pub sequence: u64,
     pub version: u64,
@@ -32,7 +27,7 @@ impl SnapshotState {
             return Err(invalid("key-value state requires a fresh snapshot"));
         }
         let batch = self.latest.materialize_snapshot()?;
-        let mut metadata = HashMap::new();
+        let mut metadata = batch.schema().metadata().clone();
         metadata.insert("zippy_kv_protocol".into(), PROTOCOL.into());
         metadata.insert("zippy_kv_seq".into(), self.sequence.to_string());
         metadata.insert("zippy_kv_version".into(), self.version.to_string());
@@ -51,20 +46,6 @@ impl SnapshotState {
     }
 }
 
-/// Shared snapshot capability; data and cursor are captured under the same producer lock.
-#[derive(Clone)]
-pub struct KeyValueSnapshotHandle(pub(crate) Arc<Mutex<SnapshotState>>);
-
-impl KeyValueSnapshotHandle {
-    /// Materializes a full snapshot only on explicit request. Metadata carries the delta cursor.
-    pub fn snapshot(&self) -> Result<RecordBatch> {
-        self.0
-            .lock()
-            .map_err(|_| invalid("key-value producer lock poisoned"))?
-            .snapshot()
-    }
-}
-
 /// Batch-oriented consumer with bounded fragment assembly and fail-closed continuity checks.
 ///
 /// Bootstrap using an atomic producer snapshot, then apply unfiltered deltas. A failed apply
@@ -74,6 +55,7 @@ pub struct KeyValueState {
     schema: SchemaRef,
     pending: Vec<RecordBatch>,
     pending_end: u64,
+    pending_delete: bool,
     received: u64,
     pending_bytes: usize,
     max_pending_bytes: usize,
@@ -113,7 +95,20 @@ impl KeyValueState {
         }
         let keys: Vec<String> = serde_json::from_str(get("zippy_kv_keys")?)
             .map_err(|_| invalid("invalid snapshot key metadata"))?;
-        let schema = Arc::new(Schema::new(schema.fields().clone()));
+        let mut logical_metadata = metadata.clone();
+        for name in [
+            "zippy_kv_protocol",
+            "zippy_kv_seq",
+            "zippy_kv_version",
+            "zippy_kv_stream_id",
+            "zippy_kv_keys",
+        ] {
+            logical_metadata.remove(name);
+        }
+        let schema = Arc::new(Schema::new_with_metadata(
+            schema.fields().clone(),
+            logical_metadata,
+        ));
         let mut latest = LatestColumnarState::new(Arc::clone(&schema), keys)?;
         latest.apply_batch(&SegmentTableView::from_record_batch(
             RecordBatch::try_new(Arc::clone(&schema), snapshot.columns().to_vec())
@@ -133,6 +128,7 @@ impl KeyValueState {
             schema,
             pending: Vec::new(),
             pending_end: 0,
+            pending_delete: false,
             received: sequence,
             pending_bytes: 0,
             max_pending_bytes,
@@ -202,11 +198,12 @@ impl KeyValueState {
                 || seq.value(row) <= 0
                 || version.value(row) <= 0
                 || end.value(row) < seq.value(row)
-                || op.value(row) != "upsert"
+                || !matches!(op.value(row), "upsert" | "delete")
             {
                 return Err(invalid("invalid delta identity, operation, or boundary"));
             }
             let sequence = seq.value(row) as u64;
+            let is_delete = op.value(row) == "delete";
             if sequence <= self.state.sequence {
                 if version.value(row) as u64 > self.state.version
                     || end.value(row) as u64 > self.state.sequence
@@ -223,9 +220,10 @@ impl KeyValueState {
             }
             if self.pending_end == 0 {
                 self.pending_end = end.value(row) as u64;
+                self.pending_delete = is_delete;
             }
-            if end.value(row) as u64 != self.pending_end {
-                return Err(invalid("delta batch boundary changed"));
+            if end.value(row) as u64 != self.pending_end || is_delete != self.pending_delete {
+                return Err(invalid("delta batch boundary or operation changed"));
             }
             first.get_or_insert(row);
             self.received = sequence;
@@ -233,9 +231,13 @@ impl KeyValueState {
                 self.push_fragment(&batch, first.take().expect("fragment started"), row + 1)?;
                 let update = concat_batches(&self.schema, &self.pending)
                     .map_err(|_| invalid("cannot assemble delta version"))?;
-                self.state
-                    .latest
-                    .apply_batch(&SegmentTableView::from_record_batch(update))?;
+                if self.pending_delete {
+                    self.state.latest.delete_batch(&update)?;
+                } else {
+                    self.state
+                        .latest
+                        .apply_batch(&SegmentTableView::from_record_batch(update))?;
+                }
                 self.state.sequence = sequence;
                 self.state.version += 1;
                 self.pending.clear();

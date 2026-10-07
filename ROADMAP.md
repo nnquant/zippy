@@ -1,104 +1,20 @@
-# Zippy Roadmap
+# Zippy 当前路线图
 
-本文件记录已经从当前审计修复中拆出的后续架构和性能工作。这里的项目不作为本轮
-`2026-05-08` 审计关账阻塞项，除非后续压测或线上运行证明其已经升级为正确性问题。
+更新：2026-09-23。实施状态统一见[当前能力表](docs/current-capabilities-2026-09-21.md)，
+新版本边界与验收标准见[单一主干收敛方案](docs/single-trunk-convergence-plan.md)。
+旧 API、配置与数据格式不再承诺兼容；旧数据目录保持原样，不自动迁移或清空。
 
-## Gateway Query Execution
+## 本地收敛状态
 
-### Streaming collect
+1. 在线影子链、Catalog/Storage 导入提交通道、endpoint snapshot 导入、Master 投影事件与 V2/V3/V4 协议已删除；外部旧文件类型、导入快照和 unknown 位点已删除；Master 持久目录及旧 Catalog adapter 也已删除；SQLite、native storage 和 native query 已固定为唯一主干，Flight 默认启动且地址不再派生。
+2. Server 旧查询适配器、Gateway crate、旧 memory ingest、重复查询解释器与远端订阅 listener 已删除；materializer 的旧持久 worker/sidecar 已删除，Rust 内部旧 KV/shard materializer 也已删除，Python 扩展的旧绑定已删除。
+3. 临时 registry 的旧表/生产者控制请求已删除，只保留配置发现与进程租约。Source/Publisher 后台运行时、专属双队列、ZeroMQ IO crate 已删除，性能工具改用同步计算基准。KV/shard materializer、descriptor forwarding 和专属基准已删除；描述符旧缺省字段和 core 并行度别名已删除；只读 actor 入口与验证包装、底层旧持久 worker、Catalog 提交器双入口、预发布文件提交入口和 Master 随机 token 回退均已退出。旧持久 registry 文件已拒绝且不改写。
+4. 保持本地格式、类型、测试和归档发行门禁。按用户 2026-09-22 指示，跨平台实机验收先延期，本次不因此阻塞。
 
-当前 remote gateway `collect` 仍采用一次性扫描、拼接、执行 residual plan、编码 Arrow IPC
-并写回。后续应改成 streaming collect：
+原生三类表、公开管理、订阅 ACK、计算和重启恢复已验收；主包旧数据 API 已删除，全量 mypy
+已纳入默认门禁。原审计 34 项中本地关闭 33 项；F28 的跨平台实机验收按用户指示延期，未计为通过。
+独立客户端查询兼容别名与无期限控制请求入口也已退出，控制 Watch 长轮询有明确 30 秒上限。
+本地因子的批量与上下文执行复用同一内核，不再维护物化 fallback 与重复表达式求值器。
 
-- 分批扫描和编码 Arrow IPC。
-- 首包尽早返回，降低大查询首包延迟。
-- 降低大结果集峰值内存。
-- 慢客户端不占住业务 worker。
-- 客户端断开后尽早取消后续 scan/encode。
-
-### Parallel persisted scan
-
-当前 persisted parquet scan 仍是同步路径。后续应在 bounded scan pool 中并行扫描多个文件：
-
-- 保持文件级并发上限。
-- 保持 projection/filter/tail/head pushdown。
-- 保留 deterministic output order。
-- 对 scan、decode、filter、encode 分别记录 metrics。
-
-### Native expression coverage
-
-Gateway 当前只原生支持 remote query 的安全子集。后续可逐步扩展：
-
-- `with_columns`
-- 复杂 `select` 表达式
-- 更多 predicate 表达式
-- join 的 remote-side capability
-
-任何扩展都必须保持 local/remote 语义一致。无法安全下推的 plan 必须继续留在 residual path。
-
-## Gateway Runtime And Configuration
-
-### Resource limit configuration
-
-当前 Gateway 连接、subscriber、blocking request 上限是内部默认值。后续可暴露为配置：
-
-- `[gateway].max_connections`
-- `[gateway].max_subscribers`
-- `[gateway].max_blocking_requests`
-- `[gateway].header_timeout_ms`
-- `[gateway].payload_timeout_ms`
-- `[gateway].write_timeout_ms`
-
-默认值应保持保守，并在 metrics 中暴露 active/rejected/timeout 计数。
-
-### Subscribe notification-driven mode
-
-当前 subscribe socket/timer 已异步化，但数据检测仍以轮询为主。后续可接入 segment committed-row
-notification：
-
-- idle subscriber 不做无意义 batch fetch。
-- 新行 commit 后唤醒订阅。
-- 支持 shutdown 和 descriptor rollover 唤醒。
-- 保持 best-effort live 订阅语义，不隐式补历史数据。
-
-## Master Control Plane
-
-### Async master server
-
-Gateway 已经有专用 async master client，但 master server 仍是同步一请求一连接模型。后续如果
-control plane 成为瓶颈，再推进 async master server：
-
-- Tokio accept/read/write。
-- bounded request execution。
-- request timeout 和 slow client 防护。
-- 保持现有 JSON-line wire protocol，或单独设计 versioned long-connection protocol。
-
-### Long-lived control sessions
-
-当前 control request 是一请求一连接。后续可评估长连接 session：
-
-- 减少高频 heartbeat/get_stream 的 connect 成本。
-- 支持 request multiplexing 前必须定义严格 ordering、timeout 和 reconnect 语义。
-- 不能影响现有同步 `MasterClient` API 的兼容性。
-
-## Diagnostics And Performance Baseline
-
-### Gateway performance profiles
-
-后续应增加可重复的 gateway benchmark：
-
-- remote `write_batch` latency/throughput。
-- remote `collect` 小结果、大结果、persisted parquet、多文件场景。
-- remote `subscribe` idle、active、filtered 场景。
-- 高并发 remote collect 下 master control request latency。
-
-### Audit closure maintenance
-
-每轮审计修复后维护单独 closure 文档，逐条标记：
-
-- `fixed`
-- `mitigated`
-- `deferred`
-- `not_applicable`
-
-关账文档必须附带验证命令和剩余风险，不用测试全绿替代风险说明。
+三种表、远端订阅和本地计算均为必须保留的产品能力。每项先实现并验证接替路径，再删除旧实现。
+实现细节、测试证据及未关闭编号统一记录在当前能力表链接的实施报告，避免多份清单漂移。

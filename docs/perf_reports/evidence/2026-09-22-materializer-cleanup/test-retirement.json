@@ -1,0 +1,330 @@
+{
+  "retired_or_migrated": [
+    {
+      "file": "crates/zippy-engines/src/stream_table.rs",
+      "test": "sharded_materializer_failure_state_is_shared_after_move",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table.rs",
+      "test": "sharded_materializer_replaces_repeated_failure_for_same_action_and_shard",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_batch_float64_nan_is_rejected",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_config_exposes_validated_read_only_accessors",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_config_rejects_invalid_values",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_direct_float64_nan_is_rejected",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_direct_float64_positive_and_negative_zero_route_together",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_golden_int64_key_uses_stable_hash_contract",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_golden_multi_utf8_key_uses_stable_hash_contract",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_golden_shard_version_changes_stable_hash_contract",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_golden_single_utf8_key_uses_stable_hash_contract",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_missing_key_column_is_rejected",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_multi_key_routing_is_deterministic",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_null_key_value_is_rejected_before_split_succeeds",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_same_utf8_key_maps_to_same_shard",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_split_preserves_per_shard_row_order_and_total_row_count",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_typed_batch_matches_direct_routing",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/src/stream_table_shard.rs",
+      "test": "shard_router_unsupported_key_type_is_rejected",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/key_value_delta.rs",
+      "test": "snapshot_bootstrap_skips_covered_rows_and_rejects_another_producer",
+      "action": "migrated",
+      "replacement": "native_bootstrap_skips_covered_events_and_rejects_another_table",
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/key_value_delta.rs",
+      "test": "snapshot_cursor_delta_fragments_duplicates_gaps_and_budget",
+      "action": "migrated",
+      "replacement": "native_snapshot_cursor_fragments_duplicates_gaps_and_budget",
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "key_value_table_materializer_appends_changelog_and_marks_snapshot_watermark",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "key_value_table_materializer_falls_back_to_replace_when_snapshot_exceeds_capacity",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "key_value_table_materializer_keeps_last_row_for_duplicate_key_in_same_batch",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "key_value_table_materializer_replaces_active_snapshot_by_key",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "key_value_table_materializer_retains_and_releases_all_segments_from_old_snapshot",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "key_value_table_materializer_rewrites_active_snapshot_for_new_key_when_capacity_fits",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "key_value_table_materializer_updates_existing_keys_in_place_when_capacity_fits",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "sharded_materializer_exports_one_active_descriptor_per_shard",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "sharded_materializer_flush_and_stop_do_not_panic",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "sharded_materializer_rejects_null_shard_key_without_writing_any_shard",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "sharded_materializer_stream_names_are_zero_padded",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "sharded_materializer_writes_rows_to_stable_key_shards_and_passes_input_through",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_descriptor_published_after_rollover_includes_retained_sealed_segment",
+      "action": "migrated",
+      "replacement": "stream_table_descriptor_after_rollover_includes_retained_sealed_segment",
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_annotates_forwarded_descriptor_control_writer_epoch",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_forwards_segment_descriptor_without_copying",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_rolls_over_full_active_segment_and_publishes_descriptor",
+      "action": "migrated",
+      "replacement": "stream_table_materializer_rolls_over_full_active_segment_and_exports_descriptor",
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_warns_once_when_descriptor_forwarding_falls_back_to_copy",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_retention_guard_blocks_release_until_external_lease_is_gone",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_retention_segments_limits_published_sealed_segments_without_persist",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_retention_waits_for_reader_lease_before_collecting_mmap",
+      "action": "retired",
+      "replacement": null,
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "stream_table_segment_profiles_produce_nonzero_rows_and_pass",
+      "action": "migrated",
+      "replacement": "stream_table_segment_copy_profile_produces_nonzero_rows_and_passes",
+      "reason": "remove old materializer/forwarding/sharding or independent retention contract; native state and durability remain tested"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-engines/tests/key_value_delta.rs",
+      "test": "native_bootstrap_skips_covered_events_and_rejects_another_table"
+    },
+    {
+      "file": "crates/zippy-engines/tests/key_value_delta.rs",
+      "test": "native_snapshot_cursor_fragments_duplicates_gaps_and_budget"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_descriptor_after_rollover_includes_retained_sealed_segment"
+    },
+    {
+      "file": "crates/zippy-engines/tests/stream_table_materializer.rs",
+      "test": "stream_table_materializer_rolls_over_full_active_segment_and_exports_descriptor"
+    },
+    {
+      "file": "crates/zippy-perf/src/lib.rs",
+      "test": "stream_table_segment_copy_profile_produces_nonzero_rows_and_passes"
+    }
+  ],
+  "retired_test_names": 36,
+  "migrated_test_names": 5,
+  "retained_same_name_tests": [
+    "native_manifest_prefix_retires_only_complete_durable_segments (test module renamed)",
+    "native_durable_prefix_waits_for_pinned_reader_before_reclaiming_segment",
+    "stream_table_frame_per_batch_seals_each_nullable_batch_as_one_segment",
+    "stream_table_frame_per_batch_rejects_oversized_frame_without_partial_commit",
+    "stream_table_materializer_rolls_over_segment_view_input",
+    "latest_state_outputs_update_and_snapshot_in_key_order",
+    "native_deletes_are_atomic_idempotent_and_allow_reinsertion"
+  ],
+  "retained_boundaries": [
+    "real append/frame storage and pinned prefix retirement",
+    "KV log preserves events; keyed state coalesces snapshots only",
+    "atomic fragments, exact cursors, duplicates, gaps, byte budgets, delete/reinsert and table identity",
+    "native actor/WAL/manifest/query/Flight/compute/restart integration"
+  ]
+}

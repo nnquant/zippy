@@ -1,0 +1,182 @@
+{
+  "date": "2026-09-22",
+  "batch": 16,
+  "overall_complete": false,
+  "audit_closed_total": 24,
+  "closed_this_batch": [],
+  "advanced_this_batch": [
+    "F07",
+    "F09",
+    "F15",
+    "F28"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F28",
+    "F29"
+  ],
+  "catalog_format": {
+    "only_physical_layout": 8,
+    "online_upgrades": false,
+    "rejected_previous_versions": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "old_database_rewritten": false,
+    "initialization_record": "catalog_layout",
+    "legacy_runtime_adapter_tables_remaining": true
+  },
+  "validation": {
+    "rust_workspace": "1742 passed, 10 ignored; final exit 0 after listener ownership fix",
+    "final_layout_tests": "4 passed after making the CRLF test portable to CRLF source checkouts",
+    "clippy": "workspace all-targets all-features -D warnings; passed",
+    "python_combined": "726 passed, 1 skipped after rebuilding extension; includes 116 client tests",
+    "client_coverage": "not separately rerun; client production code unchanged from batch 15",
+    "mypy_configured": "root 14 files, client 26 files, acceptance script 1 file; passed",
+    "mypy_repository": "FAILED: 991 errors in 12 files, checked 85 files; F29 remains open",
+    "black": "86 files unchanged; passed",
+    "ruff": "passed",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "native_acceptance": "six service starts each with Arrow 23.0.1 and 25.0.1; passed",
+    "sdist": "final archive includes exact layout.sql, layout.rs and table_admin.rs; migration.rs absent",
+    "wheel": "editable extension rebuilt; no new clean archive-to-wheel or cross-platform result",
+    "maturin_warning": "optional patchelf unavailable; editable install succeeded",
+    "platform": "Linux x86_64, CPython 3.11; no Windows/macOS runtime acceptance"
+  },
+  "acceptance": {
+    "single_transaction_empty_layout_initialization": true,
+    "old_layout_rejected_before_wal_with_unchanged_database_bytes": true,
+    "schema_inventory_constraints_and_tamper_checks_retained": true,
+    "initialization_checksum_normalizes_source_line_endings": true,
+    "same_name_requires_new_immutable_table_id": true,
+    "non_dropped_names_remain_unique": true,
+    "old_ids_cannot_be_reused": true,
+    "historical_name_schema_snapshots_and_file_pins_preserved": true,
+    "old_create_and_drop_replays_cannot_change_replacement": true,
+    "old_create_replay_succeeds_at_full_runtime_table_capacity": true,
+    "read_only_replay_handle_does_not_retain_catalog_owner": true,
+    "old_cursor_cannot_attach_to_same_name_replacement": true,
+    "same_name_recreation_recovers_after_restart_all_three_kinds": true,
+    "64_same_name_create_drop_cycles_per_kind": true,
+    "master_test_harness_transfers_owned_listener": true,
+    "alter_schema": false,
+    "physical_wal_receipt_retirement": false,
+    "legacy_gateway_shadow_import_projection_removed": false,
+    "native_local_compute_output": false
+  },
+  "deleted_source": [
+    "crates/zippy-catalog/src/migration.rs"
+  ],
+  "evidence": {
+    "catalog_full_before_final_replay_extension": {
+      "path": "/tmp/zippy-layout-catalog-full.log",
+      "sha256": "e901bae8f4941edb9963fc4a8c846269eaefd367bbae4f5cc6f4cdf5be77c166"
+    },
+    "runtime_same_name_capacity": {
+      "path": "/tmp/zippy-recreate-runtime-final.log",
+      "sha256": "d03875d53c1024635daed302aef0c59c97e1f07c4365d298c703e9eeb8aa6c7b"
+    },
+    "workspace_initial_port_conflict": {
+      "path": "/tmp/zippy-layout-workspace.log",
+      "sha256": "6b2e3c535901f9e3cbdf2dbb01a8b538c2f732a5b5df5dc4fc977ef4a33d0698"
+    },
+    "workspace_final": {
+      "path": "/tmp/zippy-layout-workspace-final.log",
+      "sha256": "45d000f4619d9d300440500e2d77ac5d150b7f238346a03f5422b969a3f12bde"
+    },
+    "final_layout_unit_tests": {
+      "path": "/tmp/zippy-layout-final-unit.log",
+      "sha256": "45c26dbacf67fdbac9bf7db3ca1e247bed296adcd7765b2d0624dd75942f4198"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-layout-clippy-final.log",
+      "sha256": "a086bda3317c0591b0cd57d9e0e349fcb5239a38ba40c7b77d6ef94707f83a80"
+    },
+    "python_combined": {
+      "path": "/tmp/zippy-layout-python.log",
+      "sha256": "d1188dbf3e5a375e76d39b916a7e4d110ce9d2172de1c0267af80541a26cdf24"
+    },
+    "native_arrow23": {
+      "path": "/tmp/zippy-layout-native-arrow23.log",
+      "sha256": "98465434b26006b078c39a8a2adc26c15dab5c1b38314903e3605eb09b2b7a7a"
+    },
+    "native_arrow25": {
+      "path": "/tmp/zippy-layout-native-arrow25.log",
+      "sha256": "55973c941edcbbf4f5921a97c8dc43877e19a6e8b712da3f79ec6cf143e9c539"
+    },
+    "maturin": {
+      "path": "/tmp/zippy-layout-maturin.log",
+      "sha256": "d3bfcd7b7f90184e3cf36d0acd7570ba3ed4eccd03ba28be1db1e798db71c25e"
+    },
+    "black": {
+      "path": "/tmp/zippy-layout-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-layout-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "mypy_configured": {
+      "path": "/tmp/zippy-layout-mypy-configured.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "mypy_client": {
+      "path": "/tmp/zippy-layout-client-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "mypy_acceptance_script": {
+      "path": "/tmp/zippy-recreate-script-mypy.log",
+      "sha256": "5d4b6d285b77932e3d08212c3b4974d0a803f98ec60408ac6ccf6a063fa6c19e"
+    },
+    "mypy_repository_failed": {
+      "path": "/tmp/zippy-layout-mypy-full.log",
+      "sha256": "53e95f51c2318a499c2e60f932178a876addd3daa3f543e1619f82e770c277a0"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-layout-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-layout-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "sdist": {
+      "path": "/tmp/zippy-layout-sdist-final.log",
+      "sha256": "eaa657860759c2922800964347e1a4a6c39816adf608690561ca3ea11187a160"
+    },
+    "archive_content_verification": {
+      "path": "/tmp/zippy-layout-package-verification.log",
+      "sha256": "e1de4c6d42e71274a8819e4befcc65617080f6b77c3fe55ca41e20a646998795"
+    }
+  },
+  "source_sha256": {
+    "crates/zippy-catalog/src/layout.rs": "453af3a2ba113cbebc0bd95f02e7513e40aed13ff3f830dfc017417532259869",
+    "crates/zippy-catalog/src/layout.sql": "096eecde69ca559bd6496e2ab10a4c3702d78c32fd7eba92ffbfe568644b1a9a",
+    "crates/zippy-catalog/src/lib.rs": "95ac41b76a0042324897d81c7d215eeb8085425829e1c45bccbdfde15faed35c",
+    "crates/zippy-catalog/src/domain.rs": "16958bc2f069803b6a595f4f8ca6b2c4ea90a6b64845eae943fbf08ae3cc8b25",
+    "crates/zippy-catalog/src/table_domain.rs": "52eb382600f1220b185dcc6863b3e7146ca5dea0b15e67b3fd8aba131c26c73e",
+    "crates/zippy-catalog/src/service.rs": "4417631e91d1d098d2637edf74b73959b11a5eae9fed815a83ded925450f7e61",
+    "crates/zippy-catalog/src/legacy_projection_domain.rs": "8b7cade0b588463fe2c3e3f10bdedc59b7a22288018777dff1aad83e1939e4f1",
+    "crates/zippy-catalog/src/snapshot_domain.rs": "8f242dc58ae1ebebb5f15e88b58f5f75ff20bfb0c55ecc5ad55f72ff8071c757",
+    "crates/zippy-catalog/tests/sqlite_foundation.rs": "87714b8e3cf81573532631f5faf2b4508a9e3d48609df9bf63c256bb60b91d24",
+    "crates/zippy-server/src/table_admin.rs": "c4900653b7e6112f1ffbfe6c9338da226d5fb36c86b99bc3e7524f5b6746946f",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "5be6c9a092bed583b37fbc85cdf93215ec3cfba589413925b6c4de8a8b594f4b",
+    "crates/zippy-server/tests/support/mod.rs": "1dc739ada224d76b7ab90d5ef1bcde5320121c6247b9929d2753eb32d093ea79",
+    "crates/zippy-master/src/server.rs": "7055a332d099fc036a03b0b9c5a5121d3d55408605841075a2dfe1a18afd83cd",
+    "scripts/check_native_client.py": "7b159090389db0096b533efbe5b493a58f456385c260df366c0c8f1596fe1b72"
+  },
+  "sdist_sha256": "d6240a65acbf520924f61c91c34d845f49a4af80cddc2fe53da0ffa8f3bdee61"
+}

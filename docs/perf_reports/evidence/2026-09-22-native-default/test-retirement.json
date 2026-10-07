@@ -1,0 +1,131 @@
+{
+  "retired_or_renamed": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_accepts_explicit_sqlite_authority_with_native_storage",
+      "action": "retired",
+      "replacement": "default native runtime and rejection of retired switches",
+      "reason": "obsolete backend selector or configured-native readiness bypass"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_derives_flight_endpoint_from_master_port_plus_two",
+      "action": "renamed_or_migrated",
+      "replacement": "zippy_config_keeps_flight_endpoint_independent_from_master",
+      "reason": "preserve serialization, budgets, endpoint isolation, readiness and real Flight query coverage"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_loads_native_query_frontend_gate",
+      "action": "renamed_or_migrated",
+      "replacement": "zippy_config_loads_native_query_operator_budget",
+      "reason": "preserve serialization, budgets, endpoint isolation, readiness and real Flight query coverage"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_merges_native_storage_toml_and_environment_override",
+      "action": "retired",
+      "replacement": "default native runtime and rejection of retired switches",
+      "reason": "obsolete backend selector or configured-native readiness bypass"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_enabled_query_canary_without_native_storage",
+      "action": "retired",
+      "replacement": "default native runtime and rejection of retired switches",
+      "reason": "obsolete backend selector or configured-native readiness bypass"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_incomplete_native_query_frontend_dependencies",
+      "action": "retired",
+      "replacement": "default native runtime and rejection of retired switches",
+      "reason": "obsolete backend selector or configured-native readiness bypass"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_invalid_native_storage_environment_value",
+      "action": "retired",
+      "replacement": "default native runtime and rejection of retired switches",
+      "reason": "obsolete backend selector or configured-native readiness bypass"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_unknown_catalog_backend_environment_value",
+      "action": "retired",
+      "replacement": "default native runtime and rejection of retired switches",
+      "reason": "obsolete backend selector or configured-native readiness bypass"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_serializes_native_storage_and_round_trips_equality",
+      "action": "renamed_or_migrated",
+      "replacement": "zippy_config_serializes_native_defaults_without_feature_switches",
+      "reason": "preserve serialization, budgets, endpoint isolation, readiness and real Flight query coverage"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "readiness_requires_every_configured_native_storage_gate",
+      "action": "renamed_or_migrated",
+      "replacement": "readiness_always_requires_every_native_storage_gate",
+      "reason": "preserve serialization, budgets, endpoint isolation, readiness and real Flight query coverage"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "flight_only_runtime_streams_real_native_snapshot_and_releases_ticket",
+      "action": "renamed_or_migrated",
+      "replacement": "default_runtime_streams_real_native_snapshot_and_releases_ticket",
+      "reason": "preserve serialization, budgets, endpoint isolation, readiness and real Flight query coverage"
+    },
+    {
+      "file": "pytests/test_server_process.py",
+      "test": "test_server_ready_record_requires_boolean_native_storage_configuration",
+      "action": "retired",
+      "replacement": "default native runtime and rejection of retired switches",
+      "reason": "obsolete backend selector or configured-native readiness bypass"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_keeps_flight_endpoint_independent_from_master"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_loads_native_query_operator_budget"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_native_defaults_enable_one_explicit_flight_endpoint"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_removed_backend_and_native_switches"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_serializes_native_defaults_without_feature_switches"
+    },
+    {
+      "file": "crates/zippy-server/src/runtime.rs",
+      "test": "readiness_always_requires_every_native_storage_gate"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "default_runtime_streams_real_native_snapshot_and_releases_ticket"
+    }
+  ],
+  "retired_test_names": 7,
+  "renamed_or_migrated_test_names": 5,
+  "retained_boundaries": [
+    "query budgets and native resource validation remain strict",
+    "endpoint independent from Master host/port",
+    "all native recovery gates unconditional even with Flight disabled",
+    "real default Flight query consumes native snapshot and releases ticket",
+    "three native table kinds, remote subscriptions and compute survive restart"
+  ],
+  "new_regressions": [
+    "retired fields reject in TOML, JSON overlay, wire serde and environment",
+    "default SQLite storage/query/Flight runtime without backend switches"
+  ]
+}

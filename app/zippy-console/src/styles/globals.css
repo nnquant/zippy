@@ -219,7 +219,7 @@ body {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
 }
 
@@ -768,13 +768,16 @@ body {
 
 .data-toolbar-group {
   display: inline-flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  max-width: 100%;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
 
 .data-toolbar-grow {
-  flex: 1;
+  flex: 1 0 auto;
 }
 
 .toolbar-icon-button {
@@ -1165,4 +1168,11 @@ body {
   .search-box {
     width: 100%;
   }
+}
+
+.data-preview-note {
+  padding: 8px 12px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }

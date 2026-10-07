@@ -45,9 +45,7 @@ where
     F: FnMut() -> Result<T, E>,
     M: Fn(ZippySegmentStoreError) -> E,
 {
-    let Some(offset) = attachment.descriptor.payload_version_offset() else {
-        return read_fn();
-    };
+    let offset = attachment.descriptor.payload_version_offset();
 
     for _ in 0..ACTIVE_PAYLOAD_READ_MAX_RETRIES {
         let before = attachment
@@ -588,9 +586,7 @@ fn pin_active_payload_version(
     descriptor: &ActiveSegmentDescriptor,
     shm_region: &ShmRegion,
 ) -> Result<u64, &'static str> {
-    let offset = descriptor
-        .payload_version_offset()
-        .ok_or("active query snapshot requires payload version capability")?;
+    let offset = descriptor.payload_version_offset();
     for _ in 0..ACTIVE_PAYLOAD_READ_MAX_RETRIES {
         let version = shm_region
             .load_u64_acquire(offset)
@@ -724,9 +720,7 @@ fn validate_active_descriptor_header(
     if descriptor.committed_row_count_offset() != SHM_COMMITTED_ROW_COUNT_OFFSET {
         return Err("active segment committed row count offset mismatch");
     }
-    let Some(payload_version_offset) = descriptor.payload_version_offset() else {
-        return Err("active segment payload version capability missing");
-    };
+    let payload_version_offset = descriptor.payload_version_offset();
     if payload_version_offset != SHM_PAYLOAD_VERSION_OFFSET {
         return Err("active segment payload version offset mismatch");
     }

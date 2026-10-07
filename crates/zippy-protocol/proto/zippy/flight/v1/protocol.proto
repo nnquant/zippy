@@ -14,6 +14,16 @@ message SessionOpenResponse {
   SessionRole role = 5;
 }
 
+// Close only the session authenticated by this RPC, never a caller-supplied identity.
+message SessionCloseRequest {
+  uint32 protocol_version = 1;
+}
+
+message SessionCloseResponse {
+  uint32 protocol_version = 1;
+  bool closed = 2;
+}
+
 enum SessionRole {
   SESSION_ROLE_UNSPECIFIED = 0;
   SESSION_ROLE_READ = 1;
@@ -32,11 +42,17 @@ message PutCommand {
   bytes producer_id = 8;
   bytes connection_id = 9;
   optional uint64 expected_writer_epoch = 10;
+  string namespace = 11;
+  // Reject name reuse before acquiring a producer or accepting any batch.
+  optional bytes expected_table_id = 12;
 }
 
 enum PutMutation {
   PUT_MUTATION_UNSPECIFIED = 0;
   PUT_MUTATION_APPEND = 1;
+  PUT_MUTATION_FRAME = 2;
+  PUT_MUTATION_KEY_VALUE_UPSERT = 3;
+  PUT_MUTATION_KEY_VALUE_DELETE = 4;
 }
 
 enum PutDurability {
@@ -72,6 +88,10 @@ message QueryCommand {
   ResourceLimit memory_limit = 8;
   ResourceLimit spill_limit = 9;
   optional uint32 result_batch_rows = 10;
+  // Requires the canonical single-table full-state query; cursor metadata shares its snapshot.
+  bool key_value_snapshot = 11;
+  // Opaque, session-owned fixed boundary; never resolve a fresh snapshot on failure.
+  optional bytes fixed_snapshot_id = 12;
 }
 
 message TableBinding {
@@ -186,7 +206,8 @@ message OffsetWatermark {
     STATE_UNSPECIFIED = 0;
     STATE_EMPTY = 1;
     STATE_KNOWN = 2;
-    STATE_LEGACY_UNKNOWN = 3;
+    reserved 3;
+    reserved "STATE_LEGACY_UNKNOWN";
   }
   State state = 1;
   uint64 offset = 2;
@@ -231,4 +252,158 @@ message CapabilitiesResponse {
   uint64 ingest_max_rows_per_put = 16;
   uint64 ingest_max_batch_bytes = 17;
   uint64 ingest_max_bytes_per_put = 18;
+  uint64 ingest_max_rows_per_frame = 19;
+}
+
+// Stable caller-assigned identities allow retries after an interrupted response.
+message CreateNamespaceRequest {
+  uint32 protocol_version = 1;
+  bytes request_id = 2;
+  bytes namespace_id = 3;
+  string name = 4;
+}
+
+message CreateTableRequest {
+  uint32 protocol_version = 1;
+  bytes request_id = 2;
+  bytes table_id = 3;
+  bytes namespace_id = 4;
+  string name = 5;
+  bytes schema_ipc = 6;
+  oneof definition {
+    AppendTableOptions append = 7;
+    FrameTableOptions frame = 8;
+    KeyValueTableOptions key_value = 9;
+  }
+}
+
+// Logical deletion guarded by the caller's observed immutable snapshot version.
+message DropTableRequest {
+  uint32 protocol_version = 1;
+  bytes request_id = 2;
+  bytes table_id = 3;
+  uint64 expected_snapshot_version = 4;
+}
+
+// Logical user schema; key-value callers explicitly retain the same ordered primary keys.
+message AlterTableSchemaRequest {
+  uint32 protocol_version = 1;
+  bytes request_id = 2;
+  bytes table_id = 3;
+  uint64 expected_schema_version = 4;
+  bytes schema_ipc = 5;
+  KeyValueTableOptions key_value = 6;
+}
+
+message AppendTableOptions {
+  optional string event_time_column = 1;
+}
+
+message FrameTableOptions {
+  string by = 1;
+}
+
+message KeyValueTableOptions {
+  repeated string keys = 1;
+}
+
+message CatalogMutationResult {
+  uint32 protocol_version = 1;
+  bytes request_id = 2;
+  uint64 catalog_revision = 3;
+  bytes object_id = 4;
+  uint64 schema_version = 5;
+}
+
+// Ordered native logs with optional durable, atomic-unit acknowledgement.
+message LogCommand {
+  uint32 protocol_version = 1;
+  bytes query_id = 2;
+  bytes session_id = 3;
+  TableBinding table = 4; // sql_name must be empty
+  oneof start {
+    bool latest = 5; // must be true; captures the opening watermark
+    uint64 offset = 6; // inclusive
+    bool committed = 11; // true and consumer required
+  }
+  optional uint64 deadline_ns = 7;
+  ResourceLimit memory_limit = 8;
+  optional uint32 batch_rows = 9;
+  LogConsumer consumer = 10;
+}
+
+message LogConsumer {
+  bytes consumer_id = 1;
+  oneof authority {
+    bool individual = 2;
+    bytes group_id = 3;
+  }
+}
+
+message LogAcknowledgement {
+  bytes request_id = 1;
+  uint64 delivery_sequence = 2;
+  uint64 processed_through = 3;
+}
+
+message LogControl {
+  uint32 protocol_version = 1;
+  oneof control {
+    bool cancel = 2;
+    LogAcknowledgement acknowledge = 3;
+  }
+}
+
+message LogMetadata {
+  oneof payload {
+    LogOpened opened = 1;
+    LogProgress progress = 2;
+    LogAcknowledgement acknowledged = 3;
+  }
+}
+
+message LogOpened {
+  uint32 protocol_version = 1;
+  bytes query_id = 2;
+  uint64 generation = 3;
+  bytes table_id = 4;
+  string table_kind = 5; // append, frame, key_value
+  OffsetWatermark watermark = 6;
+  LogConsumer consumer = 7;
+  optional uint64 next_offset = 8;
+}
+
+message LogProgress {
+  uint64 first_offset = 1;
+  uint64 last_offset = 2;
+  optional uint64 frame_first_offset = 3;
+  optional uint64 frame_last_offset = 4;
+  OffsetWatermark watermark = 5;
+  optional uint64 delivery_sequence = 6;
+  optional uint64 delivery_last_offset = 7;
+}
+
+
+message CreateFixedSnapshotRequest {
+  uint32 protocol_version = 1;
+  repeated TableBinding bindings = 2;
+  uint64 ttl_ms = 3;
+}
+
+message FixedSnapshotInfo {
+  uint32 protocol_version = 1;
+  bytes snapshot_id = 2;
+  uint64 expires_at_ns = 3;
+  uint64 catalog_revision = 4;
+  repeated QueryTableVersion tables = 5;
+}
+
+message ReleaseFixedSnapshotRequest {
+  uint32 protocol_version = 1;
+  bytes snapshot_id = 2;
+}
+
+message ReleaseFixedSnapshotResult {
+  uint32 protocol_version = 1;
+  bool released = 2;
 }

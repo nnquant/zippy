@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,41 +13,31 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::{Connection, TransactionBehavior};
 use tokio::sync::{oneshot, Semaphore};
 use zippy_types::catalog::{
-    CatalogCommandReplayProbe, CatalogDataFileReferenceSnapshot, CatalogFileRead,
-    CatalogGarbageCollection, CatalogGarbageCollectionGuard, CatalogIdempotencyRead,
-    CatalogPublicationControl, CatalogPublicationExclusion, CatalogPublicationPermit,
-    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
-    ClaimGarbageCollectionFilesRequest, ClaimedGarbageCollectionFiles,
-    FinalizeGarbageCollectionFilesRequest, FinalizedGarbageCollectionFiles,
-    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportReplayProbeV2, LegacyCatalogImportResponseV2,
-    LegacyCatalogProjectionCheckpointV4, LegacyCatalogProjectionEnvelopeV4,
-    LegacyCatalogProjectionResponseV4, LegacyCatalogReconcileEnvelopeV3,
-    LegacyCatalogReconcileResponseV3, LegacyCatalogTableProjectionV4,
-    LegacyFileViewSnapshotMapping, ListNamespacesRequest, ListNamespacesResponse,
-    ListTablesRequest, ListTablesResponse, ManagedDataFileProbe, NamespaceRef,
-    VersionedCatalogCommand, VersionedCatalogResponse,
+    CatalogCommandReplayProbe, CatalogConsumerRead, CatalogDataFileReferenceSnapshot,
+    CatalogFileRead, CatalogGarbageCollection, CatalogGarbageCollectionGuard,
+    CatalogIdempotencyRead, CatalogPublicationControl, CatalogPublicationExclusion,
+    CatalogPublicationPermit, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
+    CatalogWrite, ClaimGarbageCollectionFilesRequest, ClaimedGarbageCollectionFiles,
+    ConsumerOffsetSnapshot, FinalizeGarbageCollectionFilesRequest, FinalizedGarbageCollectionFiles,
+    ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest, ListTablesResponse,
+    ManagedDataFileProbe, NamespaceRef, ReadConsumerOffsetRequest, VersionedCatalogCommand,
+    VersionedCatalogResponse,
 };
 use zippy_types::storage::{
     CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseIssuer,
     CatalogSnapshotMemoryLeaseVerifier,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
-use zippy_types::{BoxFuture, ErrorCode, QueryId, RequestId, Result, ServerError, TableId};
+use zippy_types::{BoxFuture, ErrorCode, QueryId, RequestId, Result, ServerError};
 
 use crate::SqliteCatalogConfig;
-use crate::{
-    domain, file_domain, legacy_import_domain, legacy_projection_domain, legacy_reconcile_domain,
-    manifest_domain, snapshot_domain, table_domain,
-};
+use crate::{domain, file_domain, manifest_domain, snapshot_domain, table_domain};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 const MANIFEST_PREPARATION_THREAD_NAME: &str = "zippy-catalog-manifest-prepare";
 const CONTROL_READ_THREAD_NAME: &str = "zippy-catalog-control-read";
 const SNAPSHOT_READ_THREAD_NAME: &str = "zippy-catalog-snapshot-read";
 const REPLAY_PROBE_CAPACITY: usize = 4;
-const LEGACY_IMPORT_AVAILABLE: u8 = 0;
-const LEGACY_IMPORT_ACTIVE: u8 = 1;
-const LEGACY_IMPORT_SEALED: u8 = 2;
 
 /// A typed SQLite Catalog with thread-confined writer and read-only connections.
 ///
@@ -64,8 +54,8 @@ const LEGACY_IMPORT_SEALED: u8 = 2;
 /// being prepared outside SQLite, a later read may complete first and observe
 /// the preceding committed revision. A caller requiring read-after-write must
 /// await the mutation response before issuing the read. `open`, `close`, and
-/// `Drop` remain synchronous in this migration slice and must not be wired into
-/// the server runtime until shutdown receives an absolute deadline.
+/// `Drop` remain synchronous. The owning server supervisor coordinates its deadline
+/// and retains directory ownership until these workers have joined.
 pub struct SqliteCatalog {
     sender: Option<Sender<ServiceMessage>>,
     writer_endpoint: Arc<CatalogWriterEndpoint>,
@@ -79,27 +69,6 @@ pub struct SqliteCatalog {
     runtime_snapshot_pins: Arc<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
     snapshot_memory_lease_verifier: CatalogSnapshotMemoryLeaseVerifier,
     ownership: Arc<zippy_core::OwnedDataDirectory>,
-    legacy_import_state: AtomicU8,
-}
-
-/// Exclusive startup capability for verified V2 legacy table imports.
-///
-/// The handle is bound to one running Catalog instance, cannot be cloned, and permanently seals
-/// that instance's import window when dropped. Ordinary Catalog mutation admission also seals an
-/// unused window before executing, so V2 imports cannot be opened after normal service writes have
-/// started. The handle is intentionally not an RPC or serializable authorization token.
-pub struct SqliteCatalogLegacyImportSession<'catalog> {
-    catalog: &'catalog SqliteCatalog,
-    active: bool,
-}
-
-impl fmt::Debug for SqliteCatalogLegacyImportSession<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SqliteCatalogLegacyImportSession")
-            .field("active", &self.active)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Cloneable read-only view over one running [`SqliteCatalog`].
@@ -112,6 +81,7 @@ impl fmt::Debug for SqliteCatalogLegacyImportSession<'_> {
 #[derive(Clone)]
 pub struct SqliteCatalogReadHandle {
     endpoint: Arc<CatalogReadEndpoint>,
+    replay_probe_budget: Arc<ReplayProbeBudget>,
     runtime_snapshot_pins: Weak<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
     snapshot_memory_lease_verifier: CatalogSnapshotMemoryLeaseVerifier,
     ownership: Weak<zippy_core::OwnedDataDirectory>,
@@ -156,24 +126,11 @@ impl fmt::Debug for SqliteCatalogRuntimeSnapshotPinAdmissionControl {
     }
 }
 
-/// Cloneable lifecycle-bound submitter for trusted online legacy file-view reconciliation.
-///
-/// The handle does not own the Catalog actor. Admission closes before Catalog shutdown, and calls
-/// made after owner teardown fail terminally instead of reopening SQLite or extending authority.
-#[derive(Clone)]
-pub struct SqliteCatalogLegacyReconcileHandle {
-    endpoint: Weak<CatalogWriterEndpoint>,
-    command_budget: Arc<CommandBudget>,
-    manifest_queue_budget: Arc<ManifestQueueBudget>,
-    publication_gate: Arc<Semaphore>,
-    publication_owner_id: usize,
-}
-
 impl SqliteCatalog {
-    /// Opens or migrates the Catalog and starts its connection-owning actor.
+    /// Opens the current Catalog layout or initializes an empty database and starts its actor.
     ///
     /// Startup is synchronous and returns only after the existing foundation
-    /// preflight, durable SQLite configuration, migrations, and integrity check
+    /// preflight, durable SQLite configuration, initialization, and integrity check
     /// have completed on the actor thread.
     pub fn open(config: SqliteCatalogConfig) -> Result<Self> {
         Self::open_with_backends_and_snapshot_memory_lease_issuer(
@@ -286,7 +243,6 @@ impl SqliteCatalog {
                     runtime_snapshot_pins,
                     snapshot_memory_lease_verifier,
                     ownership,
-                    legacy_import_state: AtomicU8::new(LEGACY_IMPORT_AVAILABLE),
                 };
                 match CatalogReadPool::start(&config, read_backend) {
                     Ok(read_pool) => {
@@ -318,7 +274,7 @@ impl SqliteCatalog {
     /// Gracefully closes SQLite and joins the actor thread synchronously.
     ///
     /// This method is reliable but not deadline-bounded. It is intentionally a
-    /// pre-server lifecycle API in the current migration slice.
+    /// joined-worker API; the owning supervisor coordinates bounded shutdown.
     pub fn close(mut self) -> Result<()> {
         self.shutdown()
     }
@@ -333,6 +289,7 @@ impl SqliteCatalog {
         let read_pool = self.read_pool()?;
         read_pool.check_runtime_health()?;
         Ok(SqliteCatalogReadHandle {
+            replay_probe_budget: Arc::clone(&self.replay_probe_budget),
             endpoint: Arc::clone(&read_pool.endpoint),
             runtime_snapshot_pins: Arc::downgrade(&self.runtime_snapshot_pins),
             snapshot_memory_lease_verifier: self.snapshot_memory_lease_verifier.clone(),
@@ -343,7 +300,6 @@ impl SqliteCatalog {
     /// Creates a lifecycle-bound submitter for ordinary server-owned Catalog commands.
     pub fn write_handle(&self) -> Result<SqliteCatalogWriteHandle> {
         self.check_runtime_health()?;
-        self.seal_legacy_imports_for_ordinary_mutation()?;
         Ok(SqliteCatalogWriteHandle {
             endpoint: Arc::downgrade(&self.writer_endpoint),
             command_budget: Arc::clone(&self.command_budget),
@@ -361,84 +317,6 @@ impl SqliteCatalog {
         SqliteCatalogRuntimeSnapshotPinAdmissionControl {
             runtime_snapshot_pins: Arc::downgrade(&self.runtime_snapshot_pins),
         }
-    }
-
-    /// Creates a lifecycle-bound online legacy reconcile submitter.
-    ///
-    /// Creating this handle is an ordinary mutation boundary and permanently seals any unused V2
-    /// startup import window. It therefore cannot race an active startup import session.
-    pub fn legacy_reconcile_handle(&self) -> Result<SqliteCatalogLegacyReconcileHandle> {
-        self.check_runtime_health()?;
-        self.seal_legacy_imports_for_ordinary_mutation()?;
-        Ok(SqliteCatalogLegacyReconcileHandle {
-            endpoint: Arc::downgrade(&self.writer_endpoint),
-            command_budget: Arc::clone(&self.command_budget),
-            manifest_queue_budget: Arc::clone(&self.manifest_queue_budget),
-            publication_gate: Arc::clone(&self.publication_gate),
-            publication_owner_id: self.publication_owner_id(),
-        })
-    }
-
-    /// Resolves one exact per-table legacy revision to its immutable native snapshot mapping.
-    pub fn resolve_legacy_file_view_mapping(
-        &self,
-        table_id: zippy_types::TableId,
-        legacy_files_revision: u64,
-    ) -> BoxFuture<'_, Result<LegacyFileViewSnapshotMapping>> {
-        Box::pin(async move {
-            await_response(self.read_pool().and_then(|pool| {
-                pool.control_request(|response| ControlReadMessage::ResolveLegacyMapping {
-                    table_id,
-                    legacy_files_revision,
-                    response,
-                })
-            }))
-            .await
-        })
-    }
-
-    /// Atomically resolves the explicit mapping joined to an active table's current cursor.
-    pub fn resolve_current_legacy_file_view_mapping(
-        &self,
-        table_id: zippy_types::TableId,
-    ) -> BoxFuture<'_, Result<LegacyFileViewSnapshotMapping>> {
-        Box::pin(async move {
-            await_response(self.read_pool().and_then(|pool| {
-                pool.control_request(|response| ControlReadMessage::ResolveCurrentLegacyMapping {
-                    table_id,
-                    response,
-                })
-            }))
-            .await
-        })
-    }
-
-    /// Acquires the only V2 legacy-import capability for this Catalog instance.
-    ///
-    /// Startup orchestration must acquire this handle before submitting ordinary non-migration
-    /// writes, retain it through every verified table import, and then explicitly seal it before
-    /// publishing server readiness. Dropping the handle has the same fail-closed sealing effect.
-    pub fn begin_legacy_import_session(&self) -> Result<SqliteCatalogLegacyImportSession<'_>> {
-        self.check_runtime_health()?;
-        self.legacy_import_state
-            .compare_exchange(
-                LEGACY_IMPORT_AVAILABLE,
-                LEGACY_IMPORT_ACTIVE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|state| {
-                let message = if state == LEGACY_IMPORT_ACTIVE {
-                    "legacy import session is already active"
-                } else {
-                    "legacy import window is permanently sealed for this Catalog instance"
-                };
-                ServerError::new(ErrorCode::Conflict, message).with_retryable(false)
-            })?;
-        Ok(SqliteCatalogLegacyImportSession {
-            catalog: self,
-            active: true,
-        })
     }
 
     /// Pins one exact in-process table snapshot against safe garbage collection.
@@ -550,7 +428,6 @@ impl SqliteCatalog {
     ) -> Result<VersionedCatalogResponse> {
         let VersionedCatalogCommand::V1(envelope) = &command;
         let request_id = envelope.request_id;
-        self.seal_legacy_imports_for_command(envelope.actor.kind, request_id)?;
         let publication_permit = publication_permit
             .try_into_opaque::<SqlitePublicationPermit>()
             .map_err(|_| {
@@ -586,95 +463,6 @@ impl SqliteCatalog {
             })
         }))
         .await
-    }
-
-    fn seal_legacy_imports_for_command(
-        &self,
-        actor_kind: zippy_types::catalog::CatalogActorKind,
-        request_id: RequestId,
-    ) -> Result<()> {
-        if actor_kind == zippy_types::catalog::CatalogActorKind::Migration {
-            return Ok(());
-        }
-        self.seal_legacy_imports_for_ordinary_mutation()
-            .map_err(|error| error.with_request_id(request_id))
-    }
-
-    fn seal_legacy_imports_for_ordinary_mutation(&self) -> Result<()> {
-        loop {
-            match self.legacy_import_state.load(Ordering::Acquire) {
-                LEGACY_IMPORT_AVAILABLE => {
-                    if self
-                        .legacy_import_state
-                        .compare_exchange(
-                            LEGACY_IMPORT_AVAILABLE,
-                            LEGACY_IMPORT_SEALED,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return Ok(());
-                    }
-                }
-                LEGACY_IMPORT_ACTIVE => {
-                    return Err(ServerError::new(
-                        ErrorCode::Conflict,
-                        "ordinary Catalog writes are closed while legacy import is active",
-                    )
-                    .with_retryable(false));
-                }
-                LEGACY_IMPORT_SEALED => return Ok(()),
-                _ => {
-                    return Err(ServerError::new(
-                        ErrorCode::Internal,
-                        "legacy import lifecycle entered an invalid state",
-                    )
-                    .with_retryable(false));
-                }
-            }
-        }
-    }
-
-    fn submit_legacy_import(
-        &self,
-        command: LegacyCatalogImportEnvelopeV2,
-    ) -> BoxFuture<'_, Result<LegacyCatalogImportResponseV2>> {
-        Box::pin(async move {
-            let request_id = command.request_id;
-            let publication_permit = self
-                .acquire_shared_publication_permit()
-                .await
-                .map_err(|error| error.with_request_id(request_id))?;
-            let publication_permit = publication_permit
-                .try_into_opaque::<SqlitePublicationPermit>()
-                .map_err(|_| {
-                    ServerError::new(
-                        ErrorCode::Internal,
-                        "sqlite Catalog created an invalid publication capability",
-                    )
-                    .with_request_id(request_id)
-                    .with_retryable(false)
-                })?;
-            let queued_bytes =
-                legacy_import_domain::legacy_import_preflight_bytes(&command).await?;
-            let manifest_permit = self
-                .manifest_queue_budget
-                .reserve(queued_bytes)
-                .map_err(|error| error.with_request_id(request_id))?;
-            await_response(self.writer_request(|response| {
-                ServiceMessage::LegacyImport(LegacyImportRequest {
-                    command,
-                    state: LegacyImportRequestState {
-                        request_id,
-                        response,
-                        _manifest_permit: manifest_permit,
-                        _publication_permit: publication_permit,
-                    },
-                })
-            }))
-            .await
-        })
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -1119,72 +907,6 @@ impl SqliteCatalogReadHandle {
         }))
         .await
     }
-
-    /// Resolves one exact per-table legacy revision to its immutable native snapshot mapping.
-    pub async fn resolve_legacy_file_view_mapping(
-        &self,
-        table_id: zippy_types::TableId,
-        legacy_files_revision: u64,
-    ) -> Result<LegacyFileViewSnapshotMapping> {
-        await_response(self.endpoint.control_request(|response| {
-            ControlReadMessage::ResolveLegacyMapping {
-                table_id,
-                legacy_files_revision,
-                response,
-            }
-        }))
-        .await
-    }
-
-    /// Atomically resolves the explicit mapping joined to an active table's current cursor.
-    ///
-    /// A table with no mapping for its current snapshot returns `NotFound`; a present mapping with
-    /// malformed identity or fixed-width fields returns `DataCorruption`.
-    pub async fn resolve_current_legacy_file_view_mapping(
-        &self,
-        table_id: zippy_types::TableId,
-    ) -> Result<LegacyFileViewSnapshotMapping> {
-        await_response(self.endpoint.control_request(|response| {
-            ControlReadMessage::ResolveCurrentLegacyMapping { table_id, response }
-        }))
-        .await
-    }
-
-    /// Reads the durable singleton V4 legacy projection checkpoint.
-    pub async fn read_legacy_projection_checkpoint_v4(
-        &self,
-    ) -> Result<LegacyCatalogProjectionCheckpointV4> {
-        await_response(
-            self.endpoint
-                .control_request(ControlReadMessage::ReadLegacyProjectionCheckpointV4),
-        )
-        .await
-    }
-
-    /// Reads one V4 table projection, including seeded or dropped history when present.
-    pub async fn read_legacy_table_projection_v4(
-        &self,
-        table_id: TableId,
-    ) -> Result<Option<LegacyCatalogTableProjectionV4>> {
-        await_response(self.endpoint.control_request(|response| {
-            ControlReadMessage::ReadLegacyTableProjectionV4 { table_id, response }
-        }))
-        .await
-    }
-
-    /// Lists every V4 table projection in strict table-identity order.
-    ///
-    /// This full-state read is intended for trusted startup and continuity-loss reconciliation,
-    /// not for an unbounded external listing API.
-    pub async fn list_legacy_table_projections_v4(
-        &self,
-    ) -> Result<Vec<LegacyCatalogTableProjectionV4>> {
-        await_response(
-            self.endpoint
-                .control_request(ControlReadMessage::ListLegacyTableProjectionsV4),
-        )
-        .await
-    }
 }
 
 impl CatalogRead for SqliteCatalogReadHandle {
@@ -1286,7 +1008,41 @@ impl CatalogFileRead for SqliteCatalogReadHandle {
     }
 }
 
+impl CatalogConsumerRead for SqliteCatalog {
+    fn read_consumer_offset(
+        &self,
+        request: ReadConsumerOffsetRequest,
+    ) -> BoxFuture<'_, Result<ConsumerOffsetSnapshot>> {
+        Box::pin(async move { self.read_handle()?.read_consumer_offset(request).await })
+    }
+}
+
+impl CatalogConsumerRead for SqliteCatalogReadHandle {
+    fn read_consumer_offset(
+        &self,
+        request: ReadConsumerOffsetRequest,
+    ) -> BoxFuture<'_, Result<ConsumerOffsetSnapshot>> {
+        Box::pin(async move {
+            await_response(
+                self.endpoint.control_request(|sender| {
+                    ControlReadMessage::ReadConsumerOffset(request, sender)
+                }),
+            )
+            .await
+        })
+    }
+}
+
 impl CatalogIdempotencyRead for SqliteCatalog {
+    fn probe_command_replay<'a>(
+        &'a self,
+        command: &'a VersionedCatalogCommand,
+    ) -> BoxFuture<'a, Result<CatalogCommandReplayProbe>> {
+        Box::pin(async move { self.read_handle()?.probe_command_replay(command).await })
+    }
+}
+
+impl CatalogIdempotencyRead for SqliteCatalogReadHandle {
     fn probe_command_replay<'a>(
         &'a self,
         command: &'a VersionedCatalogCommand,
@@ -1305,13 +1061,11 @@ impl CatalogIdempotencyRead for SqliteCatalog {
                 domain::verify_command_replay_key,
             )
             .await?;
-            let result = await_response(self.read_pool().and_then(|pool| {
-                pool.control_request(|response| {
-                    ControlReadMessage::ProbeCommandReplay(CommandReplayProbeRequest {
-                        key,
-                        response,
-                        probe_permit,
-                    })
+            let result = await_response(self.endpoint.control_request(|response| {
+                ControlReadMessage::ProbeCommandReplay(CommandReplayProbeRequest {
+                    key,
+                    response,
+                    probe_permit,
                 })
             }))
             .await;
@@ -1382,182 +1136,6 @@ impl CatalogWrite for SqliteCatalogWriteHandle {
     }
 }
 
-impl SqliteCatalogLegacyImportSession<'_> {
-    /// Probes one V2 request ID through the bounded control-read lane.
-    ///
-    /// This lookup does not reserve publication or manifest-preparation capacity and does not
-    /// validate a new import command. The returned response has only passed intrinsic permanent
-    /// record checks; startup orchestration must compare it with its current migration plan.
-    pub fn probe_legacy_import_v2(
-        &self,
-        request_id: RequestId,
-    ) -> BoxFuture<'_, Result<LegacyCatalogImportReplayProbeV2>> {
-        if !self.active
-            || self.catalog.legacy_import_state.load(Ordering::Acquire) != LEGACY_IMPORT_ACTIVE
-        {
-            return Box::pin(async {
-                Err(ServerError::new(
-                    ErrorCode::Unavailable,
-                    "legacy import session is no longer active",
-                )
-                .with_retryable(false))
-            });
-        }
-        Box::pin(async move {
-            let probe_permit = self
-                .catalog
-                .replay_probe_budget
-                .reserve()
-                .map_err(|error| error.with_request_id(request_id))?;
-            let result = await_response(self.catalog.read_pool().and_then(|pool| {
-                pool.control_request(|response| {
-                    ControlReadMessage::ProbeLegacyImport(LegacyImportReplayProbeRequest {
-                        request_id,
-                        response,
-                        probe_permit,
-                    })
-                })
-            }))
-            .await;
-            result.map_err(|error| error.with_request_id(request_id))
-        })
-    }
-
-    /// Imports one fully verified legacy table or replays its exact permanent response.
-    pub fn import_legacy_table_v2(
-        &self,
-        command: LegacyCatalogImportEnvelopeV2,
-    ) -> BoxFuture<'_, Result<LegacyCatalogImportResponseV2>> {
-        if !self.active
-            || self.catalog.legacy_import_state.load(Ordering::Acquire) != LEGACY_IMPORT_ACTIVE
-        {
-            return Box::pin(async {
-                Err(ServerError::new(
-                    ErrorCode::Unavailable,
-                    "legacy import session is no longer active",
-                )
-                .with_retryable(false))
-            });
-        }
-        self.catalog.submit_legacy_import(command)
-    }
-
-    /// Permanently closes the V2 import window before server admission becomes visible.
-    pub fn seal(mut self) {
-        self.active = false;
-        self.catalog
-            .legacy_import_state
-            .store(LEGACY_IMPORT_SEALED, Ordering::Release);
-    }
-}
-
-impl SqliteCatalogLegacyReconcileHandle {
-    /// Atomically reconciles one existing migrated table to a verified full legacy file view.
-    ///
-    /// Exact request replays return the durable mapping without advancing Catalog revision. Queue,
-    /// byte, and publication admission are bounded by the owning Catalog configuration.
-    pub fn reconcile_legacy_table_v3(
-        &self,
-        command: LegacyCatalogReconcileEnvelopeV3,
-    ) -> BoxFuture<'_, Result<LegacyCatalogReconcileResponseV3>> {
-        Box::pin(async move {
-            let request_id = command.request_id;
-            let endpoint = self.endpoint.upgrade().ok_or_else(actor_stopped)?;
-            endpoint.check_admission()?;
-            let command_permit = self
-                .command_budget
-                .reserve()
-                .map_err(|error| error.with_request_id(request_id))?;
-            let publication_permit = Arc::clone(&self.publication_gate)
-                .acquire_owned()
-                .await
-                .map_err(|_| publication_gate_stopped())?;
-            let publication_permit = SqlitePublicationPermit {
-                owner_id: self.publication_owner_id,
-                _command_permit: command_permit,
-                _publication_permit: publication_permit,
-            };
-            let queued_bytes =
-                legacy_reconcile_domain::legacy_reconcile_preflight_bytes(&command).await?;
-            let manifest_permit = self
-                .manifest_queue_budget
-                .reserve(queued_bytes)
-                .map_err(|error| error.with_request_id(request_id))?;
-            await_response(endpoint.writer_request(|response| {
-                ServiceMessage::LegacyReconcile(LegacyReconcileRequest {
-                    command,
-                    state: LegacyReconcileRequestState {
-                        request_id,
-                        response,
-                        _manifest_permit: manifest_permit,
-                        _publication_permit: publication_permit,
-                    },
-                })
-            }))
-            .await
-        })
-    }
-
-    /// Applies one trusted V4 legacy projection command through replay-first preparation.
-    ///
-    /// Verification runs on the preparation worker before the writer probes permanent replay.
-    /// Cooperative byte accounting and byte-budget admission precede the publication gate so an
-    /// unqueued command cannot block unrelated publication. Once admitted, every worker stage
-    /// retains the same bounded publication, command, and queued-byte permits.
-    pub fn apply_legacy_catalog_projection_v4(
-        &self,
-        command: LegacyCatalogProjectionEnvelopeV4,
-    ) -> BoxFuture<'_, Result<LegacyCatalogProjectionResponseV4>> {
-        Box::pin(async move {
-            let request_id = command.request_id;
-            let endpoint = self.endpoint.upgrade().ok_or_else(actor_stopped)?;
-            endpoint.check_admission()?;
-            let command_permit = self
-                .command_budget
-                .reserve()
-                .map_err(|error| error.with_request_id(request_id))?;
-            let queued_bytes =
-                legacy_projection_domain::legacy_projection_preflight_bytes(&command).await?;
-            let manifest_permit = self
-                .manifest_queue_budget
-                .reserve(queued_bytes)
-                .map_err(|error| error.with_request_id(request_id))?;
-            let publication_permit = Arc::clone(&self.publication_gate)
-                .acquire_owned()
-                .await
-                .map_err(|_| publication_gate_stopped().with_request_id(request_id))?;
-            let publication_permit = SqlitePublicationPermit {
-                owner_id: self.publication_owner_id,
-                _command_permit: command_permit,
-                _publication_permit: publication_permit,
-            };
-            await_response(endpoint.writer_request(|response| {
-                ServiceMessage::LegacyProjection(LegacyProjectionRequest {
-                    command,
-                    state: LegacyProjectionRequestState {
-                        request_id,
-                        response,
-                        _manifest_permit: manifest_permit,
-                        _publication_permit: publication_permit,
-                    },
-                })
-            }))
-            .await
-        })
-    }
-}
-
-impl Drop for SqliteCatalogLegacyImportSession<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            self.catalog
-                .legacy_import_state
-                .store(LEGACY_IMPORT_SEALED, Ordering::Release);
-            self.active = false;
-        }
-    }
-}
-
 impl CatalogPublicationControl for SqliteCatalog {
     fn acquire_publication_permit(&self) -> BoxFuture<'_, Result<CatalogPublicationPermit>> {
         Box::pin(self.acquire_shared_publication_permit())
@@ -1589,7 +1167,6 @@ impl CatalogGarbageCollection for SqliteCatalog {
         request: ClaimGarbageCollectionFilesRequest,
     ) -> BoxFuture<'_, Result<ClaimedGarbageCollectionFiles>> {
         Box::pin(async move {
-            self.seal_legacy_imports_for_ordinary_mutation()?;
             let guard = guard
                 .try_into_opaque::<crate::runtime_pins::SqliteGarbageCollectionGuard>()
                 .map_err(|_| {
@@ -1638,7 +1215,6 @@ impl CatalogGarbageCollection for SqliteCatalog {
         request: FinalizeGarbageCollectionFilesRequest,
     ) -> BoxFuture<'_, Result<FinalizedGarbageCollectionFiles>> {
         Box::pin(async move {
-            self.seal_legacy_imports_for_ordinary_mutation()?;
             crate::gc_domain::validate_finalize_request(&request)?;
             let command_permit = self.command_budget.reserve()?;
             await_response(self.writer_request(|response| {
@@ -1841,6 +1417,16 @@ impl Drop for ManifestQueuePermit {
 }
 
 trait CatalogReadBackend: Send + Sync + 'static {
+    fn read_consumer_offset(
+        &self,
+        connection: &mut Connection,
+        request: ReadConsumerOffsetRequest,
+    ) -> Result<ConsumerOffsetSnapshot> {
+        deferred_control_read(connection, "read durable consumer snapshot", |connection| {
+            crate::consumer_domain::read_consumer_offset(connection, request)
+        })
+    }
+
     fn revision(&self, connection: &Connection) -> Result<u64> {
         domain::revision(connection)
     }
@@ -1914,73 +1500,6 @@ trait CatalogReadBackend: Send + Sync + 'static {
     ) -> Result<CatalogCommandReplayProbe> {
         domain::probe_command_replay(connection, key)
     }
-
-    fn probe_legacy_import_v2(
-        &self,
-        connection: &mut Connection,
-        request_id: RequestId,
-    ) -> Result<LegacyCatalogImportReplayProbeV2> {
-        legacy_import_domain::probe_legacy_catalog_import_v2(connection, request_id)
-    }
-
-    fn resolve_legacy_file_view_mapping(
-        &self,
-        connection: &Connection,
-        table_id: zippy_types::TableId,
-        legacy_files_revision: u64,
-    ) -> Result<LegacyFileViewSnapshotMapping> {
-        legacy_reconcile_domain::read_legacy_file_view_mapping(
-            connection,
-            table_id,
-            legacy_files_revision,
-        )?
-        .ok_or_else(|| {
-            ServerError::new(
-                ErrorCode::NotFound,
-                "exact legacy file-view revision mapping was not found",
-            )
-            .with_table_id(table_id)
-            .with_retryable(false)
-        })
-    }
-
-    fn resolve_current_legacy_file_view_mapping(
-        &self,
-        connection: &Connection,
-        table_id: zippy_types::TableId,
-    ) -> Result<LegacyFileViewSnapshotMapping> {
-        legacy_reconcile_domain::read_current_legacy_file_view_mapping(connection, table_id)
-    }
-
-    fn read_legacy_projection_checkpoint_v4(
-        &self,
-        connection: &Connection,
-    ) -> Result<LegacyCatalogProjectionCheckpointV4> {
-        legacy_projection_domain::read_checkpoint(connection)
-    }
-
-    fn read_legacy_table_projection_v4(
-        &self,
-        connection: &mut Connection,
-        table_id: TableId,
-    ) -> Result<Option<LegacyCatalogTableProjectionV4>> {
-        deferred_control_read(
-            connection,
-            "read legacy V4 table projection snapshot",
-            |transaction| legacy_projection_domain::read_table_projection(transaction, table_id),
-        )
-    }
-
-    fn list_legacy_table_projections_v4(
-        &self,
-        connection: &mut Connection,
-    ) -> Result<Vec<LegacyCatalogTableProjectionV4>> {
-        deferred_control_read(
-            connection,
-            "list legacy V4 table projection snapshot",
-            legacy_projection_domain::list_table_projections,
-        )
-    }
 }
 
 fn deferred_control_read<T>(
@@ -2003,6 +1522,10 @@ struct DomainCatalogReadBackend;
 impl CatalogReadBackend for DomainCatalogReadBackend {}
 
 enum ControlReadMessage {
+    ReadConsumerOffset(
+        ReadConsumerOffsetRequest,
+        oneshot::Sender<Result<ConsumerOffsetSnapshot>>,
+    ),
     Revision(oneshot::Sender<Result<u64>>),
     GetNamespace(NamespaceRef, oneshot::Sender<Result<NamespaceDescriptor>>),
     ListNamespaces(
@@ -2025,22 +1548,6 @@ enum ControlReadMessage {
         oneshot::Sender<Result<CatalogDataFileReferenceSnapshot>>,
     ),
     ProbeCommandReplay(CommandReplayProbeRequest),
-    ProbeLegacyImport(LegacyImportReplayProbeRequest),
-    ResolveLegacyMapping {
-        table_id: zippy_types::TableId,
-        legacy_files_revision: u64,
-        response: oneshot::Sender<Result<LegacyFileViewSnapshotMapping>>,
-    },
-    ResolveCurrentLegacyMapping {
-        table_id: zippy_types::TableId,
-        response: oneshot::Sender<Result<LegacyFileViewSnapshotMapping>>,
-    },
-    ReadLegacyProjectionCheckpointV4(oneshot::Sender<Result<LegacyCatalogProjectionCheckpointV4>>),
-    ReadLegacyTableProjectionV4 {
-        table_id: TableId,
-        response: oneshot::Sender<Result<Option<LegacyCatalogTableProjectionV4>>>,
-    },
-    ListLegacyTableProjectionsV4(oneshot::Sender<Result<Vec<LegacyCatalogTableProjectionV4>>>),
     Shutdown,
 }
 
@@ -2059,12 +1566,6 @@ struct ResolveTablesRequest {
 struct ResolveTablesResponse {
     tables: Vec<TableDescriptor>,
     memory_lease: Option<CatalogSnapshotMemoryLease>,
-}
-
-struct LegacyImportReplayProbeRequest {
-    request_id: RequestId,
-    response: oneshot::Sender<Result<LegacyCatalogImportReplayProbeV2>>,
-    probe_permit: ReplayProbePermit,
 }
 
 enum SnapshotReadMessage {
@@ -2399,6 +1900,11 @@ fn control_read_loop(
 ) -> Result<()> {
     while let Ok(message) = receiver.recv() {
         match message {
+            ControlReadMessage::ReadConsumerOffset(request, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.read_consumer_offset(&mut connection, request));
+                }
+            }
             ControlReadMessage::Revision(response) => {
                 if !response.is_closed() {
                     let _ = response.send(backend.revision(&connection));
@@ -2476,58 +1982,6 @@ fn control_read_loop(
                 drop(probe_permit);
                 let _ = response.send(result);
             }
-            ControlReadMessage::ProbeLegacyImport(request) => {
-                let LegacyImportReplayProbeRequest {
-                    request_id,
-                    response,
-                    probe_permit,
-                } = request;
-                if response.is_closed() {
-                    drop(probe_permit);
-                    continue;
-                }
-                let result = backend.probe_legacy_import_v2(&mut connection, request_id);
-                drop(probe_permit);
-                let _ = response.send(result);
-            }
-            ControlReadMessage::ResolveLegacyMapping {
-                table_id,
-                legacy_files_revision,
-                response,
-            } => {
-                if !response.is_closed() {
-                    let _ = response.send(backend.resolve_legacy_file_view_mapping(
-                        &connection,
-                        table_id,
-                        legacy_files_revision,
-                    ));
-                }
-            }
-            ControlReadMessage::ResolveCurrentLegacyMapping { table_id, response } => {
-                if !response.is_closed() {
-                    let _ = response.send(
-                        backend.resolve_current_legacy_file_view_mapping(&connection, table_id),
-                    );
-                }
-            }
-            ControlReadMessage::ReadLegacyProjectionCheckpointV4(response) => {
-                if !response.is_closed() {
-                    let _ =
-                        response.send(backend.read_legacy_projection_checkpoint_v4(&connection));
-                }
-            }
-            ControlReadMessage::ReadLegacyTableProjectionV4 { table_id, response } => {
-                if !response.is_closed() {
-                    let _ = response
-                        .send(backend.read_legacy_table_projection_v4(&mut connection, table_id));
-                }
-            }
-            ControlReadMessage::ListLegacyTableProjectionsV4(response) => {
-                if !response.is_closed() {
-                    let _ =
-                        response.send(backend.list_legacy_table_projections_v4(&mut connection));
-                }
-            }
             ControlReadMessage::Shutdown => break,
         }
     }
@@ -2585,9 +2039,6 @@ fn join_read_worker(actor: JoinHandle<Result<()>>, role: &str) -> Result<()> {
 
 enum ServiceMessage {
     Command(CommandRequest),
-    LegacyImport(LegacyImportRequest),
-    LegacyReconcile(LegacyReconcileRequest),
-    LegacyProjection(LegacyProjectionRequest),
     ClaimGarbageCollection(GarbageCollectionClaimRequest),
     FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
     Shutdown(Sender<Result<()>>),
@@ -2595,9 +2046,6 @@ enum ServiceMessage {
 
 enum WriterRequest {
     Command(CommandRequest),
-    LegacyImport(LegacyImportRequest),
-    LegacyReconcile(LegacyReconcileRequest),
-    LegacyProjection(LegacyProjectionRequest),
     ClaimGarbageCollection(GarbageCollectionClaimRequest),
     FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
 }
@@ -2605,87 +2053,6 @@ enum WriterRequest {
 struct CommandRequest {
     command: VersionedCatalogCommand,
     state: CommandRequestState,
-}
-
-struct LegacyImportRequest {
-    command: LegacyCatalogImportEnvelopeV2,
-    state: LegacyImportRequestState,
-}
-
-struct LegacyImportRequestState {
-    request_id: RequestId,
-    response: oneshot::Sender<Result<LegacyCatalogImportResponseV2>>,
-    _manifest_permit: Option<ManifestQueuePermit>,
-    _publication_permit: SqlitePublicationPermit,
-}
-
-struct LegacyReconcileRequest {
-    command: LegacyCatalogReconcileEnvelopeV3,
-    state: LegacyReconcileRequestState,
-}
-
-struct LegacyReconcileRequestState {
-    request_id: RequestId,
-    response: oneshot::Sender<Result<LegacyCatalogReconcileResponseV3>>,
-    _manifest_permit: Option<ManifestQueuePermit>,
-    _publication_permit: SqlitePublicationPermit,
-}
-
-struct LegacyProjectionRequest {
-    command: LegacyCatalogProjectionEnvelopeV4,
-    state: LegacyProjectionRequestState,
-}
-
-struct LegacyProjectionRequestState {
-    request_id: RequestId,
-    response: oneshot::Sender<Result<LegacyCatalogProjectionResponseV4>>,
-    _manifest_permit: Option<ManifestQueuePermit>,
-    _publication_permit: SqlitePublicationPermit,
-}
-
-impl LegacyReconcileRequestState {
-    fn send(self, result: Result<LegacyCatalogReconcileResponseV3>) {
-        let _ = self.response.send(result);
-    }
-}
-
-impl LegacyProjectionRequestState {
-    fn send(self, result: Result<LegacyCatalogProjectionResponseV4>) {
-        let _ = self.response.send(result);
-    }
-}
-
-impl LegacyImportRequestState {
-    fn send(self, result: Result<LegacyCatalogImportResponseV2>) {
-        let _ = self.response.send(result);
-    }
-}
-
-enum PreparationRequestState {
-    Command(CommandRequestState),
-    LegacyImport(LegacyImportRequestState),
-    LegacyReconcile(LegacyReconcileRequestState),
-    LegacyProjection(LegacyProjectionRequestState),
-}
-
-impl PreparationRequestState {
-    fn request_id(&self) -> RequestId {
-        match self {
-            Self::Command(state) => state.request_id,
-            Self::LegacyImport(state) => state.request_id,
-            Self::LegacyReconcile(state) => state.request_id,
-            Self::LegacyProjection(state) => state.request_id,
-        }
-    }
-
-    fn send_error(self, error: ServerError) {
-        match self {
-            Self::Command(state) => state.send(Err(error)),
-            Self::LegacyImport(state) => state.send(Err(error)),
-            Self::LegacyReconcile(state) => state.send(Err(error)),
-            Self::LegacyProjection(state) => state.send(Err(error)),
-        }
-    }
 }
 
 struct CommandRequestState {
@@ -2772,10 +2139,6 @@ impl ManifestPreparationBackend for DomainManifestPreparationBackend {
 enum ManifestWorkerJob {
     Verify(VersionedCatalogCommand),
     Prepare(domain::ManifestCommandPreparation),
-    PrepareLegacyImport(LegacyCatalogImportEnvelopeV2),
-    PrepareLegacyReconcile(Box<LegacyCatalogReconcileEnvelopeV3>),
-    VerifyLegacyProjection(Box<LegacyCatalogProjectionEnvelopeV4>),
-    PrepareLegacyProjection(legacy_projection_domain::VerifiedLegacyCatalogProjectionV4),
 }
 
 impl ManifestWorkerJob {
@@ -2783,10 +2146,6 @@ impl ManifestWorkerJob {
         match self {
             Self::Verify(command) => command_request_id(command),
             Self::Prepare(preparation) => preparation.request_id(),
-            Self::PrepareLegacyImport(command) => command.request_id,
-            Self::PrepareLegacyReconcile(command) => command.request_id,
-            Self::VerifyLegacyProjection(command) => command.request_id,
-            Self::PrepareLegacyProjection(command) => command.request_id(),
         }
     }
 }
@@ -2794,12 +2153,6 @@ impl ManifestWorkerJob {
 enum ManifestWorkerCompletion {
     Verified(Result<domain::VerifiedManifestCommand>),
     Prepared(domain::ManifestPreparationResult),
-    LegacyImportPrepared(Result<legacy_import_domain::PreparedLegacyCatalogImportV2>),
-    LegacyReconcilePrepared(Box<Result<legacy_reconcile_domain::PreparedLegacyCatalogReconcileV3>>),
-    LegacyProjectionVerified(Result<legacy_projection_domain::VerifiedLegacyCatalogProjectionV4>),
-    LegacyProjectionPrepared(
-        Box<Result<legacy_projection_domain::PreparedLegacyCatalogProjectionV4>>,
-    ),
 }
 
 enum ManifestWorkerSubmitError {
@@ -2884,44 +2237,6 @@ fn manifest_worker_loop(
                 let result = catch_unwind(AssertUnwindSafe(|| backend.prepare(preparation)))
                     .unwrap_or(panic_result);
                 ManifestWorkerCompletion::Prepared(result)
-            }
-            ManifestWorkerJob::PrepareLegacyImport(command) => {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    legacy_import_domain::prepare_legacy_catalog_import_v2(command)
-                }))
-                .unwrap_or_else(|_| Err(manifest_worker_panicked(request_id, "legacy_import")));
-                ManifestWorkerCompletion::LegacyImportPrepared(result)
-            }
-            ManifestWorkerJob::PrepareLegacyReconcile(command) => {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    legacy_reconcile_domain::prepare_legacy_catalog_reconcile_v3(*command)
-                }))
-                .unwrap_or_else(|_| Err(manifest_worker_panicked(request_id, "legacy_reconcile")));
-                ManifestWorkerCompletion::LegacyReconcilePrepared(Box::new(result))
-            }
-            ManifestWorkerJob::VerifyLegacyProjection(command) => {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    legacy_projection_domain::verify_legacy_catalog_projection_v4(*command)
-                }))
-                .unwrap_or_else(|_| {
-                    Err(manifest_worker_panicked(
-                        request_id,
-                        "legacy_projection_verify",
-                    ))
-                });
-                ManifestWorkerCompletion::LegacyProjectionVerified(result)
-            }
-            ManifestWorkerJob::PrepareLegacyProjection(command) => {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    legacy_projection_domain::prepare_verified_legacy_catalog_projection_v4(command)
-                }))
-                .unwrap_or_else(|_| {
-                    Err(manifest_worker_panicked(
-                        request_id,
-                        "legacy_projection_prepare",
-                    ))
-                });
-                ManifestWorkerCompletion::LegacyProjectionPrepared(Box::new(result))
             }
         };
         if completion_sender.send(completion).is_err() {
@@ -3094,7 +2409,7 @@ fn actor_loop(
 fn handle_service_message(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<PreparationRequestState>,
+    active_manifest: &mut Option<CommandRequestState>,
     pending_requests: &mut VecDeque<WriterRequest>,
     draining: &mut bool,
     shutdown_response: &mut Option<Sender<Result<()>>>,
@@ -3107,27 +2422,6 @@ fn handle_service_message(
             active_manifest,
             pending_requests,
             WriterRequest::Command(command),
-        ),
-        ServiceMessage::LegacyImport(request) => admit_writer_request(
-            connection,
-            manifest_worker,
-            active_manifest,
-            pending_requests,
-            WriterRequest::LegacyImport(request),
-        ),
-        ServiceMessage::LegacyReconcile(request) => admit_writer_request(
-            connection,
-            manifest_worker,
-            active_manifest,
-            pending_requests,
-            WriterRequest::LegacyReconcile(request),
-        ),
-        ServiceMessage::LegacyProjection(request) => admit_writer_request(
-            connection,
-            manifest_worker,
-            active_manifest,
-            pending_requests,
-            WriterRequest::LegacyProjection(request),
         ),
         ServiceMessage::ClaimGarbageCollection(request) => admit_writer_request(
             connection,
@@ -3153,7 +2447,7 @@ fn handle_service_message(
 fn admit_writer_request(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<PreparationRequestState>,
+    active_manifest: &mut Option<CommandRequestState>,
     pending_requests: &mut VecDeque<WriterRequest>,
     request: WriterRequest,
 ) {
@@ -3167,39 +2461,12 @@ fn admit_writer_request(
 fn start_writer_request(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<PreparationRequestState>,
+    active_manifest: &mut Option<CommandRequestState>,
     request: WriterRequest,
 ) {
     match request {
         WriterRequest::Command(command) => {
             start_command(connection, manifest_worker, active_manifest, command);
-        }
-        WriterRequest::LegacyImport(request) => {
-            let LegacyImportRequest { command, state } = request;
-            submit_manifest_job(
-                manifest_worker,
-                active_manifest,
-                ManifestWorkerJob::PrepareLegacyImport(command),
-                PreparationRequestState::LegacyImport(state),
-            );
-        }
-        WriterRequest::LegacyReconcile(request) => {
-            let LegacyReconcileRequest { command, state } = request;
-            submit_manifest_job(
-                manifest_worker,
-                active_manifest,
-                ManifestWorkerJob::PrepareLegacyReconcile(Box::new(command)),
-                PreparationRequestState::LegacyReconcile(state),
-            );
-        }
-        WriterRequest::LegacyProjection(request) => {
-            let LegacyProjectionRequest { command, state } = request;
-            submit_manifest_job(
-                manifest_worker,
-                active_manifest,
-                ManifestWorkerJob::VerifyLegacyProjection(Box::new(command)),
-                PreparationRequestState::LegacyProjection(state),
-            );
         }
         WriterRequest::ClaimGarbageCollection(request) => request.execute(connection),
         WriterRequest::FinalizeGarbageCollection(request) => request.execute(connection),
@@ -3209,7 +2476,7 @@ fn start_writer_request(
 fn start_command(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<PreparationRequestState>,
+    active_manifest: &mut Option<CommandRequestState>,
     request: CommandRequest,
 ) {
     let CommandRequest { command, state } = request;
@@ -3218,7 +2485,7 @@ fn start_command(
             manifest_worker,
             active_manifest,
             ManifestWorkerJob::Verify(command),
-            PreparationRequestState::Command(state),
+            state,
         );
     } else {
         state.send(domain::execute_command(connection, command));
@@ -3228,7 +2495,7 @@ fn start_command(
 fn handle_manifest_completion(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<PreparationRequestState>,
+    active_manifest: &mut Option<CommandRequestState>,
     completion: ManifestWorkerCompletion,
 ) {
     let Some(state) = active_manifest.take() else {
@@ -3236,145 +2503,62 @@ fn handle_manifest_completion(
         return;
     };
     match completion {
-        ManifestWorkerCompletion::Verified(Err(error)) => state.send_error(error),
+        ManifestWorkerCompletion::Verified(Err(error)) => state.send(Err(error)),
         ManifestWorkerCompletion::Verified(Ok(verified)) => {
-            let PreparationRequestState::Command(state) = state else {
-                state.send_error(ServerError::new(
-                    ErrorCode::Internal,
-                    "sqlite Catalog preparation state mismatched verified manifest",
-                ));
-                return;
-            };
             match domain::begin_verified_manifest_command(connection, verified) {
                 Ok(domain::ManifestCommandStart::Replay(response)) => state.send(Ok(response)),
                 Ok(domain::ManifestCommandStart::Prepare(preparation)) => submit_manifest_job(
                     manifest_worker,
                     active_manifest,
                     ManifestWorkerJob::Prepare(preparation),
-                    PreparationRequestState::Command(state),
+                    state,
                 ),
                 Err(error) => state.send(Err(error)),
             }
         }
         ManifestWorkerCompletion::Prepared(result) => {
-            let PreparationRequestState::Command(state) = state else {
-                state.send_error(ServerError::new(
-                    ErrorCode::Internal,
-                    "sqlite Catalog preparation state mismatched prepared manifest",
-                ));
-                return;
-            };
             state.send(domain::finalize_manifest_preparation(connection, result));
-        }
-        ManifestWorkerCompletion::LegacyImportPrepared(result) => {
-            let PreparationRequestState::LegacyImport(state) = state else {
-                state.send_error(ServerError::new(
-                    ErrorCode::Internal,
-                    "sqlite Catalog preparation state mismatched legacy import",
-                ));
-                return;
-            };
-            state.send(result.and_then(|prepared| {
-                legacy_import_domain::commit_legacy_catalog_import_v2(connection, prepared)
-            }));
-        }
-        ManifestWorkerCompletion::LegacyReconcilePrepared(result) => {
-            let PreparationRequestState::LegacyReconcile(state) = state else {
-                state.send_error(ServerError::new(
-                    ErrorCode::Internal,
-                    "sqlite Catalog preparation state mismatched legacy reconcile",
-                ));
-                return;
-            };
-            state.send((*result).and_then(|prepared| {
-                legacy_reconcile_domain::commit_legacy_catalog_reconcile_v3(connection, prepared)
-            }));
-        }
-        ManifestWorkerCompletion::LegacyProjectionVerified(result) => {
-            let PreparationRequestState::LegacyProjection(state) = state else {
-                state.send_error(ServerError::new(
-                    ErrorCode::Internal,
-                    "sqlite Catalog preparation state mismatched verified legacy projection",
-                ));
-                return;
-            };
-            match result.and_then(|verified| {
-                legacy_projection_domain::begin_verified_legacy_catalog_projection_v4(
-                    connection, verified,
-                )
-            }) {
-                Ok(legacy_projection_domain::LegacyCatalogProjectionStartV4::Replay(response)) => {
-                    state.send(Ok(response));
-                }
-                Ok(legacy_projection_domain::LegacyCatalogProjectionStartV4::Prepare(verified)) => {
-                    submit_manifest_job(
-                        manifest_worker,
-                        active_manifest,
-                        ManifestWorkerJob::PrepareLegacyProjection(verified),
-                        PreparationRequestState::LegacyProjection(state),
-                    );
-                }
-                Err(error) => state.send(Err(error)),
-            }
-        }
-        ManifestWorkerCompletion::LegacyProjectionPrepared(result) => {
-            let PreparationRequestState::LegacyProjection(state) = state else {
-                state.send_error(ServerError::new(
-                    ErrorCode::Internal,
-                    "sqlite Catalog preparation state mismatched prepared legacy projection",
-                ));
-                return;
-            };
-            state.send((*result).and_then(|prepared| {
-                legacy_projection_domain::execute_legacy_catalog_projection_v4(connection, prepared)
-            }));
         }
     }
 }
 
 fn submit_manifest_job(
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<PreparationRequestState>,
+    active_manifest: &mut Option<CommandRequestState>,
     job: ManifestWorkerJob,
-    state: PreparationRequestState,
+    state: CommandRequestState,
 ) {
     match manifest_worker.submit(job) {
         Ok(()) => *active_manifest = Some(state),
         Err(ManifestWorkerSubmitError::Full(job)) => {
             let request_id = job.request_id();
-            state.send_error(
-                ServerError::new(
-                    ErrorCode::ResourceExhausted,
-                    "sqlite catalog manifest preparation queue is full",
-                )
-                .with_request_id(request_id),
-            );
+            state.send(Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "sqlite catalog manifest preparation queue is full",
+            )
+            .with_request_id(request_id)));
         }
         Err(ManifestWorkerSubmitError::Stopped(job)) => {
             let request_id = job.request_id();
-            state.send_error(
-                ServerError::new(
-                    ErrorCode::Unavailable,
-                    "sqlite catalog manifest preparation worker is not running",
-                )
-                .with_request_id(request_id)
-                .with_retryable(false),
-            );
+            state.send(Err(ServerError::new(
+                ErrorCode::Unavailable,
+                "sqlite catalog manifest preparation worker is not running",
+            )
+            .with_request_id(request_id)
+            .with_retryable(false)));
         }
     }
 }
 
 fn fail_active_manifest_worker(
-    active_manifest: &mut Option<PreparationRequestState>,
+    active_manifest: &mut Option<CommandRequestState>,
     message: &'static str,
 ) {
     if let Some(state) = active_manifest.take() {
-        let request_id = state.request_id();
-        state.send_error(
-            ServerError::new(ErrorCode::Unavailable, message)
-                .with_request_id(request_id)
-                .with_retryable(false),
-        );
+        let request_id = state.request_id;
+        state.send(Err(ServerError::new(ErrorCode::Unavailable, message)
+            .with_request_id(request_id)
+            .with_retryable(false)));
     }
 }
 
@@ -3551,40 +2735,25 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
-    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use zippy_core::OwnedDataDirectory;
     use zippy_types::catalog::{
-        compute_legacy_catalog_projection_digest_v4,
-        compute_legacy_catalog_source_metadata_hash_v4, CatalogActor, CatalogActorKind,
-        CatalogCommandEnvelopeV1, CatalogCommandReplayProbe, CatalogCommandV1,
-        CatalogDataFileProbeMatch, CatalogFileRead, CatalogGarbageCollection,
+        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
+        CatalogCommandV1, CatalogDataFileProbeMatch, CatalogFileRead, CatalogGarbageCollection,
         CatalogGarbageCollectionGuard, CatalogIdempotencyRead, CatalogPublicationControl,
         CatalogPublicationPermit, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
         CatalogTableSnapshot, CatalogWrite, ClaimGarbageCollectionFilesRequest, CommandFingerprint,
         CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand,
-        CreateTableCommand, LegacyCatalogAdoptExistingTableCommandV4,
-        LegacyCatalogAdvanceCheckpointCommandV4, LegacyCatalogBootstrapTableCommandV4,
-        LegacyCatalogCheckpointModeV4, LegacyCatalogDropTableCommandV4,
-        LegacyCatalogImportCommandV2, LegacyCatalogImportEnvelopeV2, LegacyCatalogImportFileV2,
-        LegacyCatalogImportReplayProbeV2, LegacyCatalogProjectionCommandV4,
-        LegacyCatalogProjectionCompletenessV4, LegacyCatalogProjectionDigestTableV4,
-        LegacyCatalogProjectionEnvelopeV4, LegacyCatalogProjectionOutcomeV4,
-        LegacyCatalogProjectionPhaseV4, LegacyCatalogProjectionTableStateV4,
-        LegacyCatalogReconcileCommandV3, LegacyCatalogReconcileEnvelopeV3,
-        LegacyCatalogSyncTableMetadataCommandV4, LegacyFileViewContinuity, ManagedDataFileProbe,
-        VersionedCatalogCommand, VersionedCatalogResponse,
-        LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY, LEGACY_REGISTRY_INDEX_METADATA_KEY,
-        LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
+        CreateTableCommand, ManagedDataFileProbe, VersionedCatalogCommand,
+        VersionedCatalogResponse,
     };
     use zippy_types::query::QueryInstanceId;
     use zippy_types::storage::{CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseIssuer};
     use zippy_types::table::{
-        AppendTableDefinition, CatalogName, DataFileDescriptor, DataFileLocation,
-        DataFileProvenance, DataFileState, DataFiles, ExternalDataPath, ManagedDataPath,
-        MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile,
-        SchemaCompatibility, SchemaDescriptor, SchemaIpcPayload, SourceSegmentIdentity,
-        SourceSegmentLineage, SourceSegmentLineages, TableDefinition, TableRef,
+        AppendTableDefinition, CatalogName, DataFileLocation, DataFileProvenance, DataFileState,
+        ManagedDataPath, MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile,
+        SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages,
+        TableDefinition, TableRef,
     };
     use zippy_types::{
         ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
@@ -3594,7 +2763,6 @@ mod tests {
         deferred_control_read, domain, snapshot_domain, table_domain, verify_replay_probe_command,
         CatalogReadBackend, DomainManifestPreparationBackend, ManifestPreparationBackend,
         ManifestQueueBudget, ReplayProbeBudget, SqliteCatalog, SqliteCatalogConfig,
-        SqliteCatalogLegacyReconcileHandle, SqliteCatalogReadHandle, REPLAY_PROBE_CAPACITY,
     };
 
     const NAMESPACE_ID: u128 = 1;
@@ -3627,12 +2795,6 @@ mod tests {
 
     struct CountingReplayReadBackend {
         probe_calls: Arc<AtomicUsize>,
-    }
-
-    struct BlockingLegacyReplayReadBackend {
-        started: crossbeam_channel::Sender<()>,
-        release: crossbeam_channel::Receiver<()>,
-        block_once: AtomicBool,
     }
 
     struct BlockingSnapshotBackend {
@@ -3793,24 +2955,6 @@ mod tests {
         }
     }
 
-    impl CatalogReadBackend for BlockingLegacyReplayReadBackend {
-        fn probe_legacy_import_v2(
-            &self,
-            connection: &mut rusqlite::Connection,
-            request_id: RequestId,
-        ) -> zippy_types::Result<LegacyCatalogImportReplayProbeV2> {
-            if self.block_once.swap(false, Ordering::AcqRel) {
-                self.started
-                    .send(())
-                    .expect("observe blocking legacy replay probe");
-                self.release
-                    .recv()
-                    .expect("release blocking legacy replay probe");
-            }
-            crate::legacy_import_domain::probe_legacy_catalog_import_v2(connection, request_id)
-        }
-    }
-
     impl CatalogReadBackend for BlockingSnapshotBackend {
         fn read_snapshot(
             &self,
@@ -3955,24 +3099,6 @@ mod tests {
         .into()
     }
 
-    fn migration_command(
-        request: u128,
-        expected_revision: Option<u64>,
-        command: CatalogCommandV1,
-    ) -> VersionedCatalogCommand {
-        CatalogCommandEnvelopeV1::new(
-            request_id(request),
-            expected_revision,
-            CatalogActor {
-                kind: CatalogActorKind::Migration,
-                principal: "catalog-service-migration-test".to_owned(),
-            },
-            command,
-        )
-        .expect("valid migration command envelope")
-        .into()
-    }
-
     fn schema_ipc() -> SchemaIpcPayload {
         let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
         let mut payload = Vec::new();
@@ -3999,157 +3125,284 @@ mod tests {
         format!("sha256-v1:{}", digit.to_string().repeat(64))
     }
 
-    fn projection_migration_config(name: &str, legacy_revision: u64) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (
-                "zippy.migration.legacy_stream_name".to_owned(),
-                name.to_owned(),
-            ),
-            (
-                "zippy.migration.legacy_persisted_files_revision_base".to_owned(),
-                legacy_revision.to_string(),
-            ),
-            (
-                "zippy.migration.native_snapshot_version_base".to_owned(),
-                "1".to_owned(),
-            ),
-            (
-                "zippy.migration.source_snapshot_hash".to_owned(),
-                canonical_hash('a'),
-            ),
-            ("zippy.migration.version".to_owned(), "1".to_owned()),
-        ])
-    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_drop_is_atomic_replayable_and_preserves_pins_and_leases() {
+        use zippy_types::catalog::{
+            AcquireProducerCommand, AcquireSnapshotLeaseCommand, DropTableCommand,
+            ReleaseSnapshotLeaseCommand,
+        };
+        use zippy_types::table::{SnapshotOperation, TableState};
+        use zippy_types::{LeaseId, ProducerId};
 
-    fn projection_envelope(
-        request: u128,
-        actor_kind: CatalogActorKind,
-        source_projection_hash: String,
-        source_catalog_revision: u64,
-        command: LegacyCatalogProjectionCommandV4,
-    ) -> LegacyCatalogProjectionEnvelopeV4 {
-        LegacyCatalogProjectionEnvelopeV4::new(
-            request_id(request),
-            CatalogActor {
-                kind: actor_kind,
-                principal: "catalog-service-legacy-v4-test".to_owned(),
-            },
-            0,
-            source_projection_hash,
-            source_catalog_revision,
-            command,
-        )
-        .expect("build V4 projection envelope")
-    }
-
-    async fn create_ready_ticks_projection(
-        catalog: &SqliteCatalog,
-        request_base: u128,
-        legacy_revision: u64,
-    ) -> (
-        SqliteCatalogLegacyReconcileHandle,
-        SqliteCatalogReadHandle,
-        String,
-        LegacyCatalogProjectionEnvelopeV4,
-    ) {
-        let namespace_id = NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id");
+        let directory = TempDir::new().unwrap();
+        let data_directory = data_directory(&directory);
+        write_managed_file_fixture(&data_directory, 10, &[1; 128]);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let (catalog, issuer) =
+            SqliteCatalog::open_with_snapshot_memory_lease_issuer(config.clone()).unwrap();
+        create_append_table(&catalog).await;
+        catalog
+            .command(commit_data_file(3, 10, 2, 1, 0))
+            .await
+            .unwrap();
+        let drop_command = |request, snapshot, revision| {
+            command(
+                request,
+                revision,
+                CatalogCommandV1::DropTable(DropTableCommand {
+                    table_id: table_id(),
+                    expected_snapshot_version: snapshot,
+                }),
+            )
+        };
+        let failed = catalog
+            .command(drop_command(4, 1, Some(3)))
+            .await
+            .unwrap_err();
+        assert_eq!(failed.code(), ErrorCode::Conflict);
+        assert_eq!(
+            catalog
+                .get_table(TableRef::Id {
+                    table_id: table_id()
+                })
+                .await
+                .unwrap()
+                .current_snapshot_version,
+            2
+        );
+        let selector = CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 2,
+            schema_version: 1,
+        };
+        let handle = catalog.read_handle().unwrap();
+        let pinned = handle
+            .read_pinned_snapshot_at(
+                std::slice::from_ref(&selector),
+                unattributed_snapshot_memory_lease(&issuer, 1),
+            )
+            .await
+            .unwrap();
+        let lease_id = LeaseId::from_u128(99).unwrap();
         catalog
             .command(command(
-                request_base,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id,
-                    name: CatalogName::new("market").expect("valid namespace name"),
+                5,
+                Some(3),
+                CatalogCommandV1::AcquireSnapshotLease(AcquireSnapshotLeaseCommand {
+                    lease_id,
+                    table_id: table_id(),
+                    snapshot_version: 2,
+                    owner: "drop-test".to_owned(),
+                    expires_at_ns: crate::domain::unix_time_ns().unwrap() + 60_000_000_000,
                 }),
             ))
             .await
-            .expect("create ready-projection namespace");
-        let projection = catalog
-            .legacy_reconcile_handle()
-            .expect("create ready-projection writer handle");
-        let read = catalog
-            .read_handle()
-            .expect("create ready-projection read handle");
-        let schema_ipc = schema_ipc();
-        let schema_hash = crate::canonical_schema_hash_from_ipc(&schema_ipc)
-            .expect("hash ready-projection Schema");
-        let definition = TableDefinition::Append(AppendTableDefinition {
-            event_time_column: None,
-        });
-        let bootstrap = projection_envelope(
-            request_base + 1,
-            CatalogActorKind::Migration,
-            canonical_hash('b'),
-            1,
-            LegacyCatalogProjectionCommandV4::BootstrapTable(
-                LegacyCatalogBootstrapTableCommandV4 {
-                    table_id: table_id(),
-                    namespace_id,
-                    name: CatalogName::new("ticks").expect("valid table name"),
-                    definition: definition.clone(),
-                    schema_ipc,
-                    canonical_schema_hash: schema_hash.clone(),
-                    config: projection_migration_config("ticks", legacy_revision),
-                    writer_epoch: 0,
-                    sources: Vec::new(),
-                    files: Vec::new(),
-                    legacy_files_revision: legacy_revision,
-                },
-            ),
+            .unwrap();
+        let command = drop_command(6, 2, Some(4));
+        let response = catalog.command(command.clone()).await.unwrap();
+        assert_eq!(catalog.command(command.clone()).await.unwrap(), response);
+        assert_eq!(
+            catalog
+                .get_table(TableRef::Id {
+                    table_id: table_id()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
         );
-        projection
-            .apply_legacy_catalog_projection_v4(bootstrap.clone())
+        assert_eq!(
+            catalog
+                .command(drop_command(7, 2, None))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        let historical = catalog
+            .read_snapshot_at(std::slice::from_ref(&selector))
             .await
-            .expect("bootstrap ready-projection table");
-        let digest =
-            compute_legacy_catalog_projection_digest_v4(&[LegacyCatalogProjectionDigestTableV4 {
+            .unwrap();
+        assert_eq!(historical.tables()[0].files().len(), 1);
+        assert_eq!(historical.tables()[0].table().state, TableState::Dropped);
+        assert_eq!(historical.tables()[0].table().writer_epoch, 1);
+        let empty = catalog
+            .read_snapshot_at(&[CatalogSnapshotSelector {
                 table_id: table_id(),
-                namespace_id,
-                name: CatalogName::new("ticks").expect("valid table name"),
-                definition,
+                snapshot_version: 3,
                 schema_version: 1,
-                schema_hash: schema_hash.clone(),
-                config: BTreeMap::new(),
-                legacy_files_revision: legacy_revision,
-                writer_epoch: 0,
-                state: LegacyCatalogProjectionTableStateV4::Active,
-                sources: Vec::new(),
             }])
-            .expect("compute ready-projection digest");
-        let checkpoint = read
-            .read_legacy_projection_checkpoint_v4()
             .await
-            .expect("read initial ready-projection checkpoint");
-        projection
-            .apply_legacy_catalog_projection_v4(projection_envelope(
-                request_base + 2,
-                CatalogActorKind::Server,
-                digest.clone(),
-                1,
-                LegacyCatalogProjectionCommandV4::AdvanceCheckpoint(
-                    LegacyCatalogAdvanceCheckpointCommandV4 {
-                        expected_checkpoint_generation: checkpoint.checkpoint_generation,
-                        expected_source_catalog_revision: checkpoint.source_catalog_revision,
-                        expected_source_projection_hash: checkpoint.source_projection_hash,
-                        expected_phase: checkpoint.phase,
-                        shadow_epoch: 0,
-                        phase: LegacyCatalogProjectionPhaseV4::ReadCutoverReady,
-                        mode: LegacyCatalogCheckpointModeV4::FullReconcile,
-                        target_projection_digest: digest,
-                        observed_continuity_loss_epoch: 0,
-                    },
-                ),
+            .unwrap();
+        assert!(empty.tables()[0].files().is_empty());
+        assert_eq!(
+            empty.tables()[0].snapshot().operation,
+            SnapshotOperation::Retention
+        );
+        assert_eq!(
+            empty.tables()[0].snapshot().committed_log_offset,
+            OffsetWatermark::Known(LogOffset::new(0))
+        );
+        assert_eq!(
+            catalog
+                .command(commit_data_file(8, 11, 5, 3, 1))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            catalog
+                .command(self::command(
+                    9,
+                    None,
+                    CatalogCommandV1::AcquireProducer(AcquireProducerCommand {
+                        table_id: table_id(),
+                        producer_id: ProducerId::from_u128(1).unwrap(),
+                        expected_writer_epoch: Some(0)
+                    },)
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::Conflict
+        );
+        let replacement_id = TableId::from_u128(202).unwrap();
+        let replacement = CreateTableCommand {
+            table_id: replacement_id,
+            namespace_id: NamespaceId::from_u128(NAMESPACE_ID).unwrap(),
+            name: CatalogName::new("ticks").unwrap(),
+            definition: TableDefinition::Append(AppendTableDefinition {
+                event_time_column: None,
+            }),
+            schema_ipc: schema_ipc(),
+            config: BTreeMap::new(),
+        };
+        catalog
+            .command(self::command(
+                20,
+                None,
+                CatalogCommandV1::CreateTable(replacement.clone()),
             ))
             .await
-            .expect("mark single projection ready");
+            .unwrap();
+        let name = TableRef::Name {
+            namespace: CatalogName::new("market").unwrap(),
+            table: CatalogName::new("ticks").unwrap(),
+        };
         assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read ready projection checkpoint")
-                .phase,
-            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
+            catalog.get_table(name.clone()).await.unwrap().table_id,
+            replacement_id
         );
-        (projection, read, schema_hash, bootstrap)
+        let mut conflicting = replacement.clone();
+        conflicting.table_id = TableId::from_u128(203).unwrap();
+        assert_eq!(
+            catalog
+                .command(self::command(
+                    21,
+                    None,
+                    CatalogCommandV1::CreateTable(conflicting)
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::AlreadyExists
+        );
+        let mut reused = replacement;
+        reused.table_id = table_id();
+        reused.name = CatalogName::new("different_name").unwrap();
+        assert_eq!(
+            catalog
+                .command(self::command(
+                    22,
+                    None,
+                    CatalogCommandV1::CreateTable(reused)
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::AlreadyExists
+        );
+        let old_history = catalog
+            .read_snapshot_at(std::slice::from_ref(&selector))
+            .await
+            .unwrap();
+        assert_eq!(old_history.tables()[0].table().table_id, table_id());
+        assert_eq!(old_history.tables()[0].table().name.as_str(), "ticks");
+        assert_eq!(old_history.tables()[0].files().len(), 1);
+        assert_eq!(catalog.command(command.clone()).await.unwrap(), response);
+        assert_eq!(
+            catalog.get_table(name.clone()).await.unwrap().table_id,
+            replacement_id
+        );
+        let claim_request = ClaimGarbageCollectionFilesRequest {
+            table_id: table_id(),
+            retry_limit: 1,
+            new_claim_limit: 1,
+        };
+        let protected = catalog
+            .claim_garbage_collection_files(
+                catalog
+                    .acquire_garbage_collection_guard(table_id())
+                    .unwrap(),
+                claim_request.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(protected.files.is_empty());
+        // Releasing the durable lease still cannot collect a live query's files.
+        catalog
+            .command(self::command(
+                10,
+                None,
+                CatalogCommandV1::ReleaseSnapshotLease(ReleaseSnapshotLeaseCommand {
+                    lease_id,
+                    owner: "drop-test".to_owned(),
+                }),
+            ))
+            .await
+            .unwrap();
+        let protected = catalog
+            .claim_garbage_collection_files(
+                catalog
+                    .acquire_garbage_collection_guard(table_id())
+                    .unwrap(),
+                claim_request.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(protected.files.is_empty());
+        drop(pinned);
+        let claim = catalog
+            .claim_garbage_collection_files(
+                catalog
+                    .acquire_garbage_collection_guard(table_id())
+                    .unwrap(),
+                claim_request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim.files.len(), 1);
+        assert_eq!(claim.files[0].file_id(), FileId::from_u128(10).unwrap());
+        drop(handle);
+        catalog.close().unwrap();
+        let reopened = SqliteCatalog::open(config).unwrap();
+        assert_eq!(reopened.command(command).await.unwrap(), response);
+        assert_eq!(
+            reopened
+                .get_table(TableRef::Id {
+                    table_id: table_id()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            reopened.get_table(name).await.unwrap().table_id,
+            replacement_id
+        );
+        reopened.close().unwrap();
     }
 
     async fn create_append_table(catalog: &SqliteCatalog) {
@@ -4183,1122 +3436,6 @@ mod tests {
             ))
             .await
             .expect("create append table");
-    }
-
-    #[cfg(unix)]
-    fn external_legacy_import_command(
-        path: &std::path::Path,
-        contents: &[u8],
-    ) -> LegacyCatalogImportEnvelopeV2 {
-        let schema_ipc = schema_ipc();
-        let canonical_schema_hash = crate::canonical_schema_hash_from_ipc(&schema_ipc)
-            .expect("hash external legacy Schema");
-        let checksum = format!("sha256-v1:{:x}", Sha256::digest(contents));
-        let pending_file = PendingDataFile {
-            file_id: FileId::from_u128(10).expect("nonzero file id"),
-            table_id: table_id(),
-            schema_version: 1,
-            location: DataFileLocation::ExternalLegacy(
-                ExternalDataPath::new(path.to_str().expect("UTF-8 external legacy fixture path"))
-                    .expect("valid external legacy fixture path"),
-            ),
-            file_size_bytes: u64::try_from(contents.len())
-                .expect("external legacy fixture size fits u64"),
-            row_count: NonZeroU64::new(1).expect("nonzero row count"),
-            provenance: DataFileProvenance::Legacy {
-                offsets: None,
-                preserve_discovery_order: true,
-            },
-            partition: MetadataMap::new(),
-            statistics: MetadataMap::new(),
-            metadata: MetadataMap::from([(
-                LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY.to_owned(),
-                MetadataScalar::String(canonical_schema_hash.clone()),
-            )]),
-            checksum,
-            created_at_ns: 1,
-        };
-        LegacyCatalogImportEnvelopeV2::new(
-            request_id(2),
-            Some(1),
-            CatalogActor {
-                kind: CatalogActorKind::Migration,
-                principal: "catalog-service-external-legacy-test".to_owned(),
-            },
-            format!("sha256-v1:{}", "7".repeat(64)),
-            1,
-            LegacyCatalogImportCommandV2 {
-                table_id: table_id(),
-                namespace_id: NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id"),
-                name: CatalogName::new("ticks").expect("valid table name"),
-                definition: TableDefinition::Append(AppendTableDefinition {
-                    event_time_column: None,
-                }),
-                schema_ipc,
-                canonical_schema_hash,
-                config: BTreeMap::from([
-                    (
-                        "zippy.migration.legacy_stream_name".to_owned(),
-                        "ticks".to_owned(),
-                    ),
-                    (
-                        "zippy.migration.legacy_persisted_files_revision_base".to_owned(),
-                        "1".to_owned(),
-                    ),
-                    (
-                        "zippy.migration.native_snapshot_version_base".to_owned(),
-                        "2".to_owned(),
-                    ),
-                    (
-                        "zippy.migration.source_snapshot_hash".to_owned(),
-                        format!("sha256-v1:{}", "7".repeat(64)),
-                    ),
-                    ("zippy.migration.version".to_owned(), "2".to_owned()),
-                ]),
-                writer_epoch: 1,
-                files: vec![LegacyCatalogImportFileV2 {
-                    file: pending_file,
-                    discovery_order: 0,
-                }],
-                legacy_files_revision: 1,
-            },
-        )
-        .expect("build external legacy import")
-    }
-
-    #[cfg(unix)]
-    fn legacy_reconcile_command(
-        request: u128,
-        schema_hash: &str,
-        expected_writer_epoch: u64,
-        writer_epoch: u64,
-        expected_legacy_files_revision: u64,
-        legacy_files_revision: u64,
-        files: Vec<LegacyCatalogImportFileV2>,
-    ) -> LegacyCatalogReconcileEnvelopeV3 {
-        LegacyCatalogReconcileEnvelopeV3::new(
-            request_id(request),
-            CatalogActor {
-                kind: CatalogActorKind::Server,
-                principal: "catalog-service-legacy-reconcile-test".to_owned(),
-            },
-            format!("sha256-v1:{}", "8".repeat(64)),
-            legacy_files_revision,
-            LegacyCatalogReconcileCommandV3 {
-                table_id: table_id(),
-                expected_schema_version: 1,
-                expected_schema_hash: schema_hash.to_owned(),
-                expected_writer_epoch,
-                writer_epoch,
-                expected_legacy_files_revision,
-                legacy_files_revision,
-                files,
-            },
-        )
-        .expect("build legacy reconcile command")
-    }
-
-    #[cfg(unix)]
-    async fn import_external_legacy_file(
-        catalog: &SqliteCatalog,
-        path: &std::path::Path,
-        contents: &[u8],
-    ) -> zippy_types::catalog::CatalogQuerySnapshot {
-        std::fs::write(path, contents).expect("write external legacy fixture");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire external legacy import session");
-        catalog
-            .command(migration_command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("create external legacy namespace");
-
-        let command = external_legacy_import_command(path, contents);
-        let schema_ipc = command.command.schema_ipc.clone();
-        let canonical_schema_hash = command.command.canonical_schema_hash.clone();
-        let pending_file = command.command.files[0].file.clone();
-        let response = session
-            .import_legacy_table_v2(command)
-            .await
-            .expect("import external legacy file");
-        session.seal();
-        let selector = CatalogSnapshotSelector {
-            table_id: table_id(),
-            snapshot_version: 2,
-            schema_version: 1,
-        };
-        let schema = SchemaDescriptor {
-            table_id: table_id(),
-            schema_version: 1,
-            schema_ipc,
-            schema_hash: canonical_schema_hash,
-            compatibility: SchemaCompatibility::Initial,
-            created_at_ns: response.table.created_at_ns,
-        };
-        let files = DataFiles::new(vec![DataFileDescriptor {
-            file: pending_file,
-            legacy_discovery_order: Some(0),
-            added_snapshot_version: 2,
-            removed_snapshot_version: None,
-            state: DataFileState::Committed,
-        }])
-        .expect("build external legacy pinned file set");
-        let table =
-            CatalogTableSnapshot::new(selector, response.table, schema, response.snapshot, files)
-                .expect("build external legacy pinned table");
-        zippy_types::catalog::CatalogQuerySnapshot::new(response.catalog_revision, vec![table])
-            .expect("build external legacy pinned query snapshot")
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_replay_probe_reports_transactional_revision_and_committed_response() {
-        let directory = TempDir::new().expect("create replay probe directory");
-        let owned = data_directory(&directory);
-        let physical_file = directory.path().join("legacy-probe.parquet");
-        let contents = b"legacy-replay-probe-fixture";
-        std::fs::write(&physical_file, contents).expect("write external legacy fixture");
-        let import = external_legacy_import_command(&physical_file, contents);
-        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&owned))
-            .expect("open replay probe Catalog");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire replay probe session");
-        catalog
-            .command(migration_command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("create import namespace");
-
-        assert_eq!(
-            session
-                .probe_legacy_import_v2(request_id(2))
-                .await
-                .expect("probe missing legacy import"),
-            LegacyCatalogImportReplayProbeV2::Missing {
-                observed_catalog_revision: 1,
-            }
-        );
-        let committed = session
-            .import_legacy_table_v2(import)
-            .await
-            .expect("commit legacy import");
-        catalog
-            .command(migration_command(
-                3,
-                Some(2),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(3).expect("nonzero namespace id"),
-                    name: CatalogName::new("audit").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("advance Catalog after legacy import");
-
-        assert_eq!(
-            session
-                .probe_legacy_import_v2(request_id(2))
-                .await
-                .expect("probe committed legacy import"),
-            LegacyCatalogImportReplayProbeV2::Committed {
-                observed_catalog_revision: 3,
-                response: committed,
-            }
-        );
-        session.seal();
-        catalog.close().expect("close replay probe Catalog");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_reconcile_commits_full_views_replays_and_preserves_historical_order() {
-        let directory = TempDir::new().expect("create reconcile directory");
-        let owned = data_directory(&directory);
-        let first_path = directory.path().join("legacy-first.parquet");
-        let removed_path = directory.path().join("legacy-removed.parquet");
-        let new_path = directory.path().join("legacy-new.parquet");
-        let contents = b"legacy-reconcile-fixture";
-        for path in [&first_path, &removed_path, &new_path] {
-            std::fs::write(path, contents).expect("write reconcile fixture");
-        }
-        let base = external_legacy_import_command(&first_path, contents);
-        let mut import_body = base.command.clone();
-        import_body.files[0].file.metadata.insert(
-            LEGACY_REGISTRY_INDEX_METADATA_KEY.to_owned(),
-            MetadataScalar::UInt64(0),
-        );
-        import_body.files[0].file.metadata.insert(
-            LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY.to_owned(),
-            MetadataScalar::UInt64(0),
-        );
-        let mut removed = import_body.files[0].clone();
-        removed.file.file_id = FileId::from_u128(12).expect("nonzero removed file id");
-        removed.file.location = DataFileLocation::ExternalLegacy(
-            ExternalDataPath::new(removed_path.to_str().expect("UTF-8 removed path"))
-                .expect("valid removed path"),
-        );
-        removed.discovery_order = 1;
-        removed.file.metadata.insert(
-            LEGACY_REGISTRY_INDEX_METADATA_KEY.to_owned(),
-            MetadataScalar::UInt64(1),
-        );
-        removed.file.metadata.insert(
-            LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY.to_owned(),
-            MetadataScalar::UInt64(1),
-        );
-        import_body.files.push(removed.clone());
-        let import = LegacyCatalogImportEnvelopeV2::new(
-            base.request_id,
-            base.expected_revision,
-            base.actor.clone(),
-            base.source_snapshot_hash.clone(),
-            base.source_catalog_revision,
-            import_body.clone(),
-        )
-        .expect("build two-file import");
-        let schema_hash = import_body.canonical_schema_hash.clone();
-
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open reconcile Catalog");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire reconcile import session");
-        catalog
-            .command(migration_command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("create reconcile namespace");
-        session
-            .import_legacy_table_v2(import)
-            .await
-            .expect("import initial reconcile view");
-        session.seal();
-
-        let projection_read = catalog
-            .read_handle()
-            .expect("create projection read handle for V2/V3 assertions");
-        let seeded_projection = projection_read
-            .read_legacy_table_projection_v4(table_id())
-            .await
-            .expect("read V2-seeded projection")
-            .expect("V2 import must seed a projection row");
-        assert_eq!(seeded_projection.projection_revision, 1);
-        assert_eq!(seeded_projection.native_snapshot_version, 2);
-        assert_eq!(seeded_projection.legacy_files_revision, 1);
-        assert_eq!(seeded_projection.writer_epoch, 1);
-        assert_eq!(
-            seeded_projection.completeness,
-            LegacyCatalogProjectionCompletenessV4::Seeded
-        );
-
-        let handle = catalog
-            .legacy_reconcile_handle()
-            .expect("create online reconcile handle");
-        let mut new_file = import_body.files[0].clone();
-        new_file.file.file_id = FileId::from_u128(11).expect("nonzero new file id");
-        new_file.file.location = DataFileLocation::ExternalLegacy(
-            ExternalDataPath::new(new_path.to_str().expect("UTF-8 new path"))
-                .expect("valid new path"),
-        );
-        new_file.discovery_order = 0;
-        let mut retained = import_body.files[0].clone();
-        retained.discovery_order = 1;
-        retained.file.metadata.insert(
-            LEGACY_REGISTRY_INDEX_METADATA_KEY.to_owned(),
-            MetadataScalar::UInt64(9),
-        );
-        retained.file.metadata.insert(
-            LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY.to_owned(),
-            MetadataScalar::UInt64(1),
-        );
-        let target = vec![new_file.clone(), retained.clone()];
-        let reconcile = legacy_reconcile_command(3, &schema_hash, 1, 2, 1, 3, target.clone());
-
-        for colliding_request in [1, 2] {
-            let error = handle
-                .reconcile_legacy_table_v3(legacy_reconcile_command(
-                    colliding_request,
-                    &schema_hash,
-                    1,
-                    2,
-                    1,
-                    3,
-                    target.clone(),
-                ))
-                .await
-                .expect_err("V1 and V2 request ids must conflict with V3");
-            assert_eq!(error.code(), ErrorCode::Conflict);
-        }
-
-        let response = handle
-            .reconcile_legacy_table_v3(reconcile.clone())
-            .await
-            .expect("commit gap reconcile");
-        assert_eq!(response.catalog_revision, 3);
-        assert_eq!(response.native_snapshot_version, 3);
-        assert_eq!(response.continuity, LegacyFileViewContinuity::Gap);
-        let reconciled_projection = projection_read
-            .read_legacy_table_projection_v4(table_id())
-            .await
-            .expect("read V3-synchronized projection")
-            .expect("V3 reconcile must retain the projection row");
-        assert_eq!(reconciled_projection.projection_revision, 2);
-        assert_eq!(reconciled_projection.native_snapshot_version, 3);
-        assert_eq!(reconciled_projection.legacy_files_revision, 3);
-        assert_eq!(reconciled_projection.writer_epoch, 2);
-        let checkpoint_after_first_reconcile = projection_read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read checkpoint after first V3 reconcile");
-        assert_eq!(
-            handle
-                .reconcile_legacy_table_v3(reconcile.clone())
-                .await
-                .expect("replay exact reconcile"),
-            response
-        );
-        assert_eq!(catalog.revision().await.expect("read replay revision"), 3);
-        assert_eq!(
-            projection_read
-                .read_legacy_table_projection_v4(table_id())
-                .await
-                .expect("read projection after exact V3 replay")
-                .expect("projection remains present after exact V3 replay"),
-            reconciled_projection
-        );
-        assert_eq!(
-            projection_read
-                .read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read checkpoint after exact V3 replay"),
-            checkpoint_after_first_reconcile
-        );
-
-        let base_mapping = catalog
-            .resolve_legacy_file_view_mapping(table_id(), 1)
-            .await
-            .expect("resolve imported base mapping");
-        assert_eq!(base_mapping.native_snapshot_version, 2);
-        assert_eq!(base_mapping.continuity, LegacyFileViewContinuity::Base);
-        let mapping = catalog
-            .resolve_legacy_file_view_mapping(table_id(), 3)
-            .await
-            .expect("resolve exact reconcile mapping");
-        assert_eq!(mapping.native_snapshot_version, 3);
-        assert_eq!(mapping.request_id, Some(request_id(3)));
-
-        let snapshot = |version| CatalogSnapshotSelector {
-            table_id: table_id(),
-            snapshot_version: version,
-            schema_version: 1,
-        };
-        let old = catalog
-            .read_snapshot_at(&[snapshot(2)])
-            .await
-            .expect("read historical import snapshot");
-        let old_files = old.tables()[0].files().as_slice();
-        assert_eq!(old_files.len(), 2);
-        assert_eq!(
-            old_files
-                .iter()
-                .find(|file| file.file_id() == FileId::from_u128(10).unwrap())
-                .and_then(DataFileDescriptor::legacy_discovery_order),
-            Some(0)
-        );
-        assert_eq!(
-            old_files
-                .iter()
-                .find(|file| file.file_id() == FileId::from_u128(12).unwrap())
-                .and_then(DataFileDescriptor::legacy_discovery_order),
-            Some(1)
-        );
-        let current = catalog
-            .read_snapshot_at(&[snapshot(3)])
-            .await
-            .expect("read reconciled snapshot");
-        let current_files = current.tables()[0].files().as_slice();
-        assert_eq!(current_files.len(), 2);
-        assert_eq!(
-            current_files
-                .iter()
-                .find(|file| file.file_id() == FileId::from_u128(11).unwrap())
-                .and_then(DataFileDescriptor::legacy_discovery_order),
-            Some(0)
-        );
-        assert_eq!(
-            current_files
-                .iter()
-                .find(|file| file.file_id() == FileId::from_u128(10).unwrap())
-                .and_then(DataFileDescriptor::legacy_discovery_order),
-            Some(1)
-        );
-        assert!(current_files
-            .iter()
-            .all(|file| file.file_id() != FileId::from_u128(12).unwrap()));
-
-        let mut metadata_drift = target.clone();
-        metadata_drift[1].file.metadata.insert(
-            "source.dataset_version".to_owned(),
-            MetadataScalar::UInt64(2),
-        );
-        assert_eq!(
-            handle
-                .reconcile_legacy_table_v3(legacy_reconcile_command(
-                    8,
-                    &schema_hash,
-                    2,
-                    2,
-                    3,
-                    4,
-                    metadata_drift,
-                ))
-                .await
-                .expect_err("ordinary retained metadata changes must conflict")
-                .code(),
-            ErrorCode::Conflict
-        );
-        assert_eq!(
-            catalog
-                .revision()
-                .await
-                .expect("read revision after conflict"),
-            3
-        );
-
-        let different_payload =
-            legacy_reconcile_command(3, &schema_hash, 2, 2, 3, 4, target.clone());
-        assert_eq!(
-            handle
-                .reconcile_legacy_table_v3(different_payload)
-                .await
-                .expect_err("same request with another payload must conflict")
-                .code(),
-            ErrorCode::Conflict
-        );
-        assert_eq!(
-            handle
-                .reconcile_legacy_table_v3(legacy_reconcile_command(
-                    4,
-                    &schema_hash,
-                    2,
-                    2,
-                    1,
-                    3,
-                    target.clone(),
-                ))
-                .await
-                .expect_err("same target revision with another request must conflict")
-                .code(),
-            ErrorCode::Conflict
-        );
-        assert_eq!(
-            handle
-                .reconcile_legacy_table_v3(legacy_reconcile_command(
-                    5,
-                    &schema_hash,
-                    2,
-                    2,
-                    1,
-                    4,
-                    target.clone(),
-                ))
-                .await
-                .expect_err("stale per-table CAS must conflict")
-                .code(),
-            ErrorCode::Conflict
-        );
-
-        let empty = handle
-            .reconcile_legacy_table_v3(legacy_reconcile_command(
-                6,
-                &schema_hash,
-                2,
-                2,
-                3,
-                4,
-                Vec::new(),
-            ))
-            .await
-            .expect("commit empty authoritative target");
-        assert_eq!(empty.continuity, LegacyFileViewContinuity::Contiguous);
-        let empty_snapshot = catalog
-            .read_snapshot_at(&[snapshot(4)])
-            .await
-            .expect("read empty reconcile snapshot");
-        assert!(empty_snapshot.tables()[0].files().is_empty());
-
-        let mut resurrected = removed;
-        resurrected.discovery_order = 0;
-        assert_eq!(
-            handle
-                .reconcile_legacy_table_v3(legacy_reconcile_command(
-                    7,
-                    &schema_hash,
-                    2,
-                    2,
-                    4,
-                    5,
-                    vec![resurrected],
-                ))
-                .await
-                .expect_err("removed legacy identity resurrection must fail")
-                .code(),
-            ErrorCode::Conflict
-        );
-        let v1_collision = catalog
-            .command(command(
-                3,
-                Some(4),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(30).unwrap(),
-                    name: CatalogName::new("collision").unwrap(),
-                }),
-            ))
-            .await
-            .expect_err("V1 must reject an existing V3 request id");
-        assert_eq!(v1_collision.code(), ErrorCode::Conflict);
-        drop(handle);
-        catalog.close().expect("close reconciled Catalog");
-
-        let reopened = SqliteCatalog::open(SqliteCatalogConfig::new(&owned))
-            .expect("reopen reconciled Catalog");
-        let replay_session = reopened
-            .begin_legacy_import_session()
-            .expect("open replay session after restart");
-        let v2_collision = replay_session
-            .probe_legacy_import_v2(request_id(3))
-            .await
-            .expect_err("V2 must reject an existing V3 request id");
-        assert_eq!(v2_collision.code(), ErrorCode::Conflict);
-        replay_session.seal();
-        reopened.close().expect("close reopened reconciled Catalog");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_reconcile_handle_fails_terminally_after_catalog_close() {
-        let directory = TempDir::new().expect("create closed handle directory");
-        let owned = data_directory(&directory);
-        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&owned))
-            .expect("open closed handle Catalog");
-        let handle = catalog
-            .legacy_reconcile_handle()
-            .expect("create lifecycle-bound reconcile handle");
-        let read_handle = catalog
-            .read_handle()
-            .expect("create lifecycle-bound read handle");
-        catalog.close().expect("close handle owner");
-        let command = legacy_reconcile_command(
-            1,
-            &format!("sha256-v1:{}", "9".repeat(64)),
-            0,
-            0,
-            0,
-            1,
-            Vec::new(),
-        );
-        let error = handle
-            .reconcile_legacy_table_v3(command)
-            .await
-            .expect_err("closed reconcile handle must fail");
-        assert_eq!(error.code(), ErrorCode::Unavailable);
-        assert!(!error.retryable());
-        let read_error = read_handle
-            .resolve_current_legacy_file_view_mapping(table_id())
-            .await
-            .expect_err("closed read handle must reject current mapping lookup");
-        assert_eq!(read_error.code(), ErrorCode::Unavailable);
-        assert!(!read_error.retryable());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_reconcile_bootstraps_a_strict_v1_empty_table_base_mapping() {
-        let directory = TempDir::new().expect("create V1 bootstrap directory");
-        let owned = data_directory(&directory);
-        let physical_file = directory.path().join("v1-bootstrap.parquet");
-        let contents = b"v1-bootstrap-file";
-        std::fs::write(&physical_file, contents).expect("write V1 bootstrap file");
-        let schema_ipc = schema_ipc();
-        let schema_hash =
-            crate::canonical_schema_hash_from_ipc(&schema_ipc).expect("hash V1 bootstrap Schema");
-        let source_hash = format!("sha256-v1:{}", "7".repeat(64));
-        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&owned))
-            .expect("open V1 bootstrap Catalog");
-        catalog
-            .command(migration_command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID).unwrap(),
-                    name: CatalogName::new("market").unwrap(),
-                }),
-            ))
-            .await
-            .expect("create V1 bootstrap namespace");
-        catalog
-            .command(migration_command(
-                2,
-                Some(1),
-                CatalogCommandV1::CreateTable(CreateTableCommand {
-                    table_id: table_id(),
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID).unwrap(),
-                    name: CatalogName::new("ticks").unwrap(),
-                    definition: TableDefinition::Append(AppendTableDefinition {
-                        event_time_column: None,
-                    }),
-                    schema_ipc,
-                    config: BTreeMap::from([
-                        (
-                            "zippy.migration.legacy_stream_name".to_owned(),
-                            "ticks".to_owned(),
-                        ),
-                        (
-                            "zippy.migration.legacy_persisted_files_revision_base".to_owned(),
-                            "0".to_owned(),
-                        ),
-                        (
-                            "zippy.migration.native_snapshot_version_base".to_owned(),
-                            "1".to_owned(),
-                        ),
-                        (
-                            "zippy.migration.source_snapshot_hash".to_owned(),
-                            source_hash,
-                        ),
-                        ("zippy.migration.version".to_owned(), "1".to_owned()),
-                    ]),
-                }),
-            ))
-            .await
-            .expect("create V1 empty migrated table");
-        let missing = catalog
-            .resolve_current_legacy_file_view_mapping(table_id())
-            .await
-            .expect_err("V1 empty table has no physical base mapping before bootstrap");
-        assert_eq!(missing.code(), ErrorCode::NotFound);
-        let target_file = external_legacy_import_command(&physical_file, contents)
-            .command
-            .files;
-        let handle = catalog
-            .legacy_reconcile_handle()
-            .expect("create V1 bootstrap reconcile handle");
-        let response = handle
-            .reconcile_legacy_table_v3(legacy_reconcile_command(
-                3,
-                &schema_hash,
-                0,
-                1,
-                0,
-                2,
-                target_file,
-            ))
-            .await
-            .expect("reconcile V1 empty base");
-        assert_eq!(response.native_snapshot_version, 2);
-        assert_eq!(response.continuity, LegacyFileViewContinuity::Gap);
-        let base = catalog
-            .resolve_legacy_file_view_mapping(table_id(), 0)
-            .await
-            .expect("resolve bootstrapped V1 base");
-        assert_eq!(base.native_snapshot_version, 1);
-        assert_eq!(base.request_id, None);
-        assert_eq!(base.continuity, LegacyFileViewContinuity::Base);
-        let current = catalog
-            .resolve_current_legacy_file_view_mapping(table_id())
-            .await
-            .expect("resolve current mapping with one joined read");
-        assert_eq!(current.legacy_files_revision, 2);
-        assert_eq!(current.native_snapshot_version, 2);
-
-        let database_path = owned.directory().root().join("catalog/catalog.db");
-        let raw = rusqlite::Connection::open(&database_path).expect("open mapping tamper fixture");
-        raw.execute_batch("PRAGMA ignore_check_constraints = ON")
-            .expect("allow focused mapping corruption fixture");
-        raw.execute(
-            "UPDATE legacy_file_view_mappings SET continuity = 'invalid' \
-              WHERE table_id = ?1 AND legacy_files_revision = ?2",
-            rusqlite::params![
-                table_id().into_bytes().as_slice(),
-                2_u64.to_be_bytes().as_slice(),
-            ],
-        )
-        .expect("corrupt current mapping continuity");
-        drop(raw);
-        let corrupt = catalog
-            .resolve_current_legacy_file_view_mapping(table_id())
-            .await
-            .expect_err("malformed current mapping must fail closed");
-        assert_eq!(corrupt.code(), ErrorCode::DataCorruption);
-        let raw = rusqlite::Connection::open(database_path).expect("open mapping repair fixture");
-        raw.execute(
-            "UPDATE legacy_file_view_mappings SET continuity = 'gap' \
-              WHERE table_id = ?1 AND legacy_files_revision = ?2",
-            rusqlite::params![
-                table_id().into_bytes().as_slice(),
-                2_u64.to_be_bytes().as_slice(),
-            ],
-        )
-        .expect("repair current mapping continuity");
-        catalog.close().expect("close V1 bootstrap Catalog");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_replay_probe_rejects_v1_request_id_conflicts() {
-        let directory = TempDir::new().expect("create conflict directory");
-        let owned = data_directory(&directory);
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open conflict Catalog");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire conflict probe session");
-        catalog
-            .command(migration_command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("commit V1 request-id fixture");
-
-        let error = session
-            .probe_legacy_import_v2(request_id(1))
-            .await
-            .expect_err("V1 request ID must conflict with a V2 replay probe");
-        assert_eq!(error.code(), ErrorCode::Conflict);
-        assert_eq!(error.request_id(), Some(request_id(1)));
-        assert!(!error.retryable());
-        session.seal();
-        catalog.close().expect("close conflict Catalog");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_replay_probe_uses_only_fixed_control_read_admission() {
-        let directory = TempDir::new().expect("create bounded probe directory");
-        let owned = data_directory(&directory);
-        let catalog = SqliteCatalog::open(
-            SqliteCatalogConfig::new(&owned)
-                .with_command_capacity(1)
-                .with_manifest_queue_capacity_bytes(1),
-        )
-        .expect("open bounded probe Catalog");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire bounded probe session");
-        let publication_permit = catalog
-            .acquire_publication_permit()
-            .await
-            .expect("occupy only publication permit");
-
-        assert_eq!(catalog.command_budget.used.load(Ordering::Acquire), 1);
-        assert_eq!(
-            catalog.manifest_queue_budget.used.load(Ordering::Acquire),
-            0
-        );
-        assert_eq!(
-            session
-                .probe_legacy_import_v2(request_id(1))
-                .await
-                .expect("publication exhaustion must not block replay probe"),
-            LegacyCatalogImportReplayProbeV2::Missing {
-                observed_catalog_revision: 0,
-            }
-        );
-        assert_eq!(catalog.command_budget.used.load(Ordering::Acquire), 1);
-        assert_eq!(
-            catalog.manifest_queue_budget.used.load(Ordering::Acquire),
-            0
-        );
-        assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 0);
-
-        let replay_permits = (0..REPLAY_PROBE_CAPACITY)
-            .map(|_| {
-                catalog
-                    .replay_probe_budget
-                    .reserve()
-                    .expect("reserve fixed replay slot")
-            })
-            .collect::<Vec<_>>();
-        let exhausted = session
-            .probe_legacy_import_v2(request_id(1))
-            .await
-            .expect_err("fixed replay capacity must reject excess work");
-        assert_eq!(exhausted.code(), ErrorCode::ResourceExhausted);
-        assert_eq!(exhausted.request_id(), Some(request_id(1)));
-        drop(replay_permits);
-        drop(publication_permit);
-        session.seal();
-        catalog.close().expect("close bounded probe Catalog");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelled_legacy_replay_probe_retains_admission_until_read_exits() {
-        let directory = TempDir::new().expect("create cancelled probe directory");
-        let owned = data_directory(&directory);
-        let (started_sender, started_receiver) = crossbeam_channel::bounded(1);
-        let (release_sender, release_receiver) = crossbeam_channel::bounded(1);
-        let catalog = SqliteCatalog::open_with_backends(
-            SqliteCatalogConfig::new(&owned),
-            Arc::new(DomainManifestPreparationBackend),
-            Arc::new(BlockingLegacyReplayReadBackend {
-                started: started_sender,
-                release: release_receiver,
-                block_once: AtomicBool::new(true),
-            }),
-        )
-        .expect("open Catalog with blocking legacy probe backend");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire cancelled probe session");
-        let mut probe = session.probe_legacy_import_v2(request_id(1));
-        let mut context = Context::from_waker(Waker::noop());
-        assert!(matches!(probe.as_mut().poll(&mut context), Poll::Pending));
-        started_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("legacy replay probe must enter the read backend");
-        assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 1);
-
-        drop(probe);
-        assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 1);
-        release_sender
-            .send(())
-            .expect("release cancelled legacy replay probe");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while catalog.replay_probe_budget.used.load(Ordering::Acquire) != 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("cancelled legacy replay probe must release fixed admission");
-        session.seal();
-        catalog
-            .close()
-            .expect("close Catalog with blocking legacy probe backend");
-    }
-
-    #[cfg(unix)]
-    fn overwrite_legacy_import_response(
-        database_path: &std::path::Path,
-        response: &serde_json::Value,
-    ) {
-        let encoded = serde_json::to_vec(response).expect("encode tampered legacy response");
-        overwrite_legacy_import_response_blob(database_path, encoded);
-    }
-
-    #[cfg(unix)]
-    fn overwrite_legacy_import_response_blob(database_path: &std::path::Path, encoded: Vec<u8>) {
-        let connection = rusqlite::Connection::open(database_path).expect("open Catalog database");
-        connection
-            .execute(
-                "UPDATE legacy_import_requests SET response_blob = ?1 WHERE request_id = ?2",
-                rusqlite::params![encoded, request_id(2).into_bytes().as_slice()],
-            )
-            .expect("tamper retained legacy response");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_import_replay_rejects_semantically_tampered_responses() {
-        let directory = TempDir::new().expect("create temp directory");
-        let data_directory = data_directory(&directory);
-        let config = SqliteCatalogConfig::new(&data_directory);
-        let physical_file = directory.path().join("legacy.parquet");
-        let contents = b"legacy-replay-revision-fixture";
-        std::fs::write(&physical_file, contents).expect("write external legacy fixture");
-        let import_command = external_legacy_import_command(&physical_file, contents);
-
-        let catalog = SqliteCatalog::open(config.clone()).expect("open Catalog");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire legacy import session");
-        catalog
-            .command(migration_command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("create external legacy namespace");
-        session
-            .import_legacy_table_v2(import_command.clone())
-            .await
-            .expect("commit legacy import");
-        session.seal();
-        catalog.close().expect("close Catalog before tampering");
-
-        let database_path = data_directory.directory().root().join("catalog/catalog.db");
-        let connection = rusqlite::Connection::open(&database_path).expect("open Catalog database");
-        let response_blob: Vec<u8> = connection
-            .query_row(
-                "SELECT response_blob FROM legacy_import_requests WHERE request_id = ?1",
-                [request_id(2).into_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .expect("read retained legacy response");
-        let response: serde_json::Value =
-            serde_json::from_slice(&response_blob).expect("decode retained legacy response");
-        drop(connection);
-
-        let mut wrong_created_at = response.clone();
-        wrong_created_at["response"]["table"]["created_at_ns"] = serde_json::json!(1);
-        overwrite_legacy_import_response(&database_path, &wrong_created_at);
-        let reopened = SqliteCatalog::open(config.clone()).expect("reopen Catalog");
-        let replay_session = reopened
-            .begin_legacy_import_session()
-            .expect("acquire replay import session");
-        let error = replay_session
-            .probe_legacy_import_v2(request_id(2))
-            .await
-            .expect_err("probe must reject wrong replay creation time");
-        assert_eq!(error.code(), ErrorCode::DataCorruption);
-        assert_eq!(error.request_id(), Some(request_id(2)));
-        let error = replay_session
-            .import_legacy_table_v2(import_command.clone())
-            .await
-            .expect_err("wrong replay creation time must fail closed");
-        assert_eq!(error.code(), ErrorCode::DataCorruption);
-        assert_eq!(error.request_id(), Some(request_id(2)));
-        replay_session.seal();
-        reopened.close().expect("close reopened Catalog");
-
-        let mut invalid_summary = response.clone();
-        invalid_summary["response"]["snapshot"]["summary"]["added_files"]["value"] =
-            serde_json::json!(4097);
-        overwrite_legacy_import_response(&database_path, &invalid_summary);
-        let reopened = SqliteCatalog::open(config.clone()).expect("reopen summary Catalog");
-        let replay_session = reopened
-            .begin_legacy_import_session()
-            .expect("acquire summary replay session");
-        let error = replay_session
-            .probe_legacy_import_v2(request_id(2))
-            .await
-            .expect_err("probe must reject impossible import file count");
-        assert_eq!(error.code(), ErrorCode::DataCorruption);
-        assert_eq!(error.request_id(), Some(request_id(2)));
-        replay_session.seal();
-        reopened.close().expect("close summary replay Catalog");
-
-        overwrite_legacy_import_response_blob(&database_path, vec![0_u8; 4 * 1024 * 1024 + 1]);
-        let reopened = SqliteCatalog::open(config.clone()).expect("reopen oversized Catalog");
-        let replay_session = reopened
-            .begin_legacy_import_session()
-            .expect("acquire oversized replay session");
-        let error = replay_session
-            .probe_legacy_import_v2(request_id(2))
-            .await
-            .expect_err("probe must reject oversized response before decoding it");
-        assert_eq!(error.code(), ErrorCode::DataCorruption);
-        assert_eq!(error.request_id(), Some(request_id(2)));
-        assert!(error.to_string().contains("exceeds byte limit"));
-        replay_session.seal();
-        reopened.close().expect("close oversized replay Catalog");
-
-        let mut wrong_revision = response;
-        wrong_revision["response"]["catalog_revision"] = serde_json::json!(3);
-        wrong_revision["response"]["snapshot"]["commit_lsn"] = serde_json::json!(3);
-        overwrite_legacy_import_response(&database_path, &wrong_revision);
-        let reopened = SqliteCatalog::open(config).expect("reopen Catalog for revision check");
-        let replay_session = reopened
-            .begin_legacy_import_session()
-            .expect("acquire revision replay session");
-        let error = replay_session
-            .probe_legacy_import_v2(request_id(2))
-            .await
-            .expect_err("probe must reject replay revisions newer than its transaction");
-        assert_eq!(error.code(), ErrorCode::DataCorruption);
-        assert_eq!(error.request_id(), Some(request_id(2)));
-        let error = replay_session
-            .import_legacy_table_v2(import_command)
-            .await
-            .expect_err("wrong replay revision must fail closed");
-        assert_eq!(error.code(), ErrorCode::DataCorruption);
-        assert_eq!(error.request_id(), Some(request_id(2)));
-        replay_session.seal();
-        reopened.close().expect("close revision replay Catalog");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_import_session_is_exclusive_and_sealed_by_ordinary_writes() {
-        let directory = TempDir::new().expect("create session test directory");
-        let owned = data_directory(&directory);
-        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open Catalog");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire first import session");
-        let duplicate = catalog
-            .begin_legacy_import_session()
-            .expect_err("second active import session must be rejected");
-        assert_eq!(duplicate.code(), ErrorCode::Conflict);
-
-        let ordinary_write = catalog
-            .command(command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect_err("ordinary writes must not cross an active import session");
-        assert_eq!(ordinary_write.code(), ErrorCode::Conflict);
-        drop(session);
-        let sealed = catalog
-            .begin_legacy_import_session()
-            .expect_err("dropping a session must seal the Catalog instance");
-        assert_eq!(sealed.code(), ErrorCode::Conflict);
-        catalog.close().expect("close first Catalog");
-
-        let second_directory = TempDir::new().expect("create ordinary-write test directory");
-        let second_owned = data_directory(&second_directory);
-        let second = SqliteCatalog::open(SqliteCatalogConfig::new(&second_owned))
-            .expect("open second Catalog");
-        second
-            .command(command(
-                2,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("commit ordinary Catalog write");
-        let sealed = second
-            .begin_legacy_import_session()
-            .expect_err("ordinary mutation must seal an unused import window");
-        assert_eq!(sealed.code(), ErrorCode::Conflict);
-        second.close().expect("close second Catalog");
     }
 
     fn pending_file(file: u128, offset: u64) -> PendingDataFile {
@@ -5525,12 +3662,20 @@ mod tests {
             CatalogDataFileProbeMatch::Exact { .. }
         ));
 
+        let original = commit_data_file(3, 10, 2, 1, 0);
+        assert!(matches!(
+            handle.probe_command_replay(&original).await.unwrap(),
+            CatalogCommandReplayProbe::Exact { .. }
+        ));
         let weak_owner = Arc::downgrade(&catalog);
         let catalog = Arc::try_unwrap(catalog)
             .unwrap_or_else(|_| panic!("read handle must not retain Catalog owner"));
         assert!(weak_owner.upgrade().is_none());
         let cold_revision = handle.revision();
         catalog.close().expect("close Catalog with retained handle");
+        let replay_error = handle.probe_command_replay(&original).await.unwrap_err();
+        assert_eq!(replay_error.code(), ErrorCode::Unavailable);
+        assert!(!replay_error.retryable());
 
         let error = cold_revision
             .await
@@ -5983,88 +4128,92 @@ mod tests {
         catalog.close().expect("close catalog");
     }
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn pinned_external_legacy_reader_starts_at_offset_zero_after_checksum() {
-        let directory = TempDir::new().expect("create temp directory");
+    async fn pinned_snapshot_rebind_requires_unique_matching_admission() {
+        let directory = TempDir::new().unwrap();
         let data_directory = data_directory(&directory);
-        let physical_file = directory.path().join("legacy-events.parquet");
-        let contents = (0_u8..=127).collect::<Vec<_>>();
-        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+        let (catalog, issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
             SqliteCatalogConfig::new(&data_directory),
         )
-        .expect("open catalog");
-        let snapshot = import_external_legacy_file(&catalog, &physical_file, &contents).await;
-        let pin = catalog
-            .pin_runtime_snapshot(table_id(), 2)
-            .expect("pin external legacy snapshot");
-        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::try_new(
-            snapshot,
-            vec![pin],
-            Arc::clone(&data_directory),
-            unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
-        )
-        .expect("build pinned external legacy snapshot");
-        let file = pinned
-            .table(0)
-            .expect("pinned external legacy table")
-            .file(0)
-            .expect("pinned external legacy file");
-        let mut reader = file
-            .open_reader()
-            .expect("open checksum-validated external legacy reader");
-        let mut actual = Vec::new();
-        reader
-            .read_to_end(&mut actual)
-            .expect("read external legacy file from its first byte");
-        assert_eq!(actual, contents);
-
-        drop((reader, file, pinned));
-        catalog.close().expect("close catalog");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn pinned_external_legacy_reader_rejects_same_size_content_replacement() {
-        let directory = TempDir::new().expect("create temp directory");
-        let data_directory = data_directory(&directory);
-        let physical_file = directory.path().join("legacy-events.parquet");
-        let contents = [0x5a_u8; 128];
-        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
-            SqliteCatalogConfig::new(&data_directory),
-        )
-        .expect("open catalog");
-        let snapshot = import_external_legacy_file(&catalog, &physical_file, &contents).await;
-        let pin = catalog
-            .pin_runtime_snapshot(table_id(), 2)
-            .expect("pin external legacy snapshot");
-        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::try_new(
-            snapshot,
-            vec![pin],
-            Arc::clone(&data_directory),
-            unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
-        )
-        .expect("build pinned external legacy snapshot");
-        let file = pinned
-            .table(0)
-            .expect("pinned external legacy table")
-            .file(0)
-            .expect("pinned external legacy file");
-
-        std::fs::write(&physical_file, [0xa5_u8; 128])
-            .expect("replace external legacy contents without changing length");
-        let error = file
-            .open_reader()
-            .expect_err("same-size external legacy replacement must fail closed");
-        assert_eq!(error.code(), ErrorCode::DataCorruption);
-        assert!(!error.message().contains(
-            physical_file
-                .to_str()
-                .expect("UTF-8 external legacy fixture path")
-        ));
-
-        drop((file, pinned));
-        catalog.close().expect("close catalog");
+        .unwrap();
+        create_append_table(&catalog).await;
+        let mut pinned = catalog
+            .read_handle()
+            .unwrap()
+            .read_pinned_snapshot_at(
+                &[CatalogSnapshotSelector {
+                    table_id: table_id(),
+                    snapshot_version: 1,
+                    schema_version: 1,
+                }],
+                unattributed_snapshot_memory_lease(&issuer, 1),
+            )
+            .await
+            .unwrap();
+        let original = pinned.memory_lease_descriptor();
+        let required = pinned.retained_memory_bytes();
+        assert!(required.get() > 64 * 1024);
+        assert!(required < original.reserved_bytes());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (foreign, _) = CatalogSnapshotMemoryLeaseIssuer::new_authority().unwrap();
+        assert_eq!(
+            pinned
+                .rebind_memory_lease(snapshot_memory_lease(&foreign, &drops, required, None))
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            pinned
+                .rebind_memory_lease(snapshot_memory_lease(
+                    &issuer,
+                    &drops,
+                    NonZeroU64::new(1).unwrap(),
+                    None
+                ))
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        let query = QueryInstanceId::new(
+            zippy_types::QueryId::from_u128(90).unwrap(),
+            NonZeroU64::new(1).unwrap(),
+        );
+        assert_eq!(
+            pinned
+                .rebind_memory_lease(snapshot_memory_lease(
+                    &issuer,
+                    &drops,
+                    required,
+                    Some(query)
+                ))
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        let table = pinned.table(0).unwrap();
+        assert_eq!(
+            pinned
+                .rebind_memory_lease(snapshot_memory_lease(&issuer, &drops, required, None))
+                .unwrap_err()
+                .code(),
+            ErrorCode::Conflict
+        );
+        assert_eq!(pinned.memory_lease_descriptor(), original);
+        drop(table);
+        pinned
+            .rebind_memory_lease(snapshot_memory_lease(&issuer, &drops, required, None))
+            .unwrap();
+        assert_eq!(pinned.memory_lease_descriptor().reserved_bytes(), required);
+        assert_ne!(
+            pinned.memory_lease_descriptor().reservation_id(),
+            original.reservation_id()
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 4);
+        drop(pinned);
+        assert_eq!(drops.load(Ordering::Acquire), 5);
+        assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 0);
+        catalog.close().unwrap();
     }
 
     #[cfg(unix)]
@@ -7596,805 +5745,6 @@ mod tests {
             committed
         );
         reopened.close().expect("close reopened Catalog actor");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_v4_byte_budget_precedes_publication_gate_and_releases_command_permit() {
-        let directory = TempDir::new().expect("create V4 admission directory");
-        let data_directory = data_directory(&directory);
-        let catalog = SqliteCatalog::open(
-            SqliteCatalogConfig::new(&data_directory)
-                .with_command_capacity(1)
-                .with_manifest_queue_capacity_bytes(1),
-        )
-        .expect("open bounded Catalog for V4 admission test");
-        let projection = catalog
-            .legacy_reconcile_handle()
-            .expect("create bounded V4 projection handle");
-        let exclusion = catalog
-            .acquire_publication_exclusion()
-            .await
-            .expect("hold publication exclusion");
-        let command = projection_envelope(
-            501,
-            CatalogActorKind::Server,
-            canonical_hash('a'),
-            0,
-            LegacyCatalogProjectionCommandV4::AdvanceCheckpoint(
-                LegacyCatalogAdvanceCheckpointCommandV4 {
-                    expected_checkpoint_generation: 0,
-                    expected_source_catalog_revision: 0,
-                    expected_source_projection_hash: canonical_hash('a'),
-                    expected_phase: LegacyCatalogProjectionPhaseV4::FileShadow,
-                    shadow_epoch: 0,
-                    phase: LegacyCatalogProjectionPhaseV4::FullShadow,
-                    mode: LegacyCatalogCheckpointModeV4::FullReconcile,
-                    target_projection_digest: canonical_hash('b'),
-                    observed_continuity_loss_epoch: 0,
-                },
-            ),
-        );
-
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            projection.apply_legacy_catalog_projection_v4(command),
-        )
-        .await
-        .expect("byte-budget rejection must not wait for publication exclusion")
-        .expect_err("one-byte V4 manifest budget must reject the command");
-        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
-        assert_eq!(error.request_id(), Some(request_id(501)));
-
-        drop(exclusion);
-        let permit =
-            tokio::time::timeout(Duration::from_secs(1), catalog.acquire_publication_permit())
-                .await
-                .expect("failed V4 admission must release command capacity")
-                .expect("publication admission remains available after V4 rejection");
-        drop(permit);
-        catalog
-            .close()
-            .expect("close Catalog after V4 admission test");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_v4_service_routes_all_operations_replays_and_reads_complete_state() {
-        let directory = TempDir::new().expect("create temp directory");
-        let data_directory = data_directory(&directory);
-        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
-            .expect("open Catalog for V4 service flow");
-        let namespace_id = NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id");
-        catalog
-            .command(command(
-                401,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id,
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("create V4 fixture namespace");
-
-        let projection = catalog
-            .legacy_reconcile_handle()
-            .expect("create V4 projection handle");
-        let read = catalog.read_handle().expect("create V4 read handle");
-        let definition = TableDefinition::Append(AppendTableDefinition {
-            event_time_column: None,
-        });
-        let ticks_schema_ipc = schema_ipc();
-        let schema_hash = crate::canonical_schema_hash_from_ipc(&ticks_schema_ipc)
-            .expect("hash V4 fixture Schema");
-        let bootstrap = projection_envelope(
-            402,
-            CatalogActorKind::Migration,
-            canonical_hash('b'),
-            1,
-            LegacyCatalogProjectionCommandV4::BootstrapTable(
-                LegacyCatalogBootstrapTableCommandV4 {
-                    table_id: table_id(),
-                    namespace_id,
-                    name: CatalogName::new("ticks").expect("valid table name"),
-                    definition: definition.clone(),
-                    schema_ipc: ticks_schema_ipc,
-                    canonical_schema_hash: schema_hash.clone(),
-                    config: projection_migration_config("ticks", 7),
-                    writer_epoch: 0,
-                    sources: Vec::new(),
-                    files: Vec::new(),
-                    legacy_files_revision: 7,
-                },
-            ),
-        );
-        let bootstrap_response = projection
-            .apply_legacy_catalog_projection_v4(bootstrap.clone())
-            .await
-            .expect("bootstrap V4 table through service");
-        assert!(matches!(
-            bootstrap_response.outcome,
-            LegacyCatalogProjectionOutcomeV4::BootstrapTable(_)
-        ));
-        assert_eq!(catalog.revision().await, Ok(2));
-
-        let mut replay_without_preparable_schema = bootstrap.clone();
-        let LegacyCatalogProjectionCommandV4::BootstrapTable(command) =
-            &mut replay_without_preparable_schema.command
-        else {
-            panic!("expected bootstrap replay command");
-        };
-        command.schema_ipc = SchemaIpcPayload::new(vec![1]).expect("nonempty invalid Schema IPC");
-        assert_eq!(
-            projection
-                .apply_legacy_catalog_projection_v4(replay_without_preparable_schema)
-                .await
-                .expect("permanent replay must precede expensive Schema preparation"),
-            bootstrap_response
-        );
-        assert_eq!(catalog.revision().await, Ok(2));
-
-        let bootstrapped = read
-            .read_legacy_table_projection_v4(table_id())
-            .await
-            .expect("read bootstrapped projection")
-            .expect("bootstrapped projection exists");
-        assert_eq!(bootstrapped.projection_revision, 1);
-        assert_eq!(bootstrapped.legacy_files_revision, 7);
-
-        let adopted_table_id = TableId::from_u128(3).expect("nonzero adopted table id");
-        let adopted_schema_ipc = schema_ipc();
-        catalog
-            .command(migration_command(
-                403,
-                Some(2),
-                CatalogCommandV1::CreateTable(CreateTableCommand {
-                    table_id: adopted_table_id,
-                    namespace_id,
-                    name: CatalogName::new("adopted").expect("valid adopted table name"),
-                    definition: definition.clone(),
-                    schema_ipc: adopted_schema_ipc,
-                    config: projection_migration_config("adopted", 13),
-                }),
-            ))
-            .await
-            .expect("create empty V1 table for adoption");
-        let adopt = projection_envelope(
-            404,
-            CatalogActorKind::Migration,
-            canonical_hash('c'),
-            2,
-            LegacyCatalogProjectionCommandV4::AdoptExistingTable(
-                LegacyCatalogAdoptExistingTableCommandV4 {
-                    table_id: adopted_table_id,
-                    namespace_id,
-                    name: CatalogName::new("adopted").expect("valid adopted table name"),
-                    definition: definition.clone(),
-                    expected_schema_version: 1,
-                    expected_schema_hash: schema_hash.clone(),
-                    config: projection_migration_config("adopted", 13),
-                    expected_snapshot_version: 1,
-                    expected_legacy_files_revision: 13,
-                    expected_writer_epoch: 0,
-                    sources: Vec::new(),
-                    files: Vec::new(),
-                },
-            ),
-        );
-        let adopt_response = projection
-            .apply_legacy_catalog_projection_v4(adopt)
-            .await
-            .expect("adopt V1 table through service");
-        assert!(matches!(
-            adopt_response.outcome,
-            LegacyCatalogProjectionOutcomeV4::AdoptExistingTable(_)
-        ));
-
-        let ticks_digest = LegacyCatalogProjectionDigestTableV4 {
-            table_id: table_id(),
-            namespace_id,
-            name: CatalogName::new("ticks").expect("valid table name"),
-            definition: definition.clone(),
-            schema_version: 1,
-            schema_hash: schema_hash.clone(),
-            config: BTreeMap::new(),
-            legacy_files_revision: 7,
-            writer_epoch: 0,
-            state: LegacyCatalogProjectionTableStateV4::Active,
-            sources: Vec::new(),
-        };
-        let adopted_digest = LegacyCatalogProjectionDigestTableV4 {
-            table_id: adopted_table_id,
-            namespace_id,
-            name: CatalogName::new("adopted").expect("valid adopted table name"),
-            definition,
-            schema_version: 1,
-            schema_hash: schema_hash.clone(),
-            config: BTreeMap::new(),
-            legacy_files_revision: 13,
-            writer_epoch: 0,
-            state: LegacyCatalogProjectionTableStateV4::Active,
-            sources: Vec::new(),
-        };
-        let ready_digest = compute_legacy_catalog_projection_digest_v4(&[
-            ticks_digest.clone(),
-            adopted_digest.clone(),
-        ])
-        .expect("compute ready projection digest");
-        let initial_checkpoint = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read initial V4 checkpoint");
-        let ready = projection_envelope(
-            405,
-            CatalogActorKind::Server,
-            ready_digest.clone(),
-            2,
-            LegacyCatalogProjectionCommandV4::AdvanceCheckpoint(
-                LegacyCatalogAdvanceCheckpointCommandV4 {
-                    expected_checkpoint_generation: initial_checkpoint.checkpoint_generation,
-                    expected_source_catalog_revision: initial_checkpoint.source_catalog_revision,
-                    expected_source_projection_hash: initial_checkpoint.source_projection_hash,
-                    expected_phase: initial_checkpoint.phase,
-                    shadow_epoch: 0,
-                    phase: LegacyCatalogProjectionPhaseV4::ReadCutoverReady,
-                    mode: LegacyCatalogCheckpointModeV4::FullReconcile,
-                    target_projection_digest: ready_digest,
-                    observed_continuity_loss_epoch: 0,
-                },
-            ),
-        );
-        let ready_response = projection
-            .apply_legacy_catalog_projection_v4(ready)
-            .await
-            .expect("advance V4 checkpoint through service");
-        assert!(matches!(
-            ready_response.outcome,
-            LegacyCatalogProjectionOutcomeV4::AdvanceCheckpoint(_)
-        ));
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read ready V4 checkpoint")
-                .phase,
-            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
-        );
-
-        let mut synced_ticks_digest = ticks_digest;
-        synced_ticks_digest.writer_epoch = 1;
-        let sync_digest = compute_legacy_catalog_projection_digest_v4(&[
-            synced_ticks_digest,
-            adopted_digest.clone(),
-        ])
-        .expect("compute synced projection digest");
-        let source_metadata_hash =
-            compute_legacy_catalog_source_metadata_hash_v4(&[]).expect("hash empty V4 source set");
-        let sync = projection_envelope(
-            406,
-            CatalogActorKind::Server,
-            sync_digest,
-            3,
-            LegacyCatalogProjectionCommandV4::SyncTableMetadata(
-                LegacyCatalogSyncTableMetadataCommandV4 {
-                    table_id: table_id(),
-                    expected_projection_revision: 1,
-                    expected_schema_version: 1,
-                    expected_schema_hash: schema_hash.clone(),
-                    expected_snapshot_version: 1,
-                    expected_legacy_files_revision: 7,
-                    expected_writer_epoch: 0,
-                    expected_source_metadata_hash: source_metadata_hash.clone(),
-                    writer_epoch: 1,
-                    sources: Vec::new(),
-                },
-            ),
-        );
-        let sync_response = projection
-            .apply_legacy_catalog_projection_v4(sync)
-            .await
-            .expect("sync V4 table metadata through service");
-        assert!(matches!(
-            sync_response.outcome,
-            LegacyCatalogProjectionOutcomeV4::SyncTableMetadata(_)
-        ));
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read demoted V4 checkpoint")
-                .phase,
-            LegacyCatalogProjectionPhaseV4::FullShadow
-        );
-
-        let remaining_digest = compute_legacy_catalog_projection_digest_v4(&[adopted_digest])
-            .expect("compute post-drop projection digest");
-        let drop = projection_envelope(
-            407,
-            CatalogActorKind::Server,
-            remaining_digest,
-            4,
-            LegacyCatalogProjectionCommandV4::DropTable(LegacyCatalogDropTableCommandV4 {
-                table_id: table_id(),
-                expected_projection_revision: 2,
-                expected_schema_version: 1,
-                expected_schema_hash: schema_hash,
-                expected_snapshot_version: 1,
-                expected_legacy_files_revision: 7,
-                expected_writer_epoch: 1,
-                expected_source_metadata_hash: Some(source_metadata_hash),
-            }),
-        );
-        let drop_response = projection
-            .apply_legacy_catalog_projection_v4(drop)
-            .await
-            .expect("drop V4 table through service");
-        assert!(matches!(
-            drop_response.outcome,
-            LegacyCatalogProjectionOutcomeV4::DropTable(_)
-        ));
-        let projections = read
-            .list_legacy_table_projections_v4()
-            .await
-            .expect("list complete V4 projection state");
-        assert_eq!(projections.len(), 2);
-        assert_eq!(projections[0].table_id, table_id());
-        assert_eq!(
-            projections[0].state,
-            LegacyCatalogProjectionTableStateV4::Dropped
-        );
-        assert_eq!(projections[1].table_id, adopted_table_id);
-
-        catalog
-            .close()
-            .expect("close Catalog after V4 service flow");
-        let read_error = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect_err("retained V4 read handle must close terminally");
-        assert_eq!(read_error.code(), ErrorCode::Unavailable);
-        let write_error = projection
-            .apply_legacy_catalog_projection_v4(bootstrap)
-            .await
-            .expect_err("retained V4 write handle must close terminally");
-        assert_eq!(write_error.code(), ErrorCode::Unavailable);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_v4_drop_none_atomically_absorbs_and_drops_empty_v1_table() {
-        let directory = TempDir::new().expect("create V1 empty-drop directory");
-        let data_directory = data_directory(&directory);
-        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
-            .expect("open Catalog for V1 empty-drop test");
-        let namespace_id = NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id");
-        catalog
-            .command(migration_command(
-                551,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id,
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("create V1 empty-drop namespace");
-        let schema_ipc = schema_ipc();
-        let schema_hash =
-            crate::canonical_schema_hash_from_ipc(&schema_ipc).expect("hash V1 empty-drop Schema");
-        catalog
-            .command(migration_command(
-                552,
-                Some(1),
-                CatalogCommandV1::CreateTable(CreateTableCommand {
-                    table_id: table_id(),
-                    namespace_id,
-                    name: CatalogName::new("orphaned").expect("valid table name"),
-                    definition: TableDefinition::Append(AppendTableDefinition {
-                        event_time_column: None,
-                    }),
-                    schema_ipc,
-                    config: projection_migration_config("orphaned", 13),
-                }),
-            ))
-            .await
-            .expect("create empty V1 migration table");
-
-        let read = catalog
-            .read_handle()
-            .expect("create V1 empty-drop read handle");
-        assert_eq!(
-            read.read_legacy_table_projection_v4(table_id())
-                .await
-                .expect("read missing V1 projection"),
-            None
-        );
-        let missing_mapping = catalog
-            .resolve_current_legacy_file_view_mapping(table_id())
-            .await
-            .expect_err("empty V1 table starts without a legacy mapping");
-        assert_eq!(missing_mapping.code(), ErrorCode::NotFound);
-        let checkpoint = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read V1 empty-drop checkpoint");
-        let projection = catalog
-            .legacy_reconcile_handle()
-            .expect("create V1 empty-drop projection handle");
-        let drop_command = projection_envelope(
-            553,
-            CatalogActorKind::Server,
-            checkpoint.source_projection_hash.clone(),
-            checkpoint.source_catalog_revision,
-            LegacyCatalogProjectionCommandV4::DropTable(LegacyCatalogDropTableCommandV4 {
-                table_id: table_id(),
-                expected_projection_revision: 0,
-                expected_schema_version: 1,
-                expected_schema_hash: schema_hash,
-                expected_snapshot_version: 1,
-                expected_legacy_files_revision: 13,
-                expected_writer_epoch: 0,
-                expected_source_metadata_hash: None,
-            }),
-        );
-        let response = projection
-            .apply_legacy_catalog_projection_v4(drop_command.clone())
-            .await
-            .expect("absorb and drop empty V1 table");
-        let LegacyCatalogProjectionOutcomeV4::DropTable(result) = &response.outcome else {
-            panic!("expected V1 empty-drop outcome");
-        };
-        assert_eq!(result.projection_revision, 1);
-        assert_eq!(result.native_snapshot_version, 1);
-        assert_eq!(result.legacy_files_revision, 13);
-        assert_eq!(
-            result.completeness,
-            LegacyCatalogProjectionCompletenessV4::Seeded
-        );
-        assert_eq!(result.state, LegacyCatalogProjectionTableStateV4::Dropped);
-        assert_eq!(catalog.revision().await, Ok(3));
-
-        let dropped = read
-            .read_legacy_table_projection_v4(table_id())
-            .await
-            .expect("read absorbed V1 projection")
-            .expect("absorbed V1 projection exists");
-        assert_eq!(dropped.projection_revision, 1);
-        assert_eq!(dropped.source_metadata_hash, None);
-        assert_eq!(
-            dropped.completeness,
-            LegacyCatalogProjectionCompletenessV4::Seeded
-        );
-        assert_eq!(dropped.state, LegacyCatalogProjectionTableStateV4::Dropped);
-        let base = catalog
-            .resolve_legacy_file_view_mapping(table_id(), 13)
-            .await
-            .expect("resolve atomically bootstrapped base mapping");
-        assert_eq!(base.native_snapshot_version, 1);
-        assert_eq!(base.request_id, None);
-        assert_eq!(base.continuity, LegacyFileViewContinuity::Base);
-
-        assert_eq!(
-            projection
-                .apply_legacy_catalog_projection_v4(drop_command)
-                .await
-                .expect("replay empty V1 drop"),
-            response
-        );
-        assert_eq!(catalog.revision().await, Ok(3));
-        assert_eq!(
-            read.read_legacy_table_projection_v4(table_id())
-                .await
-                .expect("read V1 projection after replay")
-                .expect("V1 projection remains after replay"),
-            dropped
-        );
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read checkpoint after V1 drop replay"),
-            checkpoint
-        );
-        catalog
-            .close()
-            .expect("close Catalog after V1 empty-drop test");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_v3_first_commit_updates_projection_and_demotes_ready_once() {
-        let directory = TempDir::new().expect("create V3 hook directory");
-        let data_directory = data_directory(&directory);
-        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
-            .expect("open Catalog for V3 hook test");
-        let (projection, read, schema_hash, _) =
-            create_ready_ticks_projection(&catalog, 601, 1).await;
-        let ready_checkpoint = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read checkpoint before V3 hook");
-        let reconcile = legacy_reconcile_command(604, &schema_hash, 0, 0, 1, 2, Vec::new());
-        let response = projection
-            .reconcile_legacy_table_v3(reconcile.clone())
-            .await
-            .expect("commit V3 reconcile through hook");
-        assert_eq!(response.native_snapshot_version, 2);
-        let synchronized = read
-            .read_legacy_table_projection_v4(table_id())
-            .await
-            .expect("read V3-synchronized complete projection")
-            .expect("V3-synchronized projection exists");
-        assert_eq!(synchronized.projection_revision, 2);
-        assert_eq!(synchronized.native_snapshot_version, 2);
-        assert_eq!(synchronized.legacy_files_revision, 2);
-        assert_eq!(
-            synchronized.completeness,
-            LegacyCatalogProjectionCompletenessV4::Complete
-        );
-        let demoted = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read checkpoint after V3 hook");
-        assert_eq!(demoted.phase, LegacyCatalogProjectionPhaseV4::FullShadow);
-        assert_eq!(
-            demoted.checkpoint_generation,
-            ready_checkpoint.checkpoint_generation + 1
-        );
-
-        assert_eq!(
-            projection
-                .reconcile_legacy_table_v3(reconcile)
-                .await
-                .expect("replay exact V3 reconcile"),
-            response
-        );
-        assert_eq!(
-            read.read_legacy_table_projection_v4(table_id())
-                .await
-                .expect("read projection after V3 replay")
-                .expect("projection remains after V3 replay"),
-            synchronized
-        );
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read checkpoint after V3 replay"),
-            demoted
-        );
-        assert_eq!(catalog.revision().await, Ok(4));
-        catalog.close().expect("close Catalog after V3 hook test");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn native_v1_table_commits_demote_ready_and_continue_under_native_authority() {
-        let directory = TempDir::new().expect("create V1 hook directory");
-        let data_directory = data_directory(&directory);
-        let config = SqliteCatalogConfig::new(&data_directory);
-        let database_path = config.path().to_path_buf();
-        let catalog = SqliteCatalog::open(config).expect("open Catalog for V1 hook test");
-        let (_, read, _, _) = create_ready_ticks_projection(&catalog, 701, 1).await;
-        let initial_ready = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read initial ready checkpoint");
-
-        let second_table_id = TableId::from_u128(3).expect("nonzero second table id");
-        let create_second_table = command(
-            704,
-            Some(3),
-            CatalogCommandV1::CreateTable(CreateTableCommand {
-                table_id: second_table_id,
-                namespace_id: NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id"),
-                name: CatalogName::new("native_only").expect("valid native table name"),
-                definition: TableDefinition::Append(AppendTableDefinition {
-                    event_time_column: None,
-                }),
-                schema_ipc: schema_ipc(),
-                config: BTreeMap::new(),
-            }),
-        );
-        let create_response = catalog
-            .command(create_second_table.clone())
-            .await
-            .expect("commit native CreateTable while ready");
-        let create_demoted = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read checkpoint after native CreateTable");
-        assert_eq!(
-            create_demoted.phase,
-            LegacyCatalogProjectionPhaseV4::FileShadow
-        );
-        assert_eq!(
-            create_demoted.checkpoint_generation,
-            initial_ready.checkpoint_generation + 1
-        );
-        assert_eq!(catalog.revision().await, Ok(4));
-        assert_eq!(
-            catalog
-                .command(create_second_table)
-                .await
-                .expect("replay native CreateTable"),
-            create_response
-        );
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read checkpoint after CreateTable replay"),
-            create_demoted
-        );
-
-        let raw =
-            rusqlite::Connection::open(&database_path).expect("open raw checkpoint phase fixture");
-        raw.execute(
-            "UPDATE legacy_projection_checkpoint SET phase = 'read_cutover_ready' \
-             WHERE singleton = 1",
-            [],
-        )
-        .expect("restore ready phase for CommitDataFiles hook");
-        drop(raw);
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read restored ready checkpoint")
-                .phase,
-            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
-        );
-
-        let first_commit = commit_data_file(705, 10, 4, 1, 0);
-        let first_commit_response = catalog
-            .command(first_commit.clone())
-            .await
-            .expect("commit native file while ready");
-        let commit_demoted = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read checkpoint after native file commit");
-        assert_eq!(
-            commit_demoted.phase,
-            LegacyCatalogProjectionPhaseV4::FileShadow
-        );
-        assert_eq!(
-            commit_demoted.checkpoint_generation,
-            create_demoted.checkpoint_generation + 1
-        );
-        assert_eq!(catalog.revision().await, Ok(5));
-        assert_eq!(
-            catalog
-                .command(first_commit)
-                .await
-                .expect("replay native file commit"),
-            first_commit_response
-        );
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read checkpoint after native file replay"),
-            commit_demoted
-        );
-
-        let raw = rusqlite::Connection::open(&database_path)
-            .expect("open native-authority phase fixture");
-        raw.execute(
-            "UPDATE legacy_projection_checkpoint SET phase = 'native_authoritative' \
-             WHERE singleton = 1",
-            [],
-        )
-        .expect("set native-authoritative phase");
-        drop(raw);
-        catalog
-            .command(commit_data_file(706, 11, 5, 2, 1))
-            .await
-            .expect("native file commit remains available under native authority");
-        let authoritative = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read native-authoritative checkpoint");
-        assert_eq!(
-            authoritative.phase,
-            LegacyCatalogProjectionPhaseV4::NativeAuthoritative
-        );
-        assert_eq!(catalog.revision().await, Ok(6));
-        catalog.close().expect("close Catalog after V1 hook test");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn legacy_v2_import_demotes_ready_once_and_replay_is_side_effect_free() {
-        let directory = TempDir::new().expect("create V2 hook directory");
-        let data_directory = data_directory(&directory);
-        let config = SqliteCatalogConfig::new(&data_directory);
-        let database_path = config.path().to_path_buf();
-        let physical_file = directory.path().join("legacy-v2-hook.parquet");
-        let contents = b"legacy-v2-hook-fixture";
-        std::fs::write(&physical_file, contents).expect("write V2 hook fixture");
-        let import = external_legacy_import_command(&physical_file, contents);
-
-        let catalog = SqliteCatalog::open(config).expect("open Catalog for V2 hook test");
-        let session = catalog
-            .begin_legacy_import_session()
-            .expect("acquire V2 hook import session");
-        catalog
-            .command(migration_command(
-                1,
-                Some(0),
-                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
-                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
-                        .expect("nonzero namespace id"),
-                    name: CatalogName::new("market").expect("valid namespace name"),
-                }),
-            ))
-            .await
-            .expect("create V2 hook namespace");
-
-        let raw =
-            rusqlite::Connection::open(&database_path).expect("open V2 checkpoint phase fixture");
-        raw.execute(
-            "UPDATE legacy_projection_checkpoint SET phase = 'read_cutover_ready' \
-             WHERE singleton = 1",
-            [],
-        )
-        .expect("set ready phase before V2 import");
-        drop(raw);
-
-        let read = catalog.read_handle().expect("create V2 hook read handle");
-        let ready = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read ready checkpoint before V2 import");
-        assert_eq!(
-            ready.phase,
-            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
-        );
-
-        let response = session
-            .import_legacy_table_v2(import.clone())
-            .await
-            .expect("commit V2 import while ready");
-        let demoted = read
-            .read_legacy_projection_checkpoint_v4()
-            .await
-            .expect("read checkpoint after V2 import");
-        assert_eq!(demoted.phase, LegacyCatalogProjectionPhaseV4::FileShadow);
-        assert_eq!(
-            demoted.checkpoint_generation,
-            ready.checkpoint_generation + 1
-        );
-        let seeded = read
-            .read_legacy_table_projection_v4(table_id())
-            .await
-            .expect("read projection after V2 import")
-            .expect("V2 import seeds a projection row");
-        assert_eq!(seeded.projection_revision, 1);
-        assert_eq!(seeded.native_snapshot_version, 2);
-        assert_eq!(seeded.legacy_files_revision, 1);
-        assert_eq!(seeded.writer_epoch, 1);
-        assert_eq!(
-            seeded.completeness,
-            LegacyCatalogProjectionCompletenessV4::Seeded
-        );
-        assert_eq!(catalog.revision().await, Ok(2));
-
-        assert_eq!(
-            session
-                .import_legacy_table_v2(import)
-                .await
-                .expect("replay exact V2 import"),
-            response
-        );
-        assert_eq!(
-            read.read_legacy_projection_checkpoint_v4()
-                .await
-                .expect("read checkpoint after V2 replay"),
-            demoted
-        );
-        assert_eq!(
-            read.read_legacy_table_projection_v4(table_id())
-                .await
-                .expect("read projection after V2 replay")
-                .expect("projection remains after V2 replay"),
-            seeded
-        );
-        assert_eq!(catalog.revision().await, Ok(2));
-
-        session.seal();
-        catalog.close().expect("close Catalog after V2 hook test");
     }
 
     #[test]

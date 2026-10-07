@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin==1.12.6"]
 build-backend = "maturin"
 
 [project]
@@ -7,11 +7,11 @@ name = "zippy"
 version = "0.5.0"
 requires-python = ">=3.11"
 dependencies = [
+    "zippy-client==0.1.0",
     "click>=8.1.0",
     "fastapi>=0.115.0",
     "polars>=1.25.0",
-    "pyarrow>=18.0.0",
-    "rspm>=0.1.0",
+    "pyarrow>=23.0.0",
     "uvicorn>=0.30.0",
 ]
 
@@ -21,7 +21,7 @@ zippy = "zippy.cli:main"
 [project.optional-dependencies]
 dev = [
     "black>=24.10.0",
-    "maturin>=1.7,<2.0",
+    "maturin==1.12.6",
     "mypy>=1.13.0",
     "pytest>=8.3.0",
     "ruff>=0.8.0",
@@ -38,7 +38,7 @@ include = [
 ]
 
 [tool.uv.sources]
-rspm = { path = "../rspm/python", editable = true }
+zippy-client = { workspace = true }
 
 [tool.uv.workspace]
 members = ["clients/python"]
@@ -58,24 +58,21 @@ select = ["E4", "E7", "E9", "F"]
 [tool.mypy]
 python_version = "3.11"
 files = [
-    "python/zippy/state.py",
-    "python/zippy/__main__.py",
-    "python/zippy/_server_bootstrap.py",
-    "python/zippy/_internal.pyi",
-    "python/zippy/cli.py",
-    "python/zippy/cli_common.py",
-    "python/zippy/cli_gateway.py",
-    "python/zippy/cli_master.py",
-    "python/zippy/cli_pm.py",
-    "python/zippy/cli_server.py",
-    "python/zippy/server_process.py",
-    "python/zippy/cli_stream.py",
-    "python/zippy/pm_bridge.py",
-    "python/zippy/cli_webui.py",
-    "python/zippy/webui.py",
+    "python",
+    "pytests",
+    "scripts",
+    "examples",
+    "clients/python/src",
+    "clients/python/tests",
 ]
 ignore_missing_imports = true
 follow_imports = "silent"
 warn_unused_ignores = false
 disallow_untyped_defs = false
 check_untyped_defs = false
+
+[dependency-groups]
+protocol = [
+    "grpcio-tools==1.81.1",
+    "black==26.3.1",
+]

@@ -1,0 +1,136 @@
+{
+  "date": "2026-09-22",
+  "batch": 12,
+  "overall_complete": false,
+  "audit_closed_total": 22,
+  "closed_this_batch": [
+    "F16"
+  ],
+  "advanced_this_batch": [
+    "F11",
+    "F22",
+    "F28"
+  ],
+  "additional_fixes": [
+    "F44: datatype-aligned Flight decoding prevents Rust FFI misaligned pointer abort"
+  ],
+  "audit_remaining": [
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F13",
+    "F14",
+    "F15",
+    "F22",
+    "F26",
+    "F28",
+    "F29"
+  ],
+  "validation": {
+    "python": "610 passed, 1 skipped",
+    "python_client": "113 passed; coverage 81.67%",
+    "rust_workspace": "passed; exit 0",
+    "clippy": "workspace all-targets all-features -D warnings; passed; exit 0",
+    "black": "86 files unchanged; passed",
+    "ruff": "passed",
+    "mypy": "configured root 14 files and client 26 files passed; F29 remains open",
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "distributions": "both sdist/wheel built and installed in new venv; isolated imports and CLI passed; exit 0",
+    "native_recovery": "five server starts; Arrow 23.0.1 and 25.0.1 passed",
+    "platform": "Linux x86_64, CPython 3.11; no new Windows/macOS run"
+  },
+  "acceptance": {
+    "attach_log_before_atomic_snapshot": true,
+    "snapshot_bound_to_immutable_table_id": true,
+    "snapshot_covered_deltas_deduplicated": true,
+    "upsert_delete_reinsert_and_empty_state": true,
+    "recovery_hides_invalid_state": true,
+    "recovery_reauthenticates_and_reloads_full_state": true,
+    "retry_budget_and_cancellable_backoff": true,
+    "protocol_and_admin_cancel_are_terminal": true,
+    "opening_timeout_cancels_blocked_reader": true,
+    "ffi_buffers_datatype_aligned": true,
+    "old_snapshot_loader_removed": true,
+    "local_engines_retained": true,
+    "durable_ack": false,
+    "legacy_callbacks_migrated": false,
+    "gateway_removed": false
+  },
+  "evidence": {
+    "python": {
+      "path": "/tmp/zippy-state-python.log",
+      "sha256": "24a72ae608d41fe85a7bfea5f5e1a6f34929652a19efdac4c56c9b2b456b9775"
+    },
+    "python_client": {
+      "path": "/tmp/zippy-state-client.log",
+      "sha256": "01d0d2a7d78581b8c98874cd93dd021bab0b49c7f5e88d811d0feb2d97f18de8"
+    },
+    "mypy": {
+      "path": "/tmp/zippy-state-mypy.log",
+      "sha256": "fe22d95914d7fdd98483ace256b7f2708db4be1255737e5d7cca4d16703ca242"
+    },
+    "client_mypy": {
+      "path": "/tmp/zippy-state-client-mypy.log",
+      "sha256": "5107f9446510710cfc458474a6bae8746bf7ed9a2bccb85b1de3b0a14e84c8ad"
+    },
+    "native_arrow23": {
+      "path": "/tmp/zippy-state-native-final.log",
+      "sha256": "475e6908c66e23328b22dc324c4f7eabd9f9f932e3f561eada4f08843249e957"
+    },
+    "native_arrow25": {
+      "path": "/tmp/zippy-state-native-arrow25.log",
+      "sha256": "247d9ada9da58f9d2e2758b617d38656ecdcf878833dc27c39432854e7e0f92f"
+    },
+    "rust_workspace": {
+      "path": "/tmp/zippy-state-workspace-final.log",
+      "sha256": "6ac4ec199c375fa7fcc788a25bdc2f540eed38c31612d6b2b42fe7bbfb2e444c"
+    },
+    "clippy": {
+      "path": "/tmp/zippy-state-clippy.log",
+      "sha256": "52ea042bdf131b6c70353e3610fdba8367f1d02a1af3d2d4cf703b9f570d172c"
+    },
+    "black": {
+      "path": "/tmp/zippy-state-black.log",
+      "sha256": "5ca84273156ef50ec46f6f677865f09ad6e73ed0eb45f2d3775f8c0f2a797984"
+    },
+    "ruff": {
+      "path": "/tmp/zippy-state-ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    "rustfmt": {
+      "path": "/tmp/zippy-state-fmt.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_check": {
+      "path": "/tmp/zippy-state-diff.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "distributions": {
+      "path": "/tmp/zippy-state-distributions.log",
+      "sha256": "00c2085eaf1b6fa384860eb689859d48cb200085ea89a6cf6d527a034edc19cd"
+    },
+    "ffi_failure_reproduction": {
+      "path": "/tmp/zippy-state-native-ffi-failure.log",
+      "sha256": "95a0f7cd7b124c6dc85efd4a806a2c41712304deccfe58346b8cf10b0e71c7fb"
+    }
+  },
+  "source_sha256": {
+    "python/zippy/state.py": "551f24664e4f6fa7634ffd922a8dae140f3aad0dae66f2d927ad29dab55519f8",
+    "pytests/test_native_state_subscription.py": "26ef4b2e40566bcddf600a74eeb44c6d481f48efb2cdb74e5d5a972971339851",
+    "pytests/test_python_api.py": "cad568d5037996fb33681f07bc0c552ec0293c3f36b016b6f321bbd3d35388bf",
+    "pytests/test_key_value_state.py": "1bace23bdd43346cce686d56e4f831ace1baa02635eb491f90db625725fff3b0",
+    "clients/python/src/zippy_client/client.py": "93bf45c42dd4d8666f793a8dbd54ad90c3e26801dca5397ce8756185f709fa0a",
+    "clients/python/src/zippy_client/transports/flight.py": "44e763bb1e5da7bdbf84dc70208c36101dcc155d163adf28681ccfdd2a2d7ac1",
+    "clients/python/tests/test_flight_transport.py": "75bcdedf687057ff25c68cd1ac49ea6e7d0dccad9ded4520779de1d53cd8420c",
+    "clients/python/tests/test_log_reader.py": "01187159b3d35b1a7b1c67543729f0b0a68f6ead93a4b9078bce261c1a6ae24c",
+    "crates/zippy-server/src/query_service.rs": "93b1fb72434bfbcfa651b58df76c2584c1e474aa48892223ed126448f95fd3d8",
+    "crates/zippy-server/src/query_snapshot.rs": "0f0815385adda39e334a3fbe6b03dd9ed1e92e0a1a1ccf4cd66be72e22117030",
+    "scripts/check_native_client.py": "67f39027b5cde2773d23af725f80f12bfb5224baf4681545a25a3faf3b0dcd6f",
+    "pyproject.toml": "26c72942493562ee4135f86352409373cb87fc0cf9d381d4b1f36b0bbb727ac3",
+    "clients/python/pyproject.toml": "aa92766eb5c9f08d42bbfad5966c7973428e6533174423454ccd8065a8604f16",
+    "uv.lock": "18eadd263c3647bb4c1542adc29c6750d0c010eac05a9fcfa880343c2469add7"
+  }
+}

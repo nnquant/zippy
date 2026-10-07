@@ -405,25 +405,48 @@ fn active_descriptor_envelope_includes_payload_version_offset() {
     assert_eq!(envelope["payload_version_offset"], serde_json::json!(88));
 
     let descriptor = ActiveSegmentDescriptor::from_envelope_bytes(&bytes, schema, layout).unwrap();
-    assert_eq!(descriptor.payload_version_offset(), Some(88));
+    assert_eq!(descriptor.payload_version_offset(), 88);
 }
 
 #[test]
-fn active_descriptor_envelope_accepts_legacy_payload_version_absence() {
+fn active_descriptor_envelope_rejects_missing_or_invalid_payload_version_offset() {
     let (schema, layout) = tick_schema_and_layout();
     let mut writer = ActiveSegmentWriter::new_for_test(schema.clone(), layout.clone()).unwrap();
     writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
 
     let bytes = writer.active_descriptor().to_envelope_bytes().unwrap();
-    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    envelope
-        .as_object_mut()
-        .unwrap()
-        .remove("payload_version_offset");
-    let legacy = serde_json::to_vec(&envelope).unwrap();
-
-    let descriptor = ActiveSegmentDescriptor::from_envelope_bytes(&legacy, schema, layout).unwrap();
-    assert_eq!(descriptor.payload_version_offset(), None);
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for invalid in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!(0)),
+        Some(serde_json::json!("88")),
+    ] {
+        let mut malformed = envelope.clone();
+        match invalid {
+            Some(value) => {
+                malformed["payload_version_offset"] = value;
+            }
+            None => {
+                malformed
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("payload_version_offset");
+            }
+        }
+        let bytes = serde_json::to_vec(&malformed).unwrap();
+        assert!(ActiveSegmentDescriptor::from_envelope_bytes(
+            &bytes,
+            schema.clone(),
+            layout.clone()
+        )
+        .is_err());
+    }
+    let descriptor = writer
+        .active_descriptor()
+        .with_payload_version_offset_for_test(0);
+    let error = RowSpanView::from_active_descriptor(descriptor, 0, 1).unwrap_err();
+    assert!(error.contains("payload version offset mismatch"));
 }
 
 #[test]
@@ -791,4 +814,48 @@ fn active_descriptor_rejects_payload_offset_mismatch() {
     let err = RowSpanView::from_active_descriptor(descriptor, 0, 1).unwrap_err();
 
     assert!(err.contains("payload offset"));
+}
+
+#[test]
+fn utf8_bound_covers_chunk_boundaries_nulls_and_pinned_prefix_only() {
+    let schema = compile_schema(&[ColumnSpec::nullable("key", ColumnType::Utf8)]).unwrap();
+    let layout = LayoutPlan::for_schema(&schema, 2050).unwrap();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    for index in 0..2049 {
+        writer.begin_row().unwrap();
+        if index == 1023 {
+            writer.write_utf8("key", &"中".repeat(100)).unwrap();
+        } else if index % 3 == 0 {
+            writer.write_utf8("key", "a").unwrap();
+        }
+        writer.commit_row().unwrap();
+    }
+    let pinned =
+        RowSpanView::snapshot_from_active_descriptor(writer.active_descriptor(), 0, 2049).unwrap();
+    assert_eq!(pinned.max_utf8_value_bytes().unwrap(), 300);
+    writer.begin_row().unwrap();
+    writer.write_utf8("key", &"b".repeat(500)).unwrap();
+    writer.commit_row().unwrap();
+    assert_eq!(pinned.max_utf8_value_bytes().unwrap(), 300);
+    assert_eq!(
+        pinned
+            .slice_rows(1024, 2049)
+            .unwrap()
+            .max_utf8_value_bytes()
+            .unwrap(),
+        1
+    );
+    let sealed = RowSpanView::new(writer.sealed_handle_for_test().unwrap(), 0, 2050).unwrap();
+    assert_eq!(sealed.max_utf8_value_bytes().unwrap(), 500);
+    assert_eq!(
+        sealed
+            .slice_rows(0, 2049)
+            .unwrap()
+            .max_utf8_value_bytes()
+            .unwrap(),
+        300
+    );
+    writer.begin_payload_mutation_for_test().unwrap();
+    writer.finish_payload_mutation_for_test().unwrap();
+    assert!(pinned.max_utf8_value_bytes().is_err());
 }

@@ -1,0 +1,1758 @@
+   Compiling zippy-perf v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-perf)
+   Compiling zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+   Compiling zippy-python v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-python)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.86s
+     Running unittests src/lib.rs (target/debug/deps/zippy_catalog-aec72e9db0c3e58f)
+
+running 93 tests
+test encoding::tests::big_endian_u64_encoding_preserves_unsigned_order ... ok
+test encoding::tests::committed_offset_round_trips_every_state_and_boundary ... ok
+test encoding::tests::sequence_watermark_round_trips_every_state_and_boundary ... ok
+test encoding::tests::offset_watermark_round_trips_every_state_and_boundary ... ok
+test encoding::tests::u64_round_trips_full_unsigned_boundaries ... ok
+test encoding::tests::decoders_reject_wrong_width_invalid_tags_and_noncanonical_payloads ... ok
+test gc_domain::tests::claim_validation_rejects_unbounded_or_invalid_boundaries ... ok
+test encoding::tests::optional_u64_round_trips_none_and_all_boundary_values ... ok
+test gc_domain::tests::finalize_validation_requires_a_bounded_strictly_sorted_set ... ok
+test layout::tests::unsigned_metadata_encoding_round_trips_extremes_and_preserves_order ... ok
+test runtime_pins::tests::close_rejects_new_admission_without_invalidating_existing_guards ... ok
+test runtime_pins::tests::pin_and_table_budgets_are_released_with_raii_guards ... ok
+test runtime_pins::tests::garbage_collection_excludes_only_its_table_shard_entry ... ok
+test runtime_pins::tests::query_pin_records_are_unique_auditable_and_removed_with_the_guard ... ok
+test layout::tests::layout_checksum_is_independent_of_source_line_endings ... ok
+test service::tests::manifest_queue_budget_releases_completed_reservations ... ok
+test service::tests::cancelled_replay_verification_retains_admission_until_blocking_work_exits ... ok
+test domain::tests::command_replay_probe_is_read_only_and_matches_only_the_exact_fingerprint ... ok
+test domain::tests::tampered_and_unsupported_commands_never_open_domain_writes ... ok
+test domain::tests::create_namespace_replays_the_exact_response_without_advancing_revision ... ok
+test domain::tests::request_id_reuse_with_a_different_fingerprint_conflicts ... ok
+test domain::tests::expected_revision_conflict_rolls_back_every_domain_write ... ok
+test domain::tests::command_replay_probe_fails_closed_on_a_corrupt_retained_response ... ok
+test domain::tests::get_and_list_namespaces_use_exact_identity_and_stable_cursor_order ... ok
+test service::tests::deferred_control_read_keeps_multi_query_state_on_one_wal_snapshot ... ok
+test layout::tests::new_layout_has_exact_inventory_and_initializes_once ... ok
+test schema_domain::tests::corrupt_current_schema_and_exhausted_epoch_cannot_publish_new_schema ... ok
+test schema_domain::tests::rejected_changes_and_partial_sql_failure_leave_no_history_or_receipt ... ok
+test layout::tests::failed_bootstrap_validation_rolls_back_schema_and_header ... ok
+test service::tests::pinned_snapshot_rebind_requires_unique_matching_admission ... ok
+test service::tests::cancelled_inflight_resolution_retains_lease_until_sqlite_work_exits ... ok
+test service::tests::pinned_schema_sidecar_failure_rolls_back_runtime_pins ... ok
+test service::tests::cancelled_queued_resolution_retains_lease_until_control_worker_dequeues_it ... ok
+test service::tests::leased_table_resolution_returns_ownership_and_releases_it_on_read_error ... ok
+test service::tests::memory_lease_validation_precedes_resolution_worker_and_runtime_pins ... ok
+test service::tests::replay_verification_panic_is_terminal_and_releases_admission ... ok
+test snapshot_domain::tests::snapshot_peak_estimator_accepts_exact_boundaries_and_rejects_invalid_counts ... ok
+test snapshot_domain::tests::snapshot_peak_estimator_is_strictly_monotonic_for_every_input_bound ... ok
+test service::tests::panicked_resolution_worker_drops_its_inflight_memory_lease ... ok
+test snapshot_domain::tests::snapshot_peak_estimator_reports_checked_arithmetic_overflow ... ok
+test service::tests::cancelled_queued_snapshot_is_skipped_and_releases_queue_capacity ... ok
+test service::tests::read_handle_and_runtime_health_report_a_stopped_worker_as_terminal ... ok
+test storage_codec::tests::canonical_schema_hash_has_simple_nested_and_metadata_golden_values ... ok
+test storage_codec::tests::canonical_schema_hash_sorts_schema_and_field_metadata ... ok
+test service::tests::panicked_snapshot_worker_drops_its_inflight_memory_lease ... ok
+test storage_codec::tests::frozen_config_definition_and_summary_wrappers_round_trip ... ok
+test storage_codec::tests::metadata_blob_v1_golden_round_trips_and_binds_checksum_domains ... ok
+test storage_codec::tests::public_persisted_schema_decoder_maps_untrusted_ipc_to_corruption ... ok
+test storage_codec::tests::public_persisted_schema_decoder_verifies_payload_and_hash ... ok
+test storage_codec::tests::schema_decoder_accepts_a_normal_complex_schema ... ok
+test storage_codec::tests::schema_decoder_rejects_batches_trailing_bytes_and_malformed_streams ... ok
+test storage_codec::tests::schema_decoder_rejects_missing_flatbuffer_fields ... ok
+test storage_codec::tests::decoded_schema_charge_accounts_for_shared_offset_expansion ... ok
+test storage_codec::tests::schema_decoder_rejects_repeated_offsets_before_arrow_expansion ... ok
+test storage_codec::tests::schema_decoder_rejects_untrusted_lengths_before_arrow_allocates ... ok
+test storage_codec::tests::table_aware_persisted_schema_decoder_rejects_definition_mismatch ... ok
+test storage_codec::tests::typed_json_decoder_rejects_noncanonical_json_with_a_valid_checksum ... ok
+test storage_codec::tests::typed_json_v1_golden_round_trips_and_rejects_tampering_or_wrong_kind ... ok
+test table_domain::tests::table_resolution_peak_estimator_checks_arithmetic ... ok
+test table_domain::tests::table_resolution_peak_estimator_is_bounded_nonzero_and_strictly_monotonic ... ok
+test tests::maps_progress_handler_interrupt_to_deadline_exceeded ... ok
+test service::tests::pinned_reader_rejects_unsafe_or_changed_managed_files_without_path_disclosure ... ok
+test service::tests::attributed_multi_table_read_failure_rolls_back_all_runtime_pins ... ok
+test storage_codec::tests::schema_decoder_rejects_recursive_field_and_metadata_budgets ... ok
+test service::tests::forged_publication_permit_cannot_mutate_under_exclusion ... ok
+test service::tests::cancelled_inflight_snapshot_retains_memory_lease_until_sqlite_read_exits ... ok
+test service::tests::pinned_schema_charges_follow_deterministic_table_ordinals ... ok
+test service::tests::attributed_snapshot_memory_lease_follows_success_and_read_error_ownership ... ok
+test storage_codec::tests::metadata_blob_v1_rejects_oversized_encode_and_decode_payloads ... ok
+test service::tests::preparation_panic_is_terminal_and_the_same_request_can_retry ... ok
+test service::tests::cooperative_manifest_preflight_yields_and_releases_cancelled_command_budget ... ok
+test service::tests::blocked_snapshot_does_not_block_control_reads_or_writer_commit ... ok
+test service::tests::blocked_manifest_preserves_pending_mutation_fifo ... ok
+test service::tests::read_handle_applies_per_request_snapshot_limits_inside_sqlite_lane ... ok
+test wal_open_tests::journal_transition_lock_timeout_is_bounded_and_recoverable ... ok
+test service::tests::pinned_file_tasks_and_readers_protect_physical_files_until_final_drop ... ok
+test service::tests::read_handle_does_not_retain_owner_and_fails_terminally_after_close ... ok
+test service::tests::publication_exclusion_waits_for_cancelled_admitted_mutation ... ok
+test snapshot_domain::tests::lightweight_schema_reader_enforces_order_and_raw_byte_budget ... ok
+test snapshot_domain::tests::visible_file_plan_uses_v3_index_without_a_temporary_sort ... ok
+test snapshot_domain::tests::lightweight_schema_reader_is_revision_fixed_and_skips_file_manifests ... ok
+test service::tests::active_pinned_snapshot_retains_catalog_epoch_across_owner_close ... ok
+test service::tests::replay_probe_is_bounded_read_only_and_skips_manifest_preparation ... ok
+test schema_domain::tests::schema_history_is_atomic_replayable_and_fences_all_table_kinds ... ok
+test service::tests::catalog_runtime_ownership_survives_preparation_and_reopen_replays_exactly ... ok
+test service::tests::replay_probe_rejects_bad_fingerprint_before_control_read_worker ... ok
+test service::tests::blocked_manifest_preparation_keeps_reads_live_and_shutdown_drains_cancelled_commit ... ok
+test service::tests::gc_claim_rejects_forged_cross_table_and_cross_catalog_guards ... ok
+test service::tests::replay_probe_releases_fixed_admission_before_observing_its_response ... ok
+test service::tests::native_drop_is_atomic_replayable_and_preserves_pins_and_leases ... ok
+test service::tests::cancelled_admitted_gc_claim_executes_in_writer_fifo_order ... ok
+test snapshot_domain::tests::snapshot_reader_rebuilds_lineage_and_rejects_invalid_aggregates ... ok
+test service::tests::replay_probe_ignores_manifest_write_budget_for_missing_and_exact_results ... ok
+
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running tests/sqlite_catalog.rs (target/debug/deps/sqlite_catalog-89389818dba467ea)
+
+running 20 tests
+test writable_config_retains_data_directory_ownership ... ok
+test catalog_workers_hold_ownership_until_they_are_closed ... ok
+test serves_empty_contracts_and_rejects_missing_or_unimplemented_paths ... ok
+test dropping_an_unpolled_command_future_never_enqueues_or_commits ... ok
+test read_handle_reports_closed_pin_registry_until_the_last_guard_drops ... ok
+test durable_snapshot_lease_acquire_release_and_replay_are_atomic ... ok
+test snapshot_selector_validation_rejects_oversized_unsorted_and_duplicate_inputs ... ok
+test runtime_snapshot_pin_status_reports_limits_watermarks_and_rejections ... ok
+test snapshot_validation_precedes_enqueue_and_reads_do_not_share_writer_queue ... ok
+test dropping_a_polled_command_future_does_not_cancel_its_commit ... ok
+test snapshot_reads_require_exact_versions_and_reject_versions_ahead_of_current ... ok
+test fixed_snapshot_forks_keep_gc_pins_and_independent_query_accounting ... ok
+test table_listing_and_resolution_are_bounded_stable_and_revision_consistent ... ok
+test creates_table_atomically_and_replays_exactly_across_restart ... ok
+test typed_catalog_runtime_is_single_owner_and_reopen_preserves_command_replay ... ok
+test replays_create_namespace_exactly_across_restart_and_serves_reads ... ok
+test producer_acquisition_fences_stale_epochs_and_replays_without_rollback ... ok
+test raw_and_pinned_native_snapshots_share_file_id_order ... ok
+test validation_conflicts_and_injected_failure_leave_no_partial_table ... ok
+test table_read_byte_budget_pages_lists_and_rejects_oversized_resolution ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running tests/sqlite_consumer_offsets.rs (target/debug/deps/sqlite_consumer_offsets-0009fd230f7b0d55)
+
+running 4 tests
+test commits_reject_unauthorized_stale_regressing_and_undurable_acknowledgements ... ok
+test corrupt_offsets_are_bounded_and_never_returned_as_empty_replay ... ok
+test group_cas_has_one_winner_and_sql_failure_rolls_back_identity_offset_and_receipt ... ok
+test individual_progress_replays_across_restart_and_does_not_rebind_after_drop ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/sqlite_foundation.rs (target/debug/deps/sqlite_foundation-b86df38e19d9ccd3)
+
+running 51 tests
+test active_table_cursor_listing_uses_the_state_id_index ... ok
+test inspect_rejects_tampered_catalog_format_metadata ... ok
+test active_table_cursor_listing_uses_the_namespace_state_id_index ... ok
+test current_layout_has_no_legacy_channels_and_rejects_migration_request_versions ... ok
+test inspect_rejects_invalid_initialization_audit_timestamp_width ... ok
+test rejects_actor_capacity_above_the_allocation_limit ... ok
+test rejects_a_symbolic_link_catalog_database ... ok
+test generated_parent_snapshot_payload_rejects_a_dangling_reference ... ok
+test inspect_maps_negative_initialization_version_to_data_corruption ... ok
+test rejects_a_dangling_current_snapshot_at_deferred_commit ... ok
+test inspect_rejects_tampered_layout_checksum ... ok
+test rejects_an_unbounded_actor_configuration ... ok
+test rejects_an_unbounded_integrity_check_configuration ... ok
+test rejects_busy_timeout_above_sqlite_integer_limit_without_panicking ... ok
+test rejects_a_dangling_current_schema_at_deferred_commit ... ok
+test inspect_rejects_an_extra_initialization_audit_record ... ok
+test inspect_maps_integer_initialization_timestamp_to_data_corruption ... ok
+test rejects_a_sqlitex_prefixed_foreign_schema_before_enabling_wal ... ok
+test inspect_rejects_tampered_schema_metadata ... ok
+test namespace_cursor_listing_seeks_by_namespace_id_without_a_temp_sort ... ok
+test rejects_read_lane_capacities_outside_allocation_limits ... ok
+test rejects_sub_millisecond_integrity_timeout ... ok
+test generated_removed_snapshot_payload_rejects_a_dangling_reference ... ok
+test rejects_runtime_snapshot_pin_limits_outside_allocation_bounds ... ok
+test inspect_rejects_a_missing_initialization_audit_record ... ok
+test rejects_foreign_schema_before_enabling_wal ... ok
+test inspect_rejects_drift_in_reserved_table_name_uniqueness ... ok
+test inspect_rejects_global_table_cursor_index_drift ... ok
+test inspect_rejects_safe_gc_retry_index_drift ... ok
+test rejects_future_catalog_before_enabling_wal ... ok
+test inspect_rejects_namespace_table_cursor_index_drift ... ok
+test inspect_rejects_safe_gc_claim_index_drift ... ok
+test inspect_rejects_a_sqlitex_prefixed_user_schema_object ... ok
+test inspect_rejects_safe_gc_lease_index_drift ... ok
+test inspect_maps_a_dropped_catalog_table_to_data_corruption ... ok
+test inspect_rejects_an_unexpected_schema_object ... ok
+test inspect_rejects_catalog_table_column_drift ... ok
+test domain_schema_preserves_unsigned_extremes_and_canonical_tags_across_reopen ... ok
+test inspect_maps_a_renamed_catalog_table_to_data_corruption ... ok
+test initialization_is_idempotent_and_creates_the_current_domain_schema ... ok
+test rejects_catalog_from_a_future_schema_version ... ok
+test rejects_negative_user_version_as_data_corruption ... ok
+test serializes_all_inspection_on_one_actor_thread ... ok
+test current_manifest_query_uses_a_covering_manifest_index ... ok
+test rolls_back_an_interrupted_transaction_and_reopens_in_wal_mode ... ok
+test reopen_rejects_foreign_key_corruption_written_with_enforcement_disabled ... ok
+test sqlite_analyze_statistics_do_not_count_as_schema_drift ... ok
+test failed_explicit_integrity_check_blocks_inspect_until_a_successful_recheck ... ok
+test rejects_all_previous_catalog_versions_without_rewriting_or_enabling_wal ... ok
+test concurrent_opens_initialize_current_catalog_exactly_once ... ok
+test safe_gc_queries_use_table_first_indexes_and_bound_a_large_candidate_set ... ok
+
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.43s
+
+     Running tests/sqlite_manifest.rs (target/debug/deps/sqlite_manifest-048f8e3c1d21b6fc)
+
+running 11 tests
+test rejects_manifest_before_queue_when_byte_budget_is_exhausted ... ok
+test file_probe_is_dense_chunked_and_rejects_unbounded_or_ambiguous_inputs ... ok
+test bounds_actor_principal_and_charges_it_to_the_manifest_queue ... ok
+test file_probe_resolves_both_keys_and_preserves_removed_identity ... ok
+test rejects_compaction_when_persisted_input_lineage_is_corrupt ... ok
+test commits_native_files_reads_exact_history_restarts_and_replays ... ok
+test rejects_invalid_data_file_commits_without_advancing_revision ... ok
+test rolls_back_data_file_snapshot_when_idempotency_insert_fails ... ok
+test rejects_invalid_compactions_and_rolls_back_injected_failure ... ok
+test compacts_two_inputs_preserves_history_and_replays_idempotently ... ok
+test safe_gc_respects_protection_and_advances_retry_and_new_claim_after_restart ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_core-a8a3c922df93bf18)
+
+running 8 tests
+test control_transport::tests::response_line_limit_rejects_growth_without_allocating_the_limit ... ok
+test control_transport::tests::parse_error_prefers_cancelled_and_deadline_terminal_states ... ok
+test endpoint::tests::treats_bare_names_as_logical_endpoints ... ok
+test endpoint::tests::resolves_bare_logical_name_and_explicit_paths ... ok
+test endpoint::tests::resolves_logical_default_endpoint ... ok
+test durable_file::tests::directory_sync_failure_retains_published_entry_state ... ok
+test data_directory::tests::format_publish_never_overwrites_a_competing_version ... ok
+test data_directory_ownership::tests::owner_drop_unlocks_a_fork_inherited_file_description ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/config.rs (target/debug/deps/config-a6a07b6d648c8db5)
+
+running 56 tests
+test zippy_config_defaults_query_parallelism_to_four ... ok
+test zippy_config_json_overlay_preserves_explicit_query_resources ... ok
+test zippy_config_json_overlay_accepts_null_for_nullable_fields ... ok
+test zippy_config_json_overlay_resolves_relative_data_dir_from_explicit_base ... ok
+test zippy_config_json_overlay_rejects_removed_cpu_alias ... ok
+test zippy_config_json_overlay_rejects_invalid_cpu_query_and_task_limits ... ok
+test zippy_config_json_overlay_rejects_null_for_non_nullable_fields ... ok
+test zippy_config_accepts_non_loopback_flight_with_tls_and_file_authentication ... ok
+test zippy_config_derives_tasks_for_high_runtime_cpu_limit ... ok
+test zippy_config_loads_default_home_config_path ... ok
+test zippy_config_loads_explicit_flight_ingest_and_redacts_writer_token ... ok
+test zippy_config_expands_explicit_server_data_dir ... ok
+test zippy_config_rejects_invalid_runtime_max_cpu_cores ... ok
+test zippy_config_keeps_flight_endpoint_independent_from_master ... ok
+test zippy_config_keeps_environment_flight_token_out_of_debug_and_json ... ok
+test zippy_config_rejects_query_parallelism_above_runtime_limit ... ok
+test zippy_config_native_defaults_enable_one_explicit_flight_endpoint ... ok
+test zippy_config_derives_tasks_from_tighter_query_parallelism ... ok
+test zippy_config_loads_distinct_admin_auth_and_metadata_environment_limits ... ok
+test zippy_config_loads_loopback_flight_frontend_and_environment_limits ... ok
+test zippy_config_loads_native_query_canary_toml_and_env_overrides ... ok
+test zippy_config_loads_toml_and_env_overrides ... ok
+test zippy_config_loads_native_query_operator_budget ... ok
+test zippy_config_serializes_native_defaults_without_feature_switches ... ok
+test zippy_config_query_parallelism_inherits_runtime_limit ... ok
+test zippy_runtime_config_accepts_only_canonical_cpu_config ... ok
+test zippy_config_rejects_canary_operator_memory_above_query_budget ... ok
+test zippy_config_rejects_flight_ingest_without_distinct_writer_credential ... ok
+test zippy_config_rejects_flight_session_shorter_than_query_plan ... ok
+test zippy_config_rejects_identical_read_and_admin_credentials ... ok
+test zippy_config_rejects_relative_server_data_dir_from_environment ... ok
+test zippy_config_json_overlay_ignores_environment_and_derives_active_tasks ... ok
+test zippy_config_rejects_non_loopback_flight_without_tls_and_authentication ... ok
+test zippy_config_rejects_native_task_budget_below_effective_query_parallelism ... ok
+test zippy_config_rejects_native_query_concurrency_above_registry_capacity ... ok
+test zippy_config_rejects_plaintext_flight_token_in_toml ... ok
+test zippy_config_rejects_query_plan_ttl_above_one_day ... ok
+test zippy_config_rejects_local_read_session_shorter_than_query_plan ... ok
+test zippy_config_rejects_query_buffer_budget_above_runtime_limit ... ok
+test zippy_config_loads_and_validates_runtime_snapshot_pin_limits ... ok
+test zippy_config_rejects_removed_compaction_configuration ... ok
+test zippy_config_rejects_removed_cpu_environment_even_with_canonical_value ... ok
+test zippy_config_environment_explicit_task_limit_overrides_toml_value ... ok
+test zippy_config_rejects_zero_query_plan_ttl ... ok
+test zippy_config_resolves_relative_server_data_dir_from_config_parent ... ok
+test zippy_config_rejects_invalid_native_query_operator_memory ... ok
+test zippy_config_rejects_metadata_result_larger_than_shared_transport_budget ... ok
+test zippy_config_rejects_removed_compaction_environment ... ok
+test zippy_config_rejects_removed_gateway_configuration ... ok
+test zippy_config_rejects_invalid_query_canary_limits ... ok
+test zippy_config_rejects_removed_runtime_cpu_name_in_toml ... ok
+test zippy_config_rejects_zero_native_query_resource_limits ... ok
+test zippy_config_rejects_removed_endpoint_snapshot_import ... ok
+test zippy_config_rejects_removed_table_and_master_token_configuration ... ok
+test zippy_config_rejects_removed_catalog_shadow_configuration ... ok
+test zippy_config_rejects_removed_backend_and_native_switches ... ok
+
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/control_endpoint.rs (target/debug/deps/control_endpoint-19def0044f98c5de)
+
+running 8 tests
+test rejects_legacy_remote_gateway_uri ... ok
+test rejects_tcp_endpoint_without_port ... ok
+test resolves_explicit_tcp_endpoint ... ok
+test resolves_logical_default_to_unix_socket_on_unix ... ok
+test resolves_remote_zippy_uri_to_tcp_endpoint ... ok
+test tcp_endpoint_state_directories_include_the_full_address ... ok
+test unix_endpoint_state_directories_include_the_socket_name ... ok
+test resolves_localhost_remote_zippy_uri_to_tcp_endpoint ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/control_transport.rs (target/debug/deps/control_transport-d924a7fdad841bd7)
+
+running 8 tests
+test control_transport_preserves_structured_terminal_codes ... ok
+test control_transport_preserves_unmapped_code_and_explicit_retry_policy ... ok
+test tcp_control_transport_preserves_structured_not_found ... ok
+test tcp_control_transport_timeout_api_roundtrips_json_line ... ok
+test tcp_control_transport_roundtrips_json_line ... ok
+test tcp_control_transport_rejects_uncoded_error ... ok
+test tcp_control_transport_cancellation_interrupts_stalled_response ... ok
+test tcp_control_transport_trickle_response_cannot_extend_deadline ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/core_contract.rs (target/debug/deps/core_contract-c8e39fafbf070f53)
+
+running 2 tests
+test compute_kernel_contract_retains_name_and_explicit_late_policy ... ok
+test control_protocol_rejects_removed_legacy_wait_requests ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/data_directory.rs (target/debug/deps/data_directory-df172b3188a5a7bf)
+
+running 12 tests
+test initialize_rejects_non_empty_unversioned_directory ... ok
+test rejected_unversioned_directory_keeps_existing_permissions ... ok
+test initialize_recovers_from_an_inactive_bootstrap_lock ... ok
+test initialize_recovers_from_stale_version_temporary_file ... ok
+test initialize_creates_versioned_managed_layout ... ok
+test initialize_enforces_owner_only_permissions ... ok
+test read_only_open_does_not_recreate_a_missing_managed_directory ... ok
+test initialized_data_directory_can_be_reopened ... ok
+test open_rejects_symbolic_link_data_root ... ok
+test open_rejects_symbolic_link_format_marker ... ok
+test open_rejects_symbolic_link_managed_directory ... ok
+test open_rejects_unknown_or_malformed_format_versions ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/data_directory_ownership.rs (target/debug/deps/data_directory_ownership-52fb92820fa8ac31)
+
+running 7 tests
+test ownership_child_exits_without_drop ... ok
+test ownership_rejects_symbolic_link_lock_file ... ok
+test ownership_rejects_a_hard_linked_lock_file ... ok
+
+running 1 test
+test ownership_record_is_owner_only_and_diagnostic ... ok
+test ownership_is_exclusive_but_does_not_block_read_only_open ... ok
+test ownership_reuses_the_stable_lock_inode ... ok
+test abrupt_process_exit_releases_kernel_ownership ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/durable_file.rs (target/debug/deps/durable_file-0d67f7ff043902ae)
+
+running 8 tests
+test durable_remove_of_a_missing_parent_is_idempotent ... ok
+test durable_file_rejects_a_symbolic_link_parent ... ok
+test durable_file_rejects_a_regular_file_parent_component ... ok
+test durable_remove_rejects_symbolic_links_and_hard_links ... ok
+test dropping_an_unpublished_file_removes_its_temporary_inode ... ok
+test durable_file_publishes_nested_contents_and_metadata ... ok
+test durable_remove_is_idempotent_and_syncs_a_published_file ... ok
+test durable_file_never_overwrites_an_existing_target ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/errors.rs (target/debug/deps/errors-a3e3fc96d735bd23)
+
+running 1 test
+test structured_error_code_does_not_depend_on_message_words ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/logging.rs (target/debug/deps/logging-84d0825e702bcf4d)
+
+running 7 tests
+test logging_case_dispatch ... ok
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+
+running 1 test
+2026-09-23T02:14:05.392595391Z  INFO created logging snapshot component=[logging_test] event=[create_snapshot]
+2026-09-23T02:14:05.392598255Z  INFO reused logging snapshot component=[logging_test] event=[reuse_snapshot]
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+test setup_log_formats_console_logs_with_tracing_style_prefix ... ok
+test setup_log_rejects_different_config_without_creating_extra_files ... ok
+test setup_log_restricts_existing_file_to_owner_only ... ok
+test setup_log_refuses_to_follow_existing_symlink ... ok
+test setup_log_reuses_existing_snapshot_without_creating_extra_files ... ok
+test setup_log_creates_jsonl_file_and_returns_snapshot ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/master_client.rs (target/debug/deps/master_client-dbd019f9c3279964)
+
+running 7 tests
+test master_client_request_timeout_rejects_zero_and_can_be_restored ... ok
+test master_client_register_process_over_tcp ... ok
+test master_client_wait_shutdown_times_out_without_shutdown_request ... ok
+test master_client_sends_heartbeat_for_registered_process ... ok
+test master_client_unregisters_registered_process ... ok
+test master_client_gets_config ... ok
+test master_client_accepts_canonical_and_rejects_removed_cpu_wire_config ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/table_view.rs (target/debug/deps/table_view-162a7be9f0467d5f)
+
+running 2 tests
+test memory_table_view_has_no_segment_row_span ... ok
+test segment_table_view_exposes_row_span_for_engine_fast_paths ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/versioning.rs (target/debug/deps/versioning-abfb36cfdbff1f66)
+
+running 2 tests
+test base_version_is_current_release_baseline ... ok
+test build_revision_is_separate_from_release_version ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workspace_smoke.rs (target/debug/deps/workspace_smoke-61cbea66d9484d21)
+
+running 1 test
+test workspace_builds_core_crate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_engines-e24a004910b72889)
+
+running 17 tests
+test cross_sectional::tests::build_row_order_keeps_natural_order_for_non_decreasing_buckets ... ok
+test cross_sectional::tests::row_order_natural_iterates_without_materialized_indices ... ok
+test cross_sectional::tests::build_row_order_sorts_only_when_bucket_order_regresses ... ok
+test cross_sectional::tests::row_order_sorted_iterates_materialized_indices ... ok
+test stream_table::native_materializer_tests::append_descriptor_performance ... ignored, manual release benchmark for retained append descriptor publication
+test cross_sectional::tests::bucket_state_rejects_null_id_without_polluting_existing_rows ... ok
+test cross_sectional::tests::bucket_state_keeps_last_row_per_id_in_sorted_id_order ... ok
+test timeseries::tests::row_selection_all_iterates_without_materialized_indices ... ok
+test timeseries::tests::row_selection_selected_iterates_existing_indices ... ok
+test cross_sectional_bucket::tests::bucket_transaction_rollback_restores_touched_slots_and_new_keys ... ok
+test timeseries::tests::time_series_id_registry_rollback_removes_new_ids ... ok
+test latest_state::tests::latest_state_preserves_nullable_value_and_rejects_null_key_without_mutation ... ok
+test latest_state::tests::latest_state_outputs_update_and_snapshot_in_key_order ... ok
+test timeseries::tests::time_series_state_txn_rollback_removes_new_id ... ok
+test timeseries::tests::time_series_state_txn_rollback_restores_existing_id_once ... ok
+test table_view::tests::record_batch_from_full_non_identity_rows_preserves_requested_order ... ok
+test stream_table::native_materializer_tests::native_manifest_prefix_retires_only_complete_durable_segments ... ok
+
+test result: ok. 16 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bar_generator_engine.rs (target/debug/deps/bar_generator_engine-a96c33efa1c742c3)
+
+running 36 tests
+test bar_generator_auction_emit_separate_bar_outputs_auction_window_bar ... ok
+test bar_generator_auction_emit_cumulative_cross_minute_uses_regular_window ... ok
+test bar_generator_auction_emit_separate_bar_streams_before_regular_tick ... ok
+test bar_generator_auction_drop_updates_cumulative_baseline_without_output_bar ... ok
+test bar_generator_auction_emit_cumulative_empty_baseline_uses_regular_window ... ok
+test bar_generator_auction_merge_cumulative_cross_minute_uses_regular_window ... ok
+test bar_generator_auction_bounds_support_cross_midnight_window ... ok
+test bar_generator_auction_merge_to_first_regular_bar_includes_auction_tick ... ok
+test bar_generator_auction_merge_drops_stale_pending_from_previous_local_day ... ok
+test bar_generator_auction_merge_clears_unmatched_pending_on_flush ... ok
+test bar_generator_emits_completed_delta_bar_on_minute_transition ... ok
+test bar_generator_drops_non_session_ticks_without_updating_state ... ok
+test bar_generator_auction_merge_cumulative_empty_baseline_uses_regular_window ... ok
+test bar_generator_can_output_float64_volume_when_configured ... ok
+test bar_generator_continuous_morning_session_keeps_cffex_ticks_without_empty_break_bars ... ok
+test bar_generator_filters_null_price_volume_and_turnover_rows ... ok
+test bar_generator_flushes_and_clears_open_delta_bars ... ok
+test bar_generator_keeps_multi_instrument_state_independent ... ok
+test bar_generator_keeps_num_trades_null_when_all_values_missing ... ok
+test bar_generator_rejects_dt_timezone_mismatch_with_profile_timezone ... ok
+test bar_generator_outputs_null_optional_columns_when_inputs_missing ... ok
+test bar_generator_rejects_invalid_session_windows ... ok
+test bar_generator_output_schema_is_stable ... ok
+test bar_generator_rejects_nullable_instrument ... ok
+test bar_generator_rejects_on_data_schema_mismatch ... ok
+test bar_generator_session_window_is_start_inclusive_end_exclusive ... ok
+test bar_generator_sums_delta_num_trades_within_bar ... ok
+test bar_generator_supports_cross_midnight_session_window ... ok
+test bar_generator_uses_profile_timezone_for_real_shanghai_epoch ... ok
+test cumulative_mode_from_zero_uses_first_tick_as_delta ... ok
+test cumulative_mode_filters_negative_delta_and_rebases_baseline ... ok
+test cumulative_mode_resets_at_trading_day_boundary ... ok
+test bar_generator_uses_start_dt_label_when_configured ... ok
+test cumulative_mode_accepts_int64_volume_input ... ok
+test cumulative_mode_filters_null_trading_day_without_baseline_update ... ok
+test cumulative_mode_skips_first_delta_on_intraday_bootstrap ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/chain.rs (target/debug/deps/chain-7527c8d4a3e0028e)
+
+running 7 tests
+test identity_preserves_schema_buffers_and_complete_batches ... ok
+test flush_budget_includes_outputs_from_all_stages ... ok
+test execution_failure_is_terminal_and_does_not_expose_partial_output ... ok
+test flush_and_stop_route_upstream_tail_before_closing_downstream_once ... ok
+test schema_rejection_happens_before_execution_and_constructor_checks_metadata ... ok
+test flush_cannot_redefine_its_declared_output_schema ... ok
+test output_budget_counts_fanout_even_with_shared_arrow_buffers ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cross_sectional_engine.rs (target/debug/deps/cross_sectional_engine-f1ec1c7ee03ccb55)
+
+running 14 tests
+test cross_sectional_engine_accepts_shanghai_timestamp_input_schema ... ok
+test cross_sectional_engine_flush_emits_current_bucket_with_expected_schema ... ok
+test cross_sectional_engine_evaluates_multiple_same_field_factors_through_context ... ok
+test cross_sectional_engine_emits_previous_bucket_when_new_bucket_arrives ... ok
+test cross_sectional_engine_does_not_backfill_skipped_empty_buckets ... ok
+test cross_sectional_engine_flush_preserves_output_dt_timezone ... ok
+test cross_sectional_engine_keeps_last_row_per_id_within_bucket ... ok
+test cross_sectional_engine_handles_out_of_order_buckets_within_same_batch ... ok
+test cross_sectional_engine_rejects_empty_factor_list ... ok
+test cross_sectional_engine_rejects_late_data_for_closed_bucket ... ok
+test cross_sectional_engine_rejects_drop_with_metric_configuration ... ok
+test cross_sectional_engine_flush_without_open_bucket_returns_empty ... ok
+test cross_sectional_engine_rolls_back_touched_rows_when_batch_fails ... ok
+test cross_sectional_engine_preserves_same_bucket_last_row_after_batch_reordering ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/key_value_delta.rs (target/debug/deps/key_value_delta-30f98f26c8ecb271)
+
+running 3 tests
+test native_bootstrap_skips_covered_events_and_rejects_another_table ... ok
+test native_snapshot_cursor_fragments_duplicates_gaps_and_budget ... ok
+test native_deletes_are_atomic_idempotent_and_allow_reinsertion ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reactive_engine.rs (target/debug/deps/reactive_engine-32e1a01f4c6761c6)
+
+running 21 tests
+test reactive_engine_expression_factor_can_reference_previous_factor_output ... ok
+test reactive_engine_filters_rows_by_id_whitelist_before_state_updates ... ok
+test reactive_engine_filtered_rows_do_not_pollute_later_whitelist_state ... ok
+test reactive_engine_fail_fast_policy_does_not_retain_rollback_state ... ok
+test reactive_engine_appends_factor_columns_in_order ... ok
+test reactive_engine_filters_contiguous_middle_rows_by_id_whitelist ... ok
+test reactive_engine_keeps_factor_state_across_on_data_calls ... ok
+test reactive_engine_never_calls_factors_for_filtered_rows ... ok
+test reactive_engine_new_rejects_duplicate_output_field_names ... ok
+test reactive_engine_kernel_metrics_include_filtered_rows_total ... ok
+test reactive_engine_rejects_dbl_max_sentinel_by_default ... ok
+test reactive_engine_rejects_empty_id_filter ... ok
+test reactive_engine_rejects_factor_output_length_mismatch ... ok
+test reactive_engine_returns_empty_output_when_all_rows_are_filtered ... ok
+test reactive_engine_rejects_input_schema_mismatch ... ok
+test reactive_engine_rollback_policy_restores_expression_factor_state ... ok
+test reactive_engine_rollback_policy_restores_stateful_factor_state ... ok
+test reactive_engine_skip_invalid_values_does_not_pollute_expression_ts_state ... ok
+test reactive_engine_supports_mixed_output_dtypes ... ok
+test reactive_engine_skip_invalid_values_does_not_pollute_ema_state ... ok
+test reactive_engine_uses_context_evaluation_path ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reactive_latest_engine.rs (target/debug/deps/reactive_latest_engine-c519ced36b5e213c)
+
+running 5 tests
+test reactive_latest_engine_groups_by_multiple_dimensions ... ok
+test reactive_latest_engine_snapshot_is_explicit_and_flush_emits_nothing ... ok
+test reactive_latest_engine_preserves_nullable_values_in_snapshot ... ok
+test reactive_latest_engine_emits_latest_row_for_each_updated_group ... ok
+test reactive_latest_engine_invalid_key_batch_leaves_existing_state_unchanged ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/replay_determinism.rs (target/debug/deps/replay_determinism-12714ddb91eef020)
+
+running 1 test
+test replaying_same_ticks_produces_same_batches ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/stream_table_materializer.rs (target/debug/deps/stream_table_materializer-f74853b82750bb6b)
+
+running 14 tests
+test stream_table_frame_per_batch_rejects_oversized_frame_without_partial_commit ... ok
+test stream_table_flush_and_stop_emit_no_extra_batches ... ok
+test stream_table_default_row_capacity_is_large_enough_for_live_ingest ... ok
+test stream_table_materializer_exports_active_descriptor_envelope ... ok
+test stream_table_descriptor_after_rollover_includes_retained_sealed_segment ... ok
+test stream_table_materializer_rolls_over_full_active_segment_and_exports_descriptor ... ok
+test stream_table_materializer_writes_batch_into_active_segment ... ok
+test native_durable_prefix_waits_for_pinned_reader_before_reclaiming_segment ... ok
+test stream_table_on_data_passes_batch_through_without_schema_change ... ok
+test stream_table_rejects_schema_mismatch ... ok
+test stream_table_frame_per_batch_seals_each_nullable_batch_as_one_segment ... ok
+test stream_table_on_data_passes_empty_batch_through_without_modification ... ok
+test stream_table_materializer_writes_segment_view_into_active_segment ... ok
+test stream_table_materializer_rolls_over_segment_view_input ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/timeseries_engine.rs (target/debug/deps/timeseries_engine-6bec60427d0b3125)
+
+running 23 tests
+test timeseries_engine_accepts_shanghai_timestamp_input_schema ... ok
+test timeseries_engine_all_filtered_batch_returns_no_output_and_no_error ... ok
+test timeseries_engine_filtered_rows_do_not_increment_late_rows_metric ... ok
+test timeseries_engine_errors_on_zero_weight_vwap_window ... ok
+test timeseries_engine_emits_completed_window_on_window_transition ... ok
+test timeseries_engine_drop_with_metric_skips_late_rows_and_keeps_valid_rows ... ok
+test timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors ... ok
+test timeseries_engine_post_factor_flush_failure_preserves_pending_windows ... ok
+test timeseries_engine_flushes_open_windows ... ok
+test timeseries_engine_post_factors_can_extend_aggregate_outputs ... ok
+test timeseries_engine_flush_runs_post_factors ... ok
+test timeseries_engine_id_filter_keeps_only_whitelisted_rows_and_counts_filtered_rows ... ok
+test timeseries_engine_post_factors_reject_raw_input_column_references ... ok
+test timeseries_engine_post_factors_reject_ts_expr_nodes ... ok
+test timeseries_engine_pre_factors_reject_ts_expr_nodes ... ok
+test timeseries_engine_pre_factors_can_generate_columns_for_agg_sum_inputs ... ok
+test timeseries_engine_rejects_empty_id_filter ... ok
+test timeseries_engine_rejects_late_data_for_same_id ... ok
+test timeseries_engine_repeated_flush_does_not_emit_duplicate_window ... ok
+test timeseries_engine_rejects_late_rows_and_supports_full_v1_aggregations ... ok
+test timeseries_engine_rolls_back_state_when_finalize_fails ... ok
+test timeseries_kernel_records_filtered_rows_metric ... ok
+test timeseries_kernel_records_late_rows_metric_for_drop_with_metric ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_ingest-8ddfdc941e6e4cf2)
+
+running 58 tests
+test actor::tests::actor_registry_requires_an_explicit_tokio_runtime ... ok
+test actor::tests::invalid_actor_budget_fails_before_spawning_tasks ... ok
+test actor::tests::change_notifications_coalesce_without_losing_snapshot_races ... ok
+test actor::tests::actor_serializes_observations_and_drains_cleanly ... ok
+test actor::tests::online_actor_registration_is_visible_and_drained_by_original_owner ... ok
+test actor::tests::actor_publishes_fixed_active_prefix_and_rejects_rewrite ... ok
+test actor::tests::actor_snapshot_removes_persisted_prefix_without_copying_live_rows ... ok
+test actor::tests::actor_rechecks_every_persist_state_precondition ... ok
+test actor::tests::actor_panic_closes_global_admission_and_is_reported_immediately ... ok
+test actor::tests::dropped_waiter_and_historical_replay_never_roll_back_current_snapshot ... ok
+test actor::tests::definitive_rejection_with_current_parent_keeps_actor_available ... ok
+test actor::tests::per_table_and_global_admission_are_strictly_bounded ... ok
+test actor::tests::actor_publishes_retained_sealed_then_active_segments_in_offset_order ... ok
+test actor::tests::failed_retirement_admission_leaves_actor_usable ... ok
+test actor::tests::shutdown_drains_requests_accepted_before_admission_closed ... ok
+test actor::tests::invalid_receipt_fails_table_and_is_reported_during_drain ... ok
+test actor::tests::retirement_quiesces_commands_rolls_back_and_stops_only_its_actor ... ok
+test actor::tests::actor_keeps_monotonic_live_prefix_across_writer_epochs ... ok
+test actor::tests::persist_is_single_flight_and_snapshot_observes_actor_owned_state ... ok
+test actor::tests::unavailable_submit_failure_is_retained_but_backpressure_keeps_actor_idle ... ok
+test native::tests::native_ingest_memory_and_wal_performance_baseline ... ignored, manual release benchmark; run with --ignored --test-threads=1
+test native::tests::key_value_delete_accepts_only_full_rows_or_ordered_key_tombstones ... ok
+test native::tests::schema_checkpoint_requires_covered_watermark_and_strictly_newer_epoch ... ok
+test registry::tests::registry_is_published_in_table_id_order_with_exact_watermarks ... ok
+test registry::tests::registry_rejects_unsorted_or_duplicate_bootstraps_atomically ... ok
+test wal::tests::crc32c_throughput_benchmark ... ignored, release-mode WAL checksum benchmark
+test registry::tests::bootstrap_rejects_cross_table_descriptors ... ok
+test wal::tests::fingerprint_distinguishes_schema_and_mutation_kind ... ok
+test wal::tests::arrow_payload_rejects_trailing_noncanonical_bytes ... ok
+test wal::tests::prepared_fingerprint_payload_is_reused_by_wal_encoding ... ok
+test wal::tests::fingerprint_is_independent_from_schema_metadata_map_order ... ok
+test wal::tests::wal_watermark_rejects_removed_legacy_tag ... ok
+test actor::tests::shutdown_waits_for_inflight_persist_after_external_waiter_is_dropped ... ok
+test wal::tests::committed_records_recover_and_complete_uncommitted_tail_is_truncated ... ok
+test wal::tests::rejected_sink_append_rolls_back_only_the_current_uncommitted_tail ... ok
+test wal::tests::partial_tail_is_truncated_but_checksum_corruption_fails_closed ... ok
+test wal::tests::exact_epoch_reconnect_uses_the_next_segment_and_recovers_one_sequence ... ok
+test wal::tests::checkpoint_recovery_skips_leftover_prefix_and_validates_the_tail_anchor ... ok
+test native::tests::admitted_table_drop_delays_shutdown_until_catalog_outcome_is_resolved ... ok
+test native::tests::admitted_online_registration_survives_closed_admission_and_delays_shutdown ... ok
+test native::tests::persisted_unsupported_sink_rejects_before_applying_a_write ... ok
+test native::tests::table_drop_fence_rolls_back_or_permanently_retires_existing_writers ... ok
+test native::tests::cancelled_open_does_not_cancel_the_server_owned_producer_transition ... ok
+test native::tests::zero_record_commit_receipt_promotes_an_already_durable_group_out_of_order ... ok
+test native::tests::shared_operation_budget_rejects_before_applying_the_mutation ... ok
+test native::tests::durable_retry_is_idempotent_and_sequence_conflicts_fail_closed ... ok
+test native::tests::pending_durable_ack_budget_rejects_before_applying_the_mutation ... ok
+test native::tests::consumer_checkpoint_persists_prior_epoch_before_new_writer_first_batch ... ok
+test native::tests::atomic_sink_rejection_rolls_back_wal_and_allows_exact_retry ... ok
+test native::tests::same_logical_connection_resumes_without_reacquiring_producer_epoch ... ok
+test native::tests::crash_discards_uncommitted_memory_tail_before_exact_retry ... ok
+test native::tests::restart_replays_only_committed_wal_and_resumes_exact_acquire ... ok
+test native::tests::producer_reacquire_fences_old_connections_without_resetting_offsets ... ok
+test native::tests::retained_schema_wal_requires_full_manifest_coverage_and_a_fenced_epoch ... ok
+test native::tests::restart_resumes_current_epoch_without_reacquiring_or_resetting_sequence ... ok
+test checkpoint::tests::archive_conflicts_are_atomic_and_checkpoint_survives_reopen ... ok
+test wal::tests::crc32c_matches_the_castagnoli_check_vector ... ok
+test native::tests::persisted_ack_survives_cancellation_and_checks_manifest_coverage ... ok
+
+test result: ok. 56 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_master-f951bcc260ea5f38)
+
+running 13 tests
+test process_runtime::tests::adapter_boot_id_survives_clone_without_snapshot_persistence ... ok
+test process_runtime::tests::stable_contract_enforces_boot_revision_state_and_aba ... ok
+test registry::tests::process_record_requires_current_token_and_revision_fields ... ok
+test process_runtime::tests::heartbeat_advances_one_revision_without_rebuilding_the_registry ... ok
+test registry::tests::random_failure_does_not_register_process_or_advance_control_revision ... ok
+test process_runtime::tests::process_expiry_does_not_mutate_generic_records_with_spoofed_attributes ... ok
+test daemon::tests::removed_import_configuration_fails_before_creating_data_directory ... ok
+test server::tests::control_connection_limit_is_shared_and_released ... ok
+test server::tests::accept_loop_idle_sleep_stays_below_control_plane_latency_budget ... ok
+test daemon::tests::endpoint_scoped_legacy_snapshot_is_never_read_or_copied ... ok
+test daemon::tests::managed_legacy_registry_is_rejected_without_reading_or_rewriting_it ... ok
+test server::tests::control_request_size_and_newline_are_required ... ok
+test server::tests::partial_control_input_cannot_extend_absolute_deadline ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+
+     Running tests/control_transport_roundtrip.rs (target/debug/deps/control_transport_roundtrip-13b563fcee37ba76)
+
+running 1 test
+test master_server_accepts_tcp_control_requests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/master_client_roundtrip.rs (target/debug/deps/master_client_roundtrip-40aa6b4ee37ac507)
+
+running 1 test
+test master_client_fetches_master_runtime_config ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/master_server.rs (target/debug/deps/master_server-d0efac7f8b800b48)
+
+running 22 tests
+
+running 1 test
+
+running 1 test
+test master_server_logging_case_dispatch ... ok
+test master_server_rejects_regular_file_at_socket_path ... ok
+test protocol_types_roundtrip_debug_repr ... ok
+test registry_rejects_heartbeat_for_expired_process ... ok
+test registry_stores_only_process_lease_records ... ok
+test registry_updates_process_lease_timestamp_on_heartbeat ... ok
+test master_server_accepts_process_heartbeat_over_unix_socket ... ok
+test retired_data_control_requests_are_rejected_without_mutation ... ok
+test removed_control_envelopes_are_rejected ... ok
+test lease_reaper_revokes_process_and_preserves_configuration_discovery ... ok
+test master_server_logs_cleanup_failure_without_stopped_log ... ok
+test master_server_returns_structured_error_for_unknown_process_heartbeat ... ok
+test master_server_logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.08s
+
+test master_server_emits_structured_control_plane_logs ... ok
+test master_server_watch_shutdown_wakes_without_heartbeat_polling ... ok
+test master_server_registers_process_over_unix_socket ... ok
+test master_server_watch_process_wakes_on_heartbeat ... ok
+test master_server_rejects_raw_heartbeat_without_process_capability ... ok
+test master_server_survives_bad_request_and_serves_next_request ... ok
+test master_server_graceful_shutdown_times_out_with_alive_processes ... ok
+test master_server_graceful_shutdown_notifies_process_and_waits_for_unregister ... ok
+test master_server_logging_case_dispatch ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.20s
+
+test master_server_ignores_empty_control_probe_logs ... ok
+test master_server_handles_slow_client_without_blocking_accept_loop ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_operator_runtime-195989ada2222fa0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/partition_runtime.rs (target/debug/deps/partition_runtime-87e9eef08eb090f2)
+
+running 5 tests
+test rolling_state_rejects_zero_window - should panic ... ok
+test rolling_state_updates_incrementally ... ok
+test partition_runtime_fans_out_one_span_to_multiple_operators ... ok
+test partition_reader_resets_cursor_when_active_segment_rolls_over ... ok
+test partition_reader_waits_and_reads_incremental_span ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workspace_smoke.rs (target/debug/deps/workspace_smoke-ff98259fe88430a0)
+
+running 1 test
+test operator_runtime_workspace_exports_operator_trait ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_operators-fabc102c0b9ad1b3)
+
+running 9 tests
+test reactive::tests::reactive_factor_context_rejects_mismatched_column_lengths ... ok
+test reactive::tests::reactive_factor_context_resolves_columns_by_name ... ok
+test expression::tests::reactive_plan_deduplicates_repeated_ts_diff_subexpressions ... ok
+test expression::tests::reactive_plan_preserves_output_metadata_for_stateful_expressions ... ok
+test reactive::tests::stateful_float_rollback_removes_new_interned_ids ... ok
+test reactive::tests::window_transaction_performance ... ignored, manual release benchmark for transaction cost versus window size
+test reactive::tests::rolling_std_preserves_small_variations_on_large_price_levels ... ok
+test reactive::tests::window_history_maintains_running_sum_and_centered_moment_when_trimmed ... ok
+test reactive::tests::window_transactions_restore_partial_and_fully_evicted_histories ... ok
+
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cross_sectional_factors.rs (target/debug/deps/cross_sectional_factors-4c75b31dc4e77c8f)
+
+running 8 tests
+test cross_sectional_context_caches_float_values_and_stats ... ok
+test cross_sectional_context_ranks_match_existing_tie_policy ... ok
+test cs_factors_treat_nan_as_missing_sample ... ok
+test cs_factors_skip_null_samples_and_preserve_null_output ... ok
+test cs_rank_uses_average_rank_for_ties ... ok
+test cross_sectional_context_evaluation_matches_legacy_evaluate ... ok
+test cs_zscore_returns_null_when_all_samples_missing ... ok
+test cs_zscore_returns_zero_for_zero_variance ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reactive_factors.rs (target/debug/deps/reactive_factors-1d4f263aa61009a8)
+
+running 21 tests
+test evaluate_returns_schema_mismatch_for_wrong_value_type ... ok
+test evaluate_returns_schema_mismatch_for_null_value ... ok
+test clip_rejects_unordered_bounds_before_evaluation ... ok
+test ema_and_return_follow_row_order ... ok
+test expression_clip_rejects_nan_bounds_in_all_evaluators ... ok
+test expression_division_by_zero_returns_null_in_reactive_planner ... ok
+test expression_accepts_uppercase_functions ... ok
+test expression_division_by_zero_returns_null_in_row_evaluator ... ok
+test expression_factor_rejects_unknown_identifier ... ok
+test expression_factor_rejects_unsupported_function ... ok
+test expression_reactive_plan_requires_utf8_id_field ... ok
+test expression_rejects_lowercase_function_names ... ok
+test expression_factor_supports_arithmetic_and_builtin_functions ... ok
+test expression_row_evaluator_rejects_stateful_functions ... ok
+test log_factor_rejects_non_positive_input ... ok
+test expression_rejects_mixed_case_function_names ... ok
+test reactive_factor_trait_object_is_send ... ok
+test reactive_factors_reject_non_finite_float_inputs ... ok
+test return_outputs_null_when_base_is_zero ... ok
+test state_continues_across_evaluate_calls ... ok
+test v1_reactive_factors_cover_windowed_pointwise_and_cast_outputs ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_perf-9e84b8d770edd84f)
+
+running 50 tests
+test tests::drain_inclusive_throughput_uses_total_processing_elapsed_time ... ok
+test tests::empty_row_peak_tracker_finishes_at_zero ... ok
+test tests::baseline_manifest_serializes_build_config_dataset_and_completed_report ... ok
+test tests::engine_drive_does_not_admit_after_sleep_crosses_end ... ok
+test tests::engine_drive_measurement_window_is_half_open ... ok
+test tests::engine_drive_rational_deadline_excludes_first_batch_after_total_window ... ok
+test tests::evaluate_pass_rejects_latency_above_configured_p95_threshold ... ok
+test tests::evaluate_pass_rejects_latency_above_configured_p99_threshold ... ok
+test tests::inproc_completeness_rejects_unprocessed_accepted_rows ... ok
+test tests::executable_sha256_matches_standard_known_vector ... ok
+test tests::failed_kernel_batch_does_not_produce_success_latency ... ok
+test tests::inproc_processing_elapsed_extends_through_late_drain ... ok
+test tests::inproc_processing_elapsed_preserves_full_steady_window_before_drain ... ok
+test tests::invalid_profile_config_skips_metadata_capture_and_dispatch ... ok
+test tests::kernel_latency_includes_processing_and_excludes_unmeasured_batches ... ok
+test tests::latency_contract_requires_complete_current_measurements ... ok
+test tests::latency_summary_reports_sample_count_and_maximum ... ok
+test tests::performance_contract_rejects_retired_profiles_and_queue_configuration ... ok
+test tests::profile_report_uses_metadata_captured_before_dispatch ... ok
+test tests::row_peak_tracker_accumulates_rows_within_absolute_second_bucket ... ok
+test tests::row_peak_tracker_rejects_bucket_row_overflow ... ok
+test tests::row_peak_tracker_rejects_pre_origin_and_out_of_order_buckets ... ok
+test tests::row_peak_tracker_rolls_before_counting_current_batch ... ok
+test tests::row_peak_tracker_uses_exact_second_boundary_and_skips_empty_buckets ... ok
+test tests::single_row_profiles_reject_capacity_above_single_segment_limit ... ok
+test tests::source_identity_preserves_full_git_sha_and_dirty_state ... ok
+test tests::write_to_subscribe_cancelled_producer_preserves_consumer_error ... ok
+test tests::write_to_subscribe_done_waits_until_all_produced_rows_are_consumed ... ok
+test tests::write_to_subscribe_peak_tracker_reports_burst_window_not_average ... ok
+test tests::write_to_subscribe_combines_consumer_and_producer_errors_consumer_first ... ok
+test tests::write_to_subscribe_rational_deadline_matches_expected_capacity ... ok
+test tests::write_to_subscribe_startup_error_remains_primary_during_cleanup_failure ... ok
+test tests::write_to_subscribe_producer_error_sets_done_and_cancelled ... ok
+test tests::write_to_subscribe_elapsed_ns_conversion_checks_i64_boundary ... ok
+test tests::write_to_subscribe_uses_half_open_steady_measurement_window ... ok
+test tests::write_to_subscribe_rejects_measured_produced_consumed_mismatch ... ok
+test tests::write_to_subscribe_rejects_measured_sample_mismatch ... ok
+test tests::write_to_subscribe_rejects_produced_consumed_mismatch ... ok
+test tests::write_to_subscribe_multi_row_span_reuses_one_observation_timestamp ... ok
+test tests::write_to_subscribe_consumer_join_guard_records_real_panic_and_joins ... ok
+test tests::pretty_json_replacement_is_atomic_and_removes_temporary_file ... ok
+test tests::write_to_subscribe_producer_error_before_first_row_joins_consumer_and_clears_waiter ... ok
+test tests::write_to_subscribe_empty_real_segment_consumer_times_out ... ok
+test tests::tick_generators_cover_all_symbols_across_batch_boundaries ... ok
+test tests::timeseries_kernel_profile_produces_nonzero_rows_and_passes ... ok
+test tests::write_to_subscribe_live_profile_reports_complete_consumer_boundary_samples ... ok
+test tests::single_row_low_rate_profile_produces_nonzero_rows_and_passes ... ok
+test tests::stream_table_subscriber_e2e_reports_target_reader_latency ... ok
+test tests::writes_report_json_with_profile_and_pass_fields ... ok
+test tests::stream_table_segment_copy_profile_produces_nonzero_rows_and_passes ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+
+     Running unittests src/main.rs (target/debug/deps/zippy_perf-3b96a9adbdb53718)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_protocol-48681930ce757d9e)
+
+running 29 tests
+test error::tests::structured_error_round_trips_without_message_parsing ... ok
+test auth::tests::administrator_token_is_distinct_and_issues_an_explicit_role ... ok
+test auth::tests::bootstrap_token_is_redacted_and_compared_before_session_issue ... ok
+test auth::tests::writer_token_is_distinct_and_issues_a_control_isolated_role ... ok
+test error::tests::mismatched_metadata_and_details_fail_closed ... ok
+test fixed_snapshot::tests::capture_is_bounded_by_authenticated_session_and_validates_bindings ... ok
+test ingest::tests::command_accepts_wal_and_persisted_with_explicit_fencing_ids ... ok
+test fixed_snapshot::tests::release_rejects_missing_nil_oversized_and_unversioned_identities ... ok
+test error::tests::wire_watermarks_reject_removed_state_and_preserve_empty_vs_zero ... ok
+test auth::tests::local_read_sessions_use_the_same_bounded_token_authority ... ok
+test auth::tests::sessions_are_server_issued_bounded_and_expire ... ok
+test ingest::tests::command_rejects_implicit_namespace_and_fencing_identities ... ok
+test ingest::tests::limits_reject_zero_inverted_and_unbounded_values ... ok
+test ingest::tests::command_requires_explicit_mutation_supported_durability_and_nonzero_ids ... ok
+test ingest::tests::command_validates_optional_table_identity_guard ... ok
+test ingest::tests::native_receipt_round_trip_uses_stable_batch_ids_and_validates_watermarks ... ok
+test log::tests::command_requires_explicit_cursor_session_table_and_admission ... ok
+test log::tests::durable_descriptor_and_ack_require_explicit_identity_and_delivery ... ok
+test query::tests::descriptor_rejects_unknown_version_before_planning ... ok
+test query::tests::decoder_rejects_duplicate_binding_names ... ok
+test query::tests::encoder_rejects_inconsistent_table_and_binding_contracts ... ok
+test query::tests::descriptor_round_trips_validated_query ... ok
+test query::tests::encoder_rejects_logical_plan_in_sql_only_protocol_version ... ok
+test query::tests::fixed_snapshot_identity_round_trips_and_cannot_mix_with_state_cursor ... ok
+test query::tests::ticket_rejects_nil_or_wrong_width_ids ... ok
+test query::tests::state_snapshot_wire_requires_the_complete_canonical_query ... ok
+test log::tests::dropping_partial_encoding_releases_native_owner ... ok
+test log::tests::split_transport_batches_preserve_offsets_frame_and_owned_memory ... ok
+test runtime::tests::accepted_flight_socket_disables_nagle ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/flight_query.rs (target/debug/deps/flight_query-7a2f82133af203b3)
+
+running 23 tests
+test local_read_mode_is_explicit_and_cannot_bind_public_listener ... ok
+test distinct_administrator_session_can_cancel_an_exact_foreign_query ... ok
+test tls_listener_rejects_plaintext_and_untrusted_clients ... ok
+test writer_session_streams_bounded_memory_puts_and_read_session_is_rejected ... ok
+test wrong_session_does_not_consume_ticket ... ok
+test unsupported_fixed_snapshot_is_rejected_before_query_preparation ... ok
+test standard_flight_sql_client_reads_all_supported_metadata_commands ... ok
+test certificate_rotation_takes_effect_after_bounded_listener_restart ... ok
+test put_row_limit_rejects_batch_before_frontend_write ... ok
+test mutual_tls_requires_a_trusted_client_identity ... ok
+test standard_cancel_is_owner_bound_and_fenced_by_exact_ticket_identity ... ok
+test flight_round_trip_is_snapshot_fixed_and_ticket_is_single_use ... ok
+test pending_metadata_tickets_share_the_transport_byte_budget ... ok
+test shutdown_timeout_and_drop_do_not_wait_for_a_blocked_stream_poll ... ok
+test local_handshake_rejects_legacy_header_and_forged_command_identity ... ok
+test invalid_tls_identity_fails_before_startup_readiness ... ok
+test unconsumed_ticket_expires_and_releases_prepared_query ... ok
+test explicit_session_close_reclaims_capacity_and_pending_ticket ... ok
+test dropping_client_stream_releases_hanging_query ... ok
+test authenticated_handshake_issues_authoritative_session_and_rejects_spoofing ... ok
+test capabilities_and_pending_ticket_capacity_are_enforced ... ok
+test authenticated_handshake_does_not_wait_for_client_stream_eof ... ok
+test authenticated_sessions_are_bounded_and_expiry_revokes_pending_tickets ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_internal-29f65bdfb601e951)
+
+running 1 test
+test tests::server_runtime_error_exposes_stable_error_code ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_query-0e0c9cc049e45e26)
+
+running 55 tests
+test output_admission::tests::raw_log_scan_requires_utf8_bounds_and_charges_repeated_values ... ok
+test output_admission::tests::utf8_expanding_expressions_fail_before_materialization ... ok
+test output_admission::tests::empty_plan_does_not_require_a_value_buffer_bound_for_utf8_schema ... ok
+test persisted_plan::tests::persisted_manifest_rejects_cross_snapshot_and_duplicate_files ... ok
+test persisted_plan::tests::snapshot_description_validates_global_identities_once ... ok
+test prepared_plan::tests::datafusion_failures_map_to_stable_persisted_plan_classes ... ok
+test persisted_plan::tests::binder_rejects_an_opener_for_another_snapshot_synchronously ... ok
+test prepared_plan::tests::zero_limits_and_budget_overflow_are_rejected_before_planning ... ok
+test persisted_plan::tests::binder_rejects_tampered_manifest_metadata_before_opening ... ok
+test prepared_plan::tests::optimizer_fanout_from_derived_set_operations_is_pre_admitted ... ok
+test persisted_plan::tests::bound_factory_revalidates_file_meta_and_expires_with_opener ... ok
+test prepared_plan::tests::schema_width_is_charged_for_each_allowed_plan_node ... ok
+test prepared_plan::tests::wildcard_expansion_and_expression_driven_logical_nodes_are_pre_admitted ... ok
+test prepared_plan::tests::admitted_profile_is_bound_to_exact_sql_and_manifest ... ok
+test prepared_plan::tests::schema_driven_unnest_is_rejected_before_datafusion_planning ... ok
+test prepared_plan::tests::admitted_profile_binds_canonical_schema_content_not_only_its_charge ... ok
+test prepared_plan::tests::schema_and_projection_driven_join_and_group_expansions_fail_closed ... ok
+test prepared_plan::tests::non_read_only_ignored_and_unsupported_sql_are_rejected ... ok
+test persisted_plan::tests::binder_rejects_missing_foreign_reused_and_already_bound_markers ... ok
+test tests::execution_errors_keep_stable_classes_and_structured_server_errors ... ok
+test tests::deferred_open_failure_is_sticky ... ok
+test tests::parquet_metadata_charge_validates_trailer_and_verified_file_bounds ... ok
+test tests::parquet_ranges_fail_closed_on_bounds_overflow_and_premature_eof ... ok
+test tests::dropping_opening_reader_retains_captured_owner_until_job_exits ... ok
+test tests::workspace_and_datafusion_record_batches_share_one_arrow_abi ... ok
+test tests::parquet_cursors_retain_admission_and_have_independent_positions ... ok
+test tests::query_memory_children_share_one_process_limit_and_release_exactly ... ok
+test prepared_plan::tests::derived_projection_substitution_is_bounded_before_optimizer ... ok
+test persisted_plan::tests::streaming_output_admission_accepts_only_bounded_plan_subset ... ok
+test tests::deferred_open_worker_panic_is_sticky ... ok
+test tests::decoded_output_admission_is_fixed_width_and_row_group_bounded ... ok
+test tests::bounded_execution_context_enforces_memory_and_disables_temporary_files ... ok
+test tests::async_parquet_reader_uses_the_admitted_source_for_ranges_and_metadata ... ok
+test tests::deferred_reader_opens_once_on_first_operation ... ok
+test persisted_plan::tests::provider_validates_projection_and_pushes_only_unfiltered_limit ... ok
+test persisted_plan::tests::snapshot_description_accepts_maximum_expected_file_scale_linearly ... ok
+test prepared_plan::tests::qualified_self_join_retains_preoptimization_relations_and_consumes_into_binding ... ok
+test prepared_plan::tests::exists_in_and_scalar_subqueries_are_traversed_before_optimization ... ok
+test persisted_plan::tests::empty_persisted_table_executes_without_a_reader_capability ... ok
+test prepared_plan::tests::hidden_subquery_relations_and_foreign_sources_fail_before_physical_planning ... ok
+test prepared_plan::tests::foreign_table_sources_and_structural_limits_fail_closed ... ok
+test prepared_plan::tests::bindings_are_exact_unique_and_independent_from_manifest_order ... ok
+test tests::isolated_session_executes_sql_over_workspace_record_batches ... ok
+test persisted_plan::tests::provider_plans_projected_inexact_filter_without_opening_a_reader ... ok
+test persisted_plan::tests::binder_accepts_distinct_self_join_scans_and_zero_scan_plans ... ok
+test prepared_plan::tests::bounded_inline_windows_are_admitted_and_named_or_unknown_forms_fail_closed ... ok
+test tests::large_parquet_ranges_are_split_into_cancellable_positioned_reads ... ok
+test prepared_plan::tests::constant_function_outputs_fail_before_optimizer_materialization ... ok
+test prepared_plan::tests::client_derived_projections_joins_and_timestamps_are_pre_admitted ... ok
+test prepared_plan::tests::fixed_width_sort_aggregate_join_and_window_reach_output_admission ... ok
+test prepared_plan::tests::repeated_scalar_subqueries_charge_optimizer_clone_fanout ... ok
+test tests::dropped_deferred_open_future_resumes_the_same_blocking_job ... ok
+test tests::dropped_async_future_keeps_the_shared_blocking_gate_until_io_exits ... ok
+test output_admission::tests::utf8_dictionary_expansion_is_charged_before_decoding ... ok
+test prepared_plan::tests::compound_identifiers_and_join_optimizer_fanout_are_pre_admitted ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/active_plan.rs (target/debug/deps/active_plan-bf7928070b9fbfef)
+
+running 5 tests
+test native_key_value_schema_budget_uses_actual_relations ... ok
+test active_plan_clone_cannot_outlive_its_weak_execution_authority ... ok
+test active_scan_supports_fixed_width_filter_projection_and_limit ... ok
+test active_utf8_admission_requires_snapshot_proof_and_rejects_expansion ... ok
+test key_value_view_resolves_latest_events_before_filter_projection_and_limit ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_segment_store-2675afca94dd9add)
+
+running 10 tests
+test arrow_bridge::tests::sealed_utf8_array_reuses_offsets_and_value_buffers ... ok
+test arrow_bridge::tests::sealed_non_nullable_numeric_array_reuses_value_buffer ... ok
+test arrow_bridge::tests::sealed_nullable_numeric_array_reuses_value_buffer_and_preserves_nulls ... ok
+test catalog::tests::rollover_layout_failure_keeps_active_identity_unchanged ... ok
+test schema::tests::arrow_metadata_survives_compilation_and_changes_identity_deterministically ... ok
+test catalog::tests::rollover_rejects_open_row_instead_of_dropping_it ... ok
+test notify::tests::dropping_notifier_removes_subscription ... ok
+test catalog::tests::rollover_keeps_pinned_old_segment_until_collect_garbage ... ok
+test notify::tests::wait_timeout_returns_false_when_idle ... ok
+test notify::tests::notify_all_wakes_subscription ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/active_segment.rs (target/debug/deps/active_segment-134751e608f48863)
+
+running 8 tests
+test payload_mutation_rejects_nested_mutation ... ok
+test abort_row_discards_open_utf8_write_and_allows_retry ... ok
+test payload_mutation_marks_odd_then_even_version ... ok
+test payload_mutation_rejects_open_row ... ok
+test reader_only_observes_committed_prefix ... ok
+test runtime_writer_mirrors_committed_rows_and_column_buffers_into_shared_memory ... ok
+test utf8_offsets_only_become_readable_after_commit ... ok
+test write_utf8_respects_layout_values_len_boundary ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/active_segment_reader.rs (target/debug/deps/active_segment_reader-dedaef2b7b959c48)
+
+running 14 tests
+test active_segment_reader_reads_incremental_spans_from_descriptor_envelope ... ok
+test active_row_span_reads_cells_without_record_batch_materialization ... ok
+test active_segment_reader_can_seek_to_current_committed_tail ... ok
+test active_segment_reader_can_seek_to_explicit_row_offset ... ok
+test active_segment_reader_rejects_descriptor_generation_mismatch ... ok
+test active_segment_reader_exposes_control_snapshot_from_mmap_header ... ok
+test active_segment_reader_resets_cursor_after_descriptor_rollover ... ok
+test active_segment_reader_rejects_descriptor_without_payload_version_offset ... ok
+test active_segment_reader_rejects_writer_epoch_mismatch ... ok
+test control_snapshot_reports_payload_version ... ok
+test active_segment_reader_waits_on_mmap_notification_for_committed_rows ... ok
+test reader_read_available_keeps_cursor_when_payload_read_later_fails ... ok
+test active_segment_reader_tracks_waiter_count_while_blocked ... ok
+test active_segment_reader_waits_on_mmap_notification_for_rollover ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/arrow_bridge.rs (target/debug/deps/arrow_bridge-622bfcf3affb2f0e)
+
+running 29 tests
+test active_descriptor_envelope_rejects_missing_or_invalid_payload_version_offset ... ok
+test active_descriptor_envelope_rejects_version_mismatch ... ok
+test active_descriptor_can_be_reused_after_more_rows_are_committed ... ok
+test active_descriptor_envelope_rejects_schema_id_mismatch ... ok
+test active_descriptor_envelope_includes_payload_version_offset ... ok
+test active_descriptor_envelope_rejects_payload_offset_mismatch ... ok
+test active_descriptor_envelope_roundtrips_for_cross_process_attach ... ok
+test active_descriptor_rejects_committed_row_count_exceeding_capacity ... ok
+test active_descriptor_rejects_committed_row_count_offset_mismatch ... ok
+test active_query_snapshot_fixes_row_prefix_across_later_appends ... ok
+test active_descriptor_preserves_utf8_offsets_across_null_rows ... ok
+test active_descriptor_rejects_payload_offset_mismatch ... ok
+test active_descriptor_reopens_shared_segment_for_record_batch_export ... ok
+test active_descriptor_rejects_schema_id_header_mismatch ... ok
+test active_descriptor_rejects_layout_version_mismatch ... ok
+test active_query_snapshot_rejects_payload_rewrite_after_pin ... ok
+test active_descriptor_rejects_header_magic_mismatch ... ok
+test active_descriptor_uses_committed_count_as_authoritative_active_prefix ... ok
+test active_query_snapshot_slice_retains_version_and_bounds ... ok
+test debug_snapshot_helper_returns_expected_batch ... ok
+test active_record_batch_read_rejects_odd_payload_version ... ok
+test row_span_batch_reader_projects_sealed_columns_in_requested_order ... ok
+test row_span_batch_reader_splits_sealed_span_by_chunk_rows ... ok
+test row_span_converts_to_record_batch_for_debug_export ... ok
+test row_span_batch_reader_reads_active_span_chunks ... ok
+test row_span_exports_nullable_columns_as_true_nulls ... ok
+test sealed_row_span_reads_all_values_in_schema_order ... ok
+test row_span_record_batch_projection_materializes_only_requested_columns ... ok
+test utf8_bound_covers_chunk_boundaries_nulls_and_pinned_prefix_only ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/lifecycle_notify.rs (target/debug/deps/lifecycle_notify-5f73b3b506eaae47)
+
+running 3 tests
+test dropping_reader_session_releases_segment_lease ... ok
+test leases_do_not_collide_across_partitions_with_same_segment_id ... ok
+test eventfd_notifies_committed_rows_and_rollover ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/openctp_segment_perf_smoke.rs (target/debug/deps/openctp_segment_perf_smoke-7e879dd95ce81918)
+
+running 1 test
+test segment_batch_perf_smoke_compares_tick_rows ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/partition_api.rs (target/debug/deps/partition_api-57bc054b3fd9e818)
+
+running 15 tests
+test active_row_span_reads_nullable_factor_values_without_defaults ... ok
+test open_partition_with_schema_supports_column_writes_and_debug_snapshot ... ok
+test active_descriptor_can_attach_after_rollover_before_garbage_collection ... ok
+test active_row_span_exposes_borrowed_utf8_cell_values_for_hot_filters ... ok
+test active_descriptor_control_snapshot_keeps_append_only_reads_unchanged ... ok
+test partition_writer_writes_multiple_rows_in_one_transaction ... ok
+test partition_writer_writes_columnar_rows_in_one_committed_prefix ... ok
+test partition_handle_exports_active_descriptor_envelope_for_cross_process_reader ... ok
+test partition_writer_appends_active_row_span_with_nullable_columns_and_offset ... ok
+test rollover_marks_old_shared_segment_as_sealed ... ok
+test partition_writer_atomic_columnar_rows_rolls_back_failure_and_requires_empty_segment ... ok
+test partition_writer_appends_row_span_without_arrow_batch_bridge ... ok
+test reopening_partition_requires_matching_schema ... ok
+test recovered_origin_preserves_generation_and_rejects_reopen_or_rollover_conflicts ... ok
+test partition_writer_write_row_aborts_failed_transaction ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/partition_writer_api.rs (target/debug/deps/partition_writer_api-d74c35b5138a1bb4)
+
+running 1 test
+test partition_writer_multistep_api_is_not_externally_callable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/runtime_writer.rs (target/debug/deps/runtime_writer-fba4b6a43f1a053e)
+
+running 2 tests
+test runtime_writer_constructor_uses_explicit_segment_identity ... ok
+test custom_schema_partition_writer_supports_column_writes_and_active_snapshot ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/schema_layout.rs (target/debug/deps/schema_layout-f31623e7576a6275)
+
+running 5 tests
+test compile_schema_accepts_runtime_owned_column_names_and_timezones ... ok
+test compile_schema_rejects_duplicate_column_names ... ok
+test compile_schema_assigns_content_based_schema_id_and_layout ... ok
+test layout_plan_rejects_capacity_overflow ... ok
+test compile_schema_repeated_runtime_owned_inputs_keep_stable_schema_identity ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/shm_region.rs (target/debug/deps/shm_region-8542a91fea02d07a)
+
+running 6 tests
+test shm_region_backing_file_is_preallocated_to_avoid_sparse_mmap_sigbus ... ok
+test shm_region_rejects_unaligned_atomic_u64_offsets ... ok
+test shm_region_publishes_u64_with_release_acquire_across_attach ... ok
+test shm_region_reopens_by_os_id_and_reads_existing_bytes ... ok
+test shm_region_writes_from_second_attach_are_visible_to_owner ... ok
+test shm_region_mappings_do_not_retain_backing_file_descriptors ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/workspace_smoke.rs (target/debug/deps/workspace_smoke-48defa6b9074882a)
+
+running 1 test
+test segment_store_workspace_exports_compile_schema ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_server-95a73d14a34a8949)
+
+running 136 tests
+test health::tests::control_only_health_does_not_advertise_queries ... ok
+test health::tests::closed_admission_makes_both_adapters_unavailable ... ok
+test flight_query::tests::metadata_revision_conflict_restarts_capture_and_returns_only_stable_result ... ok
+test health::tests::control_only_capabilities_never_claim_future_engine_features ... ok
+test health::tests::stopped_master_removes_catalog_and_query_readiness ... ok
+test flight_query::tests::metadata_retry_preserves_resource_corruption_and_unavailable_errors ... ok
+test flight_query::tests::repeated_metadata_revision_changes_stop_at_budget_with_last_conflict ... ok
+test native_log::tests::replay_orders_and_clips_without_skipping_gaps_or_accepting_future_cursors ... ok
+test flight_security::tests::secret_files_must_be_owner_only_regular_files ... ok
+test flight_security::tests::credential_reader_rejects_symbolic_links ... ok
+test native_log::tests::frame_lineage_rejoins_files_and_rejects_partial_resume_or_identity_reuse ... ok
+test native_storage::tests::identical_startup_and_completion_error_is_not_labeled_as_cleanup_failure ... ok
+test native_query_canary::tests::canonical_digest_normalizes_schema_metadata_order ... ok
+test native_query_canary::tests::canonical_digest_is_independent_from_arrow_batch_and_row_order ... ok
+test native_query_canary::tests::canonical_digest_uses_primitive_bits_and_rejects_ambiguous_nested_values ... ok
+test native_storage::tests::cancel_in_background_hands_supervisor_ownership_to_the_reaper ... ok
+test query_physical::tests::committed_parquet_row_count_must_match_footer ... ok
+test query_service::tests::authenticated_transport_cancellation_checks_session_and_exact_generation ... ok
+test query_service::tests::draining_during_retained_conversion_rejects_transfer_and_rolls_back ... ok
+test query_service::tests::completing_planning_installs_request_and_server_plan_deadlines ... ok
+test query_service::tests::capacity_eviction_retains_query_id_tombstone_until_original_deadline ... ok
+test query_service::tests::cancelled_planning_keeps_snapshot_memory_charged_until_permit_drop ... ok
+test query_service::tests::concurrent_cancel_and_complete_have_one_atomic_terminal_outcome ... ok
+test query_service::tests::deadline_index_processes_only_due_running_generation ... ok
+test query_service::tests::cancellation_releases_logical_slot_but_retains_physical_resources ... ok
+test query_service::tests::fail_and_drop_have_distinct_planning_terminal_semantics ... ok
+test query_service::tests::finish_waits_for_outstanding_result_delivery ... ok
+test query_service::tests::execution_failure_preserves_error_and_drains_physical_resources ... ok
+test query_service::tests::finish_releases_snapshot_root_owned_memory_permit_without_deadlock ... ok
+test query_service::tests::old_plan_token_cannot_release_reused_query_generation ... ok
+test query_service::tests::cancellation_actively_wakes_waiting_physical_task ... ok
+test query_service::tests::effective_planning_deadline_uses_the_earlier_request_or_server_limit ... ok
+test query_service::tests::invalid_or_expired_completion_is_terminal_and_never_installs_partial_plan_state ... ok
+test query_service::tests::oversized_retained_charge_is_internal_and_drops_value_before_task_reservation ... ok
+test query_service::tests::concurrent_execution_failure_and_admin_cancel_keep_first_terminal ... ok
+test query_service::tests::non_drained_terminal_query_is_not_capacity_evicted ... ok
+test query_service::tests::oversized_parquet_footer_growth_rejects_and_releases_original_task_charge ... ok
+test query_service::tests::old_execution_scope_cannot_cancel_reused_query_generation ... ok
+test query_service::tests::owner_cancel_wins_over_late_planning_completion_without_attaching_snapshot ... ok
+test query_service::tests::planning_deadline_starts_at_submission_and_wakes_exact_token ... ok
+test query_service::tests::owner_and_admin_capabilities_require_the_exact_query_instance ... ok
+test query_service::tests::rejected_task_to_result_transfer_drops_result_before_task_charge ... ok
+test query_service::tests::result_permit_count_is_bounded_per_query_and_globally ... ok
+test query_service::tests::rejected_registration_does_not_decrement_or_increment_admitted_ownership ... ok
+test query_service::tests::registry_retains_revocable_snapshot_root_and_plan_drop_releases_once ... ok
+test query_service::tests::retained_old_planning_token_cannot_target_reused_query_id ... ok
+test query_service::tests::retained_permit_blocks_terminal_drain_and_shutdown_until_final_drop ... ok
+test query_service::tests::retained_rebuild_oversize_and_cancelled_commit_destroy_rebuild_before_raii ... ok
+test query_service::tests::retained_rebuild_atomically_replaces_charge_and_releases_task ... ok
+test query_service::tests::retained_memory_blocks_other_sessions_and_aggregates_globally ... ok
+test query_service::tests::result_permit_blocks_terminal_eviction_until_its_memory_is_released ... ok
+test query_service::tests::session_ledger_aggregates_queries_and_removes_idle_sessions ... ok
+test query_service::tests::shutdown_waits_for_result_permits_without_retaining_snapshot ... ok
+test query_service::tests::retained_rebuild_rejects_foreign_query_before_releasing_either_reservation ... ok
+test query_service::tests::server_plan_ttl_is_the_only_plan_timestamp_authority ... ok
+test query_service::tests::rejected_retained_rebuild_drop_panic_still_releases_original_reservations ... ok
+test query_service::tests::shutdown_waits_for_snapshot_memory_permits ... ok
+test native_storage::tests::cancel_and_wait_does_not_return_before_the_supervisor_finishes ... ok
+test query_service::tests::shutdown_revokes_planned_snapshot_without_waiting_for_token_drop ... ok
+test query_service::tests::retained_rebuild_conversion_error_and_panic_release_both_original_permits ... ok
+test query_service::tests::snapshot_derived_charge_precedes_reservation_and_resource_build ... ok
+test query_service::tests::snapshot_memory_enforces_global_budget_across_queries_and_sessions ... ok
+test query_service::tests::payload_drop_panics_still_release_task_retained_and_result_reservations ... ok
+test query_service::tests::shutdown_drains_only_after_tasks_and_snapshot_owners_exit ... ok
+test query_service::tests::task_and_result_memory_share_query_global_and_session_budget ... ok
+test query_service::tests::submission_and_completion_publish_only_honest_lifecycle_metadata ... ok
+test query_service::tests::snapshot_memory_blocks_terminal_capacity_eviction_until_permit_drop ... ok
+test query_service::tests::snapshot_memory_shares_query_budget_and_status_totals_without_using_task_capacity ... ok
+test query_service::tests::snapshot_drop_panic_still_releases_owner_accounting ... ok
+test query_service::tests::stale_owner_and_admin_instance_cannot_cancel_reused_query_id ... ok
+test query_service::tests::task_admission_enforces_per_query_and_global_cpu_memory_concurrency ... ok
+test query_service::tests::task_and_result_memory_block_each_other_across_queries_and_sessions ... ok
+test query_service::tests::task_to_retained_conversion_errors_panics_and_cancellation_roll_back ... ok
+test query_service::tests::task_to_retained_transfer_shrinks_peak_and_shares_the_memory_budget ... ok
+test query_service::tests::terminal_churn_keeps_registry_and_order_heaps_bounded ... ok
+test query_service::tests::task_resource_mapping_keeps_one_reservation_and_rolls_back_failures ... ok
+test query_service::tests::tombstone_capacity_exhaustion_fails_closed ... ok
+test query_service::tests::task_to_result_transfer_reclassifies_full_budget_atomically ... ok
+test query_service::tests::task_memory_growth_and_admin_cancel_are_linearized_across_all_ledgers ... ok
+test query_service::tests::task_reservation_rolls_back_build_errors_and_panics ... ok
+test query_service::tests::task_memory_growth_is_atomic_across_query_global_and_session_ledgers ... ok
+test query_service::tests::ttl_revokes_unexecuted_snapshot_even_when_plan_token_is_retained ... ok
+test query_service::tests::managed_sweeper_times_out_plan_and_joins_during_shutdown ... ok
+test native_query_canary::tests::primary_digest_streams_large_scalars_through_the_byte_limit ... ok
+test query_execution::tests::successful_finish_failure_and_drop_release_execution_authority ... ok
+test query_snapshot::tests::closing_snapshot_admission_waits_for_an_inflight_planning_guard ... ok
+test query_execution::tests::bind_failure_rolls_back_build_and_manifest_reservations ... ok
+test query_execution::tests::preflight_and_profile_failures_publish_failed_and_release_resources ... ok
+test query_snapshot::tests::shutdown_actively_interrupts_a_stalled_snapshot_pin_and_returns_bounded ... ok
+test query_snapshot::tests::retained_plan_token_cannot_keep_catalog_pins_after_ttl ... ok
+test query_snapshot::tests::exact_snapshot_projection_is_capability_free_ordered_and_retained_accounted ... ok
+test query_snapshot::tests::multi_actor_snapshot_is_sorted_audited_and_lifecycle_bound ... ok
+test query_snapshot::tests::multi_table_pin_budget_failure_rolls_back_every_pin_and_audit_record ... ok
+test query_snapshot::tests::native_storage_shutdown_waits_until_the_final_query_pin_is_released ... ok
+test query_snapshot::tests::projection_budget_failure_precedes_manifest_build_and_rolls_back_task_accounting ... ok
+test runtime::tests::daemon_cleanup_failures_do_not_replace_the_terminal_error_code ... ok
+test runtime::tests::incomplete_shutdown_is_promoted_to_server_error ... ok
+test runtime::tests::incomplete_startup_rollback_is_attached_to_the_startup_error ... ok
+test runtime::tests::native_query_canary_is_explicit ... ok
+test runtime::tests::daemon_rejects_unknown_launcher_state_fields_before_binding_listener ... ok
+test runtime::tests::daemon_rejects_empty_ready_nonce_before_binding_listener ... ok
+test runtime::tests::native_query_registry_uses_the_server_plan_ttl ... ok
+test runtime::tests::native_query_resources_use_query_buffer_budget ... ok
+test runtime::tests::readiness_allows_control_only_mode ... ok
+test runtime::tests::readiness_always_requires_every_native_storage_gate ... ok
+test runtime::tests::readiness_requires_both_flight_listener_and_protocol_barriers ... ok
+test runtime::tests::runtime_native_failure_revokes_dynamic_readiness ... ok
+test runtime::tests::listener_cleanup_retries_after_receive_and_join_deadlines ... ok
+test query_snapshot::tests::event_snapshot_refresh_keeps_one_identity_and_rejects_active_or_foreign_owners ... ok
+test query_execution::tests::finish_with_outstanding_task_cancels_and_leaves_only_that_task_accounted ... ok
+test runtime::tests::completed_listener_is_joined_before_cleanup_reports_success ... ok
+test query_execution::tests::real_reader_finish_closes_admission_and_drains_task_and_snapshot_pin ... ok
+test query_execution::tests::native_stream_accounts_batches_and_finishes_after_delivery_drains ... ok
+test query_snapshot::tests::persisted_file_projection_preserves_exact_identity_versions_and_scan_order ... ok
+test native_query_canary::tests::canary_output_limit_fails_before_unbounded_result_consumption ... ok
+test native_query_canary::tests::canary_cancel_drop_and_shutdown_preserve_lifecycle_boundaries ... ok
+test native_query_canary::tests::canary_executes_persisted_query_and_matches_golden_result ... ok
+test query_execution::tests::native_stream_reads_persisted_then_fixed_live_snapshot_without_overlap ... ok
+test query_execution::tests::operator_context_budget_rejection_fails_and_releases_execution_lease ... ok
+test query_snapshot::tests::admitted_parquet_cursor_retains_task_and_pin_until_final_drop ... ok
+test query_execution::tests::live_payload_rewrite_after_query_pin_fails_the_execution_closed ... ok
+test query_execution::tests::decoded_output_growth_rejection_is_sticky_and_releases_task_and_pin ... ok
+test query_execution::tests::cancelled_lease_with_reader_finish_returns_first_terminal_error ... ok
+test query_execution::tests::dropping_native_stream_cancels_before_result_reservation_release ... ok
+test native_query_canary::tests::canary_row_limit_fails_query_and_releases_all_resources ... ok
+test runtime::tests::daemon_leaf_starts_waits_and_stops_the_owned_runtime ... ok
+test runtime::tests::daemon_publishes_owner_only_ready_record_after_full_startup ... ok
+test native_query_canary::tests::public_native_engine_streams_permit_owned_results_and_cancels_on_drop ... ok
+test query_snapshot::tests::snapshot_memory_admission_precedes_catalog_resolution_and_pin_work ... ok
+test query_snapshot::tests::timed_out_planning_token_cannot_start_snapshot_pinning ... ok
+test query_snapshot::tests::unrelated_small_reservation_cannot_replace_snapshot_owned_memory ... ok
+test runtime::tests::daemon_fails_fast_and_transitions_state_after_native_health_loss ... ok
+test query_snapshot::tests::foreign_catalog_reservation_is_rejected_for_the_same_query_incarnation ... ok
+test query_execution::tests::real_reader_fail_and_drop_keep_task_pin_until_reader_drop ... ok
+test query_execution::tests::foreign_instance_revision_and_storage_issuer_fail_before_preparation ... ok
+test query_execution::tests::reader_admission_second_gate_linearizes_finish_fail_and_drop ... ok
+
+test result: ok. 136 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.57s
+
+     Running unittests src/main.rs (target/debug/deps/zippy_server-1f7566ba15b74e04)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/legacy_runtime_baseline.rs (target/debug/deps/legacy_runtime_baseline-3fbd3765714614c9)
+
+running 1 test
+test master_ready_barrier_precedes_control_wire_and_shutdown_releases_port ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/native_storage_runtime.rs (target/debug/deps/native_storage_runtime-3df6a10e32244296)
+
+running 25 tests
+test native_checkpoint_throughput_benchmark ... ignored, release-mode native ingest persistence benchmark
+test invalid_table_actor_budget_fails_before_catalog_startup ... ok
+test invalid_server_actor_fails_before_catalog_startup ... ok
+test invalid_persist_controller_budget_fails_before_catalog_startup ... ok
+test corrupt_catalog_fails_closed_after_supervisor_cleanup ... ok
+test shutdown_timeout_keeps_the_runtime_handle_and_can_be_observed_again ... ok
+test supervisor_starts_inside_an_existing_tokio_runtime_and_closes_cleanly ... ok
+test decoded_schema_charge_uses_the_same_startup_metadata_budget ... ok
+test catalog_visible_missing_parquet_prevents_native_storage_readiness ... ok
+test startup_replays_retained_intent_before_publishing_final_reconciliation ... ok
+test native_checkpoint_worker_persists_without_an_explicit_flush ... ok
+test terminal_persist_failure_revokes_health_and_fails_ordered_shutdown ... ok
+test native_log_windows_preserve_writer_handoffs_and_cancel_without_leaking_results ... ok
+test pre_replay_gate_rejects_partially_represented_multi_file_intent ... ok
+test online_creation_enforces_startup_budgets_before_catalog_commit ... ok
+test fixed_native_snapshot_keeps_live_boundary_after_checkpoint_and_release ... ok
+test actor_persist_is_recovered_as_the_same_snapshot_after_restart ... ok
+test persisted_receipts_cover_real_manifests_and_survive_restart_exactly ... ok
+test native_key_value_events_recover_versions_and_exact_persisted_receipts ... ok
+test native_frames_keep_boundaries_through_wal_recovery_and_manifest_checkpoint ... ok
+test durable_consumers_replay_atomic_units_and_ack_memory_writes_before_restart ... ok
+test native_checkpoints_recycle_tiny_budgets_and_recover_exact_receipts ... ok
+test native_schema_evolution_preserves_history_wal_and_queries_for_all_kinds ... ok
+test native_drop_retires_all_table_kinds_and_reuses_runtime_capacity ... ok
+test native_live_logs_follow_all_table_kinds_across_checkpoints_with_one_identity ... ok
+
+test result: ok. 24 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.91s
+
+     Running tests/server_binary.rs (target/debug/deps/server_binary-f6ed691e3071663c)
+
+running 9 tests
+test server_binary_rejects_missing_log_dir_value ... ok
+test server_binary_rejects_multiple_control_endpoints ... ok
+test server_binary_writes_startup_logs_and_socket ... ok
+test server_binary_handles_sigint_and_cleans_socket ... ok
+test server_binary_serves_tcp_control_endpoint ... ok
+test server_binary_uses_configured_master_host_and_port ... ok
+test server_binary_rejects_second_master_before_rebinding_the_active_data_root ... ok
+test server_binary_reads_explicit_config_file ... ok
+test server_binary_does_not_delete_new_socket_after_old_instance_exits ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+     Running tests/server_runtime.rs (target/debug/deps/server_runtime-f8fd72da8d42e42c)
+
+running 11 tests
+test transport_performance::native_flight_ingest_performance_baseline ... ignored, manual release benchmark; run with --ignored --test-threads=1
+test transport_performance::native_flight_persistent_ingest_performance_baseline ... ignored, manual release benchmark; run with --ignored --test-threads=1
+test transport_performance::percentile_uses_nearest_rank ... ok
+test corrupt_native_catalog_prevents_listener_bind_and_releases_ownership_after_cleanup ... ok
+test configured_native_storage_recovers_before_server_readiness ... ok
+test server_runtime_loads_protected_credentials_and_issues_tls_flight_session ... ok
+test control_only_runtime_is_ready_without_fabricating_query_service ... ok
+test different_endpoints_cannot_own_the_same_data_root ... ok
+test default_runtime_streams_real_native_snapshot_and_releases_ticket ... ok
+test repeated_shutdown_retries_cleanup_and_preserves_timed_out_processes ... ok
+test flight_writer_durable_put_uses_native_ingest_without_gateway ... ok
+
+test result: ok. 9 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_storage-78b6c11dac494cea)
+
+running 4 tests
+test commit::tests::catalog_error_disposition_is_conservative ... ok
+test commit::tests::publication_permit_failure_reaches_the_current_commit_caller ... ok
+test reconcile::tests::cancelled_cleanup_retains_exclusion_until_blocking_unlink_finishes ... ok
+test commit::tests::queued_staged_job_does_not_hold_publication_permit_during_rejection_cleanup ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/catalog_file_verification.rs (target/debug/deps/catalog_file_verification-60cb817ca81895af)
+
+running 17 tests
+test verifies_current_visible_managed_candidate ... ok
+test missing_current_visible_file_is_data_corruption ... ok
+test verification_byte_budget_fails_before_file_read ... ok
+test symlinked_catalog_table_directory_is_data_corruption ... ok
+test aggregate_runtime_metadata_budget_fails_closed ... ok
+test external_legacy_location_is_rejected_before_physical_read ... ok
+test bootstrap_is_complete_and_ordered_across_pages_and_snapshot_batches ... ok
+test table_count_budget_fails_closed ... ok
+test changed_current_visible_file_is_data_corruption ... ok
+test managed_file_count_budget_fails_before_verification ... ok
+test bootstrap_returns_current_runtime_descriptors_without_visible_files ... ok
+test verification_uses_owned_root_descriptor_after_path_replacement ... ok
+test noncanonical_catalog_path_is_data_corruption ... ok
+test later_physical_failure_returns_no_partial_bootstrap ... ok
+test ignores_removed_file_and_verifies_only_current_compaction_output ... ok
+test native_tables_share_the_total_file_budget ... ok
+test native_tables_share_the_verification_byte_budget ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/orphan_reconciliation.rs (target/debug/deps/orphan_reconciliation-a96654bb7ee9da3c)
+
+running 14 tests
+test invalid_scan_budgets_fail_before_filesystem_or_catalog_work ... ok
+test intent_temporary_file_is_reported_without_read_only_cleanup ... ok
+test verification_byte_budget_fails_before_unbounded_candidate_reads ... ok
+test read_only_reconciler_cannot_enter_physical_cleanup ... ok
+test symbolic_link_in_managed_parquet_tree_fails_closed ... ok
+test catalog_revision_drift_rejects_the_entire_report_as_retryable ... ok
+test retained_terminal_intent_protects_uncommitted_candidate ... ok
+test same_revision_short_probe_response_is_terminal_corruption ... ok
+test reports_verified_orphan_then_exact_catalog_reference_without_deleting ... ok
+test reports_temporary_unexpected_and_invalid_unreferenced_entries_without_removal ... ok
+test startup_cleanup_reverifies_orphan_immediately_before_unlink ... ok
+test startup_cleanup_removes_only_verified_orphans_before_admission ... ok
+test retained_multi_file_intent_is_reported_as_one_atomic_pending_group ... ok
+test partially_committed_multi_file_intent_fails_closed ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/parquet_candidate.rs (target/debug/deps/parquet_candidate-ebd6e63141b87439)
+
+running 9 tests
+test unsupported_parquet_schema_is_rejected_before_creating_a_candidate ... ok
+test row_count_must_equal_exact_offset_coverage ... ok
+test batch_schema_must_match_bound_schema_exactly ... ok
+test empty_candidate_is_rejected_and_temporary_file_is_removed ... ok
+test existing_symlink_candidate_is_rejected_without_following_it ... ok
+test publishes_exact_pending_descriptor_and_readable_parquet ... ok
+test same_identity_with_different_content_is_rejected_without_overwrite ... ok
+test byte_identical_replay_is_idempotent ... ok
+test oversized_footer_metadata_is_rejected_before_creating_a_candidate ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/persist_controller.rs (target/debug/deps/persist_controller-dfbb6b9731520ef9)
+
+running 18 tests
+test persist_authority_covers_historical_source_epochs ... ok
+test config_and_request_validation_rejects_work_before_startup ... ok
+test oversized_footer_is_rejected_while_preparing_persist_input ... ok
+test metadata_only_payload_cannot_bypass_input_budget ... ok
+test native_startup_removes_partial_intent_and_rejects_symlink_directory ... ok
+test native_mismatched_catalog_response_retains_intent_and_fails_closed ... ok
+test native_replay_rejects_tampered_retained_candidate_before_catalog ... ok
+test admission_distinguishes_oversized_and_temporarily_exhausted_input ... ok
+test dropped_ticket_does_not_cancel_and_drain_closes_admission ... ok
+test first_writer_error_closes_admission_but_drains_already_accepted_jobs ... ok
+test native_commit_unknown_replays_the_identical_catalog_envelope ... ok
+test same_table_admission_is_single_flight_until_commit_completes ... ok
+test native_startup_discards_definitively_rejected_intent_and_accepts_new_work ... ok
+test writer_parallelism_is_bounded_and_configurable ... ok
+test exact_replay_bypasses_a_lowered_commit_budget ... ok
+test replay_probe_resolves_before_any_candidate_publication ... ok
+test rejected_candidate_replacement_fails_cleanup_closed ... ok
+test definitive_post_publication_rejection_cleans_owned_candidate_and_continues ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running unittests src/lib.rs (target/debug/deps/zippy_types-e1ef86e4f246df18)
+
+running 92 tests
+test catalog::tests::catalog_traits_are_object_safe ... ok
+test catalog::tests::command_canonical_bytes_have_a_golden_form ... ok
+test catalog::tests::command_fingerprint_has_a_golden_sha256_value ... ok
+test catalog::tests::envelope_detects_command_reuse_with_a_different_body ... ok
+test catalog::tests::actor_principal_is_bounded_before_canonical_fingerprint_encoding ... ok
+test catalog::tests::maintenance_state_machine_rejects_terminal_reentry ... ok
+test catalog::tests::unsupported_command_format_cannot_be_fingerprinted ... ok
+test catalog::tests::borrowed_manifest_fingerprint_wire_matches_owned_v1_wire ... ok
+test catalog::tests::v1_codec_validates_historical_version_and_fingerprint ... ok
+test catalog::tests::schema_fingerprints_use_logical_content_and_reject_invalid_ipc ... ok
+test catalog::tests::v1_response_codec_and_empty_query_snapshot_are_explicit ... ok
+test catalog::tests::historical_snapshot_visibility_respects_removal_boundary_and_file_state ... ok
+test catalog::tests::v1_response_decode_revalidates_nested_domain_values ... ok
+test error::tests::error_code_has_a_golden_protocol_form ... ok
+test catalog::tests::catalog_snapshot_aggregates_reject_mismatch_visibility_and_order_bypass ... ok
+test error::tests::every_detail_variant_has_one_authoritative_error_code ... ok
+test error::tests::detail_variants_reject_unstructured_or_incomplete_context ... ok
+test catalog::tests::every_v1_response_outcome_has_a_frozen_snapshot_and_roundtrip ... ok
+test id::tests::stable_id_rejects_ambiguous_input ... ok
+test id::tests::stable_id_has_a_golden_string_json_representation ... ok
+test error::tests::transient_codes_have_conservative_retry_defaults ... ok
+test error::tests::structured_error_preserves_machine_readable_context ... ok
+test id::tests::stable_id_rejects_nil_from_every_public_input ... ok
+test id::tests::stable_id_round_trips_all_supported_forms ... ok
+test ingest::tests::durability_order_matches_ack_strength ... ok
+test ingest::tests::ingest_service_is_object_safe ... ok
+test ingest::tests::persisted_receipt_requires_a_positive_manifest_version ... ok
+test catalog::tests::v1_command_and_response_mirrors_reject_top_and_deep_unknown_fields ... ok
+test ingest::tests::zero_row_receipt_is_distinct_from_offset_zero ... ok
+test catalog::tests::nested_v1_command_branches_have_frozen_snapshots_and_roundtrip ... ok
+test catalog::tests::every_v1_command_has_frozen_canonical_snapshot_and_roundtrip ... ok
+test ingest::tests::write_request_clone_shares_arrow_buffers ... ok
+test key_value::tests::event_schema_roundtrips_metadata_and_rejects_ambiguous_keys ... ok
+test offset::tests::offset_types_have_golden_json_forms ... ok
+test offset::tests::offset_zero_is_valid_but_not_an_empty_watermark ... ok
+test offset::tests::range_rejects_reverse_order_from_constructor_and_serde ... ok
+test query::tests::engine_origin_checks_reject_foreign_types_and_instance_nonces ... ok
+test key_value::tests::null_primary_keys_are_rejected_before_materialization ... ok
+test query::tests::logical_plan_envelope_has_a_golden_versioned_form ... ok
+test query::tests::planned_table_version_cannot_omit_bound_schema ... ok
+test query::tests::query_engine_and_stream_are_object_safe ... ok
+test query::tests::query_instance_identity_rejects_zero_generation ... ok
+test query::tests::query_request_serializes_explicit_resource_policies ... ok
+test key_value::tests::delete_key_tombstones_fill_valid_values_and_keep_input_order ... ok
+test query::tests::query_state_machine_has_explicit_plan_ownership_phase ... ok
+test resource::tests::resource_limit_has_explicit_default_disabled_and_bytes_states ... ok
+test query::tests::result_batch_releases_opaque_owner_with_the_batch ... ok
+test runtime::tests::metric_gauge_rejects_every_non_finite_value ... ok
+test runtime::tests::runtime_registry_is_object_safe ... ok
+test runtime::tests::runtime_state_transitions_are_explicit ... ok
+test runtime::tests::validated_runtime_inputs_block_illegal_registration_and_transitions ... ok
+test runtime::tests::runtime_snapshot_rejects_boot_revision_order_and_serde_bypass ... ok
+test schema_contract::tests::admits_valid_definition_fields ... ok
+test schema_contract::tests::rejects_invalid_and_duplicate_field_names ... ok
+test schema_contract::tests::requires_utf8_key_value_fields ... ok
+test schema_evolution::tests::incompatible_changes_are_explicit_errors ... ok
+test schema_evolution::tests::additive_alignment_preserves_values_buffers_and_row_count ... ok
+test schema_contract::tests::rejects_missing_append_frame_and_key_value_fields ... ok
+test schema_evolution::tests::native_key_value_changes_preserve_control_and_primary_key_fields ... ok
+test schema_memory::tests::retained_charge_grows_with_fields_and_metadata ... ok
+test storage::tests::catalog_memory_lease_binds_descriptor_owner_and_private_authority ... ok
+test storage::tests::live_pin_selector_binds_snapshot_and_schema_versions ... ok
+test schema_hash::tests::canonical_digest_sorts_metadata_and_captures_nested_content ... ok
+test storage::tests::storage_and_exclusive_guards_are_object_safe ... ok
+test storage::tests::storage_origin_check_rejects_foreign_guard_type_and_nonce ... ok
+test subscription::tests::committed_and_at_least_once_require_durable_identity ... ok
+test storage::tests::catalog_memory_reservation_ids_are_unique_within_one_authority ... ok
+test schema_evolution::tests::metadata_changes_are_full_while_identity_fields_remain_fixed ... ok
+test subscription::tests::filtered_empty_delivery_advances_only_scanned_progress ... ok
+test subscription::tests::individual_offset_authority_must_match_consumer ... ok
+test schema_contract::tests::rejects_dictionary_wrapped_nesting_overflow ... ok
+test subscription::tests::durable_subscription_has_a_golden_authority_form ... ok
+test table::tests::frame_definition_requires_exactly_one_by_column ... ok
+test storage::tests::catalog_pin_guard_exposes_only_path_free_selection_audit_data ... ok
+test table::tests::file_provenance_prevents_native_legacy_contradictions ... ok
+test table::tests::table_definition_has_a_golden_key_value_form ... ok
+test table::tests::key_value_definition_rejects_empty_and_duplicate_keys ... ok
+test table::tests::native_lineage_rejects_identity_and_offset_ambiguity ... ok
+test schema_hash::tests::canonical_catalog_schema_hash_v1_has_a_stable_golden_value ... ok
+test table::tests::table_kind_uses_stable_catalog_names ... ok
+test subscription::tests::subscription_service_is_object_safe ... ok
+test subscription::tests::subscription_progress_and_batch_reject_impossible_offsets ... ok
+test subscription::tests::subscription_view_is_validated_against_table_definition ... ok
+test table::tests::catalog_names_are_byte_exact_and_validated ... ok
+test storage::tests::failed_owner_admission_does_not_create_a_memory_lease ... ok
+test subscription::tests::snapshot_position_defines_the_first_tail_offset ... ok
+test table::tests::catalog_names_preserve_historical_long_values ... ok
+test table::tests::data_file_locations_enforce_ownership_boundary ... ok
+test schema_contract::tests::rejects_metadata_entry_and_byte_overflow ... ok
+test schema_contract::tests::rejects_recursive_field_and_nesting_overflow ... ok
+test schema_contract::tests::rejects_dictionary_wrapped_recursive_field_overflow ... ok
+test schema_contract::tests::admits_4096_fields_and_rejects_4097_fields ... ok
+
+test result: ok. 92 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests zippy_catalog
+
+running 3 tests
+test crates/zippy-catalog/src/lib.rs - SqliteCatalogFoundation (line 275) - compile fail ... ok
+test crates/zippy-catalog/src/pinned_snapshot.rs - pinned_snapshot::SqliteCatalogPinnedQuerySnapshot (line 28) - compile fail ... ok
+test crates/zippy-catalog/src/pinned_snapshot.rs - pinned_snapshot::PinnedDataFile (line 554) - compile fail ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+   Doc-tests zippy_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_engines
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_ingest
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_master
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_operator_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_operators
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_perf
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_protocol
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_internal
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_query
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_segment_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_storage
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests zippy_types
+
+running 5 tests
+test crates/zippy-types/src/query.rs - query::OpaqueQueryExecutionToken (line 303) - compile fail ... ok
+test crates/zippy-types/src/storage.rs - storage::OpaqueQueryReadSnapshot (line 500) - compile fail ... ok
+test crates/zippy-types/src/storage.rs - storage::OpaqueLiveSnapshotPins (line 141) - compile fail ... ok
+test crates/zippy-types/src/storage.rs - storage::CatalogSnapshotMemoryLease (line 388) - compile fail ... ok
+test crates/zippy-types/src/query.rs - query::QueryResultBatch (line 316) - compile fail ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+

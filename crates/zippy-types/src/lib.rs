@@ -18,12 +18,15 @@ pub mod catalog;
 pub mod error;
 pub mod id;
 pub mod ingest;
+pub mod key_value;
 pub mod offset;
 pub mod query;
 pub mod resource;
 pub mod runtime;
 pub mod schema_contract;
+pub mod schema_evolution;
 pub mod schema_hash;
+pub mod schema_ipc;
 pub mod schema_memory;
 pub mod storage;
 pub mod subscription;
@@ -33,8 +36,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub use catalog::{
-    Catalog, CatalogIdempotencyRead, CatalogPersistence, CatalogPublicationControl,
-    CatalogPublicationExclusion, CatalogPublicationPermit, CatalogRead, CatalogWrite,
+    Catalog, CatalogConsumerRead, CatalogIdempotencyRead, CatalogPersistence,
+    CatalogPublicationControl, CatalogPublicationExclusion, CatalogPublicationPermit, CatalogRead,
+    CatalogWrite,
 };
 pub use error::{ErrorCode, Result, ServerError, ServerErrorDetails};
 pub use id::{

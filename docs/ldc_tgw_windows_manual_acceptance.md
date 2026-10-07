@@ -1,5 +1,12 @@
 # LDC TGW Windows 客户端手动验收
 
+> 2026-09-22：本文涉及的 Gateway CLI 与 `08_remote_gateway` 脚本已删除。当前操作见
+> [原生远端客户端](native-remote-client.md)，以下仅保留历史验收记录。
+
+> 历史验收记录：以下环境与命令描述 2026-07-16 的旧版本，不再作为当前安装指南。
+> 2026-09-21 已删除主包纯 Python 降级；当前远端入口使用独立 `zippy-client`，参见
+> [客户端指南](../clients/python/README.md) 和 [新契约](adr/0007-single-trunk-new-contract.md)。
+
 > 验收日期：2026-07-16
 >
 > 服务端：WSL `local-market-data-center`

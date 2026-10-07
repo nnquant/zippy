@@ -7,18 +7,11 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
 use zippy_core::{
-    control_response_result, send_control_line_request,
-    send_control_line_request_cancellable_with_deadline, send_control_line_request_with_timeout,
-    ControlEndpoint, ControlErrorCode, ControlRequest, ControlResponse, RegisterProcessRequest,
-    ZippyError,
+    control_response_result, send_control_line_request_cancellable_with_deadline,
+    send_control_line_request_with_timeout, ControlEndpoint, ControlErrorCode, ControlRequest,
+    ControlResponse, RegisterProcessRequest, ZippyError,
 };
-
-#[derive(Debug, Deserialize)]
-enum LegacyControlResponse {
-    Error { reason: String },
-}
 
 #[test]
 fn tcp_control_transport_roundtrips_json_line() {
@@ -40,11 +33,12 @@ fn tcp_control_transport_roundtrips_json_line() {
         stream.write_all(b"\n").unwrap();
     });
 
-    let response = send_control_line_request(
+    let response = send_control_line_request_with_timeout(
         &ControlEndpoint::Tcp(addr),
         ControlRequest::RegisterProcess(RegisterProcessRequest {
             app: "pytest".to_string(),
         }),
+        Duration::from_secs(2),
     )
     .unwrap();
 
@@ -202,7 +196,8 @@ fn tcp_control_transport_preserves_structured_not_found() {
             .read_line(&mut request_line)
             .unwrap();
         let response = ControlResponse::Error {
-            code: Some(ControlErrorCode::NotFound),
+            code: ControlErrorCode::NotFound,
+            retryable: false,
             reason: "stream not found stream_name=[missing]".to_string(),
         };
         let payload = serde_json::to_string(&response).unwrap();
@@ -210,11 +205,12 @@ fn tcp_control_transport_preserves_structured_not_found() {
         stream.write_all(b"\n").unwrap();
     });
 
-    let error = send_control_line_request(
+    let error = send_control_line_request_with_timeout(
         &ControlEndpoint::Tcp(addr),
         ControlRequest::RegisterProcess(RegisterProcessRequest {
             app: "typed_error_test".to_string(),
         }),
+        Duration::from_secs(2),
     )
     .unwrap_err();
 
@@ -229,17 +225,20 @@ fn tcp_control_transport_preserves_structured_not_found() {
 #[test]
 fn control_transport_preserves_structured_terminal_codes() {
     let cancelled = control_response_result(ControlResponse::Error {
-        code: Some(ControlErrorCode::Cancelled),
+        code: ControlErrorCode::Cancelled,
+        retryable: false,
         reason: "query cancelled".to_string(),
     })
     .unwrap_err();
     let deadline = control_response_result(ControlResponse::Error {
-        code: Some(ControlErrorCode::DeadlineExceeded),
+        code: ControlErrorCode::DeadlineExceeded,
+        retryable: false,
         reason: "query deadline exceeded".to_string(),
     })
     .unwrap_err();
     let conflict = control_response_result(ControlResponse::Error {
-        code: Some(ControlErrorCode::Conflict),
+        code: ControlErrorCode::Conflict,
+        retryable: false,
         reason: "data root is already owned".to_string(),
     })
     .unwrap_err();
@@ -260,7 +259,7 @@ fn control_transport_preserves_structured_terminal_codes() {
 }
 
 #[test]
-fn tcp_control_transport_accepts_legacy_uncoded_error() {
+fn tcp_control_transport_rejects_uncoded_error() {
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
@@ -274,33 +273,36 @@ fn tcp_control_transport_accepts_legacy_uncoded_error() {
             .unwrap();
     });
 
-    let error = send_control_line_request(
+    let error = send_control_line_request_with_timeout(
         &ControlEndpoint::Tcp(addr),
         ControlRequest::RegisterProcess(RegisterProcessRequest {
             app: "legacy_error_test".to_string(),
         }),
+        Duration::from_secs(2),
     )
     .unwrap_err();
 
     assert!(matches!(
         error,
-        ZippyError::Io { ref reason } if reason == "legacy failure"
+        ZippyError::Io { ref reason } if reason.contains("missing field")
     ));
     handle.join().unwrap();
 }
 
 #[test]
-fn legacy_client_ignores_structured_error_code() {
-    let response = ControlResponse::Error {
-        code: Some(ControlErrorCode::NotFound),
-        reason: "missing".to_string(),
-    };
-    let payload = serde_json::to_string(&response).unwrap();
-
-    let decoded = serde_json::from_str::<LegacyControlResponse>(&payload).unwrap();
-
-    assert!(matches!(
-        decoded,
-        LegacyControlResponse::Error { ref reason } if reason == "missing"
-    ));
+fn control_transport_preserves_unmapped_code_and_explicit_retry_policy() {
+    let error = control_response_result(ControlResponse::Error {
+        code: ControlErrorCode::PermissionDenied,
+        reason: "denied".to_owned(),
+        retryable: true,
+    })
+    .unwrap_err();
+    assert_eq!(error.code(), ControlErrorCode::PermissionDenied);
+    assert!(error.retryable());
+    for payload in [
+        r#"{"Error":{"reason":"missing","code":"NOT_FOUND"}}"#,
+        r#"{"Error":{"reason":"missing","code":null,"retryable":false}}"#,
+    ] {
+        assert!(serde_json::from_str::<ControlResponse>(payload).is_err());
+    }
 }

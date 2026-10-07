@@ -201,18 +201,6 @@ impl<'a> ReactiveFactorContext<'a> {
         self.column(index)
     }
 
-    /// Materialize this context as a RecordBatch for compatibility fallback.
-    pub fn record_batch(&self) -> Result<RecordBatch> {
-        RecordBatch::try_new(Arc::clone(&self.schema), self.columns.to_vec()).map_err(|error| {
-            ZippyError::Io {
-                reason: format!(
-                    "failed to build reactive context fallback batch error=[{}]",
-                    error
-                ),
-            }
-        })
-    }
-
     fn state_columns_by_indices(
         &self,
         id_index: usize,
@@ -307,6 +295,12 @@ pub fn classify_reactive_state_input(
             Ok(Some(value))
         }
         _ if policy == ReactiveInvalidValuePolicy::Skip => Ok(None),
+        Some(value) if !value.is_finite() => Err(ZippyError::SchemaMismatch {
+            reason: format!(
+                "non-finite reactive state input field=[{}] row=[{}] value=[{}]",
+                field, row, value
+            ),
+        }),
         Some(value) => Err(ZippyError::SchemaMismatch {
             reason: format!(
                 "invalid reactive state input field=[{}] row=[{}] value=[{}]",
@@ -327,14 +321,13 @@ pub trait ReactiveFactor: Send {
     /// Return the output field definition for this factor.
     fn output_field(&self) -> Field;
 
-    /// Evaluate the factor for each row in the batch.
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef>;
-
-    /// Evaluate the factor against a lightweight column context.
-    fn evaluate_with_context(&mut self, context: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
-        let batch = context.record_batch()?;
-        self.evaluate(&batch)
+    /// Evaluate one batch through the same context kernel used by live engines.
+    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
+        self.evaluate_with_context(&ReactiveFactorContext::from_batch(batch))
     }
+
+    /// Evaluate the factor against its canonical column context.
+    fn evaluate_with_context(&mut self, context: &ReactiveFactorContext<'_>) -> Result<ArrayRef>;
 
     /// Start recording dirty-key undo entries for this factor.
     fn begin_transaction(&mut self) {}
@@ -951,11 +944,6 @@ impl ReactiveFactor for TsEmaFactor {
         self.output_field.clone()
     }
 
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let (ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
-        self.evaluate_arrays(ids, values)
-    }
-
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
         let (ids, values) =
             ctx.resolve_state_columns(&mut self.column_cache, &self.id_field, &self.value_field)?;
@@ -977,16 +965,6 @@ impl ReactiveFactor for TsEmaFactor {
 }
 
 impl TsEmaFactor {
-    fn evaluate_arrays(&mut self, ids: &StringArray, values: &Float64Array) -> Result<ArrayRef> {
-        let value_field = self.value_field.clone();
-        self.evaluate_arrays_with_policy(
-            ids,
-            values,
-            ReactiveInvalidValuePolicy::Reject,
-            &value_field,
-        )
-    }
-
     fn evaluate_arrays_with_policy(
         &mut self,
         ids: &StringArray,
@@ -1086,11 +1064,6 @@ impl ReactiveFactor for WindowHistoryFactor {
         self.output_field.clone()
     }
 
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let (ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
-        self.evaluate_arrays(ids, values)
-    }
-
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
         let (ids, values) =
             ctx.resolve_state_columns(&mut self.column_cache, &self.id_field, &self.value_field)?;
@@ -1112,16 +1085,6 @@ impl ReactiveFactor for WindowHistoryFactor {
 }
 
 impl WindowHistoryFactor {
-    fn evaluate_arrays(&mut self, ids: &StringArray, values: &Float64Array) -> Result<ArrayRef> {
-        let value_field = self.value_field.clone();
-        self.evaluate_arrays_with_policy(
-            ids,
-            values,
-            ReactiveInvalidValuePolicy::Reject,
-            &value_field,
-        )
-    }
-
     fn evaluate_arrays_with_policy(
         &mut self,
         ids: &StringArray,
@@ -1165,11 +1128,6 @@ struct UnaryFloatFactor {
 impl ReactiveFactor for UnaryFloatFactor {
     fn output_field(&self) -> Field {
         self.output_field.clone()
-    }
-
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let (_ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
-        self.evaluate_values(values)
     }
 
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
@@ -1247,11 +1205,6 @@ struct CastFactor {
 impl ReactiveFactor for CastFactor {
     fn output_field(&self) -> Field {
         self.output_field.clone()
-    }
-
-    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let (_ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
-        self.evaluate_values(values)
     }
 
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
@@ -1354,44 +1307,6 @@ fn extract_context_state_columns<'a>(
         })?;
 
     validate_id_array(id_array, id_field)?;
-    Ok((id_array, value_array))
-}
-
-fn extract_columns<'a>(
-    batch: &'a RecordBatch,
-    id_field: &str,
-    value_field: &str,
-) -> Result<(&'a StringArray, &'a Float64Array)> {
-    let id_index = batch
-        .schema()
-        .index_of(id_field)
-        .map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing utf8 id field field=[{}]", id_field),
-        })?;
-    let value_index =
-        batch
-            .schema()
-            .index_of(value_field)
-            .map_err(|_| ZippyError::SchemaMismatch {
-                reason: format!("missing float64 value field field=[{}]", value_field),
-            })?;
-
-    let id_array = batch
-        .column(id_index)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
-            reason: format!("id field must be utf8 field=[{}]", id_field),
-        })?;
-    let value_array = batch
-        .column(value_index)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
-            reason: format!("value field must be float64 field=[{}]", value_field),
-        })?;
-
-    validate_id_value_arrays(id_array, value_array, id_field, value_field)?;
     Ok((id_array, value_array))
 }
 

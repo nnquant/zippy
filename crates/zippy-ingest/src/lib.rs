@@ -10,37 +10,31 @@
 mod actor;
 mod checkpoint;
 mod materializer;
-mod memory;
 mod native;
 mod registry;
 mod wal;
 
 pub use actor::{
-    TableActorAdmissionControl, TableActorFailureMonitor, TableActorHandle,
+    TableActorAdmissionControl, TableActorChanges, TableActorFailureMonitor, TableActorHandle,
     TableActorLiveSegmentPublication, TableActorLiveSegmentRole, TableActorLiveSegmentSnapshot,
     TableActorLiveSegmentsPublication, TableActorLiveSegmentsPublishRequest,
-    TableActorPersistRequest, TableActorRegistry, TableActorRegistryConfig,
-    TableActorRegistryHandle, TableActorSnapshot, TableActorSnapshotRequest,
+    TableActorPersistRequest, TableActorRegistrar, TableActorRegistry, TableActorRegistryConfig,
+    TableActorRegistryHandle, TableActorRetirement, TableActorSnapshot, TableActorSnapshotRequest,
     TableActorWriterEpochUpdateRequest, TablePersistenceStatus,
 };
 pub use materializer::{
-    NativeAppendMaterializerConfig, NativeAppendMaterializerSink,
-    DEFAULT_NATIVE_APPEND_MAX_LIVE_SEGMENTS, DEFAULT_NATIVE_APPEND_ROW_CAPACITY,
-    MAX_NATIVE_APPEND_LIVE_SEGMENTS,
-};
-pub use memory::{
-    MemoryIngestCatalog, MemoryIngestConfig, MemoryIngestHandle, MemoryIngestRegistration,
-    MemoryIngestRuntime, MemoryIngestShutdownOutcome, MemoryIngestStatus,
-    DEFAULT_MEMORY_INGEST_MAX_ACTIVE_TABLES, DEFAULT_MEMORY_INGEST_OPERATION_TIMEOUT,
-    MAX_MEMORY_INGEST_ACTIVE_TABLES,
+    NativeTableMaterializerConfig, NativeTableMaterializerSink,
+    DEFAULT_NATIVE_TABLE_MAX_LIVE_SEGMENTS, DEFAULT_NATIVE_TABLE_ROW_CAPACITY,
+    MAX_NATIVE_TABLE_LIVE_SEGMENTS,
 };
 pub use native::{
     NativeIngestApplyContext, NativeIngestConfig, NativeIngestHandle, NativeIngestRuntime,
     NativeIngestShutdownOutcome, NativeIngestSink, NativeIngestSinkError, NativeIngestStatus,
-    NativeIngestTableBootstrap, DEFAULT_NATIVE_INGEST_MAX_ACTIVE_OPERATIONS,
-    DEFAULT_NATIVE_INGEST_MAX_PENDING_DURABLE_ACKS, DEFAULT_NATIVE_INGEST_MAX_RECEIPTS_PER_EPOCH,
-    MAX_NATIVE_INGEST_ACTIVE_OPERATIONS, MAX_NATIVE_INGEST_PENDING_DURABLE_ACKS,
-    MAX_NATIVE_INGEST_RECEIPTS_PER_EPOCH,
+    NativeIngestTableBootstrap, NativePersistedState, NativeTableCheckpointGuard,
+    NativeTableRegistration, NativeTableTransitionGuard,
+    DEFAULT_NATIVE_INGEST_MAX_ACTIVE_OPERATIONS, DEFAULT_NATIVE_INGEST_MAX_PENDING_DURABLE_ACKS,
+    DEFAULT_NATIVE_INGEST_MAX_RECEIPTS_PER_EPOCH, MAX_NATIVE_INGEST_ACTIVE_OPERATIONS,
+    MAX_NATIVE_INGEST_PENDING_DURABLE_ACKS, MAX_NATIVE_INGEST_RECEIPTS_PER_EPOCH,
 };
 pub use registry::{TableRuntime, TableRuntimeBootstrap, TableRuntimeRegistry};
 pub use wal::{

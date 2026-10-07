@@ -452,9 +452,6 @@ impl WriteReceipt {
                 OffsetWatermark::Known(previous) => previous
                     .checked_next()
                     .ok_or(InvalidWriteReceipt::OffsetSpaceExhausted)?,
-                OffsetWatermark::LegacyUnknown => {
-                    return Err(InvalidWriteReceipt::LegacyUnknownWriteBoundary);
-                }
             };
             if range.first() != expected_first {
                 return Err(InvalidWriteReceipt::NonContiguousOffsets {
@@ -466,7 +463,9 @@ impl WriteReceipt {
                 return Err(InvalidWriteReceipt::ResultWatermarkMismatch);
             }
         }
-        if durability_reached == Durability::Persisted && persisted_snapshot_version.is_none() {
+        if durability_reached == Durability::Persisted
+            && persisted_snapshot_version.is_none_or(|version| version == 0)
+        {
             return Err(InvalidWriteReceipt::PersistedWithoutSnapshot);
         }
         if durability_reached != Durability::Persisted && persisted_snapshot_version.is_some() {
@@ -585,9 +584,6 @@ pub enum InvalidWriteReceipt {
         /// The number of positions in the offset range.
         offsets: u128,
     },
-    /// New native writes cannot be appended after an unresolved legacy boundary.
-    #[error("write receipt cannot prove continuity after a legacy-unknown watermark")]
-    LegacyUnknownWriteBoundary,
     /// The previous watermark exhausted the fixed-width logical offset space.
     #[error("write receipt cannot allocate an offset after u64::MAX")]
     OffsetSpaceExhausted,
@@ -605,7 +601,7 @@ pub enum InvalidWriteReceipt {
     #[error("write receipt result watermark does not equal the assigned range end")]
     ResultWatermarkMismatch,
     /// Persisted durability always names its covering manifest version.
-    #[error("persisted write receipt must contain a snapshot version")]
+    #[error("persisted write receipt must contain a positive snapshot version")]
     PersistedWithoutSnapshot,
     /// Weaker durability must not imply that a manifest is already committed.
     #[error("snapshot version requires persisted durability")]
@@ -750,6 +746,23 @@ mod tests {
             )
         );
         assert!(serde_json::from_str::<MutationFingerprintDigest>(r#""xyz""#).is_err());
+    }
+
+    #[test]
+    fn persisted_receipt_requires_a_positive_manifest_version() {
+        for version in [None, Some(0), Some(1)] {
+            let receipt = WriteReceipt::new(
+                request_id(1),
+                0,
+                0,
+                None,
+                OffsetWatermark::Empty,
+                OffsetWatermark::Empty,
+                Durability::Persisted,
+                version,
+            );
+            assert_eq!(receipt.is_ok(), version == Some(1));
+        }
     }
 
     #[test]

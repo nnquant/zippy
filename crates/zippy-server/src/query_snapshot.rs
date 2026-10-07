@@ -1,7 +1,7 @@
 //! Lifecycle-bound native query snapshots over table actors and the SQLite Catalog.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -9,8 +9,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
-#[cfg(test)]
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[cfg(test)]
 use zippy_catalog::PinnedTableManifest;
 use zippy_catalog::{
@@ -149,10 +148,12 @@ impl ProjectedSnapshotManifest {
         self.catalog_revision
     }
 
+    #[cfg(test)]
     pub(crate) fn tables(&self) -> &[PersistedTableDescription] {
         self.description.tables()
     }
 
+    #[cfg(test)]
     pub(crate) fn table(&self, table_index: usize) -> Option<&PersistedTableDescription> {
         self.description.table(table_index)
     }
@@ -303,6 +304,7 @@ pub(crate) struct NativeQuerySnapshotCoordinator {
 }
 
 struct NativeQuerySnapshotCoordinatorInner {
+    event_window_admission: Arc<Semaphore>,
     catalog: SqliteCatalogReadHandle,
     table_actors: TableActorRegistryHandle,
     nonce: u64,
@@ -328,12 +330,40 @@ enum TestPinStage {
 }
 
 impl NativeQuerySnapshotCoordinator {
+    /// Serializes transient Catalog construction for event windows under the shared budget.
+    /// Hold through log-plan lease compaction; the native active-query limit bounds waiters.
+    pub(crate) async fn admit_event_window(
+        &self,
+        planning: &QueryPlanningToken,
+    ) -> Result<OwnedSemaphorePermit> {
+        self.ensure_planning_active(planning)?;
+        let mut cancellation = planning.cancellation();
+        tokio::select! {
+            biased;
+            terminal = cancellation.wait_terminal() => Err(terminal?.error.unwrap_or_else(||
+                ServerError::new(ErrorCode::Cancelled, "event window admission cancelled"))),
+            permit = Arc::clone(&self.inner.event_window_admission).acquire_owned() => {
+                permit.map_err(|_| ServerError::new(ErrorCode::Unavailable,
+                    "event window admission closed"))
+            }
+        }
+    }
+
+    /// Registers a coalesced wakeup before the caller pins its next event window.
+    pub(crate) fn table_changes(
+        &self,
+        table_id: TableId,
+    ) -> Result<zippy_ingest::TableActorChanges> {
+        Ok(self.inner.table_actors.table(table_id)?.changes())
+    }
+
     pub(crate) fn new(
         catalog: SqliteCatalogReadHandle,
         table_actors: TableActorRegistryHandle,
     ) -> Self {
         Self {
             inner: Arc::new(NativeQuerySnapshotCoordinatorInner {
+                event_window_admission: Arc::new(Semaphore::new(1)),
                 catalog,
                 table_actors,
                 nonce: next_coordinator_nonce(),
@@ -881,44 +911,16 @@ impl NativeQuerySnapshotCoordinator {
         let resolved = canonicalize_tables(resolved)?;
         let mut pending = Vec::with_capacity(resolved.len());
         for table in resolved.values() {
-            if crate::native_storage::is_legacy_catalog_shadow_table(table)? {
-                pending.push(PendingTableBoundary::PersistedOnly {
-                    table_id: table.table_id,
-                    schema_version: table.current_schema_version,
-                    persisted_snapshot_version: table.current_snapshot_version,
-                    writer_epoch: table.writer_epoch,
-                });
-            } else {
-                pending.push(PendingTableBoundary::Actor(
-                    self.inner
-                        .table_actors
-                        .table(table.table_id)?
-                        .try_snapshot()?,
-                ));
-            }
+            pending.push(
+                self.inner
+                    .table_actors
+                    .table(table.table_id)?
+                    .try_snapshot()?,
+            );
         }
-
         let mut boundaries = Vec::with_capacity(pending.len());
-        for pending in pending {
-            boundaries.push(match pending {
-                PendingTableBoundary::Actor(request) => {
-                    TableBoundary::from_actor(request.wait().await?)
-                }
-                PendingTableBoundary::PersistedOnly {
-                    table_id,
-                    schema_version,
-                    persisted_snapshot_version,
-                    writer_epoch,
-                } => TableBoundary {
-                    table_id,
-                    schema_version,
-                    persisted_snapshot_version,
-                    writer_epoch,
-                    actor_committed_log_offset: None,
-                    live_segments: Arc::from([]),
-                    live_high_watermark: None,
-                },
-            });
+        for request in pending {
+            boundaries.push(TableBoundary::from_actor(request.wait().await?));
         }
         validate_table_boundaries(query_id, &resolved, &boundaries)?;
 
@@ -1016,9 +1018,8 @@ impl NativeQuerySnapshotCoordinator {
                 .with_table_id(boundary.table_id));
             }
             if manifest.table_descriptor().writer_epoch != boundary.writer_epoch
-                || boundary.actor_committed_log_offset.is_some_and(|offset| {
-                    manifest.snapshot_metadata().committed_log_offset != offset
-                })
+                || manifest.snapshot_metadata().committed_log_offset
+                    != boundary.actor_committed_log_offset
             {
                 return Err(ServerError::new(
                     ErrorCode::Conflict,
@@ -1030,9 +1031,7 @@ impl NativeQuerySnapshotCoordinator {
             }
             let (active_segment, retained_sealed_segments) =
                 project_live_read_descriptors(query_id, boundary)?;
-            let max_log_offset = boundary
-                .live_high_watermark
-                .unwrap_or(manifest.snapshot_metadata().committed_log_offset);
+            let max_log_offset = boundary.live_high_watermark;
             descriptors.push(TableReadSnapshotDescriptor {
                 table_id: boundary.table_id,
                 schema_version: boundary.schema_version,
@@ -1078,21 +1077,11 @@ fn project_live_read_descriptors(
     Option<SegmentReadSnapshotDescriptor>,
     Vec<SegmentReadSnapshotDescriptor>,
 )> {
-    if boundary.live_high_watermark.is_none() {
-        if !boundary.live_segments.is_empty() || boundary.actor_committed_log_offset.is_some() {
-            return Err(corruption(
-                query_id,
-                "persisted-only boundary unexpectedly owns actor live state",
-            )
-            .with_table_id(boundary.table_id));
-        }
-        return Ok((None, Vec::new()));
-    }
     let mut active_segment = None;
     let mut retained = Vec::with_capacity(boundary.live_segments.len());
     for (index, segment) in boundary.live_segments.iter().enumerate() {
         if segment.schema_version() != boundary.schema_version
-            || segment.identity().writer_epoch != boundary.writer_epoch
+            || segment.identity().writer_epoch > boundary.writer_epoch
             || segment.offsets().len() != segment.span().row_count() as u128
         {
             return Err(corruption(
@@ -1116,6 +1105,12 @@ fn project_live_read_descriptors(
             schema_version: segment.schema_version(),
             committed_rows,
             committed_log_offset: OffsetWatermark::Known(segment.offsets().last()),
+            max_utf8_value_bytes: Some(segment.span().max_utf8_value_bytes().map_err(|error| {
+                corruption(
+                    query_id,
+                    format!("cannot bound live UTF-8 values error=[{error}]"),
+                )
+            })?),
         };
         match segment.role() {
             TableActorLiveSegmentRole::RetainedSealed if active_segment.is_none() => {
@@ -1139,12 +1134,8 @@ fn project_live_read_descriptors(
         .live_segments
         .last()
         .map(|segment| OffsetWatermark::Known(segment.offsets().last()))
-        .unwrap_or_else(|| {
-            boundary
-                .actor_committed_log_offset
-                .expect("actor live boundary always has persisted watermark")
-        });
-    if boundary.live_high_watermark != Some(expected_high_watermark) {
+        .unwrap_or(boundary.actor_committed_log_offset);
+    if boundary.live_high_watermark != expected_high_watermark {
         return Err(corruption(
             query_id,
             "actor live high watermark differs from its segment boundary",
@@ -1154,25 +1145,15 @@ fn project_live_read_descriptors(
     Ok((active_segment, retained))
 }
 
-enum PendingTableBoundary {
-    Actor(zippy_ingest::TableActorSnapshotRequest),
-    PersistedOnly {
-        table_id: TableId,
-        schema_version: u64,
-        persisted_snapshot_version: u64,
-        writer_epoch: u64,
-    },
-}
-
 #[derive(Clone)]
 struct TableBoundary {
     table_id: TableId,
     schema_version: u64,
     persisted_snapshot_version: u64,
     writer_epoch: u64,
-    actor_committed_log_offset: Option<OffsetWatermark>,
+    actor_committed_log_offset: OffsetWatermark,
     live_segments: Arc<[TableActorLiveSegmentSnapshot]>,
-    live_high_watermark: Option<OffsetWatermark>,
+    live_high_watermark: OffsetWatermark,
 }
 
 impl TableBoundary {
@@ -1182,9 +1163,9 @@ impl TableBoundary {
             schema_version: snapshot.schema_version,
             persisted_snapshot_version: snapshot.persisted_snapshot_version,
             writer_epoch: snapshot.writer_epoch,
-            actor_committed_log_offset: Some(snapshot.committed_log_offset),
+            actor_committed_log_offset: snapshot.committed_log_offset,
             live_segments: snapshot.live_segments,
-            live_high_watermark: Some(snapshot.max_log_offset),
+            live_high_watermark: snapshot.max_log_offset,
         }
     }
 }
@@ -1198,7 +1179,394 @@ pub(crate) struct NativeQueryReadSnapshot {
     live_segments: Box<[Arc<[TableActorLiveSegmentSnapshot]>]>,
 }
 
+/// Decodes one pinned table schema while holding only a transient decode reservation.
+fn decode_pinned_schema(
+    planning: &QueryPlanningToken,
+    table: &zippy_catalog::PinnedTableManifest,
+) -> Result<arrow::datatypes::SchemaRef> {
+    let _decode = planning.reserve_snapshot_memory(
+        NonZeroU64::new(PROJECTED_SCHEMA_DECODE_TRANSIENT_BYTES)
+            .expect("nonzero schema decode budget"),
+    )?;
+    Ok(decode_persisted_table_schema(table.table_descriptor(), table.schema())?.into_schema())
+}
+
+/// Schema and exact cursor retain their own accounting lease, including after result EOF.
+pub(crate) struct NativeKeyValueSnapshotOutput {
+    pub(crate) schema: arrow::datatypes::SchemaRef,
+    _memory: CatalogSnapshotMemoryLease,
+}
+
 impl NativeQueryReadSnapshot {
+    /// Forks a frozen subset for an independently admitted query without observing live actors.
+    pub(crate) fn fork_for_query(
+        &self,
+        planning: &QueryPlanningToken,
+        requested: &[TableId],
+        memory: CatalogSnapshotMemoryLease,
+    ) -> Result<Self> {
+        let query_id = planning.instance_id().query_id();
+        if planning.is_cancelled() {
+            return Err(ServerError::new(
+                ErrorCode::Cancelled,
+                "snapshot fork query was cancelled",
+            )
+            .with_query_id(query_id));
+        }
+        if requested.is_empty() || requested.len() > 32 {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "fixed snapshot query requires a bounded nonempty table set",
+            )
+            .with_query_id(query_id));
+        }
+        let mut indices = BTreeSet::new();
+        for id in requested {
+            let index = self
+                .descriptor
+                .tables
+                .binary_search_by_key(id, |table| table.table_id)
+                .map_err(|_| {
+                    ServerError::new(
+                        ErrorCode::InvalidArgument,
+                        "query table is outside the fixed snapshot",
+                    )
+                    .with_query_id(query_id)
+                    .with_table_id(*id)
+                })?;
+            indices.insert(index);
+        }
+        let indices = indices.into_iter().collect::<Vec<_>>();
+        if memory.reserved_bytes() < self.retained_charge()?
+            || memory.query_instance_id() != Some(planning.instance_id())
+        {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "snapshot fork memory does not cover its query metadata",
+            )
+            .with_query_id(query_id));
+        }
+        let pinned = self.pinned.fork_for_query(&indices, memory)?;
+        Ok(Self {
+            descriptor: QueryReadSnapshotDescriptor {
+                query_id,
+                catalog_revision: self.descriptor.catalog_revision,
+                tables: indices
+                    .iter()
+                    .map(|index| self.descriptor.tables[*index].clone())
+                    .collect(),
+            },
+            pinned,
+            coordinator_nonce: self.coordinator_nonce,
+            requested_table_ids: requested.to_vec(),
+            live_segments: indices
+                .iter()
+                .map(|index| Arc::clone(&self.live_segments[*index]))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn retained_charge(&self) -> Result<NonZeroU64> {
+        let live_count = self
+            .live_segments
+            .iter()
+            .try_fold(0_u64, |count, spans| count.checked_add(spans.len() as u64))
+            .ok_or_else(|| {
+                corruption(
+                    self.descriptor.query_id,
+                    "live snapshot sidecar count overflowed",
+                )
+            })?;
+        self.pinned
+            .retained_memory_bytes()
+            .get()
+            .checked_add(live_count.checked_mul(512).ok_or_else(|| {
+                corruption(self.descriptor.query_id, "live snapshot charge overflowed")
+            })?)
+            .and_then(|bytes| bytes.checked_add(1024 * 1024))
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                corruption(
+                    self.descriptor.query_id,
+                    "retained snapshot charge overflowed",
+                )
+            })
+    }
+
+    /// Releases only transient decode headroom; immutable metadata and live sidecars stay charged.
+    pub(crate) fn compact_memory(&mut self, planning: &QueryPlanningToken) -> Result<()> {
+        let retained = self.retained_charge()?;
+        if retained < self.pinned.memory_lease_descriptor().reserved_bytes() {
+            let lease = planning.reserve_snapshot_memory(retained)?;
+            self.pinned.rebind_memory_lease(lease)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn requested_table_ids(&self) -> &[TableId] {
+        &self.requested_table_ids
+    }
+
+    /// Builds an offset-ordered, path-free event plan under a dedicated metadata lease.
+    pub(crate) fn log_plan(
+        &mut self,
+        planning: &QueryPlanningToken,
+        start: Option<LogOffset>,
+    ) -> Result<Arc<crate::native_log::NativeLogPlan>> {
+        use crate::native_log::{log_error, NativeLogLocation, NativeLogPlan, NativeLogSource};
+        use zippy_types::table::{DataFileProvenance, TableKind};
+        // Catalog owns its post-decode retained estimate. Replace the planning-peak lease
+        // before decoding a log schema or retaining this window beside other subscribers.
+        self.compact_memory(planning)?;
+        if self.descriptor.tables.len() != 1 || self.requested_table_ids.len() != 1 {
+            return Err(log_error("event window must bind exactly one native table"));
+        }
+        let table = self.pinned.tables().next().expect("one pinned table");
+        let boundary = &self.descriptor.tables[0];
+        let kind = table.table_descriptor().kind();
+        let watermark = boundary.max_log_offset;
+        let mut source_count = self.live_segments[0].len();
+        for file in table.files() {
+            let DataFileProvenance::Native(provenance) = file.provenance();
+            source_count = source_count
+                .checked_add(if kind == TableKind::Frame {
+                    provenance.source_lineage().as_slice().len()
+                } else {
+                    1
+                })
+                .ok_or_else(|| log_error("event source count overflowed"))?;
+        }
+        // Account both the full source vector and schema before constructing either. Sort is
+        // in-place; no physical file capabilities are copied into this projection.
+        let bytes = (source_count as u64)
+            .checked_mul(512)
+            .and_then(|bytes| {
+                bytes.checked_add(table.retained_schema_charge_bytes().get().checked_mul(3)?)
+            })
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| log_error("event plan charge overflowed"))?;
+        let memory = planning.reserve_snapshot_memory(bytes)?;
+        let schema = decode_pinned_schema(planning, &table)?;
+        let mut sources = Vec::with_capacity(source_count);
+        for (file_index, file) in table.files().enumerate() {
+            let DataFileProvenance::Native(provenance) = file.provenance();
+            let physical = provenance.offsets();
+            if physical.len() != u128::from(file.row_count().get())
+                || file.schema_version() > boundary.schema_version
+            {
+                return Err(log_error(
+                    "event file rows or schema do not match its native coverage",
+                ));
+            }
+            let description = project_pinned_file(
+                self.descriptor.query_id,
+                0,
+                file_index,
+                boundary.table_id,
+                NonZeroU64::new(boundary.persisted_snapshot_version).unwrap(),
+                NonZeroU64::new(boundary.schema_version).unwrap(),
+                &file,
+            )?;
+            let mut push = |selected, frame, frame_source| {
+                sources.push(NativeLogSource {
+                    location: NativeLogLocation::File(description),
+                    physical,
+                    selected,
+                    frame,
+                    frame_source,
+                })
+            };
+            if kind == TableKind::Frame {
+                for lineage in provenance.source_lineage().as_slice() {
+                    push(lineage.offsets, Some(lineage.offsets), Some(lineage.source));
+                }
+            } else {
+                push(physical, None, None);
+            }
+        }
+        for (index, segment) in self.live_segments[0].iter().enumerate() {
+            let physical = segment.offsets();
+            sources.push(NativeLogSource {
+                location: NativeLogLocation::Live {
+                    index,
+                    max_utf8_value_bytes: segment
+                        .span()
+                        .max_utf8_value_bytes()
+                        .map_err(log_error)?,
+                },
+                physical,
+                selected: physical,
+                frame: (kind == TableKind::Frame).then_some(physical),
+                frame_source: (kind == TableKind::Frame).then_some(segment.identity()),
+            });
+        }
+        crate::native_log::select_sources(&mut sources, watermark, start)?;
+        Ok(Arc::new(NativeLogPlan {
+            schema,
+            kind,
+            watermark,
+            sources,
+            _memory: memory,
+        }))
+    }
+
+    /// Borrows a live source only inside an already-admitted execution task.
+    pub(crate) fn log_span(&self, index: usize, offsets: OffsetRange) -> Result<&RowSpanView> {
+        let segment = self
+            .live_segments
+            .first()
+            .and_then(|segments| segments.get(index))
+            .ok_or_else(|| {
+                corruption(
+                    self.descriptor.query_id,
+                    "event source index is out of bounds",
+                )
+            })?;
+        if segment.offsets() != offsets || self.descriptor.tables.len() != 1 {
+            return Err(corruption(
+                self.descriptor.query_id,
+                "event source differs from the pinned window",
+            ));
+        }
+        Ok(segment.span())
+    }
+    /// Derives complete-state metadata from the same immutable boundary used by the query.
+    pub(crate) fn key_value_snapshot_output(
+        &self,
+        planning: &QueryPlanningToken,
+    ) -> Result<Arc<NativeKeyValueSnapshotOutput>> {
+        use arrow::array::{Array, Int64Array};
+        use zippy_types::key_value::{BATCH_END, SEQUENCE, STATE_VERSION_METADATA, VERSION};
+        use zippy_types::table::{MetadataScalar, TableKind};
+        let query_id = self.descriptor.query_id;
+        if self.descriptor.tables.len() != 1 || self.requested_table_ids.len() != 1 {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "key-value snapshot requires exactly one table",
+            )
+            .with_query_id(query_id));
+        }
+        let table = self.pinned.tables().next().expect("one pinned table");
+        if table.table_descriptor().kind() != TableKind::KeyValue {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "state snapshot requires a key-value table",
+            )
+            .with_query_id(query_id));
+        }
+        // The output shares fields with the logical schema, but decoding and metadata construction
+        // are separately reserved before allocation. Only the schema/metadata lease survives
+        // decoding; its owners include every emitted result batch, even after query EOF.
+        let charge = table
+            .retained_schema_charge_bytes()
+            .get()
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| corruption(query_id, "state snapshot schema charge overflowed"))?;
+        let memory = planning.reserve_snapshot_memory(charge)?;
+        let physical = decode_pinned_schema(planning, &table)?;
+        let logical = zippy_types::key_value::decode_log_schema(&physical)?
+            .ok_or_else(|| corruption(query_id, "state snapshot requires a native event schema"))?;
+        let boundary = &self.descriptor.tables[0];
+        let sequence = match boundary.max_log_offset {
+            OffsetWatermark::Empty => 0,
+            OffsetWatermark::Known(offset) => offset
+                .get()
+                .checked_add(1)
+                .filter(|value| *value <= i64::MAX as u64)
+                .ok_or_else(|| corruption(query_id, "state cursor exceeds the protocol domain"))?,
+        };
+        let mut version = match table
+            .snapshot_metadata()
+            .summary
+            .get(STATE_VERSION_METADATA)
+        {
+            Some(MetadataScalar::UInt64(version)) => *version,
+            None if table.snapshot_metadata().committed_log_offset == OffsetWatermark::Empty => 0,
+            _ => {
+                return Err(corruption(
+                    query_id,
+                    "persisted state version is missing or invalid",
+                ))
+            }
+        };
+        if boundary.max_log_offset != table.snapshot_metadata().committed_log_offset {
+            let last = self.live_segments[0]
+                .iter()
+                .max_by_key(|segment| segment.offsets().last())
+                .ok_or_else(|| corruption(query_id, "state cursor has no covering live span"))?;
+            if Some(last.offsets().last()) != boundary.max_log_offset.known() {
+                return Err(corruption(query_id, "state cursor and live tail differ"));
+            }
+            let count = last.span().row_count();
+            let tail = last
+                .span()
+                .slice_rows(count - 1, count)
+                .map_err(|error| corruption(query_id, error))?
+                .as_record_batch_with_projection(&[SEQUENCE, VERSION, BATCH_END])
+                .map_err(|error| corruption(query_id, error.to_string()))?;
+            let read = |column: usize| -> Result<u64> {
+                let values = tail
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| corruption(query_id, "state tail control type is invalid"))?;
+                if values.is_null(0) || values.value(0) <= 0 {
+                    return Err(corruption(query_id, "state tail control value is invalid"));
+                }
+                Ok(values.value(0) as u64)
+            };
+            if read(0)? != sequence || read(2)? != sequence {
+                return Err(corruption(
+                    query_id,
+                    "state snapshot ends inside an atomic mutation",
+                ));
+            }
+            let live_version = read(1)?;
+            if live_version <= version {
+                return Err(corruption(
+                    query_id,
+                    "live state version does not advance the manifest",
+                ));
+            }
+            version = live_version;
+        }
+        if version > sequence || version > i64::MAX as u64 || (sequence == 0) != (version == 0) {
+            return Err(corruption(
+                query_id,
+                "state snapshot version and cursor disagree",
+            ));
+        }
+        let mut metadata = logical.logical.metadata().clone();
+        for (name, value) in [
+            ("zippy_kv_protocol", "2".to_owned()),
+            ("zippy_kv_seq", sequence.to_string()),
+            ("zippy_kv_version", version.to_string()),
+            (
+                "zippy_kv_stream_id",
+                format!("{:032x}", boundary.table_id.as_u128()),
+            ),
+            (
+                "zippy_kv_keys",
+                serde_json::to_string(&logical.keys)
+                    .map_err(|error| corruption(query_id, error.to_string()))?,
+            ),
+        ] {
+            metadata.insert(name.to_owned(), value);
+        }
+        let schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            logical.logical.fields().clone(),
+            metadata,
+        ));
+        Ok(Arc::new(NativeKeyValueSnapshotOutput {
+            schema,
+            _memory: memory,
+        }))
+    }
+
     /// Builds capability-free plan metadata without exposing physical files or server time.
     pub(crate) fn plan_draft(&self) -> QueryPlanDraft {
         QueryPlanDraft::new(
@@ -1583,7 +1951,7 @@ fn project_active_segment_description(
     schema_version: NonZeroU64,
 ) -> Result<ActiveSegmentDescription> {
     if segment.schema_version != audit.schema_version
-        || segment.identity.writer_epoch != audit.writer_epoch
+        || segment.identity.writer_epoch > audit.writer_epoch
         || segment.committed_rows == 0
     {
         return Err(corruption(
@@ -1621,6 +1989,11 @@ fn project_active_segment_description(
         offsets,
         NonZeroU64::new(segment.committed_rows).expect("zero live rows rejected above"),
     )
+    .map(|description| {
+        segment.max_utf8_value_bytes.map_or(description, |maximum| {
+            description.with_utf8_value_bound(maximum)
+        })
+    })
     .map_err(|error| {
         corruption(
             query_id,
@@ -1767,7 +2140,6 @@ mod tests {
     };
 
     use super::{NativeQuerySnapshotCoordinator, TestPinStage};
-    use crate::legacy_catalog_migration::LEGACY_STREAM_NAME_CONFIG_KEY;
     use crate::native_storage::{
         NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
     };
@@ -1779,7 +2151,7 @@ mod tests {
 
     const NAMESPACE: u128 = 1;
     const NATIVE_TABLE: u128 = 10;
-    const LEGACY_TABLE: u128 = 20;
+    const SECOND_TABLE: u128 = 20;
 
     fn namespace_id() -> NamespaceId {
         NamespaceId::from_u128(NAMESPACE).expect("nonzero namespace id")
@@ -1892,6 +2264,7 @@ mod tests {
             request_id(100),
             table_id(NATIVE_TABLE),
             1,
+            0,
             vec![candidate],
             OffsetWatermark::Known(offset),
         )
@@ -1947,26 +2320,21 @@ mod tests {
             ))
             .await
             .expect("create native table");
-        let mut legacy_config = BTreeMap::new();
-        legacy_config.insert(
-            LEGACY_STREAM_NAME_CONFIG_KEY.to_owned(),
-            "legacy_ticks".to_owned(),
-        );
         catalog
             .command(command(
                 3,
                 2,
                 CatalogCommandV1::CreateTable(CreateTableCommand {
-                    table_id: table_id(LEGACY_TABLE),
+                    table_id: table_id(SECOND_TABLE),
                     namespace_id: namespace_id(),
-                    name: CatalogName::new("legacy_ticks").expect("valid legacy table name"),
+                    name: CatalogName::new("second_ticks").expect("valid second table name"),
                     definition: TableDefinition::Append(AppendTableDefinition::default()),
                     schema_ipc: schema_ipc(),
-                    config: legacy_config,
+                    config: BTreeMap::new(),
                 }),
             ))
             .await
-            .expect("create legacy persisted-only table");
+            .expect("create second native table");
     }
 
     async fn start_runtime(
@@ -2001,7 +2369,7 @@ mod tests {
     fn mixed_refs() -> Vec<TableRef> {
         vec![
             TableRef::Id {
-                table_id: table_id(LEGACY_TABLE),
+                table_id: table_id(SECOND_TABLE),
             },
             TableRef::Id {
                 table_id: table_id(NATIVE_TABLE),
@@ -2047,9 +2415,166 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mixed_actor_and_persisted_only_snapshot_is_sorted_audited_and_lifecycle_bound() {
+    async fn event_snapshot_refresh_keeps_one_identity_and_rejects_active_or_foreign_owners() {
+        use zippy_types::query::QueryEngine;
+        use zippy_types::{ErrorCode, ResourceLimit};
+        let temp = tempfile::tempdir().unwrap();
+        let ownership =
+            Arc::new(OwnedDataDirectory::acquire_or_initialize(temp.path().join("db")).unwrap());
+        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+        seed_mixed_tables(&catalog).await;
+        catalog.close().unwrap();
+        let mut runtime =
+            NativeStorageRuntime::start(NativeStorageRuntimeConfig::new(&ownership)).unwrap();
+        let engine = runtime.query_engine();
+        let owner = engine.owner(session_id());
+        let resources = runtime.query_resource_coordinator();
+        let coordinator = runtime.query_snapshot_coordinator();
+        let table = TableRef::Id {
+            table_id: table_id(NATIVE_TABLE),
+        };
+        let mut window = engine
+            .prepare_log_window(
+                owner.as_ref(),
+                crate::NativeLogRequest {
+                    query_id: query_id(880),
+                    table: table.clone(),
+                    start: Some(LogOffset::new(0)),
+                    deadline_ns: None,
+                    memory_limit_bytes: ResourceLimit::ServerDefault,
+                    batch_rows: None,
+                },
+            )
+            .await
+            .unwrap();
+        let instance = window.instance_id();
+        let task = window.execution.admit_build_task(charge()).unwrap();
+        assert_eq!(
+            window
+                .execution
+                .snapshot_refresh_token()
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::Conflict
+        );
+        drop(task);
+        for _ in 0..16 {
+            let refresh = window.execution.snapshot_refresh_token().unwrap();
+            assert_eq!(
+                runtime
+                    .runtime_snapshot_pin_status()
+                    .unwrap()
+                    .active_query_pins,
+                0
+            );
+            let mut snapshot = coordinator
+                .pin_persisted(&refresh, std::slice::from_ref(&table))
+                .await
+                .unwrap();
+            let plan = snapshot
+                .log_plan(&refresh, Some(LogOffset::new(0)))
+                .unwrap();
+            window.info = window.execution.replace_native_snapshot(snapshot).unwrap();
+            window.plan = plan;
+            assert_eq!(resources.status().registered_queries, 1);
+            assert_eq!(resources.status().active_snapshot_owners, 1);
+            assert_eq!(window.instance_id(), instance);
+        }
+        let foreign = resources
+            .submit(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query_id(881),
+                    deadline_ns: None,
+                },
+                projection_budget(),
+            )
+            .unwrap();
+        let snapshot = coordinator
+            .pin_persisted(&foreign, std::slice::from_ref(&table))
+            .await
+            .unwrap();
+        assert_eq!(
+            window
+                .execution
+                .replace_native_snapshot(snapshot)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        drop(foreign);
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .unwrap()
+                .active_query_pins,
+            1
+        );
+        let rejected = engine
+            .prepare_log_window(
+                owner.as_ref(),
+                crate::NativeLogRequest {
+                    query_id: query_id(882),
+                    table: table.clone(),
+                    start: None,
+                    deadline_ns: None,
+                    memory_limit_bytes: ResourceLimit::ServerDefault,
+                    batch_rows: None,
+                },
+            )
+            .await
+            .unwrap();
+        let rejected_id = rejected.instance_id();
+        assert_eq!(
+            rejected
+                .follow(Some(LogOffset::new(1)))
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        let rejected_status = engine.status(owner.as_ref(), rejected_id).await.unwrap();
+        assert_eq!(
+            rejected_status.state,
+            zippy_types::query::QueryState::Failed
+        );
+        assert_eq!(rejected_status.metrics["query.active_memory_bytes"], 0);
+        let refresh = window.execution.snapshot_refresh_token().unwrap();
+        let snapshot = coordinator.pin_persisted(&refresh, &[table]).await.unwrap();
+        let admission = coordinator.admit_event_window(&refresh).await.unwrap();
+        let mut waiting = Box::pin(coordinator.admit_event_window(&refresh));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        engine.cancel(owner.as_ref(), instance).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .code(),
+            ErrorCode::Cancelled
+        );
+        drop(admission);
+        assert_eq!(
+            window
+                .execution
+                .replace_native_snapshot(snapshot)
+                .unwrap_err()
+                .code(),
+            ErrorCode::Cancelled
+        );
+        drop(refresh);
+        drop(window);
+        assert_eq!(resources.status().active_memory_bytes, 0);
+        assert_eq!(resources.status().active_snapshot_owners, 0);
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_actor_snapshot_is_sorted_audited_and_lifecycle_bound() {
         let (_temp, _ownership, mut runtime) = start_runtime(8).await;
-        assert_eq!(runtime.table_runtime_count(), 1);
+        assert_eq!(runtime.table_runtime_count(), 2);
         let snapshot_coordinator = runtime.query_snapshot_coordinator();
         let query = query_id(101);
         let resources = runtime.query_resource_coordinator();
@@ -2087,7 +2612,7 @@ mod tests {
         let draft = snapshot.plan_draft();
         assert_eq!(draft.snapshots().len(), 2);
         assert_eq!(draft.snapshots()[0].table_id, table_id(NATIVE_TABLE));
-        assert_eq!(draft.snapshots()[1].table_id, table_id(LEGACY_TABLE));
+        assert_eq!(draft.snapshots()[1].table_id, table_id(SECOND_TABLE));
 
         let status = runtime
             .runtime_snapshot_pin_status()
@@ -2254,9 +2779,9 @@ mod tests {
         assert_eq!(native.schema_version().get(), 1);
         assert_eq!(native.schema().as_ref(), arrow_schema().as_ref());
         assert_eq!(native.file_count(), 0);
-        let legacy = manifest.table(1).expect("legacy projected table");
+        let legacy = manifest.table(1).expect("second projected table");
         assert_eq!(legacy.table_index(), 1);
-        assert_eq!(legacy.table_id(), table_id(LEGACY_TABLE));
+        assert_eq!(legacy.table_id(), table_id(SECOND_TABLE));
         assert_eq!(legacy.snapshot_version().get(), 1);
         assert_eq!(legacy.schema_version().get(), 1);
         assert_eq!(legacy.schema().as_ref(), arrow_schema().as_ref());
@@ -3003,7 +3528,8 @@ mod tests {
             .expect("shutdown cancellation must wake stalled pin")
             .expect("stalled pin task must join")
             .expect_err("shutdown must cancel stalled pin");
-        assert_eq!(pin_error.code(), zippy_types::ErrorCode::Cancelled);
+        assert_eq!(pin_error.code(), zippy_types::ErrorCode::Unavailable);
+        assert!(pin_error.retryable());
         let (_runtime, outcome, remaining_query_pins) =
             tokio::time::timeout(Duration::from_secs(2), shutdown)
                 .await

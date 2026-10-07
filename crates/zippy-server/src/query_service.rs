@@ -155,6 +155,7 @@ impl QueryPlanDraft {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshots(&self) -> &[QueryTableVersion] {
         &self.snapshots
     }
@@ -225,9 +226,9 @@ pub(crate) struct QueryResultCharge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryRetainedKind {
     ProjectedSnapshotManifest,
+    #[cfg(test)]
     SchemaManifest,
     PhysicalPlan,
-    ParquetMetadata,
     OperatorArena,
 }
 
@@ -303,6 +304,7 @@ pub(crate) struct QueryRuntimeStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct QuerySessionResourceStatus {
     pub session_id: SessionId,
     pub active_logical_queries: usize,
@@ -335,6 +337,7 @@ pub(crate) struct QueryTerminalSignal {
     pub error: Option<ServerError>,
 }
 
+#[derive(Clone)]
 pub(crate) struct QueryCancellation {
     query_id: QueryId,
     cancelled: Arc<AtomicBool>,
@@ -374,11 +377,6 @@ pub(crate) struct QueryResourceCoordinator {
 }
 
 impl QueryResourceCoordinator {
-    #[cfg(test)]
-    pub(crate) fn new(config: QueryServiceResourceConfig) -> Result<Self> {
-        Self::with_registry_config(config, QueryServiceRegistryConfig::default())
-    }
-
     #[cfg(test)]
     pub(crate) fn with_registry_config(
         config: QueryServiceResourceConfig,
@@ -530,6 +528,7 @@ impl QueryResourceCoordinator {
             coordinator_nonce: self.inner.nonce,
             control,
             armed: true,
+            snapshot_phase: QueryState::Planning,
         })
     }
 
@@ -703,6 +702,33 @@ impl QueryResourceCoordinator {
         Ok(())
     }
 
+    /// Transport-only cancellation after the Flight authority authenticates the session.
+    /// Local callers must continue using the non-forgeable owner capability.
+    pub(crate) fn cancel_authenticated_session(
+        &self,
+        session_id: SessionId,
+        instance_id: QueryInstanceId,
+    ) -> Result<()> {
+        let control = self.inner.control_instance(instance_id)?;
+        if control.owner_session_id != session_id {
+            return Err(permission_denied(
+                "authenticated session does not own the query instance",
+                Some(instance_id.query_id()),
+            ));
+        }
+        self.inner.terminate_control(
+            &control,
+            QueryState::Cancelled,
+            ServerError::new(
+                ErrorCode::Cancelled,
+                "query cancelled by authenticated owner",
+            )
+            .with_query_id(instance_id.query_id()),
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn sweep_expired(&self, now_ns: u64) -> usize {
         self.inner.sweep_expired(now_ns)
     }
@@ -730,6 +756,7 @@ impl QueryResourceCoordinator {
         self.inner.query_status(&control)
     }
 
+    #[cfg(test)]
     pub(crate) fn session_status_owned(
         &self,
         owner: &dyn QueryOwnerCapability,
@@ -884,6 +911,7 @@ impl QueryAdminHandle {
         self.coordinator.inner.query_status(&control)
     }
 
+    #[cfg(test)]
     pub(crate) fn session_status(&self, session_id: SessionId) -> QuerySessionResourceStatus {
         self.coordinator.inner.session_status(session_id)
     }
@@ -1057,6 +1085,7 @@ impl SessionResourceUsage {
             && self.active_result_memory_bytes == 0
     }
 
+    #[cfg(test)]
     fn status(self, session_id: SessionId) -> QuerySessionResourceStatus {
         QuerySessionResourceStatus {
             session_id,
@@ -1119,6 +1148,7 @@ struct QueryRegistry {
 }
 
 impl QueryRegistry {
+    #[cfg(test)]
     fn get(&self, query_id: &QueryId) -> Option<&RegistryEntry> {
         self.by_id.get(query_id)
     }
@@ -1424,6 +1454,7 @@ impl CoordinatorState {
         }
     }
 
+    #[cfg(test)]
     fn session_status(&self, session_id: SessionId) -> QuerySessionResourceStatus {
         self.sessions
             .get(&session_id)
@@ -1808,6 +1839,7 @@ impl CoordinatorInner {
         self: &Arc<Self>,
         control: &Arc<QueryControl>,
         memory_bytes: NonZeroU64,
+        expected_state: QueryState,
     ) -> Result<CatalogSnapshotMemoryLease> {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
@@ -1817,11 +1849,12 @@ impl CoordinatorInner {
                     .with_query_id(control.query_id)
             }));
         }
-        if query.state != QueryState::Planning {
-            return Err(
-                ServerError::new(ErrorCode::Conflict, "query is not planning")
-                    .with_query_id(control.query_id),
-            );
+        if query.state != expected_state {
+            return Err(ServerError::new(
+                ErrorCode::Conflict,
+                "query snapshot admission phase changed",
+            )
+            .with_query_id(control.query_id));
         }
         if global.lifecycle != QueryServiceLifecycle::Accepting {
             return Err(unavailable(control.query_id));
@@ -2268,6 +2301,7 @@ impl CoordinatorInner {
         })
     }
 
+    #[cfg(test)]
     fn transfer_task_to_result(
         self: &Arc<Self>,
         control: &Arc<QueryControl>,
@@ -2936,9 +2970,10 @@ impl CoordinatorInner {
         for control in controls {
             let mut query = control.state.lock().unwrap();
             let error = ServerError::new(
-                ErrorCode::Cancelled,
-                "query cancelled during QueryService shutdown",
+                ErrorCode::Unavailable,
+                "query interrupted during QueryService shutdown",
             )
+            .with_retryable(true)
             .with_query_id(control.query_id);
             let signal = Self::terminate_locked(
                 &mut global,
@@ -2970,6 +3005,7 @@ impl CoordinatorInner {
         self.state.lock().unwrap().status()
     }
 
+    #[cfg(test)]
     fn session_status(&self, session_id: SessionId) -> QuerySessionResourceStatus {
         self.state.lock().unwrap().session_status(session_id)
     }
@@ -3225,6 +3261,7 @@ pub(crate) struct QueryPlanningToken {
     coordinator_nonce: u64,
     control: Arc<QueryControl>,
     armed: bool,
+    snapshot_phase: QueryState,
 }
 
 impl QueryPlanningToken {
@@ -3265,7 +3302,7 @@ impl QueryPlanningToken {
             )
             .with_query_id(self.control.query_id)
         })?;
-        owner.reserve_snapshot_memory(&self.control, memory_bytes)
+        owner.reserve_snapshot_memory(&self.control, memory_bytes, self.snapshot_phase)
     }
 
     /// Binds a private native snapshot to the exact reservation retained by its pinned owner.
@@ -3392,6 +3429,114 @@ pub(crate) struct QueryExecutionScope {
 }
 
 impl QueryExecutionScope {
+    /// Issues a non-owning snapshot admission token for an idle running event reader.
+    ///
+    /// This does not create another query or change its cancellation identity. Every physical
+    /// task and retained plan must have drained first; delivered results may remain accounted.
+    pub(crate) fn snapshot_refresh_token(&mut self) -> Result<QueryPlanningToken> {
+        let owner = self
+            .control
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(self.query_id()))?;
+        let query = self.control.state.lock().unwrap();
+        ensure_refresh_running(&query, self.query_id())?;
+        ensure_refresh_drained(&query, self.query_id())?;
+        drop(query);
+        // The old window is exhausted. Release its Catalog pin before reserving the next
+        // planning peak; delivered results retain their independent accounting owners.
+        self.ownership
+            .as_ref()
+            .ok_or_else(|| unavailable(self.query_id()))?
+            .release();
+        Ok(QueryPlanningToken {
+            coordinator_nonce: owner.nonce,
+            control: Arc::clone(&self.control),
+            armed: false,
+            snapshot_phase: QueryState::Running,
+        })
+    }
+
+    /// Atomically replaces the idle event reader's snapshot without retiring its query.
+    ///
+    /// Installation requires the previous window to have released its physical snapshot.
+    /// Retained result leases remain charged independently across this transition.
+    pub(crate) fn replace_native_snapshot(
+        &mut self,
+        snapshot: crate::query_snapshot::NativeQueryReadSnapshot,
+    ) -> Result<QueryPlanInfo> {
+        let owner = self
+            .control
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(self.query_id()))?;
+        let descriptor = snapshot.memory_lease_descriptor();
+        let draft = snapshot.plan_draft();
+        let mut global = owner.state.lock().unwrap();
+        let mut query = self.control.state.lock().unwrap();
+        ensure_refresh_running(&query, self.query_id())?;
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            return Err(unavailable(self.query_id()));
+        }
+        ensure_refresh_drained(&query, self.query_id())?;
+        if descriptor.query_instance_id() != Some(self.instance_id())
+            || query
+                .snapshot_memory_reservations
+                .get(&descriptor.reservation_id())
+                != Some(&descriptor)
+            || draft.query_id != self.query_id()
+        {
+            return Err(invalid(
+                "refreshed snapshot does not own this query's memory reservation",
+            ));
+        }
+        let plan = query
+            .plan
+            .as_mut()
+            .expect("running query retains plan metadata");
+        if draft.catalog_revision < plan.catalog_revision
+            || draft.snapshots.len() != plan.snapshots.len()
+            || draft
+                .snapshots
+                .iter()
+                .zip(&plan.snapshots)
+                .any(|(new, old)| {
+                    new.table_id != old.table_id
+                        || new.schema_version != old.schema_version
+                        || new.snapshot_version < old.snapshot_version
+                })
+        {
+            return Err(invalid(
+                "refreshed snapshot changed tables, schema, or regressed versions",
+            ));
+        }
+        let ownership = self
+            .ownership
+            .as_ref()
+            .ok_or_else(|| unavailable(self.query_id()))?;
+        let mut current = ownership.snapshot.lock().unwrap();
+        if current.is_some() {
+            return Err(invalid(
+                "snapshot refresh must first release the exhausted window",
+            ));
+        }
+        if global.active_snapshot_owners >= owner.config.max_active_queries {
+            return Err(exhausted(
+                self.query_id(),
+                "snapshot refresh owner admission is exhausted",
+            ));
+        }
+        *current = Some(snapshot.into_opaque());
+        global.active_snapshot_owners += 1;
+        plan.catalog_revision = draft.catalog_revision;
+        plan.snapshots = draft.snapshots;
+        let info = plan.clone();
+        drop(current);
+        drop(query);
+        drop(global);
+        Ok(info)
+    }
+
     pub(crate) fn query_id(&self) -> QueryId {
         self.control.query_id
     }
@@ -3593,6 +3738,7 @@ impl QueryTaskReservation {
         Ok(())
     }
 
+    #[cfg(test)]
     fn try_into_result(&mut self, charge: QueryResultCharge) -> Result<QueryResultReservation> {
         let owner = self
             .owner
@@ -3814,6 +3960,7 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
     ///
     /// The task charge must cover memory materialized by `convert` until the reclassification
     /// commits. A rejected transfer drops the converted result before releasing that task charge.
+    #[cfg(test)]
     pub(crate) fn into_result<T: Send + 'static>(
         mut self,
         charge: QueryResultCharge,
@@ -3944,6 +4091,7 @@ impl<R: Send + 'static> QueryRetainedPermit<R> {
             .expect("live retained permit owns its query resource")
     }
 
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> QueryRetainedKind {
         self.reservation
             .as_ref()
@@ -3952,6 +4100,7 @@ impl<R: Send + 'static> QueryRetainedPermit<R> {
             .kind
     }
 
+    #[cfg(test)]
     pub(crate) fn memory_bytes(&self) -> NonZeroU64 {
         self.reservation
             .as_ref()
@@ -4030,6 +4179,7 @@ impl<R: Send + 'static> QueryResultPermit<R> {
             .load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn cancellation(&self) -> QueryCancellation {
         self.reservation
             .as_ref()
@@ -4113,6 +4263,28 @@ fn validate_plan_snapshot_binding(
             invalid("query plan table versions do not match snapshot owner")
                 .with_query_id(draft.query_id),
         );
+    }
+    Ok(())
+}
+
+/// An event-window snapshot can be replaced only while its query remains running.
+fn ensure_refresh_running(query: &QueryControlState, query_id: QueryId) -> Result<()> {
+    if query.state != QueryState::Running {
+        return Err(query.error.clone().unwrap_or_else(|| {
+            invalid("snapshot refresh requires a running query").with_query_id(query_id)
+        }));
+    }
+    Ok(())
+}
+
+/// Physical readers and retained plans must not observe a snapshot replacement.
+fn ensure_refresh_drained(query: &QueryControlState, query_id: QueryId) -> Result<()> {
+    if query.active_tasks != 0 || query.active_retained_permits != 0 {
+        return Err(ServerError::new(
+            ErrorCode::Conflict,
+            "snapshot refresh requires drained physical readers",
+        )
+        .with_query_id(query_id));
     }
     Ok(())
 }
@@ -5032,6 +5204,68 @@ mod tests {
             QueryState::TimedOut
         );
         drop(current);
+    }
+
+    #[test]
+    fn authenticated_transport_cancellation_checks_session_and_exact_generation() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let token = coordinator
+            .register_planned(
+                owner.as_ref(),
+                info(query_id(71), 100),
+                None,
+                budget(),
+                snapshot(query_id(71), Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let instance = token.instance_id();
+        assert_eq!(
+            coordinator
+                .cancel_owned(coordinator.owner(session_id(1)).as_ref(), instance)
+                .unwrap_err()
+                .code(),
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            coordinator
+                .cancel_authenticated_session(session_id(2), instance)
+                .unwrap_err()
+                .code(),
+            ErrorCode::PermissionDenied
+        );
+        let stale = zippy_types::query::QueryInstanceId::new(
+            instance.query_id(),
+            NonZeroU64::new(instance.generation().get() + 1).unwrap(),
+        );
+        assert_eq!(
+            coordinator
+                .cancel_authenticated_session(session_id(1), stale)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), instance)
+                .unwrap()
+                .state,
+            QueryState::Planned
+        );
+        coordinator
+            .cancel_authenticated_session(session_id(1), instance)
+            .unwrap();
+        coordinator
+            .cancel_authenticated_session(session_id(1), instance)
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), instance)
+                .unwrap()
+                .state,
+            QueryState::Cancelled
+        );
     }
 
     #[test]

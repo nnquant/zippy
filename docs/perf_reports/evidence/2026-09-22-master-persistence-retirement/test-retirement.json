@@ -1,0 +1,389 @@
+{
+  "retired_or_renamed": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_compaction_source_deletion_without_snapshot_leases",
+      "action": "renamed_or_migrated",
+      "replacement": "zippy_config_rejects_removed_compaction_configuration",
+      "reason": "retain runtime contract; retire obsolete snapshot/compatibility expectation"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "catalog_revision_and_ids_survive_snapshot_restore",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "catalog_revision_ignores_runtime_only_control_changes",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "discovery_exposes_only_explicit_tables_with_stable_ids",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "empty_snapshot_read_succeeds_and_nonempty_read_is_unsupported",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "every_legacy_write_is_rejected_with_request_context",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "explicit_public_marker_overrides_physical_shard_name_fallback",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "malformed_explicit_metadata_is_data_corruption",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "malformed_internal_marker_is_data_corruption",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "namespace_pagination_is_strict_and_bounded",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "repeated_segment_metadata_does_not_advance_catalog_revision",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "resolution_preserves_input_order_and_reports_missing_tables",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "snapshot_version_tracks_only_committed_file_view",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "stopped_master_rejects_every_catalog_read_entrypoint",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "table_mapping_does_not_hold_or_reacquire_registry_lock",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_catalog.rs",
+      "test": "table_pagination_uses_strict_stable_id_cursors",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/legacy_runtime.rs",
+      "test": "restored_legacy_definitions_do_not_survive_as_live_runtime_records",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/server.rs",
+      "test": "compaction_groups_keep_persisted_file_when_writer_epoch_differs_from_live",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/server.rs",
+      "test": "compaction_groups_skip_persisted_file_when_writer_epoch_matches_live",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/src/server.rs",
+      "test": "persisted_file_order_keeps_writer_epochs_contiguous",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/golden_contracts.rs",
+      "test": "legacy_registry_v1_preserves_table_and_persisted_metadata",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/golden_contracts.rs",
+      "test": "legacy_registry_v1_restores_durable_state_without_runtime_leases",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/golden_contracts.rs",
+      "test": "legacy_registry_v1_round_trip_is_canonical_and_lossless",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "master_client_drop_table_removes_catalog_dependencies_and_persisted_files",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_client_roundtrip.rs",
+      "test": "segment_reader_leases_are_not_persisted_to_snapshot",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_does_not_restore_active_segment_descriptor_from_snapshot",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_persists_catalog_source_definition_and_drop_tombstone_across_restarts",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_persists_registered_streams_to_snapshot_on_register_stream",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_restores_authoritative_source_definition_after_reverse_order_failover",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_restores_control_plane_entities_from_snapshot_as_restored",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_restores_legacy_snapshot_without_frame_size",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_restores_registered_streams_from_snapshot_as_restored",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_acquires_segment_reader_lease_without_snapshot_write",
+      "action": "renamed_or_migrated",
+      "replacement": "master_server_acquires_segment_reader_lease",
+      "reason": "retain runtime contract; retire obsolete snapshot/compatibility expectation"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_compaction_worker_sorts_and_replaces_persisted_files",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_graceful_shutdown_timeout_keeps_writer_source_alive_in_snapshot",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_releases_segment_reader_lease_without_snapshot_write",
+      "action": "renamed_or_migrated",
+      "replacement": "master_server_releases_segment_reader_lease",
+      "reason": "retain runtime contract; retire obsolete snapshot/compatibility expectation"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_restores_exact_catalog_state_when_snapshot_write_fails",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_returns_error_when_shutdown_snapshot_flush_fails",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_rolls_back_stream_registration_when_snapshot_write_fails",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "persistent_snapshots_exclude_live_status_and_metrics_before_reload",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "runtime_status_updates_ignore_snapshot_failures_and_keep_latest_live_state",
+      "action": "renamed_or_migrated",
+      "replacement": "runtime_status_updates_keep_latest_live_state",
+      "reason": "retain runtime contract; retire obsolete snapshot/compatibility expectation"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "snapshot_store_imports_legacy_file_view_revision_once",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "snapshot_store_reads_legacy_ring_capacity_into_buffer_and_frame_size",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-server/src/health.rs",
+      "test": "phase_one_capabilities_never_claim_future_engine_features",
+      "action": "renamed_or_migrated",
+      "replacement": "control_only_capabilities_never_claim_future_engine_features",
+      "reason": "retain runtime contract; retire obsolete snapshot/compatibility expectation"
+    },
+    {
+      "file": "crates/zippy-server/tests/legacy_runtime_baseline.rs",
+      "test": "restart_keeps_durable_catalog_but_rejects_old_runtime_capability",
+      "action": "retired",
+      "replacement": "native SQLite catalog, TableActor and Flight durability/recovery tests",
+      "reason": "obsolete Master snapshot, Catalog adapter, compaction or restoration contract"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "catalog_only_runtime_is_ready_without_fabricating_query_service",
+      "action": "renamed_or_migrated",
+      "replacement": "control_only_runtime_is_ready_without_fabricating_query_service",
+      "reason": "retain runtime contract; retire obsolete snapshot/compatibility expectation"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "repeated_shutdown_preserves_the_first_timeout_outcome",
+      "action": "renamed_or_migrated",
+      "replacement": "repeated_shutdown_retries_cleanup_and_preserves_timed_out_processes",
+      "reason": "retain runtime contract; retire obsolete snapshot/compatibility expectation"
+    }
+  ],
+  "added": [
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_removed_compaction_configuration"
+    },
+    {
+      "file": "crates/zippy-core/tests/config.rs",
+      "test": "zippy_config_rejects_removed_compaction_environment"
+    },
+    {
+      "file": "crates/zippy-master/src/daemon.rs",
+      "test": "managed_legacy_registry_is_rejected_without_reading_or_rewriting_it"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_acquires_segment_reader_lease"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "master_server_releases_segment_reader_lease"
+    },
+    {
+      "file": "crates/zippy-master/tests/master_server.rs",
+      "test": "runtime_status_updates_keep_latest_live_state"
+    },
+    {
+      "file": "crates/zippy-server/src/health.rs",
+      "test": "control_only_capabilities_never_claim_future_engine_features"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "control_only_runtime_is_ready_without_fabricating_query_service"
+    },
+    {
+      "file": "crates/zippy-server/tests/server_runtime.rs",
+      "test": "repeated_shutdown_retries_cleanup_and_preserves_timed_out_processes"
+    },
+    {
+      "file": "pytests/test_server_process.py",
+      "test": "test_server_native_ready_record_requires_native_catalog"
+    }
+  ],
+  "retired_test_names": 40,
+  "renamed_or_migrated_test_names": 7,
+  "retained_boundaries": [
+    "runtime live status and metrics update remains in memory",
+    "segment lease acquisition and release remain covered",
+    "shutdown retries retain timeout process identities and directory ownership while listener cleanup advances",
+    "native table state, exact receipts, catalog metadata and ACK recover across restart"
+  ],
+  "new_regressions": [
+    "managed retired registry rejects before SQLite creation and preserves original bytes",
+    "retired compaction TOML and environment inputs reject",
+    "native catalog/query readiness cannot be represented by degraded legacy health",
+    "live native matrix asserts no legacy registry file after all restarts"
+  ]
+}

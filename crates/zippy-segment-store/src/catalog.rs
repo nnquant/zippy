@@ -11,9 +11,8 @@ use arrow::record_batch::RecordBatch;
 
 use crate::{
     compile_schema, debug::active_segment_record_batch, notify::SegmentBroadcaster,
-    ActiveSegmentWriter, ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, PersistenceQueue,
-    PersistenceRetryPolicy, PersistenceWorker, ReaderSession, RowSpanView, SealedSegmentHandle,
-    SegmentNotifier, ShmRegion, ZippySegmentStoreError,
+    ActiveSegmentWriter, ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, ReaderSession,
+    RowSpanView, SealedSegmentHandle, SegmentNotifier, ShmRegion, ZippySegmentStoreError,
 };
 
 fn segment_store_latency_trace_enabled() -> bool {
@@ -61,7 +60,6 @@ pub struct SegmentStore {
     pub(crate) store_id: u64,
     pub(crate) config: SegmentStoreConfig,
     pub(crate) partitions: Arc<Mutex<HashMap<(String, String), PartitionHandle>>>,
-    pub(crate) persistence: PersistenceQueue,
     pub(crate) sessions: Arc<Mutex<HashMap<u64, ReaderSessionState>>>,
     pub(crate) pins: Arc<Mutex<HashMap<LeaseKey, usize>>>,
     pub(crate) next_session_id: Arc<AtomicU64>,
@@ -74,7 +72,6 @@ impl SegmentStore {
             store_id: next_store_id(),
             config,
             partitions: Arc::new(Mutex::new(HashMap::new())),
-            persistence: PersistenceQueue::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pins: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(1)),
@@ -107,6 +104,19 @@ impl SegmentStore {
         schema: CompiledSchema,
         writer_epoch: u64,
     ) -> Result<PartitionHandle, ZippySegmentStoreError> {
+        self.open_partition_with_schema_and_origin(stream, partition, schema, writer_epoch, 0)
+    }
+
+    /// Open a partition with an explicit initial generation for durable source identity.
+    /// Reopening an existing partition must agree with its original generation seed.
+    pub fn open_partition_with_schema_and_origin(
+        &self,
+        stream: &str,
+        partition: &str,
+        schema: CompiledSchema,
+        writer_epoch: u64,
+        initial_generation: u64,
+    ) -> Result<PartitionHandle, ZippySegmentStoreError> {
         let mut partitions = self.partitions.lock().unwrap();
         let key = (stream.to_string(), partition.to_string());
         if let Some(handle) = partitions.get(&key) {
@@ -118,17 +128,18 @@ impl SegmentStore {
                     "partition writer epoch mismatch",
                 ));
             }
+            if handle.inner.initial_generation != initial_generation {
+                return Err(ZippySegmentStoreError::Schema(
+                    "partition initial generation mismatch",
+                ));
+            }
             return Ok(handle.clone());
         }
 
         let handle = PartitionHandle::new(
-            self.store_id,
-            stream,
-            partition,
             schema,
             self.config.default_row_capacity,
-            writer_epoch,
-            self.persistence.clone(),
+            (writer_epoch, initial_generation),
         )?;
         partitions.insert(key, handle.clone());
         Ok(handle)
@@ -205,54 +216,6 @@ impl SegmentStore {
         Ok(())
     }
 
-    /// 将 sealed segment 放入最小持久化队列。
-    pub fn enqueue_persistence(
-        &self,
-        _segment: SealedSegmentHandle,
-    ) -> Result<(), ZippySegmentStoreError> {
-        Err(ZippySegmentStoreError::Writer(
-            "manual persistence enqueue is disabled; rollover enqueues automatically",
-        ))
-    }
-
-    /// 启动后台 parquet 持久化 worker。
-    pub fn start_persistence_worker(
-        &self,
-        output_dir: impl Into<std::path::PathBuf>,
-    ) -> Result<PersistenceWorker, ZippySegmentStoreError> {
-        self.persistence
-            .start_worker(output_dir.into())
-            .map_err(ZippySegmentStoreError::Io)
-    }
-
-    /// 按指定策略启动后台 parquet 持久化 worker。
-    pub fn start_persistence_worker_with_policy(
-        &self,
-        output_dir: impl Into<std::path::PathBuf>,
-        policy: PersistenceRetryPolicy,
-    ) -> Result<PersistenceWorker, ZippySegmentStoreError> {
-        self.persistence
-            .start_worker_with_policy(output_dir.into(), policy)
-            .map_err(ZippySegmentStoreError::Io)
-    }
-
-    /// 仅用于测试：同步 flush 一条 parquet。
-    pub fn flush_one_for_test(&self) -> Result<std::path::PathBuf, ZippySegmentStoreError> {
-        self.persistence
-            .flush_one_for_test()
-            .map_err(ZippySegmentStoreError::Writer)
-    }
-
-    /// 仅用于测试：在给定超时内同步 flush 一条 parquet。
-    pub fn flush_one_timeout_for_test(
-        &self,
-        timeout: std::time::Duration,
-    ) -> Result<Option<std::path::PathBuf>, ZippySegmentStoreError> {
-        self.persistence
-            .flush_one_timeout_for_test(timeout)
-            .map_err(ZippySegmentStoreError::Writer)
-    }
-
     pub(crate) fn attach_lease(
         &self,
         session_id: u64,
@@ -320,41 +283,33 @@ pub struct PartitionHandle {
 impl PartitionHandle {
     /// 创建一个最小分区。
     pub fn new(
-        store_id: u64,
-        stream: &str,
-        partition: &str,
         schema: CompiledSchema,
         row_capacity: usize,
-        writer_epoch: u64,
-        persistence: PersistenceQueue,
+        origin: (u64, u64),
     ) -> Result<Self, ZippySegmentStoreError> {
+        let (writer_epoch, initial_generation) = origin;
         let layout = LayoutPlan::for_schema(&schema, row_capacity)
             .map_err(ZippySegmentStoreError::Layout)?;
-        let persistence_key = format!("store-{store_id}-{stream}-{partition}");
         let writer = ActiveSegmentWriter::new_with_origin_for_test(
             schema.clone(),
             layout,
             1,
-            0,
+            initial_generation,
             writer_epoch,
-            1,
-            persistence_key,
+            initial_generation.saturating_add(1),
         )
         .map_err(ZippySegmentStoreError::Writer)?;
 
         Ok(Self {
             inner: Arc::new(PartitionInner {
-                store_id,
                 partition_id: next_partition_id(),
                 schema,
-                _stream: stream.to_string(),
-                _partition: partition.to_string(),
                 writer_epoch,
-                persistence,
+                initial_generation,
                 state: Mutex::new(PartitionState {
                     row_capacity,
                     active_segment_id: 1,
-                    generation: 0,
+                    generation: initial_generation,
                     writer,
                     retired_segments: HashMap::new(),
                 }),
@@ -476,13 +431,10 @@ impl PartitionHandle {
 
 #[derive(Debug)]
 struct PartitionInner {
-    store_id: u64,
     partition_id: u64,
     schema: CompiledSchema,
-    _stream: String,
-    _partition: String,
     writer_epoch: u64,
-    persistence: PersistenceQueue,
+    initial_generation: u64,
     state: Mutex<PartitionState>,
     broadcaster: SegmentBroadcaster,
 }
@@ -1246,10 +1198,8 @@ impl PartitionWriterHandle {
     }
 
     /// 创建新的 active segment，按需入队底层持久化队列，并通知 reader。
-    fn rollover_inner(
-        &self,
-        enqueue_persistence: bool,
-    ) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
+    /// Seal the active segment, retain it for pinned readers, and notify subscribers.
+    pub fn rollover(&self) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
         let sealed = {
             let mut state = self.handle.inner.state.lock().unwrap();
             if state.writer.has_open_row() {
@@ -1259,15 +1209,18 @@ impl PartitionWriterHandle {
             }
             let old_segment_id = state.active_segment_id;
             let old_generation = state.generation;
-            let next_segment_id = old_segment_id + 1;
-            let next_generation = old_generation + 1;
+            let next_segment_id = old_segment_id
+                .checked_add(1)
+                .ok_or(ZippySegmentStoreError::Writer("segment identity exhausted"))?;
+            let next_generation =
+                old_generation
+                    .checked_add(1)
+                    .ok_or(ZippySegmentStoreError::Writer(
+                        "segment generation exhausted",
+                    ))?;
             let schema = self.handle.inner.schema.clone();
             let layout = LayoutPlan::for_schema(&schema, state.row_capacity)
                 .map_err(ZippySegmentStoreError::Layout)?;
-            let persistence_key = format!(
-                "store-{}-{}-{}",
-                self.handle.inner.store_id, self.handle.inner._stream, self.handle.inner._partition
-            );
             let new_writer = ActiveSegmentWriter::new_with_origin_for_test(
                 schema,
                 layout,
@@ -1275,7 +1228,6 @@ impl PartitionWriterHandle {
                 next_generation,
                 self.handle.inner.writer_epoch,
                 next_generation.saturating_add(1),
-                persistence_key,
             )
             .map_err(ZippySegmentStoreError::Writer)?;
             let sealed = state
@@ -1297,31 +1249,12 @@ impl PartitionWriterHandle {
             sealed
         };
 
-        if enqueue_persistence {
-            self.handle
-                .inner
-                .persistence
-                .enqueue(sealed.clone())
-                .map_err(ZippySegmentStoreError::Writer)?;
-        }
         self.handle
             .inner
             .broadcaster
             .notify_all()
             .map_err(ZippySegmentStoreError::Io)?;
         Ok(sealed)
-    }
-
-    /// 创建新的 active segment 并通知 reader。
-    pub fn rollover(&self) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
-        self.rollover_inner(true)
-    }
-
-    /// 创建新的 active segment 并通知 reader，但不进入底层通用持久化队列。
-    pub fn rollover_without_persistence(
-        &self,
-    ) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
-        self.rollover_inner(false)
     }
 }
 

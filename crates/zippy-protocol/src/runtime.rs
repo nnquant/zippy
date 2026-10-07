@@ -161,6 +161,13 @@ impl FlightServerRuntime {
         if startup_timeout.is_zero() {
             return Err(invalid("Flight startup timeout must be positive"));
         }
+        if !endpoint.ip().is_loopback()
+            && (!service.status().authentication_required || tls.is_none())
+        {
+            return Err(invalid(
+                "non-loopback Flight listeners require TLS and bearer authentication",
+            ));
+        }
         let listener = TcpListener::bind(endpoint).map_err(|error| {
             unavailable(format!(
                 "bind Flight listener failed endpoint=[{endpoint}] error=[{error}]"
