@@ -13,7 +13,7 @@ enum CliProfile {
     TimeseriesKernel,
     StreamTableSegmentCopy,
     SingleRowLowRate,
-    WriteToSubscribeE2e,
+    SegmentWriteToRead,
     StreamTableSubscriberE2e,
 }
 
@@ -61,7 +61,7 @@ fn main() {
             CliProfile::TimeseriesKernel => PerfProfile::TimeseriesKernel,
             CliProfile::StreamTableSegmentCopy => PerfProfile::StreamTableSegmentCopy,
             CliProfile::SingleRowLowRate => PerfProfile::SingleRowLowRate,
-            CliProfile::WriteToSubscribeE2e => PerfProfile::WriteToSubscribeE2e,
+            CliProfile::SegmentWriteToRead => PerfProfile::SegmentWriteToRead,
             CliProfile::StreamTableSubscriberE2e => PerfProfile::StreamTableSubscriberE2e,
         },
         rows_per_batch: cli.rows_per_batch,
@@ -212,5 +212,27 @@ fn write_failed_baseline_manifest(
             path = %path.display(),
             "failed baseline manifest write failed"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{error::ErrorKind, Parser};
+
+    use super::{Cli, CliProfile};
+
+    #[test]
+    fn segment_write_to_read_cli_accepts_new_profile_name() {
+        let cli = Cli::try_parse_from(["zippy-perf", "segment-write-to-read"]).unwrap();
+
+        assert_eq!(cli.profile, CliProfile::SegmentWriteToRead);
+    }
+
+    #[test]
+    fn segment_write_to_read_cli_rejects_retired_profile_name() {
+        let error = Cli::try_parse_from(["zippy-perf", "write-to-subscribe-e2e"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("segment-write-to-read"));
     }
 }

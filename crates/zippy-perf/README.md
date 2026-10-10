@@ -5,12 +5,13 @@
 - `timeseries-kernel`：同步 TimeSeriesEngine 计算与最终 flush。
 - `stream-table-segment-copy`：物化写入 active segment。
 - `single-row-low-rate`：单行物化写入。
-- `write-to-subscribe-e2e`：独立 producer/consumer 的真实共享内存可见性。
+- `segment-write-to-read`：同进程独立 producer/consumer 线程间的 segment 可见性。
 - `stream-table-subscriber-e2e`：物化器写入至外部 reader 读取。
 
 旧后台 Source/Publisher、ZeroMQ remote pipeline、runtime-stream-table 和 descriptor forwarding profile 已删除，
 CLI 不接受旧 profile、endpoint、buffer-capacity、overflow-policy 或 max-queue-depth。
 原生远端 Flight 的功能与恢复验收由 `scripts/check_native_client.py` 执行。
+旧名 `write-to-subscribe-e2e` 已删除，CLI 和 JSON 报告配置均不接受该名称或旧枚举值。
 
 ## 同步计算基准
 
@@ -76,7 +77,7 @@ TMPDIR=/dev/shm cargo run -p zippy-perf --release -- single-row-low-rate \
 写入到同机 reader 可见性基准：
 
 ```bash
-TMPDIR=/dev/shm cargo run -p zippy-perf --release -- write-to-subscribe-e2e \
+TMPDIR=/dev/shm cargo run -p zippy-perf --release -- segment-write-to-read \
   --rows-per-batch 1 \
   --target-rows-per-sec 200 \
   --duration-sec 60 \
@@ -85,12 +86,13 @@ TMPDIR=/dev/shm cargo run -p zippy-perf --release -- write-to-subscribe-e2e \
   --max-p99-micros 300
 ```
 
-`write-to-subscribe-e2e` 强制 `rows_per_batch=1`，使用独立 producer/consumer 线程。consumer
+`segment-write-to-read` 强制 `rows_per_batch=1`，使用独立 producer/consumer 线程。consumer
 先进入 waiter/futex notification wait；producer 按节奏写入行并 commit，consumer 被唤醒后调用
 `ActiveSegmentReader::read_available()`，再逐行读取共享 monotonic origin 下的
 `sent_elapsed_ns` 并记录延迟。这个边界覆盖 commit、notify、consumer 线程调度、mmap
-可见性、阻塞唤醒和 read availability，不包含 Python conversion 或 callback 执行，也不经过
-Zippy runtime queue/worker。
+可见性、阻塞唤醒和 read availability，不经过 Flight、ingest、WAL 或 TableActor，也不包含
+Python 序列化、解码或公开客户端 callback 执行。真实公开写入到订阅路径由
+`scripts/bench_public_e2e.py` 单独测量。
 
 报告的 `latency.sample_count` 和 `latency.max_micros` 分别给出稳态样本数与最大值。只有
 produced/consumed 总数相等，且稳态 produced/consumed/sample count 全部相等时才会构造报告，
