@@ -1,0 +1,25 @@
+{
+  "production_commit": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+  "branch": "feature/public-path-latency-bench",
+  "command": "PYO3_PYTHON=$PWD/.venv/bin/python cargo test -p zippy-server --lib live_log_refresh_memory_ -- --nocapture",
+  "expected_exit_code": 101,
+  "observed_result": "1 passed; 1 failed; history count assertion failed",
+  "production_files": {
+    "crates/zippy-server/src/native_log.rs": {
+      "sha256": "c9d21cafe18188aed98d19eabe2df1417a048cb755f769744df99ab5c6566eb2",
+      "equals_e1e67b5": true
+    },
+    "crates/zippy-server/src/query_snapshot.rs": {
+      "sha256": "39e7ce7dfd9ad7449418226cc9606d86373b14434fc94640edb3617f72aefca3",
+      "equals_e1e67b5": true
+    },
+    "crates/zippy-server/src/query_service.rs": {
+      "sha256": "daed402825e4461efe06f46a57aeee8a5bae2b9851568a4e554dff6033eb7824",
+      "equals_e1e67b5": true
+    }
+  },
+  "test_file": "crates/zippy-server/src/native_query_canary.rs",
+  "test_file_sha256": "8f320ca619227c25aa6e5ba5b62e18405a1d7816c386f024d7ad3919a264e414",
+  "failure_log_sha256": "9ff09324b7801858003f591ff8091b57f8b103983093720be38cf1c7ebb60b59",
+  "release_server_sha256": "db04614e0fd82a556283912afc0fe305fda66bd7eff26018b6d937447442698c"
+}

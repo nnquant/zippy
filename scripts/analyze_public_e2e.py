@@ -26,6 +26,135 @@ from bench_public_e2e import check_integrity, measurement_mask, summarize_ns
 NANOSECONDS_PER_SECOND = 1_000_000_000
 MAX_REPORT_BYTES = 300_000
 MIN_CLUSTER_INTERVALS = 5
+MAX_P50_SLOPE_MICROS_PER_MINUTE = 20.0
+MAX_LAST_TO_FIRST_P50_RATIO = 1.15
+
+
+def _p50_trend(
+    buckets: Sequence[dict[str, Any]], metric: str, measurement_complete: bool
+) -> dict[str, Any]:
+    full = [bucket for bucket in buckets if bucket["complete_minute"]]
+    sampled = [bucket for bucket in full if bucket[metric]["count"] > 0]
+    slope = ratio = first = last = None
+    failures = []
+    if len(sampled) >= 2:
+        times = [bucket["minute_index"] + 0.5 for bucket in sampled]
+        medians = [bucket[metric]["p50_micros"] for bucket in sampled]
+        x_mean, y_mean = math.fsum(times) / len(times), math.fsum(medians) / len(medians)
+        slope = math.fsum((x - x_mean) * (y - y_mean) for x, y in zip(times, medians)) / math.fsum(
+            (x - x_mean) ** 2 for x in times
+        )
+        first, last = medians[0], medians[-1]
+        if first > 0:
+            ratio = last / first
+        else:
+            failures.append("first complete-minute p50 is zero; ratio is undefined")
+    else:
+        failures.append("fewer than 2 sampled complete minutes; trend is not estimated")
+    if len(sampled) != len(full):
+        failures.append("one or more complete minutes contain no samples")
+    if not measurement_complete:
+        failures.append("measurement is incomplete or censored; trend gate cannot pass")
+    eligible = not failures
+    if slope is not None and slope > MAX_P50_SLOPE_MICROS_PER_MINUTE:
+        failures.append(f"p50 slope exceeds limit=[{MAX_P50_SLOPE_MICROS_PER_MINUTE}]")
+    if ratio is not None and ratio > MAX_LAST_TO_FIRST_P50_RATIO:
+        failures.append(f"last-to-first p50 ratio exceeds limit=[{MAX_LAST_TO_FIRST_P50_RATIO}]")
+    return {
+        "complete_minute_count": len(full),
+        "sampled_complete_minute_count": len(sampled),
+        "slope_micros_per_minute": slope,
+        "first_complete_minute_p50_micros": first,
+        "last_complete_minute_p50_micros": last,
+        "last_to_first_p50_ratio": ratio,
+        "max_slope_micros_per_minute": MAX_P50_SLOPE_MICROS_PER_MINUTE,
+        "max_last_to_first_p50_ratio": MAX_LAST_TO_FIRST_P50_RATIO,
+        "eligible": eligible,
+        "passed": eligible and not failures,
+        "failures": failures,
+    }
+
+
+def minute_latency_trends(
+    writer_sent_ns: Sequence[int],
+    ack_ns: Sequence[int],
+    visible_sent_ns: Sequence[int],
+    received_ns: Sequence[int],
+    *,
+    measurement_complete: bool,
+) -> dict[str, Any]:
+    """Bucket eligible latencies by actual send time and assess complete-minute p50 growth.
+
+    :param writer_sent_ns: Actual writer send timestamps after the original warmup mask.
+    :param ack_ns: Corresponding acknowledgement timestamps, including every measured write.
+    :param visible_sent_ns: Writer-verified send timestamps of delivered measured samples.
+    :param received_ns: Corresponding subscriber receive timestamps.
+    :param measurement_complete: False for a failed, censored, or incomplete source run.
+    :returns: Minute p50/p99, strict >10ms counts, and separate ack/visible trend gates.
+    :raises ValueError: Array lengths, timestamp order, or measurement ranges are invalid.
+    :example: minute_latency_trends([], [], [], [], measurement_complete=False)["buckets"] == []
+
+    The common origin is the first eligible actual send. Buckets are half-open 60-second
+    intervals; their coverage ends at the last eligible writer send, not at a delayed receive.
+    An exact final boundary sample enters a zero-coverage tail bucket. Every partial tail is
+    displayed but excluded from OLS and first/last ratios because its short exposure and fewer
+    samples are not comparable to a full minute. OLS uses unweighted complete-minute p50s
+    against actual minute centers and a signed slope. At least two sampled complete minutes,
+    no empty complete minutes, and a complete source run are required for a passing gate.
+    """
+    for starts, ends in ((writer_sent_ns, ack_ns), (visible_sent_ns, received_ns)):
+        if len(starts) != len(ends):
+            raise ValueError("latency timestamp array lengths differ")
+        if any(end < start for start, end in zip(starts, ends)):
+            raise ValueError("latency endpoint precedes actual send time")
+        if any(right < left for left, right in zip(starts, starts[1:])):
+            raise ValueError("actual send timestamps must be nondecreasing")
+    if visible_sent_ns and (
+        not writer_sent_ns
+        or visible_sent_ns[0] < writer_sent_ns[0]
+        or visible_sent_ns[-1] > writer_sent_ns[-1]
+    ):
+        raise ValueError("visible sends fall outside the measured writer interval")
+    origin = writer_sent_ns[0] if writer_sent_ns else None
+    last_sent = writer_sent_ns[-1] if writer_sent_ns else None
+    span_ns = last_sent - origin if origin is not None and last_sent is not None else 0
+    minute_ns = 60 * NANOSECONDS_PER_SECOND
+    bucket_count = span_ns // minute_ns + 1 if writer_sent_ns else 0
+    ack_buckets: list[list[int]] = [[] for _ in range(bucket_count)]
+    visible_buckets: list[list[int]] = [[] for _ in range(bucket_count)]
+    if origin is not None:
+        for starts, ends, grouped in (
+            (writer_sent_ns, ack_ns, ack_buckets),
+            (visible_sent_ns, received_ns, visible_buckets),
+        ):
+            for start, end in zip(starts, ends):
+                grouped[(start - origin) // minute_ns].append(end - start)
+    buckets = []
+    for index, (ack_values, visible_values) in enumerate(zip(ack_buckets, visible_buckets)):
+        coverage_ns = min(minute_ns, span_ns - index * minute_ns)
+        bucket: dict[str, Any] = {
+            "minute_index": index,
+            "start_offset_seconds": index * 60,
+            "send_coverage_seconds": coverage_ns / NANOSECONDS_PER_SECOND,
+            "complete_minute": coverage_ns == minute_ns,
+        }
+        for name, values in (("ack_latency", ack_values), ("visible_latency", visible_values)):
+            stats = summarize_ns(values)
+            bucket[name] = {key: stats[key] for key in ("count", "p50_micros", "p99_micros")}
+            bucket[name]["over_10ms_count"] = sum(value > 10_000_000 for value in values)
+        buckets.append(bucket)
+    return {
+        "bucket_clock": "actual sent_ns; both latencies are assigned by the same send boundary",
+        "origin_sent_ns": origin,
+        "last_measured_sent_ns": last_sent,
+        "send_coverage_seconds": span_ns / NANOSECONDS_PER_SECOND,
+        "tail_policy": "partial/zero-coverage final minute shown but excluded from trend gates",
+        "buckets": buckets,
+        "p50_trends": {
+            metric: _p50_trend(buckets, metric, measurement_complete)
+            for metric in ("ack_latency", "visible_latency")
+        },
+    }
 
 
 def spike_statistics(
@@ -218,6 +347,13 @@ def analyze_cell(
         "background_achieved_rows_per_second": cell["background"].get(
             "achieved_rows_per_second", 0.0
         ),
+        "minute_trends": minute_latency_trends(
+            [sent for sent, include in zip(writer["sent_ns"], mask) if include],
+            [ack for ack, include in zip(writer["ack_ns"], mask) if include],
+            measured_sent,
+            measured_received,
+            measurement_complete=complete,
+        ),
         "visible_spikes": {
             f"over_{milliseconds}ms": spike_statistics(
                 measured_sent, measured_received, milliseconds * 1_000_000, cluster_gap_ns
@@ -328,6 +464,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "exposure": "first measured actual sent_ns through last measured received_ns",
             "frequency": "count / observed exposure minutes; final minute uses actual exposure",
             "minute_buckets": "left-closed/right-open, except final observed endpoint is included",
+            "minute_trends": (
+                "actual sent_ns buckets from first to last measured send; "
+                "original received_ns spike buckets remain unchanged and can differ at boundaries"
+            ),
+            "trend_gate": (
+                "complete-minute p50 unweighted OLS signed slope <=20us/min and last/first <=1.15; "
+                "requires complete source run and at least 2 sampled complete minutes"
+            ),
+            "trend_tail": (
+                "partial/zero-coverage minute displayed only; excluded from OLS and ratio gates"
+            ),
             "cluster": "adjacent exceedance receive gaps <= configured gap form one cluster",
             "cluster_gap_milliseconds": args.cluster_gap_ms,
             "cluster_intervals": "successive cluster-start receive times; fewer than 5 yields null",

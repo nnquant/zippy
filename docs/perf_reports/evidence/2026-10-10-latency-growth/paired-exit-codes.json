@@ -1,0 +1,62 @@
+[
+  {
+    "label": "paired-e1",
+    "exit_code": 1,
+    "command": [
+      "/home/jiangda/develop/zippy/.venv/bin/python3",
+      "scripts/bench_public_e2e.py",
+      "--server-bin",
+      "/tmp/zippy-perf-raw/2026-10-10-latency-growth/server-e1e67b5",
+      "--durability",
+      "memory",
+      "--background-rate",
+      "0",
+      "--rate",
+      "1000",
+      "--samples",
+      "20000",
+      "--warmup-seconds",
+      "2",
+      "--warmup-samples",
+      "1000",
+      "--background-batch-rows",
+      "1000",
+      "--timeout-seconds",
+      "600",
+      "--report-json",
+      "docs/perf_reports/evidence/2026-10-10-latency-growth/paired-e1.json",
+      "--raw-samples-json",
+      "/tmp/zippy-perf-raw/2026-10-10-latency-growth/paired-e1.json"
+    ]
+  },
+  {
+    "label": "paired-candidate",
+    "exit_code": 1,
+    "command": [
+      "/home/jiangda/develop/zippy/.venv/bin/python3",
+      "scripts/bench_public_e2e.py",
+      "--server-bin",
+      "/tmp/zippy-perf-raw/2026-10-10-latency-growth/server-candidate",
+      "--durability",
+      "memory",
+      "--background-rate",
+      "0",
+      "--rate",
+      "1000",
+      "--samples",
+      "20000",
+      "--warmup-seconds",
+      "2",
+      "--warmup-samples",
+      "1000",
+      "--background-batch-rows",
+      "1000",
+      "--timeout-seconds",
+      "600",
+      "--report-json",
+      "docs/perf_reports/evidence/2026-10-10-latency-growth/paired-candidate.json",
+      "--raw-samples-json",
+      "/tmp/zippy-perf-raw/2026-10-10-latency-growth/paired-candidate.json"
+    ]
+  }
+]

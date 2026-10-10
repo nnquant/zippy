@@ -1,0 +1,35 @@
+   Compiling zippy-core v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-core)
+   Compiling zippy-types v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-types)
+   Compiling zippy-segment-store v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-segment-store)
+   Compiling zippy-protocol v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-protocol)
+   Compiling zippy-query v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-query)
+   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)
+   Compiling zippy-catalog v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-catalog)
+   Compiling zippy-master v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-master)
+   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)
+   Compiling zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.77s
+     Running unittests src/lib.rs (target/debug/deps/zippy_server-6a7989d3ef94bc0f)
+
+running 2 tests
+live refresh history_files=[1] other_files=[1] active_snapshot_memory_bytes=[1272296]
+live refresh history_files=[1] other_files=[1] active_snapshot_memory_bytes=[1272296]
+live refresh history_files=[1] other_files=[256] active_snapshot_memory_bytes=[1272296]
+test native_query_canary::tests::live_log_refresh_memory_excludes_same_namespace_background_history ... ok
+live refresh history_files=[256] other_files=[1] active_snapshot_memory_bytes=[8391176]
+
+thread 'native_query_canary::tests::live_log_refresh_memory_does_not_grow_with_persisted_history' panicked at crates/zippy-server/src/native_query_canary.rs:2317:9:
+one-row live refresh retained history: small=[1272296] large=[8391176]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test native_query_canary::tests::live_log_refresh_memory_does_not_grow_with_persisted_history ... FAILED
+
+failures:
+
+failures:
+    native_query_canary::tests::live_log_refresh_memory_does_not_grow_with_persisted_history
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 136 filtered out; finished in 1.75s
+
+error: test failed, to rerun pass `-p zippy-server --lib`

@@ -1,5 +1,9 @@
 //! Lifecycle-bound native query snapshots over table actors and the SQLite Catalog.
 
+#[path = "live_log_snapshot.rs"]
+mod live_log_snapshot;
+pub(crate) use live_log_snapshot::LiveLogSnapshot;
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
@@ -1030,7 +1034,7 @@ impl NativeQuerySnapshotCoordinator {
                 .with_retryable(true));
             }
             let (active_segment, retained_sealed_segments) =
-                project_live_read_descriptors(query_id, boundary)?;
+                project_live_read_descriptors(query_id, boundary, true)?;
             let max_log_offset = boundary.live_high_watermark;
             descriptors.push(TableReadSnapshotDescriptor {
                 table_id: boundary.table_id,
@@ -1073,6 +1077,7 @@ impl Drop for SnapshotPlanningAdmission {
 fn project_live_read_descriptors(
     query_id: QueryId,
     boundary: &TableBoundary,
+    bound_utf8: bool,
 ) -> Result<(
     Option<SegmentReadSnapshotDescriptor>,
     Vec<SegmentReadSnapshotDescriptor>,
@@ -1105,12 +1110,16 @@ fn project_live_read_descriptors(
             schema_version: segment.schema_version(),
             committed_rows,
             committed_log_offset: OffsetWatermark::Known(segment.offsets().last()),
-            max_utf8_value_bytes: Some(segment.span().max_utf8_value_bytes().map_err(|error| {
-                corruption(
-                    query_id,
-                    format!("cannot bound live UTF-8 values error=[{error}]"),
-                )
-            })?),
+            max_utf8_value_bytes: if bound_utf8 {
+                Some(segment.span().max_utf8_value_bytes().map_err(|error| {
+                    corruption(
+                        query_id,
+                        format!("cannot bound live UTF-8 values error=[{error}]"),
+                    )
+                })?)
+            } else {
+                None
+            },
         };
         match segment.role() {
             TableActorLiveSegmentRole::RetainedSealed if active_segment.is_none() => {

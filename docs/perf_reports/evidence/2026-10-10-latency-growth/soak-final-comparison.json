@@ -1,0 +1,2079 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "public_e2e_comparison",
+  "analysis_script_sha256": "d9dcda7bcfef11dff2d59cc69197a7ea31aba6f5634c0efdef9fae784f7b1813",
+  "rules": {
+    "latency": "original dual-condition warmup; nearest-rank; p99.9 null below 10000 samples",
+    "exceedances": "strict visible latency > threshold; equality excluded",
+    "exposure": "first measured actual sent_ns through last measured received_ns",
+    "frequency": "count / observed exposure minutes; final minute uses actual exposure",
+    "minute_buckets": "left-closed/right-open, except final observed endpoint is included",
+    "minute_trends": "actual sent_ns buckets from first to last measured send; original received_ns spike buckets remain unchanged and can differ at boundaries",
+    "trend_gate": "complete-minute p50 unweighted OLS signed slope <=20us/min and last/first <=1.15; requires complete source run and at least 2 sampled complete minutes",
+    "trend_tail": "partial/zero-coverage minute displayed only; excluded from OLS and ratio gates",
+    "cluster": "adjacent exceedance receive gaps <= configured gap form one cluster",
+    "cluster_gap_milliseconds": 10.0,
+    "cluster_intervals": "successive cluster-start receive times; fewer than 5 yields null",
+    "interpretation": "descriptive only; truncated runs are censored; no periodicity claim"
+  },
+  "runs": [
+    {
+      "label": "b5-soak",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json",
+        "sha256": "2ed2de9a8b2248fef6f22652caa42ba988ffeec03c9874319cb7297ea661550d",
+        "bytes": 53055717
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-08-public-path-e2e/soak.json",
+        "sha256": "238e95fffdc1ec8cce62c03239079f4f19cb87cfffddbd1f4700d0755fafd64e",
+        "bytes": 7927
+      },
+      "raw_sha256_verified_against_prior_identity": true,
+      "metadata": {
+        "git_sha": "7c6b6a9784336827c7239a872e50bccfda15d501",
+        "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T10:10:08.246199+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "19c886769cb064aed6e848ebe38669e5ee4e3269e58cdd14dfc921d15f8fad56",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "e557c394bb4b2bd3750db959f71d916bc0dbc56da1c37cc319b7f3ff3a7442bb",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--durability",
+          "memory",
+          "--background-rate",
+          "100000",
+          "--rate",
+          "1000",
+          "--samples",
+          "300000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "900",
+          "--report-json",
+          "docs/perf_reports/evidence/2026-10-08-public-path-e2e/soak.json",
+          "--raw-samples-json",
+          "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 300000,
+        "durability": [
+          "memory"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 900.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 300000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 300000,
+            "p50_micros": 812.747,
+            "p95_micros": 1203.339,
+            "p99_micros": 1482.741,
+            "p99_9_micros": 18246.198,
+            "max_micros": 41827.315,
+            "mean_micros": 905.5442282066666,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 300000,
+            "p50_micros": 2842.847,
+            "p95_micros": 4832.509,
+            "p99_micros": 5693.982,
+            "p99_9_micros": 20766.074,
+            "max_micros": 44185.003,
+            "mean_micros": 2907.1372570666667,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 302000,
+            "received_count": 302000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[2842.847] exceeds limit=[1000.000]",
+            "visible_p99_micros=[5693.982] exceeds limit=[3000.000]",
+            "visible_p99_9_micros=[20766.074] exceeds limit=[10000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 999.86782879487,
+          "background_achieved_rows_per_second": 99999.9616921342,
+          "minute_trends": {
+            "bucket_clock": "actual sent_ns; both latencies are assigned by the same send boundary",
+            "origin_sent_ns": 966714356283213,
+            "last_measured_sent_ns": 967014395161976,
+            "send_coverage_seconds": 300.038878763,
+            "tail_policy": "partial/zero-coverage final minute shown but excluded from trend gates",
+            "buckets": [
+              {
+                "minute_index": 0,
+                "start_offset_seconds": 0,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60001,
+                  "p50_micros": 756.027,
+                  "p99_micros": 1197.621,
+                  "over_10ms_count": 55
+                },
+                "visible_latency": {
+                  "count": 60001,
+                  "p50_micros": 1358.068,
+                  "p99_micros": 2234.756,
+                  "over_10ms_count": 90
+                }
+              },
+              {
+                "minute_index": 1,
+                "start_offset_seconds": 60,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60000,
+                  "p50_micros": 838.156,
+                  "p99_micros": 1309.131,
+                  "over_10ms_count": 112
+                },
+                "visible_latency": {
+                  "count": 60000,
+                  "p50_micros": 2135.922,
+                  "p99_micros": 3345.318,
+                  "over_10ms_count": 119
+                }
+              },
+              {
+                "minute_index": 2,
+                "start_offset_seconds": 120,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60000,
+                  "p50_micros": 836.526,
+                  "p99_micros": 1453.502,
+                  "over_10ms_count": 115
+                },
+                "visible_latency": {
+                  "count": 60000,
+                  "p50_micros": 2863.322,
+                  "p99_micros": 4511.368,
+                  "over_10ms_count": 129
+                }
+              },
+              {
+                "minute_index": 3,
+                "start_offset_seconds": 180,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60000,
+                  "p50_micros": 824.963,
+                  "p99_micros": 1490.287,
+                  "over_10ms_count": 114
+                },
+                "visible_latency": {
+                  "count": 60000,
+                  "p50_micros": 3513.89,
+                  "p99_micros": 5383.118,
+                  "over_10ms_count": 140
+                }
+              },
+              {
+                "minute_index": 4,
+                "start_offset_seconds": 240,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 59956,
+                  "p50_micros": 836.323,
+                  "p99_micros": 1631.775,
+                  "over_10ms_count": 112
+                },
+                "visible_latency": {
+                  "count": 59956,
+                  "p50_micros": 4138.743,
+                  "p99_micros": 6313.526,
+                  "over_10ms_count": 164
+                }
+              },
+              {
+                "minute_index": 5,
+                "start_offset_seconds": 300,
+                "send_coverage_seconds": 0.038878763,
+                "complete_minute": false,
+                "ack_latency": {
+                  "count": 43,
+                  "p50_micros": 775.375,
+                  "p99_micros": 1403.562,
+                  "over_10ms_count": 0
+                },
+                "visible_latency": {
+                  "count": 43,
+                  "p50_micros": 4468.773,
+                  "p99_micros": 6331.987,
+                  "over_10ms_count": 0
+                }
+              }
+            ],
+            "p50_trends": {
+              "ack_latency": {
+                "complete_minute_count": 5,
+                "sampled_complete_minute_count": 5,
+                "slope_micros_per_minute": 14.739899999999988,
+                "first_complete_minute_p50_micros": 756.027,
+                "last_complete_minute_p50_micros": 836.323,
+                "last_to_first_p50_ratio": 1.1062078470742447,
+                "max_slope_micros_per_minute": 20.0,
+                "max_last_to_first_p50_ratio": 1.15,
+                "eligible": true,
+                "passed": true,
+                "failures": []
+              },
+              "visible_latency": {
+                "complete_minute_count": 5,
+                "sampled_complete_minute_count": 5,
+                "slope_micros_per_minute": 693.9318000000001,
+                "first_complete_minute_p50_micros": 1358.068,
+                "last_complete_minute_p50_micros": 4138.743,
+                "last_to_first_p50_ratio": 3.047522657186533,
+                "max_slope_micros_per_minute": 20.0,
+                "max_last_to_first_p50_ratio": 1.15,
+                "eligible": true,
+                "passed": false,
+                "failures": [
+                  "p50 slope exceeds limit=[20.0]",
+                  "last-to-first p50 ratio exceeds limit=[1.15]"
+                ]
+              }
+            }
+          },
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 217717,
+              "frequency_per_minute": 43537.227188891055,
+              "exposure_start_sent_ns": 966714356283213,
+              "exposure_end_received_ns": 967014398817923,
+              "exposure_seconds": 300.04253471,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 1476,
+                  "frequency_per_minute": 1476.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 36545,
+                  "frequency_per_minute": 36545.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 59692,
+                  "frequency_per_minute": 59692.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 60001,
+                  "frequency_per_minute": 60001.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 59956,
+                  "frequency_per_minute": 59956.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.04253471,
+                  "count": 47,
+                  "frequency_per_minute": 66298.79456095974
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 1347,
+              "cluster_frequency_per_minute": 269.3618092451956,
+              "cluster_sizes_rows": {
+                "max": 1151,
+                "mean": 161.63103192279138
+              },
+              "cluster_start_interval_count": 1346,
+              "cluster_start_intervals_micros": {
+                "count": 1346,
+                "p50_micros": 44042.202,
+                "p95_micros": 1037785.228,
+                "p99_micros": 1041506.679,
+                "p99_9_micros": null,
+                "max_micros": 1051492.979,
+                "mean_micros": 222014.09965230312,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.597986104,
+                0.615391799,
+                1.637886745,
+                1.653704108,
+                2.676587155,
+                2.698443575,
+                2.711225082,
+                3.122033526,
+                3.72246731,
+                4.762022071,
+                4.779348414,
+                5.398524893,
+                5.802699872,
+                5.831010114,
+                5.878021101,
+                6.332033257,
+                6.398234809,
+                6.692000082,
+                6.841722991,
+                6.854581817
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 11222,
+              "frequency_per_minute": 2244.0818287673237,
+              "exposure_start_sent_ns": 966714356283213,
+              "exposure_end_received_ns": 967014398817923,
+              "exposure_seconds": 300.04253471,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 169,
+                  "frequency_per_minute": 169.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 176,
+                  "frequency_per_minute": 176.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 377,
+                  "frequency_per_minute": 377.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 1295,
+                  "frequency_per_minute": 1295.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 9191,
+                  "frequency_per_minute": 9191.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.04253471,
+                  "count": 14,
+                  "frequency_per_minute": 19748.577103264604
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 2708,
+              "cluster_frequency_per_minute": 541.5232215560428,
+              "cluster_sizes_rows": {
+                "max": 260,
+                "mean": 4.144017725258493
+              },
+              "cluster_start_interval_count": 2707,
+              "cluster_start_intervals_micros": {
+                "count": 2707,
+                "p50_micros": 28784.749,
+                "p95_micros": 1009339.932,
+                "p99_micros": 1023813.576,
+                "p99_9_micros": null,
+                "max_micros": 1042969.477,
+                "mean_micros": 110590.96309420023,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.597986104,
+                0.615391799,
+                1.637886745,
+                1.653704108,
+                2.676587155,
+                2.698443575,
+                3.72246731,
+                4.762022071,
+                4.779348414,
+                5.802699872,
+                6.398234809,
+                6.841722991,
+                6.854581817,
+                6.865046903,
+                7.888672856,
+                7.907452625,
+                8.931291865,
+                8.948455258,
+                9.971521027,
+                9.983104305
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 642,
+              "frequency_per_minute": 128.38179772488164,
+              "exposure_start_sent_ns": 966714356283213,
+              "exposure_end_received_ns": 967014398817923,
+              "exposure_seconds": 300.04253471,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 90,
+                  "frequency_per_minute": 90.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 119,
+                  "frequency_per_minute": 119.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 129,
+                  "frequency_per_minute": 129.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 140,
+                  "frequency_per_minute": 140.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 164,
+                  "frequency_per_minute": 164.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.04253471,
+                  "count": 0,
+                  "frequency_per_minute": 0.0
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 633,
+              "cluster_frequency_per_minute": 126.58205289696275,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.014218009478673
+              },
+              "cluster_start_interval_count": 632,
+              "cluster_start_intervals_micros": {
+                "count": 632,
+                "p50_micros": 29100.374,
+                "p95_micros": 1041069.464,
+                "p99_micros": 1049415.655,
+                "p99_9_micros": null,
+                "max_micros": 2080904.839,
+                "mean_micros": 472806.28550158226,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.615391799,
+                1.653704108,
+                2.698443575,
+                4.779348414,
+                5.818428048,
+                6.854581817,
+                6.865046903,
+                7.907452625,
+                8.948455258,
+                9.983104305,
+                11.029460991,
+                12.070392974,
+                13.108897825,
+                13.119030453,
+                14.157505355,
+                15.196187532,
+                16.235097418,
+                16.24562853,
+                17.28537458,
+                18.323302365
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "critical-soak",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json",
+        "sha256": "4a8bf0b0e083ddd23a2531df38c0a8266ee80a0ac91c31ad84ecca18a6f2dcce",
+        "bytes": 53034031
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-10-critical-section/soak.json",
+        "sha256": "d89cddb11d906770ed96d7d758f96d82f7306e75b43aefd66377c71fcd2656fe",
+        "bytes": 7937
+      },
+      "raw_sha256_verified_against_prior_identity": true,
+      "metadata": {
+        "git_sha": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e",
+        "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T10:41:14.777951+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "49f9e1c924200ee23d2c741da6cfca693c5a6149f08e6bc7dd857ef99dff2736",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "8aa8431af472f5adadc7f03324b840fde66dc18ac0a3c62e13eaeb3dd606e7d5",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--durability",
+          "memory",
+          "--background-rate",
+          "100000",
+          "--rate",
+          "1000",
+          "--samples",
+          "300000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "900",
+          "--report-json",
+          "docs/perf_reports/evidence/2026-10-10-critical-section/soak.json",
+          "--raw-samples-json",
+          "/tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 300000,
+        "durability": [
+          "memory"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 900.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 300000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 300000,
+            "p50_micros": 830.995,
+            "p95_micros": 1229.486,
+            "p99_micros": 1485.417,
+            "p99_9_micros": 8391.969,
+            "max_micros": 45757.37,
+            "mean_micros": 912.82219042,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 300000,
+            "p50_micros": 2879.595,
+            "p95_micros": 4870.871,
+            "p99_micros": 5711.784,
+            "p99_9_micros": 10906.406,
+            "max_micros": 49040.372,
+            "mean_micros": 2923.8518506200003,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 302000,
+            "received_count": 302000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[2879.595] exceeds limit=[1000.000]",
+            "visible_p99_micros=[5711.784] exceeds limit=[3000.000]",
+            "visible_p99_9_micros=[10906.406] exceeds limit=[10000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 999.8976050924575,
+          "background_achieved_rows_per_second": 99999.94095312423,
+          "minute_trends": {
+            "bucket_clock": "actual sent_ns; both latencies are assigned by the same send boundary",
+            "origin_sent_ns": 968580986802037,
+            "last_measured_sent_ns": 968881016200388,
+            "send_coverage_seconds": 300.029398351,
+            "tail_policy": "partial/zero-coverage final minute shown but excluded from trend gates",
+            "buckets": [
+              {
+                "minute_index": 0,
+                "start_offset_seconds": 0,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60001,
+                  "p50_micros": 772.722,
+                  "p99_micros": 1206.596,
+                  "over_10ms_count": 29
+                },
+                "visible_latency": {
+                  "count": 60001,
+                  "p50_micros": 1366.448,
+                  "p99_micros": 2323.402,
+                  "over_10ms_count": 38
+                }
+              },
+              {
+                "minute_index": 1,
+                "start_offset_seconds": 60,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 59999,
+                  "p50_micros": 863.112,
+                  "p99_micros": 1364.247,
+                  "over_10ms_count": 61
+                },
+                "visible_latency": {
+                  "count": 59999,
+                  "p50_micros": 2157.183,
+                  "p99_micros": 3502.389,
+                  "over_10ms_count": 67
+                }
+              },
+              {
+                "minute_index": 2,
+                "start_offset_seconds": 120,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 59872,
+                  "p50_micros": 850.726,
+                  "p99_micros": 1459.67,
+                  "over_10ms_count": 57
+                },
+                "visible_latency": {
+                  "count": 59872,
+                  "p50_micros": 2893.987,
+                  "p99_micros": 4581.28,
+                  "over_10ms_count": 72
+                }
+              },
+              {
+                "minute_index": 3,
+                "start_offset_seconds": 180,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60094,
+                  "p50_micros": 840.964,
+                  "p99_micros": 1452.432,
+                  "over_10ms_count": 58
+                },
+                "visible_latency": {
+                  "count": 60094,
+                  "p50_micros": 3550.22,
+                  "p99_micros": 5214.66,
+                  "over_10ms_count": 87
+                }
+              },
+              {
+                "minute_index": 4,
+                "start_offset_seconds": 240,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60002,
+                  "p50_micros": 858.319,
+                  "p99_micros": 1626.173,
+                  "over_10ms_count": 59
+                },
+                "visible_latency": {
+                  "count": 60002,
+                  "p50_micros": 4170.631,
+                  "p99_micros": 6390.226,
+                  "over_10ms_count": 109
+                }
+              },
+              {
+                "minute_index": 5,
+                "start_offset_seconds": 300,
+                "send_coverage_seconds": 0.029398351,
+                "complete_minute": false,
+                "ack_latency": {
+                  "count": 32,
+                  "p50_micros": 855.274,
+                  "p99_micros": 1401.972,
+                  "over_10ms_count": 0
+                },
+                "visible_latency": {
+                  "count": 32,
+                  "p50_micros": 4419.41,
+                  "p99_micros": 5746.653,
+                  "over_10ms_count": 0
+                }
+              }
+            ],
+            "p50_trends": {
+              "ack_latency": {
+                "complete_minute_count": 5,
+                "sampled_complete_minute_count": 5,
+                "slope_micros_per_minute": 14.904600000000006,
+                "first_complete_minute_p50_micros": 772.722,
+                "last_complete_minute_p50_micros": 858.319,
+                "last_to_first_p50_ratio": 1.1107733441004657,
+                "max_slope_micros_per_minute": 20.0,
+                "max_last_to_first_p50_ratio": 1.15,
+                "eligible": true,
+                "passed": true,
+                "failures": []
+              },
+              "visible_latency": {
+                "complete_minute_count": 5,
+                "sampled_complete_minute_count": 5,
+                "slope_micros_per_minute": 700.1403,
+                "first_complete_minute_p50_micros": 1366.448,
+                "last_complete_minute_p50_micros": 4170.631,
+                "last_to_first_p50_ratio": 3.052169566642858,
+                "max_slope_micros_per_minute": 20.0,
+                "max_last_to_first_p50_ratio": 1.15,
+                "eligible": true,
+                "passed": false,
+                "failures": [
+                  "p50 slope exceeds limit=[20.0]",
+                  "last-to-first p50 ratio exceeds limit=[1.15]"
+                ]
+              }
+            }
+          },
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 218803,
+              "frequency_per_minute": 43755.76565764975,
+              "exposure_start_sent_ns": 968580986802037,
+              "exposure_end_received_ns": 968881019947445,
+              "exposure_seconds": 300.033145408,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 1850,
+                  "frequency_per_minute": 1850.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 37218,
+                  "frequency_per_minute": 37218.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 59606,
+                  "frequency_per_minute": 59606.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 60090,
+                  "frequency_per_minute": 60090.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 60002,
+                  "frequency_per_minute": 60002.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.033145408,
+                  "count": 37,
+                  "frequency_per_minute": 66977.60365478077
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 1217,
+              "cluster_frequency_per_minute": 243.37311099646598,
+              "cluster_sizes_rows": {
+                "max": 1131,
+                "mean": 179.78882497945767
+              },
+              "cluster_start_interval_count": 1216,
+              "cluster_start_intervals_micros": {
+                "count": 1216,
+                "p50_micros": 47095.825,
+                "p95_micros": 1056724.797,
+                "p99_micros": 1061466.072,
+                "p99_9_micros": null,
+                "max_micros": 1071486.916,
+                "mean_micros": 246509.33281167762,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.049995526,
+                0.600713158,
+                0.78747684,
+                1.641312555,
+                1.730450045,
+                1.882175637,
+                2.683003875,
+                2.707367203,
+                3.728021663,
+                3.746444793,
+                4.768617439,
+                4.787410121,
+                5.810433574,
+                5.82871251,
+                6.850313208,
+                6.863121934,
+                6.876784506,
+                7.895974061,
+                7.914266061,
+                8.936728594
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 11946,
+              "frequency_per_minute": 2388.9360591321138,
+              "exposure_start_sent_ns": 968580986802037,
+              "exposure_end_received_ns": 968881019947445,
+              "exposure_seconds": 300.033145408,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 111,
+                  "frequency_per_minute": 111.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 130,
+                  "frequency_per_minute": 130.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 387,
+                  "frequency_per_minute": 387.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 1119,
+                  "frequency_per_minute": 1119.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 10190,
+                  "frequency_per_minute": 10190.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.033145408,
+                  "count": 9,
+                  "frequency_per_minute": 16291.849537649377
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 2381,
+              "cluster_frequency_per_minute": 476.14739300130276,
+              "cluster_sizes_rows": {
+                "max": 397,
+                "mean": 5.017219655606888
+              },
+              "cluster_start_interval_count": 2380,
+              "cluster_start_intervals_micros": {
+                "count": 2380,
+                "p50_micros": 32133.681,
+                "p95_micros": 1027977.195,
+                "p99_micros": 1041691.32,
+                "p99_9_micros": null,
+                "max_micros": 1061961.805,
+                "mean_micros": 125773.33229705882,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.600713158,
+                1.641312555,
+                2.683003875,
+                3.728021663,
+                4.768617439,
+                5.810433574,
+                6.850313208,
+                6.863121934,
+                7.895974061,
+                8.936728594,
+                9.978227251,
+                9.989907147,
+                11.022182487,
+                12.071650673,
+                13.113591836,
+                13.12651241,
+                14.160115629,
+                15.201855441,
+                16.244782043,
+                16.259323792
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 373,
+              "frequency_per_minute": 74.59175875240905,
+              "exposure_start_sent_ns": 968580986802037,
+              "exposure_end_received_ns": 968881019947445,
+              "exposure_seconds": 300.033145408,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 38,
+                  "frequency_per_minute": 38.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 67,
+                  "frequency_per_minute": 67.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 72,
+                  "frequency_per_minute": 72.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 87,
+                  "frequency_per_minute": 87.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 109,
+                  "frequency_per_minute": 109.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.033145408,
+                  "count": 0,
+                  "frequency_per_minute": 0.0
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 369,
+              "cluster_frequency_per_minute": 73.7918471303993,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.010840108401084
+              },
+              "cluster_start_interval_count": 368,
+              "cluster_start_intervals_micros": {
+                "count": 368,
+                "p50_micros": 1031316.502,
+                "p95_micros": 1061856.636,
+                "p99_micros": 2099412.195,
+                "p99_9_micros": null,
+                "max_micros": 3132811.382,
+                "mean_micros": 796038.6475298912,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                6.863121934,
+                9.989907147,
+                12.071650673,
+                13.12651241,
+                16.259323792,
+                18.351365844,
+                20.443436908,
+                22.547744273,
+                23.587511195,
+                24.638143849,
+                26.725548545,
+                28.811214385,
+                30.904567797,
+                32.997584227,
+                35.092911164,
+                36.134730439,
+                37.188562017,
+                38.230491342,
+                39.283783617,
+                40.318059806
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "soak-final",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/soak-final.json",
+        "sha256": "c07b6740b82b5aa2e10943a93c37da101972c72c77eb8fe7ff12cf28f3b4aec0",
+        "bytes": 107667873
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-10-latency-growth/soak-final.json",
+        "sha256": "36913aabf66140dbde873944cc76098838b30f77f37a59795ba2f1e521359565",
+        "bytes": 7992
+      },
+      "raw_sha256_verified_against_prior_identity": false,
+      "metadata": {
+        "git_sha": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+        "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T11:52:22.082617+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "4313a31a58eaf41edebfa115789f99567afd2aa852f26f7898b3dbe7cb064604",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "9298888be7c8a5b003dcd568c009470f2aacf3b4c01e2c351d73ff293e27f730",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--rate",
+          "1000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "1200",
+          "--samples",
+          "600100",
+          "--durability",
+          "memory",
+          "--background-rate",
+          "100000",
+          "--report-json",
+          "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-10-latency-growth/soak-final.json",
+          "--raw-samples-json",
+          "/tmp/zippy-perf-raw/2026-10-10-latency-growth/soak-final.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 600100,
+        "durability": [
+          "memory"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 1200.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 600100,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 600100,
+            "p50_micros": 831.331,
+            "p95_micros": 1370.622,
+            "p99_micros": 2481.782,
+            "p99_9_micros": 21542.473,
+            "max_micros": 349681.961,
+            "mean_micros": 975.5330379286786,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 600100,
+            "p50_micros": 1160.945,
+            "p95_micros": 1905.245,
+            "p99_micros": 5537.777,
+            "p99_9_micros": 73774.958,
+            "max_micros": 349989.424,
+            "mean_micros": 1549.009005124146,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 602100,
+            "received_count": 602100,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1160.945] exceeds limit=[1000.000]",
+            "visible_p99_micros=[5537.777] exceeds limit=[3000.000]",
+            "visible_p99_9_micros=[73774.958] exceeds limit=[10000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 992.2631827899188,
+          "background_achieved_rows_per_second": 99999.97698629765,
+          "minute_trends": {
+            "bucket_clock": "actual sent_ns; both latencies are assigned by the same send boundary",
+            "origin_sent_ns": 972848562499781,
+            "last_measured_sent_ns": 973453340796808,
+            "send_coverage_seconds": 604.778297027,
+            "tail_policy": "partial/zero-coverage final minute shown but excluded from trend gates",
+            "buckets": [
+              {
+                "minute_index": 0,
+                "start_offset_seconds": 0,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 55068,
+                  "p50_micros": 835.463,
+                  "p99_micros": 2013.815,
+                  "over_10ms_count": 128
+                },
+                "visible_latency": {
+                  "count": 55068,
+                  "p50_micros": 1156.196,
+                  "p99_micros": 3670.163,
+                  "over_10ms_count": 270
+                }
+              },
+              {
+                "minute_index": 1,
+                "start_offset_seconds": 60,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 54313,
+                  "p50_micros": 896.593,
+                  "p99_micros": 3546.02,
+                  "over_10ms_count": 154
+                },
+                "visible_latency": {
+                  "count": 54313,
+                  "p50_micros": 1261.527,
+                  "p99_micros": 37986.582,
+                  "over_10ms_count": 1449
+                }
+              },
+              {
+                "minute_index": 2,
+                "start_offset_seconds": 120,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 65842,
+                  "p50_micros": 808.335,
+                  "p99_micros": 1579.338,
+                  "over_10ms_count": 67
+                },
+                "visible_latency": {
+                  "count": 65842,
+                  "p50_micros": 1132.143,
+                  "p99_micros": 2206.671,
+                  "over_10ms_count": 95
+                }
+              },
+              {
+                "minute_index": 3,
+                "start_offset_seconds": 180,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 57871,
+                  "p50_micros": 838.714,
+                  "p99_micros": 2634.696,
+                  "over_10ms_count": 163
+                },
+                "visible_latency": {
+                  "count": 57871,
+                  "p50_micros": 1177.333,
+                  "p99_micros": 27324.893,
+                  "over_10ms_count": 824
+                }
+              },
+              {
+                "minute_index": 4,
+                "start_offset_seconds": 240,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 57602,
+                  "p50_micros": 840.608,
+                  "p99_micros": 2587.017,
+                  "over_10ms_count": 165
+                },
+                "visible_latency": {
+                  "count": 57602,
+                  "p50_micros": 1177.306,
+                  "p99_micros": 4160.196,
+                  "over_10ms_count": 239
+                }
+              },
+              {
+                "minute_index": 5,
+                "start_offset_seconds": 300,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 63350,
+                  "p50_micros": 829.185,
+                  "p99_micros": 2380.504,
+                  "over_10ms_count": 83
+                },
+                "visible_latency": {
+                  "count": 63350,
+                  "p50_micros": 1163.916,
+                  "p99_micros": 4139.062,
+                  "over_10ms_count": 106
+                }
+              },
+              {
+                "minute_index": 6,
+                "start_offset_seconds": 360,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 65920,
+                  "p50_micros": 794.028,
+                  "p99_micros": 1356.294,
+                  "over_10ms_count": 62
+                },
+                "visible_latency": {
+                  "count": 65920,
+                  "p50_micros": 1102.014,
+                  "p99_micros": 1779.451,
+                  "over_10ms_count": 67
+                }
+              },
+              {
+                "minute_index": 7,
+                "start_offset_seconds": 420,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 60035,
+                  "p50_micros": 821.295,
+                  "p99_micros": 1449.29,
+                  "over_10ms_count": 64
+                },
+                "visible_latency": {
+                  "count": 60035,
+                  "p50_micros": 1132.244,
+                  "p99_micros": 1946.755,
+                  "over_10ms_count": 70
+                }
+              },
+              {
+                "minute_index": 8,
+                "start_offset_seconds": 480,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 48999,
+                  "p50_micros": 942.746,
+                  "p99_micros": 3715.701,
+                  "over_10ms_count": 149
+                },
+                "visible_latency": {
+                  "count": 48999,
+                  "p50_micros": 1366.595,
+                  "p99_micros": 23350.139,
+                  "over_10ms_count": 829
+                }
+              },
+              {
+                "minute_index": 9,
+                "start_offset_seconds": 540,
+                "send_coverage_seconds": 60.0,
+                "complete_minute": true,
+                "ack_latency": {
+                  "count": 66292,
+                  "p50_micros": 813.154,
+                  "p99_micros": 1626.242,
+                  "over_10ms_count": 70
+                },
+                "visible_latency": {
+                  "count": 66292,
+                  "p50_micros": 1138.115,
+                  "p99_micros": 2126.052,
+                  "over_10ms_count": 72
+                }
+              },
+              {
+                "minute_index": 10,
+                "start_offset_seconds": 600,
+                "send_coverage_seconds": 4.778297027,
+                "complete_minute": false,
+                "ack_latency": {
+                  "count": 4808,
+                  "p50_micros": 894.111,
+                  "p99_micros": 2006.012,
+                  "over_10ms_count": 7
+                },
+                "visible_latency": {
+                  "count": 4808,
+                  "p50_micros": 1255.203,
+                  "p99_micros": 2582.046,
+                  "over_10ms_count": 7
+                }
+              }
+            ],
+            "p50_trends": {
+              "ack_latency": {
+                "complete_minute_count": 10,
+                "sampled_complete_minute_count": 10,
+                "slope_micros_per_minute": 0.2521757575757571,
+                "first_complete_minute_p50_micros": 835.463,
+                "last_complete_minute_p50_micros": 813.154,
+                "last_to_first_p50_ratio": 0.973297441059628,
+                "max_slope_micros_per_minute": 20.0,
+                "max_last_to_first_p50_ratio": 1.15,
+                "eligible": true,
+                "passed": true,
+                "failures": []
+              },
+              "visible_latency": {
+                "complete_minute_count": 10,
+                "sampled_complete_minute_count": 10,
+                "slope_micros_per_minute": 2.0236666666666636,
+                "first_complete_minute_p50_micros": 1156.196,
+                "last_complete_minute_p50_micros": 1138.115,
+                "last_to_first_p50_ratio": 0.9843616480250754,
+                "max_slope_micros_per_minute": 20.0,
+                "max_last_to_first_p50_ratio": 1.15,
+                "eligible": true,
+                "passed": true,
+                "failures": []
+              }
+            }
+          },
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 25797,
+              "frequency_per_minute": 2559.3129814003714,
+              "exposure_start_sent_ns": 972848562499781,
+              "exposure_end_received_ns": 973453341989921,
+              "exposure_seconds": 604.77949014,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 1517,
+                  "frequency_per_minute": 1517.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 5582,
+                  "frequency_per_minute": 5582.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 912,
+                  "frequency_per_minute": 912.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 3025,
+                  "frequency_per_minute": 3025.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 2084,
+                  "frequency_per_minute": 2084.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 60.0,
+                  "count": 2597,
+                  "frequency_per_minute": 2597.0
+                },
+                {
+                  "minute_index": 6,
+                  "exposure_seconds": 60.0,
+                  "count": 419,
+                  "frequency_per_minute": 419.0
+                },
+                {
+                  "minute_index": 7,
+                  "exposure_seconds": 60.0,
+                  "count": 543,
+                  "frequency_per_minute": 543.0
+                },
+                {
+                  "minute_index": 8,
+                  "exposure_seconds": 60.0,
+                  "count": 8177,
+                  "frequency_per_minute": 8177.0
+                },
+                {
+                  "minute_index": 9,
+                  "exposure_seconds": 60.0,
+                  "count": 823,
+                  "frequency_per_minute": 823.0
+                },
+                {
+                  "minute_index": 10,
+                  "exposure_seconds": 4.77949014,
+                  "count": 118,
+                  "frequency_per_minute": 1481.3295545369615
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 6932,
+              "cluster_frequency_per_minute": 687.7217345841523,
+              "cluster_sizes_rows": {
+                "max": 245,
+                "mean": 3.7214368147720713
+              },
+              "cluster_start_interval_count": 6931,
+              "cluster_start_intervals_micros": {
+                "count": 6931,
+                "p50_micros": 33991.771,
+                "p95_micros": 401631.889,
+                "p99_micros": 1010194.43,
+                "p99_9_micros": null,
+                "max_micros": 1050392.61,
+                "mean_micros": 87243.24883638724,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.050044698,
+                0.613615659,
+                1.65980269,
+                2.7101953,
+                2.73610215,
+                3.758013781,
+                3.776518293,
+                4.804336158,
+                4.822188146,
+                5.170026364,
+                5.258142837,
+                5.850761849,
+                5.869623871,
+                6.825140914,
+                6.840595912,
+                6.895855963,
+                6.907227736,
+                6.921244979,
+                7.346143873,
+                7.478592011
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 6478,
+              "frequency_per_minute": 642.6805246157153,
+              "exposure_start_sent_ns": 972848562499781,
+              "exposure_end_received_ns": 973453341989921,
+              "exposure_seconds": 604.77949014,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 443,
+                  "frequency_per_minute": 443.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 2080,
+                  "frequency_per_minute": 2080.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 239,
+                  "frequency_per_minute": 239.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 1021,
+                  "frequency_per_minute": 1021.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 486,
+                  "frequency_per_minute": 486.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 60.0,
+                  "count": 428,
+                  "frequency_per_minute": 428.0
+                },
+                {
+                  "minute_index": 6,
+                  "exposure_seconds": 60.0,
+                  "count": 122,
+                  "frequency_per_minute": 122.0
+                },
+                {
+                  "minute_index": 7,
+                  "exposure_seconds": 60.0,
+                  "count": 146,
+                  "frequency_per_minute": 146.0
+                },
+                {
+                  "minute_index": 8,
+                  "exposure_seconds": 60.0,
+                  "count": 1349,
+                  "frequency_per_minute": 1349.0
+                },
+                {
+                  "minute_index": 9,
+                  "exposure_seconds": 60.0,
+                  "count": 150,
+                  "frequency_per_minute": 150.0
+                },
+                {
+                  "minute_index": 10,
+                  "exposure_seconds": 4.77949014,
+                  "count": 14,
+                  "frequency_per_minute": 175.75096409760562
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 2448,
+              "cluster_frequency_per_minute": 242.86537886064696,
+              "cluster_sizes_rows": {
+                "max": 241,
+                "mean": 2.6462418300653594
+              },
+              "cluster_start_interval_count": 2447,
+              "cluster_start_intervals_micros": {
+                "count": 2447,
+                "p50_micros": 58458.406,
+                "p95_micros": 1030930.034,
+                "p99_micros": 1044140.601,
+                "p99_9_micros": null,
+                "max_micros": 1295707.627,
+                "mean_micros": 246513.81523579892,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.613615659,
+                1.65980269,
+                2.7101953,
+                3.758013781,
+                4.804336158,
+                5.850761849,
+                6.895855963,
+                6.907227736,
+                7.943677053,
+                8.988159134,
+                10.034674048,
+                10.046994065,
+                10.06344341,
+                10.154315709,
+                10.576460576,
+                10.610274056,
+                11.092978009,
+                11.157231169,
+                11.575430053,
+                11.683062704
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 4028,
+              "frequency_per_minute": 399.6167263278946,
+              "exposure_start_sent_ns": 972848562499781,
+              "exposure_end_received_ns": 973453341989921,
+              "exposure_seconds": 604.77949014,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 270,
+                  "frequency_per_minute": 270.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 1449,
+                  "frequency_per_minute": 1449.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 95,
+                  "frequency_per_minute": 95.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 824,
+                  "frequency_per_minute": 824.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 239,
+                  "frequency_per_minute": 239.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 60.0,
+                  "count": 106,
+                  "frequency_per_minute": 106.0
+                },
+                {
+                  "minute_index": 6,
+                  "exposure_seconds": 60.0,
+                  "count": 67,
+                  "frequency_per_minute": 67.0
+                },
+                {
+                  "minute_index": 7,
+                  "exposure_seconds": 60.0,
+                  "count": 70,
+                  "frequency_per_minute": 70.0
+                },
+                {
+                  "minute_index": 8,
+                  "exposure_seconds": 60.0,
+                  "count": 829,
+                  "frequency_per_minute": 829.0
+                },
+                {
+                  "minute_index": 9,
+                  "exposure_seconds": 60.0,
+                  "count": 72,
+                  "frequency_per_minute": 72.0
+                },
+                {
+                  "minute_index": 10,
+                  "exposure_seconds": 4.77949014,
+                  "count": 7,
+                  "frequency_per_minute": 87.87548204880281
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 1277,
+              "cluster_frequency_per_minute": 126.69080425042735,
+              "cluster_sizes_rows": {
+                "max": 234,
+                "mean": 3.1542678151918557
+              },
+              "cluster_start_interval_count": 1276,
+              "cluster_start_intervals_micros": {
+                "count": 1276,
+                "p50_micros": 190115.972,
+                "p95_micros": 1069640.178,
+                "p99_micros": 1140403.721,
+                "p99_9_micros": null,
+                "max_micros": 5236053.273,
+                "mean_micros": 471922.5069365204,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                1.65980269,
+                6.895855963,
+                6.907227736,
+                10.046994065,
+                10.06344341,
+                11.575430053,
+                12.137795258,
+                13.197342824,
+                16.33225478,
+                18.428191084,
+                20.521576622,
+                21.577208588,
+                22.618385641,
+                23.660917288,
+                24.722269731,
+                26.813975494,
+                28.907325086,
+                29.950703725,
+                31.003294398,
+                33.102636113
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "metadata_differences": {
+    "command_argv": {
+      "b5-soak": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--durability",
+        "memory",
+        "--background-rate",
+        "100000",
+        "--rate",
+        "1000",
+        "--samples",
+        "300000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "900",
+        "--report-json",
+        "docs/perf_reports/evidence/2026-10-08-public-path-e2e/soak.json",
+        "--raw-samples-json",
+        "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json"
+      ],
+      "critical-soak": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--durability",
+        "memory",
+        "--background-rate",
+        "100000",
+        "--rate",
+        "1000",
+        "--samples",
+        "300000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "900",
+        "--report-json",
+        "docs/perf_reports/evidence/2026-10-10-critical-section/soak.json",
+        "--raw-samples-json",
+        "/tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json"
+      ],
+      "soak-final": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--rate",
+        "1000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "1200",
+        "--samples",
+        "600100",
+        "--durability",
+        "memory",
+        "--background-rate",
+        "100000",
+        "--report-json",
+        "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-10-latency-growth/soak-final.json",
+        "--raw-samples-json",
+        "/tmp/zippy-perf-raw/2026-10-10-latency-growth/soak-final.json"
+      ]
+    },
+    "extension_sha256": {
+      "b5-soak": "e557c394bb4b2bd3750db959f71d916bc0dbc56da1c37cc319b7f3ff3a7442bb",
+      "critical-soak": "8aa8431af472f5adadc7f03324b840fde66dc18ac0a3c62e13eaeb3dd606e7d5",
+      "soak-final": "9298888be7c8a5b003dcd568c009470f2aacf3b4c01e2c351d73ff293e27f730"
+    },
+    "git_sha": {
+      "b5-soak": "7c6b6a9784336827c7239a872e50bccfda15d501",
+      "critical-soak": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e",
+      "soak-final": "e1e67b569d1f5ffb48f6a093c242f271608a8265"
+    },
+    "server_sha256": {
+      "b5-soak": "19c886769cb064aed6e848ebe38669e5ee4e3269e58cdd14dfc921d15f8fad56",
+      "critical-soak": "49f9e1c924200ee23d2c741da6cfca693c5a6149f08e6bc7dd857ef99dff2736",
+      "soak-final": "4313a31a58eaf41edebfa115789f99567afd2aa852f26f7898b3dbe7cb064604"
+    },
+    "started_at_utc": {
+      "b5-soak": "2026-10-10T10:10:08.246199+00:00",
+      "critical-soak": "2026-10-10T10:41:14.777951+00:00",
+      "soak-final": "2026-10-10T11:52:22.082617+00:00"
+    }
+  }
+}

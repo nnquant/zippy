@@ -1,0 +1,14 @@
+{
+  "base_commit": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+  "candidate_before_sha256": "16b94d80e4b3127b9b7b69ce69ad0d18d27870224b061b3f0fd80a885c82c27d",
+  "files": {
+    "crates/zippy-server/src/native_log.rs": "34550cd89cf73017588600d0d7f7ace25211c10d54321417abed4ee7252d0635",
+    "crates/zippy-server/src/native_query.rs": "42a281a5983d287db82bdbc4cbf3207e09cd21a56ddf2fb13222855fbcb0cf60",
+    "crates/zippy-server/src/query_snapshot.rs": "fa7b6cf05fe4336c1c357c947adffad034deb9fb9bb0da104368148a26cd1660",
+    "crates/zippy-server/src/query_service.rs": "892dba9e868781c18e83c3062bb6110593ca34c42a40997b2b16a2dcfe769cd6"
+  },
+  "e1_server_sha256": "ea5f6452398b8ffb720e1878f425d38ebfd8997d6a423bc79a4d6d77a948f6eb",
+  "source_restored": true,
+  "candidate_rebuilt_sha256": "16b94d80e4b3127b9b7b69ce69ad0d18d27870224b061b3f0fd80a885c82c27d",
+  "candidate_rebuild_matches": true
+}

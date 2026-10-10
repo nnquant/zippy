@@ -885,3 +885,477 @@ sha256sum -c RAW-SHA256SUMS
   WSL2 主机上的结果也不能充当裸机或本机 Rust SHM 100–300µs SLA 的证明。
 
 原有 CI 延迟门限和配置未改；本次没有 commit、push 或切换分支。
+
+
+## 可见延迟随时间增长（阶段 1.7，2026-10-10）
+
+本轮结论：已去除已追上订阅每次刷新时对本表全历史清单的重复读取；确定性回归及全部指定功能检查通过。最终有背景十分钟趋势满足门限（2.024µs/min、末/首0.984），但无背景五分钟斜率22.576µs/min及四格尾部对比未全面达标，**整体验收未通过**；详见本节末的最终表和 `final-acceptance.json`。
+
+本节追加修复前 control-a/control-b、历史趋势复算、最小实现及验证，前述阶段的历史数据不变。功能验证与性能验收分别记录，不以工作量回归通过代替长时延迟验收。
+
+### 分钟统计口径与可复算身份
+
+在原始双条件预热 mask 后，以第一条实际计量 sent_ns 为共同起点；按实际 sent_ns 划分左闭右开 60 秒桶，ack 与 visible 的同一行归同一个发送分钟。各延迟分位数沿用 nearest-rank，>10ms 是严格大于。所有分桶使用真实时间，不把“60,000 行”当作“一分钟”。
+
+发送覆盖终点是最后一条计量 sent_ns；某桶必须完整覆盖 60 秒才进入趋势判定。尾桶仍展示 count/p50/p99/>10ms，但不参与 OLS 或首末比例：短窗口样本量和暴露时长与完整分钟不可比，慢响应也不能把发送覆盖延长。若最后一条恰好位于分钟边界，则属于一个零发送覆盖的尾桶，不据此制造额外完整分钟。
+
+OLS 对各完整分钟 p50 按实际分钟中心作无权线性回归，单位 µs/min，保留有符号斜率；至少 2 个有样本的完整分钟才估计。门限同时要求 slope≤20µs/min、最后完整分钟 p50 / 第一完整分钟 p50≤1.15；源运行必须完整且没有空的完整分钟才能通过。首分钟 p50=0 时比例未定义，不判通过。趋势判定与原 C/D 延迟门限分别报告。新增分析输出位于每格 `minute_trends.buckets` 和 `minute_trends.p50_trends`；分析 CLI 的退出 0 仍仅表示报告成功生成，自动化验收应读取 `p50_trends.visible_latency.passed` 并额外检查所需完整分钟数（10 或 5）。新增 20 个单元测试覆盖真实发送分桶、预热、部分尾桶、边界样本、正负斜率、比例、空桶与不完整运行；该分析测试文件共 38 项通过。
+
+既有分析中的超限“每分钟桶”按 received_ns 分桶，其暴露终点也是最后接收时刻；这部分保留兼容、不覆写历史结果。新 minute_trends 明确按 sent_ns，跨分钟才收到的慢样本可能与旧桶不同。用户监督数据若按 received 分钟聚合，应先对齐口径再比较，不能把边界小差异当作样本丢失。
+
+固定 N/目标速率只能近似持续时长。例如 180,000 / 1,000 并不保证从首发到末发覆盖满 180 秒，运行可能只含 2 个完整分钟；本次 control-a 实际为 180.010450329 秒，得到 3 个完整分钟和 10.450329ms 尾桶。后续计划以 600,100 / 300,100 样本留约 0.1 秒余量，面向 10 / 5 个完整分钟；最终仍以真实 sent 覆盖和完整桶数为准，不能仅凭样本数填“10 分钟通过”。
+
+### 旧趋势与 control-a/control-b 对照
+
+| 数据集 | 配置 | 完整分钟 | visible p50 OLS（µs/min） | visible 末/首 | visible 趋势门限 | ack OLS（µs/min） | ack 末/首 | ack 趋势门限 |
+| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | --- |
+| b5bf6d3 收录的历史 soak | memory / 背景 100,000 | 5 | 693.9318 | 3.047523 | 未通过 | 14.7399 | 1.106208 | 通过 |
+| e1e67b5 收录的 critical-section soak | memory / 背景 100,000 | 5 | 700.1403 | 3.052170 | 未通过 | 14.9046 | 1.110773 | 通过 |
+| control-a-before（e1 生产，无背景） | memory / 背景 0 | 3 | 718.5290 | 2.040058 | 未通过 | 26.3970 | 1.066344 | 未通过 |
+| control-b-before（e1 生产，有背景及诊断采样） | memory / 背景 100,000 | 3 | 754.6140 | 2.075679 | 未通过 | 33.2280 | 1.084720 | 未通过 |
+
+归档标签不是测量时的 clean checkout 身份：b5bf6d3 收录的旧 soak metadata 是 `7c6b6a9… dirty=true`；e1e67b5 收录的 critical-section soak metadata 是 `b5bf6d3… dirty=true`；本次 control-a/control-b metadata 均是 `e1e67b5… dirty=true`。各原始 SHA、完整 metadata 和配置由对应 trends JSON 保留，不改写为发布提交上新测的数据。
+
+两次历史 soak 的 ack 趋势较平，而 visible p50 每分钟增长约 0.7ms。control-a 无背景仍呈约 0.719ms/min 的 visible 增长，说明背景批量写入并非该趋势的必要条件。control-a ack 的3分钟OLS为26.397µs/min，超过20门限，不能称为所有ack场景均已达标；其末/首仍只有1.0663。上述是观测对照，不单独证明耗时具体落在哪一跳。
+
+#### control-a 分钟明细
+
+| 发送时间窗 | 样本数 | ack p50 / p99（µs） | ack >10ms | visible p50 / p99（µs） | visible >10ms | 参与趋势 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| [0, 60.000000000) 秒 | 60,001 | 795.766 / 1478.049 | 45 | 1381.709 / 2704.121 | 49 | 是 |
+| [60, 120.000000000) 秒 | 60,000 | 854.607 / 1280.839 | 74 | 2093.864 / 3316.874 | 76 | 是 |
+| [120, 180.000000000) 秒 | 59,987 | 848.560 / 1416.813 | 74 | 2818.767 / 4214.934 | 79 | 是 |
+| [180, 240) 秒，观测至 180.010450329 秒 | 12 | 817.945 / 1110.857 | 0 | 2977.006 / 3904.362 | 0 | 否，尾桶 |
+
+control-a 计量 ack/visible 各180,000；含预热182,000行全部收到，缺口/重复/乱序/意外序号均为0，ordered end marker完整；实际前景999.937749行/秒，背景0，所有进程正常退出。原基准整体exit=1，仅由以下原始C层延迟门限造成：
+
+- `visible_p50_micros=[2113.357] exceeds limit=[1000.000]`
+- `visible_p99_micros=[3923.731] exceeds limit=[3000.000]`
+- `visible_p99_9_micros=[13970.027] exceeds limit=[10000.000]`
+
+control-a 证据为 `docs/perf_reports/evidence/2026-10-10-latency-growth/control-a-before.json` 与 `control-a-before-trends.json`；trends文件20,181字节。历史趋势保存在同一 evidence 目录的 `historical-soak-trends.json`，其原字段已逐项验证与归档 comparison 一致，仅新增分钟趋势；`control-before-trends.json` 同时保存本次 A/B 对照、元信息差异和原始样本 SHA。新 evidence 本段中的简称均相对于 `docs/perf_reports/evidence/2026-10-10-latency-growth/`。
+
+#### control-b 分钟明细与完整性
+
+| 发送时间窗 | 样本数 | ack p50 / p99（µs） | ack >10ms | visible p50 / p99（µs） | visible >10ms | 参与趋势 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| [0, 60) 秒 | 60,001 | 784.418 / 1208.959 | 40 | 1403.047 / 2216.414 | 47 | 是 |
+| [60, 120) 秒 | 59,999 | 862.721 / 1374.690 | 59 | 2212.046 / 3566.725 | 68 | 是 |
+| [120, 180) 秒 | 60,000 | 850.874 / 1385.802 | 59 | 2912.275 / 4282.177 | 75 | 是 |
+| [180, 240) 秒，观测至 180.098918507 秒 | 100 | 882.189 / 1442.167 | 0 | 3208.078 / 4544.651 | 0 | 否，尾桶 |
+
+control-b 计量 ack/visible 各 180,100；含预热 182,100 行全部收到，缺口/重复/乱序/意外序号均为 0，ordered end marker 完整，所有进程退出 0。前景实际 999.999214 行/秒，背景 99,999.934861 行/秒。原基准整体 exit=1，仅由原 C 层 visible p50=2187.854µs>1000、p99=4045.516µs>3000、p99.9=10223.684µs>10000 造成。新趋势门限单独判定：visible 斜率和比例均失败；ack 斜率失败、比例通过，不能遗漏 ack 的失败项。
+
+A/B 使用同一 release server 和扩展 SHA、同一原基准脚本 SHA，但 B 启用了边界和资源诊断且增加 100 个计量样本；因此二者不是只有背景速率单变量不同的严格开销实验。两者和旧两次 soak 均出现增长，诊断用于定位增长边界，不能据此量化背景写入的独立成本。
+
+### control-b 边界与资源诊断
+
+诊断证据为 `control-b-before-diagnostic-analysis.json`，原始边界/资源 JSONL 留在 `/tmp/zippy-perf-raw/2026-10-10-latency-growth/` 并由证据记录输入身份。每 1,000 行固定采样一次，约 1Hz，可能与 checkpoint 周期有相位关系；下述结论限定在采样点，不能覆盖全部客户端慢事件。总计 183 个边界样本，原预热 mask 后 181 个，三个完整分钟分别为 61 / 59 / 60 个，尾桶 1 个。下表是稀疏诊断样本，不替代上方完整 180,100 行统计。
+
+| 边界 | 第 1 / 2 / 3 完整分钟 p50（µs） | p50 OLS（µs/min） | 末 / 首 |
+| --- | --- | ---: | ---: |
+| sent → read_chunk 返回 | 1402.111 / 2081.972 / 2995.439 | 796.6640 | 2.136378 |
+| read_chunk → next 返回 | 36.280 / 33.003 / 32.041 | -2.1195 | 0.883159 |
+| next 返回 → 基准 received | 5.220 / 4.779 / 4.789 | -0.2155 | 0.917433 |
+| 采样样本总 visible | 1444.903 / 2114.013 / 3037.850 | 796.4735 | 2.102459 |
+
+增长主要发生在 read_chunk 返回以前；被单独测量的 Python 日志元信息校验/event 构造后缀，以及 next 返回交接至 received 读钟的段，没有同向 p50 增长。received 之后的 to_pylist 和列表追加未被单独计时；它们造成的后续消费积压仍可能落入下一行的 sent→read_chunk，不能仅凭分界采样排除所有客户端累积。sent→read_chunk 仍包括服务端处理/等待、本地传输和客户端 C++ Arrow 解码，**不是已观测的 server-send 时间戳**，不能仅凭此表把上游所有增长归给服务端。每事件都经过包装和 modulo 判断，采样事件额外两次读钟及字典插入；结果消费完成后输出。稀疏分钟 p99 仅供描述，不能用于替代完整基准 p99 验收。
+
+资源采样每约 60 秒一次，以下是监控经过时间：elapsed=0 的原点比首计量 sent 早 2.519452273 秒；首资源快照 elapsed=0.301095862，位于计量起点前 2.218356411 秒。实际采样时间保存在证据内。CPU 为累计 CPU 秒及相邻快照差，不是 CPU 百分比，也不是精确计量分钟桶。
+
+| 监控经过秒 | probe 持久行 / files / lineage | 背景持久行 / files / lineage | server 累计 CPU 秒 | server 本间隔 CPU 秒 | subscriber 累计 CPU 秒 | subscriber 本间隔 CPU 秒 | server mapped segment 文件 |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 60.304 | 59,215 / 57 / 57 | 5,922,000 / 57 / 113 | 59.70 | 59.68 | 13.61 | 13.47 | 2 |
+| 120.308 | 119,239 / 114 / 114 | 11,926,000 / 114 / 227 | 136.49 | 76.79 | 26.68 | 13.07 | 2 |
+| 180.312 | 179,405 / 171 / 171 | 17,941,000 / 171 / 341 | 216.09 | 79.60 | 37.51 | 10.83 | 2 |
+
+同三次快照中，采样保留的 server TID 22（comm=zippy-catalog-s）单线程累计 CPU 为 17.14 / 48.09 / 83.06 秒，相邻增量约 17.14 / 30.95 / 34.97 秒；TID 21 的 control 线程累计 CPU 另为 3.88 / 7.40 / 10.06 秒。线程采样只保留 CPU 最高的 12 个，不能把未列出的线程当作 0。server RSS 为 89,763,840 / 95,543,296 / 99,389,440 字节。持久 files/lineage 持续增加，server CPU（尤其 Catalog 线程）随时间增加，而 subscriber CPU 没有同向增长；这与重复历史快照工作的代码证据相符。mapped segment 文件在这三个快照均为 2，但结束快照为 3，不能泛化为全程恒定 2。
+
+资源采样 `monitor_errors=[]`。独立 Catalog 只读查询有 50ms progress budget，非跨表原子快照；每次整个快照约 4.6–6.7ms。末次采样时部分 worker 已正常退出，保留 FileNotFound 而不当作运行失败或伪填 0 CPU/RSS。writer/subscriber 保留原始样本整数列表，RSS 增长不能直接证明泄漏；server RSS 增长也需要所有权/预算证据才能归因。
+
+### 现有刷新路径与确定性工作量证据
+
+修复前订阅窗口每次 refresh 都调用 `NativeQuerySnapshotCoordinator::pin_persisted` 再构造 log_plan。e1e67b5 的 `native_log.rs` 中 `NativeLogWindow::refresh` 先取得 snapshot_refresh_token、admit_event_window，随后无条件 pin_persisted；`query_snapshot.rs` 的 pin_persisted 沿既有Catalog快照路径读取、固定并核算持久文件和lineage等元信息。即使订阅游标已追到持久前缀之后，仍可能携带与本表历史文件数量相关的快照工作。这里描述的是修复前 e1e67b5 的代码路径，避免将正在实现的路径与旧生产混同。
+
+在 production files 与 e1e67b5 校验一致时，确定性回归使用相同单行live刷新，改变本表或同namespace背景表历史文件数，得到：
+
+| 本表历史文件 | 背景表历史文件 | active_snapshot_memory_bytes | 判定 |
+| ---: | ---: | ---: | --- |
+| 1 | 1 | 1,272,296 | 小历史对照 |
+| 256 | 1 | 8,391,176 | 历史无关性断言失败 |
+| 1 | 256 | 1,272,296 | 背景历史隔离断言通过 |
+
+该证据证明单行live刷新保留的快照核算字节随**本表**持久历史增加；从1到256个文件增加7,118,880字节，总量约为原来的6.60倍，而同namespace背景表的256文件不增加此指标。它衡量快照核算工作/持有量，不是RSS，不是逐跳实测耗时，也不能独自归因全部0.7ms/min。结合无背景 control-a 仍增长、control-b 的增长位于 Python 后缀之前，以及 Catalog 线程 CPU 随历史增长，这确定了本次最小修复目标：每次 live 刷新重复读取和保留全历史快照。工作量依赖已经由确定性测试证明；该依赖具体解释多少延迟增长，仍须修复后的同工作量回归及长时干预对照验证，不能先行归因全部 0.7ms/min。
+
+证据：`history-refresh-before.log`（1 passed、1 failed、预期exit101）、`history-refresh-before-metadata.json`（生产文件与e1的SHA一致及命令/日志身份）、`history-regression-test.patch`。此失败是新增不随历史增长约束在旧代码上的预期回归证据，不应改写为旧功能完整性失败。
+
+### 最小方案及边界
+
+服务端内部新增私有live日志快照。每次基于一个一致Actor观察判定：只有订阅的下一条inclusive cursor严格大于Actor committed watermark时，才能用Actor快照、固定Catalog表元信息/revision，以及cursor之后的live suffix构建窗口，不读取该表全部历史files/lineage。若cursor仍需要持久文件回放，则走既有完整快照路径。Empty committed、latest-only start和边界相等情况必须有明确分支；不能把catalog最新committed代替Actor当前观察。
+
+该方案针对已追上的订阅刷新，不改变公开Client API、Flight wire、文件格式或持久化语义。全历史查询、落后消费者的Parquet回放保留既有能力。工作量目标是去除“随历史持久文件总数增加”的部分；仍允许与当前所需live suffix大小相关，不能承诺所有窗口永远恒定字节或零分配。
+
+| 关注点 | 必须维持的约束 / 最终验收点 |
+| --- | --- |
+| schema | 订阅固定schema/kind；Catalog 的 schema/snapshot 版本可领先 Actor、不能落后，writer_epoch 要相等。演进后沿既有SchemaMismatch终止，不能用旧schema解码新live span。 |
+| drop / 生命周期 | 按不可变table_id及Active状态验证，保留table actor生命周期、窗口租约和RowSpan所有权；drop/retire期间不输出悬空capability，也不重新绑定同名新表。 |
+| cancel / shutdown | 快速路径仍由QueryService的查询实例、generation、cancellation/deadline与refresh token管理；取消或关闭后停止等待与交付，预算随实际请求/快照所有者释放；已入队或开始的后台请求仍可能完成并回收结果（`crates/zippy-ingest/src/actor.rs:1819`）。 |
+| budget | 固定元信息、live描述/行视图、结果解码均纳入现有内存预算与所有权账本；不能跳过charge来“通过恒定工作量测试”。预算耗尽必须按现有错误契约失败。 |
+| fencing / epoch | Catalog 与 Actor 的 writer_epoch 相等；segment identity/generation 固定，segment 的 writer_epoch≤Actor、schema_version 与 Actor 相等；fencing切换不能混用旧epoch描述或以无效cursor跳过行。 |
+| watermark / cursor | 同一Actor观察固定committed/max/live范围；窗口watermark不得回退，cursor之前不重放、之后不漏发，空窗仍保留先登记watch后捕捉边界的防丢唤醒顺序。 |
+| prepared checkpoint | Catalog已提交而Actor尚未publish时，查询仍以Actor的persisted边界与live范围为准；不能将Catalog最新文件和旧Actor live组合造成重复。 |
+| lagging fallback | cursor≤Actor committed 时回到原持久快照/Parquet+live路径；start=None 也走原路径。live 缺口、重叠或错误 watermark 直接报 DataCorruption，未来 cursor 或 Frame 内部 cursor 报 InvalidArgument，不用回退掩盖损坏。 |
+| frame / KV | 保留原 Frame/KV 原子边界标记、序号与切片规则；消费者仍须拼齐完整 frame/mutation 才能作为原子业务变更使用（`crates/zippy-server/src/native_log.rs:65`），不暗示每个推送 batch 都是完整 mutation。 |
+
+### 实际实现、复杂度及安全边界
+
+根因的具体历史读集位于 `crates/zippy-catalog/src/snapshot_domain.rs:580`、`crates/zippy-catalog/src/snapshot_domain.rs:603`：逐文件解码并读取 lineage；`crates/zippy-catalog/src/pinned_snapshot.rs:361` 对完整快照序列化计费。修复前 e1e67b5 的 `crates/zippy-server/src/native_log.rs:153` 每次 refresh 无条件进入该路径；当前该位置已改为优先选择 live 路径（`:150`）。旧完整历史路径仍保留，因此可从当前 `crates/zippy-server/src/query_snapshot.rs:1321` 的 log_plan 查看先构造全部文件 source、最后裁剪 cursor 的流程。
+
+| 当前源码位置 | 改动与约束 |
+| --- | --- |
+| `crates/zippy-server/src/native_log.rs:150` | 有显式 cursor 时尝试 live 快照；仍需要持久前缀则回到旧 full 路径；两条路径都拒绝 watermark 回退。 |
+| `crates/zippy-server/src/live_log_snapshot.rs:82` | 按固定 table_id 解析 Catalog descriptor、观察 Actor，再读取实际 Catalog revision。schema/epoch 使用原校验，Catalog 可领先，但不能落后于 Actor。 |
+| `crates/zippy-server/src/live_log_snapshot.rs:140` | snapshot 与 plan 分别预留、持有与自身存活期对应的预算；保留原协调峰值，未靠取消内存计费通过回归。 |
+| `crates/zippy-server/src/live_log_snapshot.rs:168`、`crates/zippy-server/src/live_log_snapshot.rs:255` | 先验证覆盖并按 cursor 裁剪，再只扫描本次选中 suffix 的 UTF-8 offsets；损坏使用原 `cannot bound live UTF-8 values` 错误映射。 |
+| `crates/zippy-server/src/native_log.rs:527` | 共用完整性校验从指定持久边界的下一 offset 开始；完整历史入口仍从 0 校验。Frame 身份、边界、缺口和未来 cursor 校验保留。 |
+| `crates/zippy-server/src/query_service.rs:3483` | 两种快照复用同一个安装函数，保留 running/drained、查询实例与 reservation 归属、schema/版本单调、服务状态和 owner 上限检查。 |
+
+新快照只持有固定 RowSpan/Arc 和预算，无持久文件 capability，不需要 Catalog 文件 GC pin；checkpoint 随后回收 Actor 前缀不影响已经持有的 span。Prepared checkpoint 期间 Catalog 可领先，快路仍以同一次 Actor 观察的 committed/max/live 范围为准。schema/drop/shutdown 仍由原 changes/watch 与交付前检查终止；Frame checkpoint 必须落在完整 frame 末尾，KV 必须落在 BATCH_END（`crates/zippy-ingest/src/actor.rs:2079`、`crates/zippy-ingest/src/actor.rs:2123`），没有绕过这些写入侧约束。
+
+令 H 为本表历史文件/lineage 数，S 为 Actor 当前持有并遍历的 live 段元数据数（包括观察时随后跳过或裁剪的持久前缀），U 为本次选中 suffix 的 UTF-8 offset 数。固定 schema 下，新 live 规划为 Append/KV O(S+U)，Frame 为 O(S log S+U)，不再读取或保留 O(H) 的历史清单。Actor 快照仍创建当前可见 span 数组，见 `crates/zippy-ingest/src/actor.rs:1269`；S 的既有硬上限为 1024（`crates/zippy-ingest/src/actor.rs:29`、`crates/zippy-ingest/src/actor.rs:1353`）。不能把该实现描述成所有场景严格 O(新增行数)：当前 live 元数据仍全部检查，Frame 使用 BTreeSet，schema 宽度及 Catalog 控制队列也有成本。
+
+首次 `prepare_log_window` 仍完整绑定历史（`crates/zippy-server/src/native_query.rs:358`）；follow 注册 watch 后的权威刷新，若带显式且已追上的 cursor，可以选择 live。start=None 或 cursor≤Actor committed 的回放仍保留完整历史路径。本次没有修改 Actor、Catalog、wire、持久格式或公开 API；新增符号只在 Server 内部使用。
+
+### 确定性回归与功能验证
+
+主要回归只修改原 `native_query_canary.rs` 的 cfg(test) 模块，使用 e1 已有接口，移植该测试文件或证据中的 patch 即可在 e1 编译。1→256 个历史文件通过一次额外 persist 创建，没有随文件数制造 255 次 Catalog 版本提交；固定 Int64 schema、一个 live span、一个输出行，避免把 UTF-8 payload 扫描混入该历史清单计数。
+
+旧版失败摘录：
+
+```text
+one-row live refresh retained history: small=[1272296] large=[8391176]
+test result: FAILED. 1 passed; 1 failed
+```
+
+修复后 `live-refresh-after.log`：
+
+```text
+live refresh history_files=[1] other_files=[1] active_snapshot_memory_bytes=[136446]
+live refresh history_files=[256] other_files=[1] active_snapshot_memory_bytes=[136446]
+live refresh history_files=[1] other_files=[256] active_snapshot_memory_bytes=[136446]
+test result: ok. 6 passed; 0 failed
+```
+
+这是保留快照/计划的账本字节，不是 RSS、刷新峰值或 wall-clock 时间。回归核对输出值/offset/行数，并在 drop stream 后检查账本归零，见 `crates/zippy-server/src/native_query_canary.rs:2194`、`crates/zippy-server/src/native_query_canary.rs:2312`。另有 UTF-8 已消费前缀 2048 字节而选中新值 2 字节的上界回归，以及 live 后缀连续性、Frame 与未来 cursor 测试。
+
+集成测试补强三条现有用例：同一订阅跨 writer epoch；三类 schema 演进后以既有 SchemaMismatch 终止；三类慢消费者跨四次 checkpoint，先回放 persisted+live，再追上后续 live，并核验行值、offset、Frame/KV 边界及释放后的内存。位置为 `crates/zippy-server/tests/native_storage_runtime.rs:44`、`crates/zippy-server/tests/native_storage_runtime.rs:3183`、`crates/zippy-server/tests/native_storage_runtime.rs:3381`。三条均在最终全 workspace 运行中通过。
+
+开发期间缺少 QueryReadSnapshotGuard::into_any 的编译失败保留在 `live-refresh-initial-compile-failure.log`；并行子代理在源码写入中遇到同一错误，记录于 `integration-build-in-progress.log`。子代理的三类集成运行还遇到原有 Flight 监听端口绑定 EPERM；该失败日志保留，主执行环境的全 workspace 测试随后通过同一用例。上述开发/环境失败没有冒充 e1 上的确定性回归失败。
+
+Prepared 状态对新 live owner 的精确暂停交错没有另加专项测试，安全论证来自共用 Actor 边界和原两阶段 checkpoint 测试；本轮新增测试不声称覆盖全部并发分支。
+
+### 第一轮修复后四格：保留失败结果
+
+证据为 `baseline-first-comparison.json`（95,649 字节）。该文件由原分析工具同时校验并复算旧 critical-section 基线与本次 baseline-after；原 raw/summary 没有覆盖。以下每个单元格写“旧 → 首轮修复后”，延迟单位 µs。
+
+| 配置 | 端点 | p50 | p99 | p99.9 | max |
+| --- | --- | ---: | ---: | ---: | ---: |
+| memory / 背景 0 | visible | 1235.225 → 1284.912 | 1748.249 → 9261.024 | 6157.364 → 24231.985 | 14533.116 → 52628.646 |
+| memory / 背景 0 | ack | 766.404 → 934.285 | 1102.931 → 4231.288 | 5534.270 → 19809.060 | 14051.882 → 43976.578 |
+| memory / 背景 100,000 | visible | 1250.600 → 1409.590 | 1956.124 → 6957.274 | 8475.353 → 18678.962 | 16042.638 → 37995.509 |
+| memory / 背景 100,000 | ack | 765.001 → 1000.361 | 1220.421 → 4181.477 | 7745.233 → 14823.676 | 15416.948 → 32065.179 |
+| wal / 背景 0 | visible | 1332.277 → 1344.823 | 2321.517 → 4607.874 | 5178.351 → 17045.909 | 14788.946 → 44092.962 |
+| wal / 背景 0 | ack | 2012.409 → 2411.572 | 3467.674 → 10546.941 | 6485.029 → 37437.286 | 13484.120 → 240018.116 |
+| wal / 背景 100,000 | visible | 1349.946 → 1319.142 | 2235.049 → 3362.977 | 5235.842 → 8633.245 | 12153.181 → 35160.880 |
+| wal / 背景 100,000 | ack | 2052.186 → 2390.348 | 3425.499 → 6418.051 | 6894.838 → 24873.606 | 12486.548 → 139482.514 |
+
+| 配置 | 前景实测速率（行/s） | 背景实测速率（行/s） | visible >10ms 次数 | visible >10ms /min | 实际暴露秒数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| memory / 背景 0 | 1000.011 → 818.385 | 0.000 → 0.000 | 5 → 181 | 14.999685 → 444.376645 | 20.000419832 → 24.438728092 |
+| memory / 背景 100,000 | 1000.018 → 827.809 | 99999.284 → 99999.426 | 8 → 96 | 23.999830 → 238.405675 | 20.000141281 → 24.160498736 |
+| wal / 背景 0 | 477.115 → 348.551 | 0.000 → 0.000 | 8 → 57 | 11.450913 → 59.604688 | 41.918053711 → 57.378036949 |
+| wal / 背景 100,000 | 465.648 → 372.544 | 100014.130 → 99999.753 | 5 → 14 | 6.984790 → 15.647169 | 42.950466812 → 53.683831463 |
+
+两次四格均完整采集每格 20,000 个计量 ack/visible 样本，均无缺口、重复、乱序或意外序号，ordered end marker 完整；所有 worker/server 退出码为 0。两次原基准主脚本均退出 1，结构完整不等于延迟验收通过。>10ms 频次以首计量 sent 至末计量 received 的实际暴露归一化，严格 >10ms，未以名义 20 秒替代实际时长。全部窗口不足 60 秒，本表不能估计分钟趋势斜率。
+
+本次各格的原 C/D 门限失败项：
+
+- memory / 背景 0：`visible_p50_micros=[1284.912] exceeds limit=[1000.000]`；`visible_p99_micros=[9261.024] exceeds limit=[3000.000]`；`visible_p99_9_micros=[24231.985] exceeds limit=[10000.000]`。
+- memory / 背景 100,000：`visible_p50_micros=[1409.590] exceeds limit=[1000.000]`；`visible_p99_micros=[6957.274] exceeds limit=[3000.000]`；`visible_p99_9_micros=[18678.962] exceeds limit=[10000.000]`。
+- wal / 背景 0：`visible_p50_micros=[1344.823] exceeds limit=[1000.000]`；`visible_p99_micros=[4607.874] exceeds limit=[3000.000]`；`visible_p99_9_micros=[17045.909] exceeds limit=[10000.000]`；`wal_ack_p50_micros=[2411.572] exceeds limit=[2000.000]`；`wal_ack_p99_micros=[10546.941] exceeds limit=[5000.000]`。
+- wal / 背景 100,000：`visible_p50_micros=[1319.142] exceeds limit=[1000.000]`；`visible_p99_micros=[3362.977] exceeds limit=[3000.000]`；`wal_ack_p50_micros=[2390.348] exceeds limit=[2000.000]`；`wal_ack_p99_micros=[6418.051] exceeds limit=[5000.000]`。
+
+首轮四格 visible p99/p99.9/max 均较旧 critical-section 恶化，ack 四个分位也全部恶化，前景吞吐四格均下降；仅 wal/背景100k 的 visible p50 有小幅下降（1349.946→1319.142µs），仍高于原 1000µs 门限，不能以此掩盖其余失败。原始配置、门限和样本数保持一致，没有放宽门限或丢弃不利格。
+
+数据身份及比较限制：
+
+- `e1-critical-section`：git=`b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e`、dirty=true，开始 UTC `2026-10-10T10:38:34.904725+00:00`；server SHA256=`49f9e1c924200ee23d2c741da6cfca693c5a6149f08e6bc7dd857ef99dff2736`；extension SHA256=`8aa8431af472f5adadc7f03324b840fde66dc18ac0a3c62e13eaeb3dd606e7d5`。原 raw SHA256=`0f446725df388dca5e4e9a32fe6eb281041a3e540f79712fd3d0a95652f624f2`。
+- `baseline-after-first`：git=`e1e67b569d1f5ffb48f6a093c242f271608a8265`、dirty=true，开始 UTC `2026-10-10T11:22:58.203960+00:00`；server SHA256=`16b94d80e4b3127b9b7b69ce69ad0d18d27870224b061b3f0fd80a885c82c27d`；extension SHA256=`74c32f8d66409865dc892fd76624d4df79c4f9f74b22121d4e14861a2469678a`。原 raw SHA256=`e8f77f7737124acd5d77f68e929fbc63cdaccd7874c41d6a690be38b2b875fa1`。
+
+旧列为 e1 收录的 critical-section 数据，测量 metadata 实际是 b5bf6d3 dirty；不是当前时段重跑的 clean e1。两次开始相差约 44 分钟，server/extension 二进制不同。仅由这一前后对照无法区分代码效应与主机负载/调度/存储状态变化；环境漂移也不能在缺乏对照时用于豁免首轮失败。同期对照另列如下，不替换本轮失败证据。
+
+### 同期旧版/新版短对照
+
+为检查首轮退化是否稳定复现，在相同主机时段顺序运行 memory/0 各 20,000 样本；未修改基准门限或采样。仅将四个生产文件临时替换为 git show e1e67b5 的内容构建旧版对照二进制，finally 按保存的原始字节恢复当前修改，再重建新版。分支与 HEAD 未变；新二进制重建前后的 SHA-256 完全相同（16b94d80…），证明下面和首轮使用相同实现，见 paired-build-metadata.json。原测试文件的生产部分没有改动；旧版构建不会编译 cfg(test)。
+
+| 端点 | 同期 e1 p50 / p99 / p99.9 / max（µs） | 同期新版（µs） |
+| --- | --- | --- |
+| visible | 1410.006 / 3120.534 / 7052.390 / 18096.914 | 1141.498 / 2024.712 / 7271.563 / 16798.914 |
+| ack | 856.262 / 2474.306 / 6370.340 / 17102.335 | 830.445 / 1578.881 / 6872.111 / 16060.826 |
+
+两次各 20,000 样本与完整性均通过；前景分别约 1009.559 / 999.874 行/秒。新版 p50/p99 改善，但 visible 和 ack 的 p99.9 略差，不能据此宣布尾延迟全部不劣化。二者原 C 门限均失败、主脚本退出 1，见 paired-exit-codes.json 与 paired-comparison.json。新版首轮 memory/0 的 p99=9261µs、p99.9=24232µs，在代码和二进制未变时下降到本表水平；这证明短运行存在明显变化，但不足以把首轮全部退化归咎于环境，更不能删除首轮结果。
+
+静态固定开销复核：对于已追上、单次无 Conflict 重试的刷新尝试，新旧均为两次 Catalog 请求与一次 Actor 请求；opening、重试和落后回放不能套用这个固定计数。旧版第二次请求进入 snapshot worker，新版 revision 进入 control worker。revision 仅按 catalog_meta 主键读取 8 字节值（`crates/zippy-catalog/src/service.rs:913`、`crates/zippy-catalog/src/service.rs:1908` 是派发；实际查询为 `crates/zippy-catalog/src/layout.rs:379`、`crates/zippy-catalog/src/layout.rs:386`，主键见 `crates/zippy-catalog/src/layout.sql:3`，8 字节解码见 `crates/zippy-catalog/src/encoding.rs:27`），没有隐藏的全表扫描。落后消费者需先做候选快路检查再完整回放，仍可能增加固定开销。长时验收使用原基准，不启用诊断 monkeypatch；其后预先安排再跑一轮完整四格，以检验结果稳定性，所有轮次保留。
+
+
+### 计费修正前候选 v1 的十分钟结果
+
+首轮候选（server SHA 16b94d80…）完成 600,100 个计量样本，实际发送覆盖 609.676086756 秒，有 10 个完整分钟。visible p50 OLS 为 **2.539952µs/min**，末/首 **1.023047878**；ack OLS 为 1.006842µs/min，末/首 1.001167277。两项 p50 趋势门限通过，含预热 602,100 行全部收到、完整性零错误，但原 C 延迟门限全部失败、主脚本 exit=1。全程 visible p50/p99/p99.9/max 为 1164.755 / 11680.840 / 103240.193 / 375478.372µs；>10ms 共 6,594 次、648.933549 次/分钟。第 2/8 个完整分钟的 p99 分别达 62.202/73.734ms，不能以趋势通过掩盖尾延迟恶化。
+
+前景实际 984.291900 行/秒、背景 99999.972283 行/秒；schedule_lag p50/max 为 5.226/19.067 秒。此滞后是实际 sent 相对预定发送 deadline 的落后，ack/visible 从实际 sent 起算，不含发送前排程积压。分钟样本数在 50,501–67,022 之间，未按固定行数重分桶或丢弃样本。
+
+原名 `soak-after.json` 的 raw/summary 保留，详细分钟表、斜率、尾桶、配置和二进制身份见 `soak-candidate-v1-trends.json`；完整解释另存 `soak-candidate-v1.md`。随后审查发现每个 live span 深拷贝 LayoutPlan 的宽表计费遗漏，必须修正，故此处仅是 v1 的独立证据，最终版本另行构建测量。现有客户端消费与基准逻辑未改变，服务端去除历史清单工作后增长停止，支持服务端刷新路径是本次线性增长的主要来源；这不等于排除所有客户端开销或解释全部尾部尖峰。
+
+
+### 最终候选补齐快照独立计费
+
+最终只读审查发现 v1 的每段固定 512 字节没有覆盖 RowSpanView 内 ActiveSegmentDescriptor 深拷贝的 LayoutPlan 列数组和 SHM 定位字符串；CompiledSchema/列名/映射仍共享，但布局 Vec 不是共享所有权。这是新快照 retained 计费的实际遗漏，已在 `crates/zippy-server/src/live_log_snapshot.rs:224` 修复为：
+
+`64KiB + Σ(512B + compiled_columns_i × sizeof(ColumnLayout) + shm_os_id_i.len())`。
+
+每段只读列数与字符串长度，生产计算仍为 O(S)，不逐列扫描。plan 保持自己的 schema/source 租约，不能借 plan 的预算替寿命更长的 snapshot 付费。依据为 `crates/zippy-segment-store/src/view.rs:89`、`crates/zippy-segment-store/src/segment.rs:87`、`crates/zippy-segment-store/src/layout.rs:23` 的 Clone 与拥有关系。
+
+宽表回归 `live_wide_snapshot_owns_layout_charge_after_plan_drop`（`crates/zippy-server/src/live_log_snapshot.rs:369`）通过真实 runtime 构造 128 列、32 段，逐个实际 layout entry 计数且确认 32 个布局指针互异：实际布局 262,144 字节、snapshot lease 346,208 字节、plan lease 188,432 字节。释放 plan 后账本精确保留 snapshot 的 346,208 字节，释放 snapshot 后归零。该回归连同已有聚焦测试共 7 passed；首次 fixture 导入错误记录于 `live-refresh-accounting-initial-compile-failure.log`，修正后输出为 `live-refresh-accounting-after.log`。
+
+最终历史无关性回归的三种历史规模均为 **136,577 字节**，而 v1 是 136,446 字节；增加来自补齐本次单段的实际深拷贝费用。两轮日志均保留，不能将旧值当作最终版本输出。
+
+前置 planning reservation 维持原完整快照路径的 346,658,536 字节，没有新增 256MiB 的最低准入要求。4096 列×1024 段的布局本身为 268,435,456 字节，小于该总预算，不能声称已证明总峰值不足；但固定 coordination 子项没有按 S×C 建模，本轮尚未完成所有合法输入组合及取消时序的全域瞬时峰值证明。这是继承的估算边界，不是本轮测出的内存超额，也不是遗漏 retained 计费的豁免理由。
+
+
+### 最终功能验证与 release 构建
+
+计费修正后的精确 argv、cwd、环境、退出码、时间和日志 SHA 见 `final-validation.json`，9 个源码及 release 二进制身份见 `final-implementation-metadata.json`。工作目录为 `/home/jiangda/develop/zippy`；所有命令设置 `PYO3_PYTHON=$PWD/.venv/bin/python`、`UV_CACHE_DIR=/tmp/zippy-uv-cache`。以下 11 条命令均退出 0；日志位于本节 evidence 目录。
+
+| 命令 | exit | 外层耗时（s） | 结果 | 日志 |
+| --- | ---: | ---: | --- | --- |
+| `cargo fmt --all -- --check` | 0 | 1.105 | 格式检查通过；空日志以记录的退出 0 为准 | `final-fmt.log` |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 0 | 2.398 | workspace/all-targets、warnings 作为错误；通过 | `final-clippy.log` |
+| `cargo test --workspace -j 4` | 0 | 81.384 | 93 组结果；1,228 passed、7 ignored、0 failed | `final-cargo-test-workspace.log` |
+| `cargo build --release -p zippy-server --bin zippy-server` | 0 | 30.533 | optimized release server 构建成功 | `final-build-server.log` |
+| `uv run --no-sync maturin develop --release` | 0 | 19.703 | optimized release 扩展构建并 editable 安装成功 | `final-build-extension.log` |
+| `uv run --no-sync pytest pytests -q` | 0 | 5.134 | 434 passed；pytest 内部报告 4.72s | `final-pytest-root.log` |
+| `uv run --no-sync pytest clients/python/tests -q` | 0 | 3.307 | 247 passed；覆盖率 85.45% ≥ 80%；pytest 内部报告 3.03s | `final-pytest-client.log` |
+| `uv run --no-sync ruff check scripts/analyze_public_e2e.py pytests/test_analyze_public_e2e.py` | 0 | 0.082 | 指定 2 文件全部通过 | `final-ruff.log` |
+| `uv run --no-sync black --check -l 100 scripts/analyze_public_e2e.py` | 0 | 0.174 | 分析脚本无需格式修改 | `final-black-script.log` |
+| `uv run --no-sync black --check -l 100 pytests/test_analyze_public_e2e.py` | 0 | 0.148 | 分析测试文件无需格式修改 | `final-black-test.log` |
+| `uv run --no-sync mypy scripts/analyze_public_e2e.py pytests/test_analyze_public_e2e.py` | 0 | 0.129 | 指定 2 个源文件无类型错误 | `final-mypy.log` |
+
+Rust 结果包含单元、集成及 doc tests；7 个 ignored 是既有手工 release 性能基准，未计入通过数。主要历史无关性、宽表计费、UTF-8 suffix、连续性/未来 cursor、跨 checkpoint、schema 演进和 writer epoch 测试均在最终全 workspace 运行通过。两套 Python 测试在 release 扩展重新安装之后执行；Ruff/Black/mypy 的范围是本次改动的两份 Python 文件，没有冒称全仓 Python lint。
+
+最终 server SHA-256 为 `4313a31a58eaf41edebfa115789f99567afd2aa852f26f7898b3dbe7cb064604`，extension 为 `9298888be7c8a5b003dcd568c009470f2aacf3b4c01e2c351d73ff293e27f730`。原 benchmark 脚本仍为 `bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015`。最终性能数据必须匹配这些身份，不能仅凭相同 dirty HEAD 把 v1 与最终候选混为一轮。
+
+
+### 发现与未证明的边界
+
+- 已追上窗口的第二次 Catalog 请求从 snapshot 读队列改为 control 读队列；原第一次 resolve 也走 control。两队列与 writer 分属独立线程/连接，不能称为 revision 在同一队列等待 background commit/fsync（`crates/zippy-catalog/src/service.rs:913`、`crates/zippy-catalog/src/service.rs:1724`、`crates/zippy-catalog/src/service.rs:1735`、`crates/zippy-catalog/src/service.rs:2262`）。control 内部同步处理单次 backend 调用，可能等前面的读操作；本轮没有测量各队列等待时长，未把尾部尖峰归因于它，也未据此改调度。细节见 `catalog-tail-risk-audit.md`。
+- 首次打开和需要持久回放的窗口仍有原历史清单成本与限制：`crates/zippy-server/src/query_snapshot.rs:57` 的上限为 4096 个 visible files、16384 个 lineage rows、2MiB 原始响应。这里没有长期全天、新订阅跨该上限的验收数据；本次优化不能宣称已经解决该独立的历史查询规模边界。
+- Actor 当前 live 元数据仍需遍历，Frame 仍使用 BTreeSet；prepared 状态对新 owner 的精确暂停交错没有另加专项测试。前置规划预算的全域瞬时峰值证明也未在本轮完成，具体范围见前文；未以全量测试通过代替这些证明。
+- 固定每 1000 行的诊断采样可能与周期维护存在相位相关；read_chunk 前的边界包括网络及客户端 C++ 解码，而 received 之后的 to_pylist/列表追加未独立计时。服务端根因结论综合代码读集、确定性账本计数、Catalog 线程 CPU、无背景对照和服务端修改后的长时干预结果，不单凭稀疏采样排除所有客户端因素。
+
+
+### 最终计费修正版：长时趋势与四格性能验收
+
+最终版十分钟有背景 soak 的 ack/visible p50 趋势均通过；五分钟无背景 control 的 visible 斜率 **22.5756µs/min > 20µs/min，未通过**，其首末比例与 ack 趋势通过。四格相对 e1 收录的旧 critical-section 基线也未全部不劣化。三次原基准均因延迟门限退出 1，故本轮**不能宣布阶段 1.7 全部验收通过**；功能、样本完整性和构建身份通过不能替代这些失败项。
+
+本节仅报告最后一次计费修正后的预定三组运行。此前 v1 首轮四格、短配对和 v1 soak 仍独立保留；不选择其中较好数字替换最终版本，也不以最终结果覆盖旧失败。
+
+证据为 `soak-final-comparison.json`、`control-final-comparison.json`、`baseline-final-comparison.json` 与逐项 `final-acceptance.json`。三个 comparison 分别为 74,069 / 43,375 / 143,161 字节，验收 JSON 为 59,832 字节，均小于 300,000 字节。历史 raw 的 expected SHA 来自此前已保存的 trends/comparison，并在本次读取时验证；历史 summary 和 raw 均未修改。
+
+#### 最终运行归属、时长与完整性
+
+三次运行的 server SHA-256 均为 `4313a31a58eaf41edebfa115789f99567afd2aa852f26f7898b3dbe7cb064604`，extension 为 `9298888be7c8a5b003dcd568c009470f2aacf3b4c01e2c351d73ff293e27f730`，benchmark 脚本为 `bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015`。它们与 `final-implementation-metadata.json` 一致，metadata 的 HEAD 为 e1e67b5、dirty=true；不能只凭 HEAD 把这些测量称为 clean e1。
+
+| 最终运行 | 计量样本 / 含预热收到 | 外层 wall time（s） | 实际计量 sent 覆盖（s） | 完整分钟 | 原脚本 exit |
+| --- | --- | ---: | ---: | ---: | ---: |
+| soak-final | 600,100 / 602,100 | 613.409 | 604.778297027 | 10 | 1 |
+| control-a-final | 300,100 / 302,100 | 324.010 | 318.291605742 | 5 | 1 |
+| baseline-final 四格 | 每格 20,000 / 分别 22,000、21,975、21,000、21,000 | 154.675 | 各格见下方真实暴露与吞吐 | 各格不足 1 分钟 | 1 |
+
+外层 wall time 包括启动、预热和结束等阶段，不能代替计量暴露。预热沿原双条件 mask 排除：最终 memory/背景100k 短格为 1,975 行，WAL 两格各 1,000 行；不强行把每格预热改写成 2,000。六格所有 missing/duplicate/out_of_order/unexpected 均为 0，ack/visible 计量数相等且符合配置，ordered end marker 完整，server/worker 退出码全为 0。
+
+这次从三份最终 raw 的 `diagnostic_logs` 重新检查了全部 21 份预期 server/worker 日志（soak 4、control 3、baseline 14），全部存在；不区分大小写扫描 SEQUENCE_GAP、SequenceGap 及空格/连字符变体，匹配数均为 0，整份 raw 同样为 0。未将上轮的零错误结论沿用。本次最终 raw/summary SHA 与 comparison 再次核对一致；9 份当前源码哈希和稳定运行 metadata 均与最终构建记录匹配，详细逐文件结果保存在 `final-acceptance.json`。
+
+#### 长时完整分钟趋势判定
+
+| 运行 / 端点 | 完整分钟数 | p50 OLS（µs/min） | 首分钟 p50（µs） | 末分钟 p50（µs） | 末 / 首 | slope≤20 | ratio≤1.15 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| soak-final / visible | 10 | 2.023667 | 1156.196 | 1138.115 | 0.984361648 | 通过 | 通过 |
+| soak-final / ack | 10 | 0.252176 | 835.463 | 813.154 | 0.973297441 | 通过 | 通过 |
+| control-a-final / visible | 5 | 22.575600 | 1126.362 | 1268.704 | 1.126373226 | **未通过** | 通过 |
+| control-a-final / ack | 5 | 13.584200 | 812.413 | 902.193 | 1.110510295 | 通过 | 通过 |
+
+两次运行实际达到要求的 10 / 5 个完整分钟。OLS 使用所有完整分钟，首末比例仅用首末两个完整分钟；二者不互相替代，正斜率与末/首小于 1 可以同时出现。尾桶仅展示，未加入趋势，也未将 22.5756 四舍五入到门限内。
+
+##### soak-final 逐分钟明细
+
+| 实际 sent 分钟窗 | 数量 | ack p50 / p99（µs） | ack >10ms | visible p50 / p99（µs） | visible >10ms | 趋势 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| [0, 60) 秒 | 55,068 | 835.463 / 2013.815 | 128 | 1156.196 / 3670.163 | 270 | 是 |
+| [60, 120) 秒 | 54,313 | 896.593 / 3546.020 | 154 | 1261.527 / 37986.582 | 1,449 | 是 |
+| [120, 180) 秒 | 65,842 | 808.335 / 1579.338 | 67 | 1132.143 / 2206.671 | 95 | 是 |
+| [180, 240) 秒 | 57,871 | 838.714 / 2634.696 | 163 | 1177.333 / 27324.893 | 824 | 是 |
+| [240, 300) 秒 | 57,602 | 840.608 / 2587.017 | 165 | 1177.306 / 4160.196 | 239 | 是 |
+| [300, 360) 秒 | 63,350 | 829.185 / 2380.504 | 83 | 1163.916 / 4139.062 | 106 | 是 |
+| [360, 420) 秒 | 65,920 | 794.028 / 1356.294 | 62 | 1102.014 / 1779.451 | 67 | 是 |
+| [420, 480) 秒 | 60,035 | 821.295 / 1449.290 | 64 | 1132.244 / 1946.755 | 70 | 是 |
+| [480, 540) 秒 | 48,999 | 942.746 / 3715.701 | 149 | 1366.595 / 23350.139 | 829 | 是 |
+| [540, 600) 秒 | 66,292 | 813.154 / 1626.242 | 70 | 1138.115 / 2126.052 | 72 | 是 |
+| [600, 660) 秒，观测至 604.778297027 秒 | 4,808 | 894.111 / 2006.012 | 7 | 1255.203 / 2582.046 | 7 | 否，尾桶 |
+
+##### control-a-final 逐分钟明细
+
+| 实际 sent 分钟窗 | 数量 | ack p50 / p99（µs） | ack >10ms | visible p50 / p99（µs） | visible >10ms | 趋势 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| [0, 60) 秒 | 55,648 | 812.413 / 2149.573 | 99 | 1126.362 / 11381.513 | 614 | 是 |
+| [60, 120) 秒 | 59,452 | 860.683 / 2322.158 | 84 | 1198.057 / 41888.954 | 949 | 是 |
+| [120, 180) 秒 | 54,121 | 868.549 / 4115.561 | 189 | 1206.758 / 8401.375 | 436 | 是 |
+| [180, 240) 秒 | 62,505 | 816.965 / 2957.978 | 66 | 1139.129 / 4070.557 | 103 | 是 |
+| [240, 300) 秒 | 52,609 | 902.193 / 3242.380 | 165 | 1268.704 / 54061.997 | 1,763 | 是 |
+| [300, 360) 秒，观测至 318.291605742 秒 | 15,765 | 891.228 / 3722.289 | 19 | 1323.821 / 18317.589 | 203 | 否，尾桶 |
+
+分钟表沿 sent 分桶、排除原预热且不按固定行数重排。soak 第 2/4/9 分钟、control 第 2/5 分钟仍有明显尾部升高；不能由 p50 斜率下降推导 p99/p99.9 已达标。
+
+##### 历史趋势与最终结果的描述对照
+
+| 数据集 | 背景行/s | 完整分钟 | visible p50 OLS（µs/min） | visible 末 / 首 | ack p50 OLS（µs/min） | ack 末 / 首 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| b5-soak | 100000 | 5 | 693.931800 | 3.047522657 | 14.739900 | 1.106207847 |
+| critical-soak | 100000 | 5 | 700.140300 | 3.052169567 | 14.904600 | 1.110773344 |
+| soak-final | 100000 | 10 | 2.023667 | 0.984361648 | 0.252176 | 0.973297441 |
+| control-a-before | 0 | 3 | 718.529000 | 2.040058363 | 26.397000 | 1.066343624 |
+| control-a-final | 0 | 5 | 22.575600 | 1.126373226 | 13.584200 | 1.110510295 |
+
+旧 b5 收录的 soak 实际 metadata 为 7c6b6a9 dirty，旧 critical-section soak 为 b5bf6d3 dirty，control-a-before 为 e1e67b5 dirty；不是相同时间、相同样本时长的 clean checkout 实验。最终两组的 p50 增长斜率较修复前大幅下降，但无背景组仍超过 20µs/min，不能称增长验收完全解决。
+
+#### 长时全程分位、吞吐与发起滞后
+
+| 运行 / 端点 | p50（µs） | p99（µs） | p99.9（µs） | max（µs） |
+| --- | ---: | ---: | ---: | ---: |
+| soak-final / visible | 1160.945 | 5537.777 | 73774.958 | 349989.424 |
+| soak-final / ack | 831.331 | 2481.782 | 21542.473 | 349681.961 |
+| control-a-final / visible | 1183.565 | 19071.302 | 131010.665 | 229079.073 |
+| control-a-final / ack | 847.828 | 3078.575 | 21148.140 | 196598.107 |
+
+| 运行 | 实际前景 / 背景（行/s） | visible >10ms 次数 / 每分钟 | >10ms 暴露（s） | schedule_lag p50 / p99 / max（s） |
+| --- | ---: | ---: | ---: | ---: |
+| soak-final | 992.263183 / 99999.976986 | 4,028 / 399.616726 | 604.779490140 | 5.286970 / 12.242719 / 12.532741 |
+| control-a-final | 942.843698 / 0.000000 | 4,068 / 766.840505 | 318.293045931 | 7.888227 / 17.630278 / 18.219322 |
+
+schedule_lag 是实际 sent 相对 pacing deadline 的发起滞后；ack/visible 从实际 sent 起算，未包含发起前落后。全部样本最终收到，不表示前景稳定达到目标 1,000 行/s。>10ms 频次按首计量 sent 至末 received 的真实暴露计算，与仅到末 sent 的趋势覆盖明确分开；minute_trends 使用 sent，原 visible_spikes 的分钟桶使用 received，未混用两者。
+
+最终 soak 及 control 的原 C 门限均失败：
+
+- soak-final：`visible_p50_micros=[1160.945] exceeds limit=[1000.000]`；`visible_p99_micros=[5537.777] exceeds limit=[3000.000]`；`visible_p99_9_micros=[73774.958] exceeds limit=[10000.000]`。
+- control-a-final：`visible_p50_micros=[1183.565] exceeds limit=[1000.000]`；`visible_p99_micros=[19071.302] exceeds limit=[3000.000]`；`visible_p99_9_micros=[131010.665] exceeds limit=[10000.000]`。
+
+#### 最终四格：e1 归档基线与修正版比较
+
+每格均为 20,000 计量样本。下面写“旧 critical-section → 最终版”，单位 µs；基线 metadata 是 b5bf6d3 dirty，不能把归档标签 e1 当成测量的 clean SHA。`baseline-final-comparison.json` 同时保留首轮 v1 四格，不以更差的 v1 作为“不退化”的宽松参考。
+
+| 配置 | 端点 | p50 | p99 | p99.9 | max |
+| --- | --- | ---: | ---: | ---: | ---: |
+| memory / 背景 0 | visible | 1235.225 → 1173.032 | 1748.249 → 3997.895 | 6157.364 → 11302.025 | 14533.116 → 82013.172 |
+| memory / 背景 0 | ack | 766.404 → 842.886 | 1102.931 → 2861.496 | 5534.270 → 8016.655 | 14051.882 → 81337.597 |
+| memory / 背景 100,000 | visible | 1250.600 → 1114.327 | 1956.124 → 1703.472 | 8475.353 → 7979.449 | 16042.638 → 15788.483 |
+| memory / 背景 100,000 | ack | 765.001 → 794.074 | 1220.421 → 1329.655 | 7745.233 → 7635.078 | 15416.948 → 15420.724 |
+| wal / 背景 0 | visible | 1332.277 → 1151.847 | 2321.517 → 2336.516 | 5178.351 → 5785.015 | 14788.946 → 19676.950 |
+| wal / 背景 0 | ack | 2012.409 → 2158.020 | 3467.674 → 3986.645 | 6485.029 → 10613.945 | 13484.120 → 34692.992 |
+| wal / 背景 100,000 | visible | 1349.946 → 1248.405 | 2235.049 → 4586.896 | 5235.842 → 18915.198 | 12153.181 → 38466.093 |
+| wal / 背景 100,000 | ack | 2052.186 → 2312.963 | 3425.499 → 9579.661 | 6894.838 → 27363.958 | 12486.548 → 82413.945 |
+
+| 配置 | 前景行/s：旧 → 最终 | 最终背景行/s | visible >10ms 次数：旧 → 最终 | >10ms /min：旧 → 最终 | 最终暴露（s） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| memory / 背景 0 | 1000.010677 → 977.295334 | 0.000000 | 5 → 34 | 14.999685 → 99.683050 | 20.464863292 |
+| memory / 背景 100,000 | 1000.018086 → 1001.266364 | 100035.400804 | 8 → 6 | 23.999830 → 18.022586 | 19.974936419 |
+| wal / 背景 0 | 477.115497 → 439.184004 | 0.000000 | 8 → 9 | 11.450913 → 11.858244 | 45.537941254 |
+| wal / 背景 100,000 | 465.648269 → 357.660665 | 100009.238140 | 5 → 50 | 6.984790 → 53.649969 | 55.918019441 |
+
+逐分位以不引入容差的“最终值≤旧值”描述比较：visible p50 四格都下降，但只有 memory/背景100k 的 visible p99/p99.9/max 也全部下降，其余三格这三项均升高。ack p50/p99 四格全部升高，ack p99.9 仅 memory/背景100k 下降，ack max 四格全部升高。因此 visible 四分位全不增仅 1/4 格，ack 为 0/4 格；不能宣布四格全部不劣化。吞吐和 >10ms 频次单列为描述对照，没有凭它们创造替代通过门限。
+
+四格原 C/D 门限也全部失败，原始失败项为：
+
+- memory / 背景 0：`visible_p50_micros=[1173.032] exceeds limit=[1000.000]`；`visible_p99_micros=[3997.895] exceeds limit=[3000.000]`；`visible_p99_9_micros=[11302.025] exceeds limit=[10000.000]`。
+- memory / 背景 100,000：`visible_p50_micros=[1114.327] exceeds limit=[1000.000]`。
+- wal / 背景 0：`visible_p50_micros=[1151.847] exceeds limit=[1000.000]`；`wal_ack_p50_micros=[2158.020] exceeds limit=[2000.000]`。
+- wal / 背景 100,000：`visible_p50_micros=[1248.405] exceeds limit=[1000.000]`；`visible_p99_micros=[4586.896] exceeds limit=[3000.000]`；`visible_p99_9_micros=[18915.198] exceeds limit=[10000.000]`；`wal_ack_p50_micros=[2312.963] exceeds limit=[2000.000]`；`wal_ack_p99_micros=[9579.661] exceeds limit=[5000.000]`。
+
+最终四格与此前历史发生在不同主机时段，这些是观察到的前后差异，不足以单独判断每项退化的因果来源。同期短配对和首轮失败已经单独保留；没有对明显不利的格做选择性删除，也没有提升 20µs/min 或原 C/D 门限。
+
+#### 本轮验收状态及原始身份
+
+| 检查 | 最终结果 |
+| --- | --- |
+| 6 格样本/序号/端标记/进程退出 | 通过 |
+| 本轮捕获日志 SEQUENCE_GAP、构建身份、原始证据一致性 | 通过 |
+| 有背景 10 完整分钟 ack/visible p50 趋势 | 通过 |
+| 无背景 5 完整分钟 ack/visible p50 趋势 | **未通过：visible 22.5756µs/min** |
+| 三次运行的原 C/D 延迟门限 | **未通过** |
+| 四格各端点所报告分位数全部不升高 | **未通过** |
+| 阶段 1.7 整体验收 | **未全部通过** |
+
+原始样本留在 `/tmp/zippy-perf-raw/2026-10-10-latency-growth/`，各 SHA 已在分析后再读取核对：
+
+| raw 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| soak-final.json | 107,667,873 | `c07b6740b82b5aa2e10943a93c37da101972c72c77eb8fe7ff12cf28f3b4aec0` |
+| control-a-final.json | 54,040,665 | `49761b30500eabc07ef4771ee6be05d5a993a0d1cc249450667ef04e28cfc0e6` |
+| baseline-final.json | 15,103,131 | `6c5645cd3ec5f0a3301e75b231544a694f2f524857afecc35dafdb986e7127ce` |
+
+精确基准 argv、cwd、外层耗时及 exit 由 `final-benchmark-commands.json` 保存。完整分钟逐点、分位数、历史 SHA 校验、元信息差异、日志逐文件哈希和失败理由分别保存在上述 comparison 与 `final-acceptance.json`；本段未重新复述功能验证日志。
+
+
+基准共用 `--rate 1000 --warmup-seconds 2 --warmup-samples 1000 --background-batch-rows 1000 --timeout-seconds 1200`；soak 使用 memory/背景100000、600100 样本，control 使用 memory/背景0、300100 样本，四格使用 memory/wal×背景0/100000、各20000样本。Python 均通过 `UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync` 执行，精确参数与路径见命令 JSON。
+
+OLS 是观测斜率，不能将无背景组的小幅超限直接认定为某个确定的新线性根因，也不能用波动或环境推测豁免失败。
+
+### 最终证据交付与尚未完成项
+
+证据索引为 `docs/perf_reports/evidence/2026-10-10-latency-growth/README.md`。`SHA256SUMS` 收录76份证据文件（不含清单自身），`sha256sum -c SHA256SUMS` 全部通过；最大单文件为 `baseline-final-comparison.json`，143161字节，所有证据均≤300000字节。逐行raw留在指定/tmp目录，comparison记录其路径、字节数和SHA。
+
+`final-source-audit.json` 已复核9份源码与release二进制的SHA、原基准脚本与e1逐字节一致、报告e1历史前缀完整、旧版失败测试文件及patch一致；生产diff没有临时诊断插桩。分支仍为 `feature/public-path-latency-bench`，HEAD仍为e1e67b5；没有commit、push或切换分支。
+
+未完成的验收项是：无背景5分钟的趋势门限、四格相对e1的全面不退化，以及残余尾部尖峰的具体归因。已完成服务端历史清单依赖的最小修复、可移植的确定性回归和要求的测量/功能验证，但**本轮整体性能验收未通过**。现有证据不足以把残余失败归因于环境或某条读队列；本轮没有进一步实施缺乏定位依据的调度改动。前置峰值估算证明、首次/落后历史回放的规模边界仍如“发现”所述，不冒称已经解决。
+
+### 监督方独立复核（2026-10-10 20:29–20:52）
+
+以上为实现方记录，保持原样。监督方在同一台机器上复核如下；机器在复核期间没有运行构建或测试。
+
+**回归测试有效性**：在 `e1e67b5` 的 git worktree 中只放入 `native_query_canary.rs` 的测试改动，结果为
+`live_log_refresh_memory_does_not_grow_with_persisted_history` 失败（`small=[1272296] large=[8391176]`），
+另一个"背景表历史"对照测试通过，与实现方一致。
+
+**ABBA 交替对照**：memory 档，背景 100,000，每轮 180,100 样本；`server-e1`（sha256 `ea5f6452…`）与
+`server-final`（sha256 `4313a31a…`，即当前 release 构建）按 e1 → final → final → e1 的顺序运行。逐分钟数据见
+`evidence/2026-10-10-latency-growth/supervisor-ab-summary.json`。
+
+| 运行 | 各分钟 visible p50（ms） | p50 斜率 | 末/首 | 末分钟 p99（ms） | >100ms |
+|---|---|---:|---:|---:|---:|
+| run1 e1 | 1.533 / 2.269 / 3.003 | 735.3µs/min | 1.959 | 5.541 | 0 |
+| run2 final | 1.127 / 1.101 / 1.125 | −0.9µs/min | 0.998 | 1.928 | 0 |
+| run3 final | 1.078 / 1.121 / 1.087 | 4.8µs/min | 1.009 | 1.680 | 0 |
+| run4 e1 | 1.415 / 2.313 / 3.104 | 844.1µs/min | 2.193 | 5.578 | 0 |
+
+**10 分钟浸泡**（`server-final`，600,100 样本）：斜率 3.26µs/min，末/首 1.037，达到门限；各分钟 p50 在
+1.076–1.133ms，p99 在 1.43–1.99ms；完整性零错误，日志无 SEQUENCE_GAP。第 0 分钟有 2 个样本超过 100ms
+（最大 308ms），对应的 ack 同样约为 308ms，属于写入侧停顿，与订阅刷新路径无关。脚本退出码为 1，原因是第 C 档的绝对门限
+（p50 ≤ 1ms、p99.9 ≤ 10ms），`e1e67b5` 同样达不到，不属于本阶段的通过标准。
+
+**对实现方"未通过"项的判断**：实现方最终浸泡和 control-a 中 100–350ms 的连续停顿，每次都伴随同等幅度的 ack
+停顿，写端发起滞后的 p50 达到 5.3s。也就是说写入路径整体被卡住，而本次改动只涉及订阅刷新的读路径。监督方的 ABBA 对照中，
+两个版本都没有出现这类停顿，新版在 p50、p99、>10ms 次数和发起滞后上都优于 e1。据此判定这些停顿来自当时的运行环境，
+不是本次改动造成的退化。无背景对照和 WAL 两格未由监督方重跑；确定性测试已经证明根因与背景表无关。
+
+**其他发现**：`zippy-catalog` 的
+`service::tests::cooperative_manifest_preflight_yields_and_releases_cancelled_command_budget` 在 5 次全量运行中失败 1 次
+（`ResourceExhausted ... outstanding command budget exhausted used=[1] maximum=[1]`）。该 crate 本次没有改动，
+属于早已存在的不稳定测试，需要另行修复。

@@ -1,0 +1,206 @@
+{
+  "audit_version": 1,
+  "scope": "最终构建与基准结束后的源码及产物身份审计；未运行编译、测试或基准。",
+  "base_commit": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+  "git": {
+    "expected_branch": "feature/public-path-latency-bench",
+    "observed_branch": "feature/public-path-latency-bench",
+    "observed_head": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+    "worktree_intentionally_dirty": true,
+    "tracked_changed_paths": [
+      "crates/zippy-server/src/native_log.rs",
+      "crates/zippy-server/src/native_query.rs",
+      "crates/zippy-server/src/native_query_canary.rs",
+      "crates/zippy-server/src/query_service.rs",
+      "crates/zippy-server/src/query_snapshot.rs",
+      "crates/zippy-server/tests/native_storage_runtime.rs",
+      "docs/perf_reports/2026-10-08-public-path-e2e-baseline.md",
+      "pytests/test_analyze_public_e2e.py",
+      "scripts/analyze_public_e2e.py"
+    ],
+    "unexpected_tracked_paths": [],
+    "unexpected_untracked_paths": []
+  },
+  "metadata_reference": {
+    "path": "docs/perf_reports/evidence/2026-10-10-latency-growth/final-implementation-metadata.json",
+    "sha256": "1c0cb045fa076f3631a0c679dcdab66ea4ddbcd9c8907aaf31391dfc57190e34"
+  },
+  "source_sha256": {
+    "crates/zippy-server/src/native_log.rs": {
+      "expected_sha256": "34550cd89cf73017588600d0d7f7ace25211c10d54321417abed4ee7252d0635",
+      "observed_sha256": "34550cd89cf73017588600d0d7f7ace25211c10d54321417abed4ee7252d0635",
+      "bytes": 29207,
+      "matches": true
+    },
+    "crates/zippy-server/src/native_query.rs": {
+      "expected_sha256": "42a281a5983d287db82bdbc4cbf3207e09cd21a56ddf2fb13222855fbcb0cf60",
+      "observed_sha256": "42a281a5983d287db82bdbc4cbf3207e09cd21a56ddf2fb13222855fbcb0cf60",
+      "bytes": 46832,
+      "matches": true
+    },
+    "crates/zippy-server/src/native_query_canary.rs": {
+      "expected_sha256": "8f320ca619227c25aa6e5ba5b62e18405a1d7816c386f024d7ad3919a264e414",
+      "observed_sha256": "8f320ca619227c25aa6e5ba5b62e18405a1d7816c386f024d7ad3919a264e414",
+      "bytes": 105615,
+      "matches": true
+    },
+    "crates/zippy-server/src/query_service.rs": {
+      "expected_sha256": "892dba9e868781c18e83c3062bb6110593ca34c42a40997b2b16a2dcfe769cd6",
+      "observed_sha256": "892dba9e868781c18e83c3062bb6110593ca34c42a40997b2b16a2dcfe769cd6",
+      "bytes": 327635,
+      "matches": true
+    },
+    "crates/zippy-server/src/query_snapshot.rs": {
+      "expected_sha256": "fa7b6cf05fe4336c1c357c947adffad034deb9fb9bb0da104368148a26cd1660",
+      "observed_sha256": "fa7b6cf05fe4336c1c357c947adffad034deb9fb9bb0da104368148a26cd1660",
+      "bytes": 143641,
+      "matches": true
+    },
+    "crates/zippy-server/tests/native_storage_runtime.rs": {
+      "expected_sha256": "0fa43344b37352e4301dea1d7305d8cd371aa1ba2be84451d2ef1fc1457bc284",
+      "observed_sha256": "0fa43344b37352e4301dea1d7305d8cd371aa1ba2be84451d2ef1fc1457bc284",
+      "bytes": 174959,
+      "matches": true
+    },
+    "pytests/test_analyze_public_e2e.py": {
+      "expected_sha256": "a8d61b45ca1780628c4ab0c51a4763ab31cd476abacb150d602a5ab72d48f76b",
+      "observed_sha256": "a8d61b45ca1780628c4ab0c51a4763ab31cd476abacb150d602a5ab72d48f76b",
+      "bytes": 15056,
+      "matches": true
+    },
+    "scripts/analyze_public_e2e.py": {
+      "expected_sha256": "d9dcda7bcfef11dff2d59cc69197a7ea31aba6f5634c0efdef9fae784f7b1813",
+      "observed_sha256": "d9dcda7bcfef11dff2d59cc69197a7ea31aba6f5634c0efdef9fae784f7b1813",
+      "bytes": 24101,
+      "matches": true
+    },
+    "crates/zippy-server/src/live_log_snapshot.rs": {
+      "expected_sha256": "ea18765936bcdc7622a6d53b7e76be2b3c828e19b34d4aebb037839339d7c3db",
+      "observed_sha256": "ea18765936bcdc7622a6d53b7e76be2b3c828e19b34d4aebb037839339d7c3db",
+      "bytes": 23865,
+      "matches": true
+    }
+  },
+  "binaries": {
+    "server": {
+      "path": "/home/jiangda/develop/zippy/target/release/zippy-server",
+      "expected_sha256": "4313a31a58eaf41edebfa115789f99567afd2aa852f26f7898b3dbe7cb064604",
+      "observed_sha256": "4313a31a58eaf41edebfa115789f99567afd2aa852f26f7898b3dbe7cb064604",
+      "bytes": 103650408,
+      "matches": true
+    },
+    "extension": {
+      "path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+      "expected_sha256": "9298888be7c8a5b003dcd568c009470f2aacf3b4c01e2c351d73ff293e27f730",
+      "observed_sha256": "9298888be7c8a5b003dcd568c009470f2aacf3b4c01e2c351d73ff293e27f730",
+      "bytes": 105523632,
+      "matches": true
+    }
+  },
+  "benchmark": {
+    "path": "scripts/bench_public_e2e.py",
+    "base_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+    "current_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+    "bytes": 36834
+  },
+  "report_prefix": {
+    "path": "docs/perf_reports/2026-10-08-public-path-e2e-baseline.md",
+    "base_bytes": 80289,
+    "base_sha256": "d848f564852c653f8758879b98ea9c4de19af4724673c527665bf7144ef6ba8a",
+    "current_prefix_sha256": "d848f564852c653f8758879b98ea9c4de19af4724673c527665bf7144ef6ba8a",
+    "checked_current_bytes": 118974,
+    "appended_bytes": 38685,
+    "note": "只约束原 e1 前缀；主代理仍可追加最终验证说明。"
+  },
+  "regression_test": {
+    "path": "crates/zippy-server/src/native_query_canary.rs",
+    "cfg_test_module_line": 1839,
+    "current_sha256": "8f320ca619227c25aa6e5ba5b62e18405a1d7816c386f024d7ad3919a264e414",
+    "recorded_before_sha256": "8f320ca619227c25aa6e5ba5b62e18405a1d7816c386f024d7ad3919a264e414",
+    "patch_path": "docs/perf_reports/evidence/2026-10-10-latency-growth/history-regression-test.patch",
+    "patch_sha256": "24ccaa2d347e38711e1911b577baccd69e176f17289766bc8bde36f9171f0834",
+    "current_diff_sha256": "24ccaa2d347e38711e1911b577baccd69e176f17289766bc8bde36f9171f0834",
+    "note": "唯一改动块在原 cfg(test) 模块内新增 210 行；旧版编译及预期失败使用已有 history-refresh-before.log 证据，本轮未重复构建。"
+  },
+  "instrumentation_review": {
+    "reviewed_production_paths": [
+      "crates/zippy-server/src/native_log.rs",
+      "crates/zippy-server/src/native_query.rs",
+      "crates/zippy-server/src/native_query_canary.rs",
+      "crates/zippy-server/src/query_service.rs",
+      "crates/zippy-server/src/query_snapshot.rs",
+      "crates/zippy-server/src/live_log_snapshot.rs"
+    ],
+    "added_production_line_counts": {
+      "crates/zippy-server/src/native_log.rs": 64,
+      "crates/zippy-server/src/native_query.rs": 1,
+      "crates/zippy-server/src/native_query_canary.rs": 0,
+      "crates/zippy-server/src/query_service.rs": 22,
+      "crates/zippy-server/src/query_snapshot.rs": 16,
+      "crates/zippy-server/src/live_log_snapshot.rs": 334
+    },
+    "suspicious_added_production_markers": [],
+    "temporary_diagnostic_programs": {
+      "/tmp/zippy-growth-diagnostic-runner.py": {
+        "outside_repository": true,
+        "under_tmp": true,
+        "exists": true,
+        "expected_sha256": "e5a77296783183b8f8ae72878a0122a1d3b90fe505b14963fec1c861959a629b",
+        "observed_sha256": "e5a77296783183b8f8ae72878a0122a1d3b90fe505b14963fec1c861959a629b",
+        "matches_recorded_diagnostic": true
+      },
+      "/tmp/zippy-growth-diagnostic-analyze.py": {
+        "outside_repository": true,
+        "under_tmp": true,
+        "exists": true,
+        "expected_sha256": "1c70c0874c62957a090dea2d69a018a243df04049a1fde2098d9c272eb881a1a",
+        "observed_sha256": "1c70c0874c62957a090dea2d69a018a243df04049a1fde2098d9c272eb881a1a",
+        "matches_recorded_diagnostic": true
+      }
+    },
+    "manual_conclusion": "生产 diff 仅包含 live 快照选择、所有权/预算、后缀校验及读者分派；未发现临时时钟采样、打印、monkeypatch 或资源监控。新增 eprintln 位于 cfg(test) 内；analyze_public_e2e 的 sent_ns 计算为离线分析。",
+    "limitation": "静态 diff 审查及源码/产物身份核对，不声称证明二进制全部传递依赖的可复现构建。"
+  },
+  "git_diff_check": {
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "artifact_size_limit": {
+    "maximum_bytes": 300000,
+    "existing_evidence_file_count": 74,
+    "largest_existing_evidence": {
+      "path": "docs/perf_reports/evidence/2026-10-10-latency-growth/baseline-final-comparison.json",
+      "bytes": 143161
+    },
+    "oversized_existing_evidence": []
+  },
+  "checks": {
+    "nine_sources_match_final_metadata": true,
+    "server_and_extension_match_final_metadata": true,
+    "branch_unchanged": true,
+    "head_unchanged": true,
+    "benchmark_byte_identical_to_e1": true,
+    "benchmark_matches_final_metadata": true,
+    "report_preserves_entire_e1_prefix": true,
+    "canary_production_prefix_unchanged": true,
+    "regression_patch_equals_current_canary_diff": true,
+    "canary_matches_recorded_e1_failure_test": true,
+    "no_new_production_instrumentation_markers": true,
+    "diagnostic_programs_remain_outside_repository_under_tmp": true,
+    "git_diff_check_passes": true,
+    "changed_paths_stay_within_implementation_and_evidence_scope": true,
+    "existing_final_metadata_not_modified": true,
+    "existing_evidence_files_at_most_300000_bytes": true
+  },
+  "all_checks_passed": true,
+  "notes": [
+    "本审计新增一个 JSON 文件，不覆盖或更新时间化既有 metadata。",
+    "每文件 300000 字节限制核对新 evidence 产物；已有源码和 release 二进制不受该证据文件大小限制。"
+  ]
+}

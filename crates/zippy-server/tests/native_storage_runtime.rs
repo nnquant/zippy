@@ -249,6 +249,30 @@ async fn native_schema_evolution_preserves_history_wal_and_queries_for_all_kinds
                     )
                     .await
                     .unwrap();
+                let mut live = fixed_engine
+                    .subscribe_log(
+                        fixed_owner.as_ref(),
+                        zippy_server::NativeLogRequest {
+                            query_id: QueryId::from_u128(9899).unwrap(),
+                            table: fixed_table.clone(),
+                            start: Some(LogOffset::new(0)),
+                            deadline_ns: None,
+                            memory_limit_bytes: ResourceLimit::ServerDefault,
+                            batch_rows: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .into_stream();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), live.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                        .offsets,
+                    OffsetRange::single(LogOffset::new(0))
+                );
                 let actor = runtime.table_actor(table_id()).unwrap();
                 let retained = actor.snapshot().await.unwrap();
                 let (window, owner) = prepare_event_window(&runtime, 900, Some(0)).await;
@@ -296,6 +320,19 @@ async fn native_schema_evolution_preserves_history_wal_and_queries_for_all_kinds
                         .await
                         .unwrap(),
                 );
+                // Continuous readers must observe actor retirement even after a live-only read.
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), live.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .err()
+                        .unwrap()
+                        .code(),
+                    ErrorCode::SchemaMismatch
+                );
+                assert!(live.next().await.is_none());
+                drop(live);
                 assert_eq!(
                     tokio::task::block_in_place(
                         || writer.write_memory(write_request(1, 1, "rejected"))
@@ -3170,6 +3207,10 @@ async fn native_log_windows_preserve_writer_handoffs_and_cancel_without_leaking_
             NativeTableMaterializerConfig::new().with_row_capacity(2),
         )
         .unwrap();
+    let live_engine = runtime.query_engine();
+    let live_owner = live_engine.owner(SessionId::from_u128(8800).unwrap());
+    let mut live = None;
+    let mut live_id = None;
     for epoch in 1..=2 {
         let mut writer = ingest
             .open_writer(OpenWriterRequest {
@@ -3196,7 +3237,65 @@ async fn native_log_windows_preserve_writer_handoffs_and_cancel_without_leaking_
             })
             .unwrap();
         tokio::task::block_in_place(|| writer.write_memory(request)).unwrap();
+        if epoch == 1 {
+            let subscription = live_engine
+                .subscribe_log(
+                    live_owner.as_ref(),
+                    zippy_server::NativeLogRequest {
+                        query_id: QueryId::from_u128(8800).unwrap(),
+                        table: TableRef::Id {
+                            table_id: table_id(),
+                        },
+                        start: Some(LogOffset::new(0)),
+                        deadline_ns: None,
+                        memory_limit_bytes: ResourceLimit::ServerDefault,
+                        batch_rows: std::num::NonZeroU32::new(1),
+                    },
+                )
+                .await
+                .unwrap();
+            live_id = Some(subscription.instance_id());
+            live = Some(subscription.into_stream());
+        }
+        let event = tokio::time::timeout(Duration::from_secs(5), live.as_mut().unwrap().next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event.offsets,
+            OffsetRange::single(LogOffset::new(epoch as u64 - 1))
+        );
+        assert_eq!(
+            event
+                .batch
+                .record_batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            10 * epoch as i64
+        );
+        assert_eq!(
+            live_engine
+                .status(live_owner.as_ref(), live_id.unwrap())
+                .await
+                .unwrap()
+                .state,
+            QueryState::Running
+        );
     }
+    drop(live);
+    assert_eq!(
+        live_engine
+            .status(live_owner.as_ref(), live_id.unwrap())
+            .await
+            .unwrap()
+            .metrics["query.active_memory_bytes"],
+        0
+    );
+    drop((live_owner, live_engine));
     let window = prepare_event_window(&runtime, 8001, Some(0)).await;
     assert_eq!(
         consume_event_window(&runtime, window).await,
@@ -3423,8 +3522,55 @@ async fn native_live_logs_follow_all_table_kinds_across_checkpoints_with_one_ide
             .await
             .unwrap();
         let latest_id = latest.instance_id();
+        let slow = engine
+            .subscribe_log(owner.as_ref(), request(9006, None))
+            .await
+            .unwrap();
+        let slow_id = slow.instance_id();
         let mut replay = replay.into_stream();
         let mut latest = latest.into_stream();
+        let mut slow = slow.into_stream();
+        let assert_event = |event: &zippy_server::NativeLogBatch, offset: u64| {
+            assert_eq!(event.offsets, OffsetRange::single(LogOffset::new(offset)));
+            assert_eq!(
+                event
+                    .batch
+                    .record_batch()
+                    .column_by_name("price")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                offset as i64
+            );
+            if kind == TableKind::Frame {
+                assert_eq!(
+                    event.frame,
+                    Some(
+                        OffsetRange::new(
+                            LogOffset::new(offset / 2 * 2),
+                            LogOffset::new(offset / 2 * 2 + 1),
+                        )
+                        .unwrap()
+                    )
+                );
+            }
+            if kind == TableKind::KeyValue {
+                assert_eq!(
+                    event
+                        .batch
+                        .record_batch()
+                        .column_by_name(zippy_types::key_value::SEQUENCE)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    offset as i64 + 1
+                );
+            }
+        };
         // The network transport reads the same native log with one stable identity.
         use arrow_flight::flight_service_client::FlightServiceClient;
         use arrow_flight::{FlightData, FlightDescriptor};
@@ -3566,38 +3712,23 @@ async fn native_live_logs_follow_all_table_kinds_across_checkpoints_with_one_ide
                         .unwrap()
                         .unwrap()
                         .unwrap();
-                    assert_eq!(event.offsets, OffsetRange::single(LogOffset::new(offset)));
-                    if kind == TableKind::Frame {
-                        assert_eq!(
-                            event.frame,
-                            Some(
-                                OffsetRange::new(
-                                    LogOffset::new(2 * sequence),
-                                    LogOffset::new(2 * sequence + 1)
-                                )
-                                .unwrap()
-                            )
-                        );
-                    }
-                    if kind == TableKind::KeyValue {
-                        assert_eq!(
-                            event
-                                .batch
-                                .record_batch()
-                                .column_by_name(zippy_types::key_value::SEQUENCE)
-                                .unwrap()
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .unwrap()
-                                .value(0),
-                            offset as i64 + 1
-                        );
-                    }
+                    assert_event(&event, offset);
                 }
             }
             for instance in [replay_id, latest_id] {
                 let status = engine.status(owner.as_ref(), instance).await.unwrap();
                 assert_eq!(status.state, QueryState::Running);
+            }
+            if sequence == 1 {
+                // First enter a live-only refresh, then stop polling through four checkpoints.
+                for offset in 2..4 {
+                    let event = tokio::time::timeout(Duration::from_secs(5), slow.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    assert_event(&event, offset);
+                }
             }
         }
         for offset in 0..18 {
@@ -3748,6 +3879,56 @@ async fn native_live_logs_follow_all_table_kinds_across_checkpoints_with_one_ide
         assert_eq!(
             engine
                 .status(owner.as_ref(), replay_id)
+                .await
+                .unwrap()
+                .metrics["query.active_memory_bytes"],
+            0
+        );
+        let snapshot = runtime
+            .table_actor(table_id())
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.committed_log_offset,
+            OffsetWatermark::Known(LogOffset::new(17))
+        );
+        drop(snapshot);
+        write(&mut writer, 9);
+        // Cursor 4 is now persisted: the same reader must fall back to a complete window,
+        // consume the durable prefix, then deliver the not-yet-checkpointed live suffix.
+        for offset in 4..20 {
+            let event = tokio::time::timeout(Duration::from_secs(5), slow.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_event(&event, offset);
+        }
+        write(&mut writer, 10);
+        // Having caught up, cursor 20 returns to the live-only path without a new identity.
+        for offset in 20..22 {
+            let event = tokio::time::timeout(Duration::from_secs(5), slow.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_event(&event, offset);
+        }
+        assert_eq!(
+            engine.status(owner.as_ref(), slow_id).await.unwrap().state,
+            QueryState::Running
+        );
+        engine.cancel(owner.as_ref(), slow_id).await.unwrap();
+        assert_eq!(
+            slow.next().await.unwrap().err().unwrap().code(),
+            ErrorCode::Cancelled
+        );
+        drop(slow);
+        assert_eq!(
+            engine
+                .status(owner.as_ref(), slow_id)
                 .await
                 .unwrap()
                 .metrics["query.active_memory_bytes"],

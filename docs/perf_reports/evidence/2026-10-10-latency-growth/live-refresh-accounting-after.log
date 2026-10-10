@@ -1,0 +1,20 @@
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.40s
+     Running unittests src/lib.rs (target/debug/deps/zippy_server-6a7989d3ef94bc0f)
+
+running 7 tests
+test native_log::tests::live_suffix_keeps_coverage_frame_and_future_cursor_validation ... ok
+test query_snapshot::live_log_snapshot::tests::live_utf8_bound_only_scans_the_selected_suffix ... ok
+live wide snapshot columns=[128] segments=[32] layout_bytes=[262144] snapshot_bytes=[346208] plan_bytes=[188432] coordination_peak=[346658536]
+test query_snapshot::live_log_snapshot::tests::live_wide_snapshot_owns_layout_charge_after_plan_drop ... ok
+test query_execution::tests::live_payload_rewrite_after_query_pin_fails_the_execution_closed ... ok
+test query_execution::tests::native_stream_reads_persisted_then_fixed_live_snapshot_without_overlap ... ok
+live refresh history_files=[1] other_files=[1] active_snapshot_memory_bytes=[136577]
+live refresh history_files=[1] other_files=[1] active_snapshot_memory_bytes=[136577]
+live refresh history_files=[256] other_files=[1] active_snapshot_memory_bytes=[136577]
+test native_query_canary::tests::live_log_refresh_memory_does_not_grow_with_persisted_history ... ok
+live refresh history_files=[1] other_files=[256] active_snapshot_memory_bytes=[136577]
+test native_query_canary::tests::live_log_refresh_memory_excludes_same_namespace_background_history ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 134 filtered out; finished in 2.02s
+

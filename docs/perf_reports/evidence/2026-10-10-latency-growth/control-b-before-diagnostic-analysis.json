@@ -1,0 +1,2297 @@
+{
+  "schema_version": 1,
+  "cell_index": 0,
+  "durability": "memory",
+  "background_rate": 100000.0,
+  "original_cell_passed": false,
+  "original_failures": [
+    "visible_p50_micros=[2187.854] exceeds limit=[1000.000]",
+    "visible_p99_micros=[4045.516] exceeds limit=[3000.000]",
+    "visible_p99_9_micros=[10223.684] exceeds limit=[10000.000]"
+  ],
+  "boundary_metadata": {
+    "type": "boundary_metadata",
+    "pid": 58,
+    "sample_every": 1000,
+    "durability": "memory",
+    "background_rate": 100000.0,
+    "scope": "read_chunk return includes server wait, IPC and C++ Arrow decoding; post_chunk_python covers Python log validation/event construction; no payload decoding before the benchmark received timestamp",
+    "overhead": "two clock reads plus dictionary insertion per sampled event; method wrapping and modulo checks each event; output after consumption"
+  },
+  "origin_sent_ns": 970146251012618,
+  "last_measured_sent_ns": 970326349931125,
+  "sample_count_total": 183,
+  "sample_count_after_original_warmup": 181,
+  "minute_buckets": [
+    {
+      "minute_index": 0,
+      "start_offset_seconds": 0,
+      "send_coverage_seconds": 60.0,
+      "complete_minute": true,
+      "sample_count": 61,
+      "sent_to_read_chunk_return": {
+        "count": 61,
+        "p50_micros": 1402.111,
+        "p99_micros": 1899.166
+      },
+      "read_chunk_to_next_return": {
+        "count": 61,
+        "p50_micros": 36.28,
+        "p99_micros": 64.193
+      },
+      "next_return_to_benchmark_received": {
+        "count": 61,
+        "p50_micros": 5.22,
+        "p99_micros": 9.649
+      },
+      "sampled_visible": {
+        "count": 61,
+        "p50_micros": 1444.903,
+        "p99_micros": 1935.996
+      }
+    },
+    {
+      "minute_index": 1,
+      "start_offset_seconds": 60,
+      "send_coverage_seconds": 60.0,
+      "complete_minute": true,
+      "sample_count": 59,
+      "sent_to_read_chunk_return": {
+        "count": 59,
+        "p50_micros": 2081.972,
+        "p99_micros": 3364.517
+      },
+      "read_chunk_to_next_return": {
+        "count": 59,
+        "p50_micros": 33.003,
+        "p99_micros": 57.59
+      },
+      "next_return_to_benchmark_received": {
+        "count": 59,
+        "p50_micros": 4.779,
+        "p99_micros": 28.485
+      },
+      "sampled_visible": {
+        "count": 59,
+        "p50_micros": 2114.013,
+        "p99_micros": 3405.836
+      }
+    },
+    {
+      "minute_index": 2,
+      "start_offset_seconds": 120,
+      "send_coverage_seconds": 60.0,
+      "complete_minute": true,
+      "sample_count": 60,
+      "sent_to_read_chunk_return": {
+        "count": 60,
+        "p50_micros": 2995.439,
+        "p99_micros": 4144.134
+      },
+      "read_chunk_to_next_return": {
+        "count": 60,
+        "p50_micros": 32.041,
+        "p99_micros": 80.443
+      },
+      "next_return_to_benchmark_received": {
+        "count": 60,
+        "p50_micros": 4.789,
+        "p99_micros": 17.113
+      },
+      "sampled_visible": {
+        "count": 60,
+        "p50_micros": 3037.85,
+        "p99_micros": 4191.885
+      }
+    },
+    {
+      "minute_index": 3,
+      "start_offset_seconds": 180,
+      "send_coverage_seconds": 0.098918507,
+      "complete_minute": false,
+      "sample_count": 1,
+      "sent_to_read_chunk_return": {
+        "count": 1,
+        "p50_micros": 3299.408,
+        "p99_micros": 3299.408
+      },
+      "read_chunk_to_next_return": {
+        "count": 1,
+        "p50_micros": 29.195,
+        "p99_micros": 29.195
+      },
+      "next_return_to_benchmark_received": {
+        "count": 1,
+        "p50_micros": 4.85,
+        "p99_micros": 4.85
+      },
+      "sampled_visible": {
+        "count": 1,
+        "p50_micros": 3333.453,
+        "p99_micros": 3333.453
+      }
+    }
+  ],
+  "component_trends": {
+    "sent_to_read_chunk_return": {
+      "complete_minute_count": 3,
+      "p50_slope_micros_per_minute": 796.6639999999999,
+      "p50_last_to_first_ratio": 2.1363779329881867,
+      "p99_slope_micros_per_minute": 1122.484,
+      "p99_last_to_first_ratio": 2.1820809765970957
+    },
+    "read_chunk_to_next_return": {
+      "complete_minute_count": 3,
+      "p50_slope_micros_per_minute": -2.119500000000002,
+      "p50_last_to_first_ratio": 0.8831587651598676,
+      "p99_slope_micros_per_minute": 8.125,
+      "p99_last_to_first_ratio": 1.2531428660445842
+    },
+    "next_return_to_benchmark_received": {
+      "complete_minute_count": 3,
+      "p50_slope_micros_per_minute": -0.21550000000000002,
+      "p50_last_to_first_ratio": 0.9174329501915709,
+      "p99_slope_micros_per_minute": 3.732,
+      "p99_last_to_first_ratio": 1.7735516633848067
+    },
+    "sampled_visible": {
+      "complete_minute_count": 3,
+      "p50_slope_micros_per_minute": 796.4735,
+      "p50_last_to_first_ratio": 2.102459473058053,
+      "p99_slope_micros_per_minute": 1127.9445,
+      "p99_last_to_first_ratio": 2.1652343289965477
+    }
+  },
+  "resource_observations": [
+    {
+      "offset_from_first_measured_send_seconds": -2.218356411,
+      "final": false,
+      "snapshot_duration_millis": 4.559407,
+      "processes": {
+        "server": {
+          "pid": 17,
+          "rss_mib": 21.80859375,
+          "anonymous_mib": 4.91015625,
+          "file_mib": 16.8984375,
+          "shmem_mib": 0.0,
+          "threads": 16,
+          "cpu_seconds_cumulative": 0.02,
+          "cpu_seconds_since_previous_point": null,
+          "seconds_since_previous_point": null,
+          "cpu_seconds_per_60_seconds_normalized": null,
+          "average_cpu_cores_since_previous_point": null,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 143,
+          "fd_count": 32,
+          "io": {
+            "rchar": 271262,
+            "wchar": 503802,
+            "syscr": 111,
+            "syscw": 381,
+            "read_bytes": 0,
+            "write_bytes": 671744,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 17,
+              "name": "zippy-server",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 18,
+              "name": "zippy-native-st",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 19,
+              "name": "zippy-catalog-s",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 20,
+              "name": "zippy-catalog-m",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 21,
+              "name": "zippy-catalog-c",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 22,
+              "name": "zippy-catalog-s",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 23,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 24,
+              "name": "zippy-query-swe",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 26,
+              "name": "native-ingest-c",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 27,
+              "name": "zippy-master-li",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 28,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 29,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            }
+          ]
+        },
+        "subscriber": {
+          "pid": 58,
+          "rss_mib": 84.97265625,
+          "anonymous_mib": 36.75390625,
+          "file_mib": 48.21875,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 0.14,
+          "cpu_seconds_since_previous_point": null,
+          "seconds_since_previous_point": null,
+          "cpu_seconds_per_60_seconds_normalized": null,
+          "average_cpu_cores_since_previous_point": null,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 233,
+          "fd_count": 9,
+          "io": {
+            "rchar": 5732423,
+            "wchar": 56,
+            "syscr": 609,
+            "syscw": 7,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 58,
+              "name": "python3",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 63,
+              "name": "jemalloc_bg_thd",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 87,
+              "name": "default-executo",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 88,
+              "name": "resolver-execut",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 89,
+              "name": "grpc_global_tim",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 130,
+              "name": "event_engine",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 131,
+              "name": "event_engine",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 132,
+              "name": "event_engine",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 133,
+              "name": "event_engine",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 134,
+              "name": "event_engine",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 135,
+              "name": "event_engine",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 136,
+              "name": "event_engine",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            }
+          ]
+        },
+        "writer": {
+          "pid": 59,
+          "rss_mib": 84.84765625,
+          "anonymous_mib": 37.3125,
+          "file_mib": 47.53515625,
+          "shmem_mib": 0.0,
+          "threads": 2,
+          "cpu_seconds_cumulative": 0.13,
+          "cpu_seconds_since_previous_point": null,
+          "seconds_since_previous_point": null,
+          "cpu_seconds_per_60_seconds_normalized": null,
+          "average_cpu_cores_since_previous_point": null,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 198,
+          "fd_count": 4,
+          "io": {
+            "rchar": 5697581,
+            "wchar": 32,
+            "syscr": 603,
+            "syscw": 4,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 59,
+              "name": "python3",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 62,
+              "name": "jemalloc_bg_thd",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            }
+          ]
+        },
+        "background": {
+          "pid": 60,
+          "rss_mib": 84.34375,
+          "anonymous_mib": 37.26171875,
+          "file_mib": 47.08203125,
+          "shmem_mib": 0.0,
+          "threads": 2,
+          "cpu_seconds_cumulative": 0.15,
+          "cpu_seconds_since_previous_point": null,
+          "seconds_since_previous_point": null,
+          "cpu_seconds_per_60_seconds_normalized": null,
+          "average_cpu_cores_since_previous_point": null,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 199,
+          "fd_count": 4,
+          "io": {
+            "rchar": 5697581,
+            "wchar": 32,
+            "syscr": 603,
+            "syscw": 4,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 60,
+              "name": "python3",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 61,
+              "name": "jemalloc_bg_thd",
+              "cpu_seconds": 0.0,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            }
+          ]
+        }
+      },
+      "catalog_tables": [
+        {
+          "name": "ticks",
+          "snapshot_version": 1,
+          "persisted_log_offset": null,
+          "persisted_log_rows": 0,
+          "snapshot_count": 1,
+          "file_counts_by_state": {},
+          "lineage_count": 0
+        },
+        {
+          "name": "background",
+          "snapshot_version": 1,
+          "persisted_log_offset": null,
+          "persisted_log_rows": 0,
+          "snapshot_count": 1,
+          "file_counts_by_state": {},
+          "lineage_count": 0
+        }
+      ],
+      "catalog_database_bytes": {
+        "main": 4096,
+        "-wal": 424392,
+        "-shm": 32768
+      },
+      "catalog_query_millis": 1.555243,
+      "catalog_errors": [],
+      "files": {
+        "parquet_count": 0,
+        "parquet_bytes": 0,
+        "segment_count": 0,
+        "segment_bytes": 0,
+        "complete": true,
+        "errors": [],
+        "duration_ns": 189631
+      }
+    },
+    {
+      "offset_from_first_measured_send_seconds": 57.784756339,
+      "final": false,
+      "snapshot_duration_millis": 5.579664,
+      "processes": {
+        "server": {
+          "pid": 17,
+          "rss_mib": 85.60546875,
+          "anonymous_mib": 64.546875,
+          "file_mib": 21.05859375,
+          "shmem_mib": 0.0,
+          "threads": 20,
+          "cpu_seconds_cumulative": 59.7,
+          "cpu_seconds_since_previous_point": 59.68,
+          "seconds_since_previous_point": 60.00311275,
+          "cpu_seconds_per_60_seconds_normalized": 59.67690401195062,
+          "average_cpu_cores_since_previous_point": 0.9946150668658437,
+          "mapped_segment_files": 2,
+          "mapped_segment_mib": 15.140625,
+          "vma_count": 167,
+          "fd_count": 36,
+          "io": {
+            "rchar": 319538689,
+            "wchar": 702528339,
+            "syscr": 61879,
+            "syscw": 760810,
+            "read_bytes": 12288,
+            "write_bytes": 872804352,
+            "cancelled_write_bytes": 233967616
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 33,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 21.34,
+              "delta_cpu_seconds": 21.34,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 22,
+              "name": "zippy-catalog-s",
+              "cpu_seconds": 17.14,
+              "delta_cpu_seconds": 17.14,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 18,
+              "name": "zippy-native-st",
+              "cpu_seconds": 6.93,
+              "delta_cpu_seconds": 6.93,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 21,
+              "name": "zippy-catalog-c",
+              "cpu_seconds": 3.88,
+              "delta_cpu_seconds": 3.88,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 191,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 3.82,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 57,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 3.8,
+              "delta_cpu_seconds": 3.8,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 27,
+              "name": "zippy-master-li",
+              "cpu_seconds": 0.78,
+              "delta_cpu_seconds": 0.78,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 194,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.48,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 23,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.43,
+              "delta_cpu_seconds": 0.43,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 193,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.39,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 192,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.34,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 29,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.09,
+              "delta_cpu_seconds": 0.09,
+              "delta_wall_seconds": 60.00311275
+            }
+          ]
+        },
+        "subscriber": {
+          "pid": 58,
+          "rss_mib": 96.3125,
+          "anonymous_mib": 45.31640625,
+          "file_mib": 50.99609375,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 13.61,
+          "cpu_seconds_since_previous_point": 13.47,
+          "seconds_since_previous_point": 60.00311275,
+          "cpu_seconds_per_60_seconds_normalized": 13.469301223876924,
+          "average_cpu_cores_since_previous_point": 0.22448835373128206,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 240,
+          "fd_count": 9,
+          "io": {
+            "rchar": 6210479,
+            "wchar": 478112,
+            "syscr": 60366,
+            "syscw": 59764,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 58,
+              "name": "python3",
+              "cpu_seconds": 7.17,
+              "delta_cpu_seconds": 7.04,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 137,
+              "name": "event_engine",
+              "cpu_seconds": 0.44,
+              "delta_cpu_seconds": 0.44,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 132,
+              "name": "event_engine",
+              "cpu_seconds": 0.43,
+              "delta_cpu_seconds": 0.43,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 136,
+              "name": "event_engine",
+              "cpu_seconds": 0.42,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 139,
+              "name": "event_engine",
+              "cpu_seconds": 0.42,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 144,
+              "name": "event_engine",
+              "cpu_seconds": 0.42,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 145,
+              "name": "event_engine",
+              "cpu_seconds": 0.42,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 133,
+              "name": "event_engine",
+              "cpu_seconds": 0.41,
+              "delta_cpu_seconds": 0.41,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 135,
+              "name": "event_engine",
+              "cpu_seconds": 0.41,
+              "delta_cpu_seconds": 0.41,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 140,
+              "name": "event_engine",
+              "cpu_seconds": 0.4,
+              "delta_cpu_seconds": 0.4,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 142,
+              "name": "event_engine",
+              "cpu_seconds": 0.39,
+              "delta_cpu_seconds": 0.39,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 130,
+              "name": "event_engine",
+              "cpu_seconds": 0.38,
+              "delta_cpu_seconds": 0.38,
+              "delta_wall_seconds": 60.00311275
+            }
+          ]
+        },
+        "writer": {
+          "pid": 59,
+          "rss_mib": 103.328125,
+          "anonymous_mib": 52.38671875,
+          "file_mib": 50.94140625,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 20.21,
+          "cpu_seconds_since_previous_point": 20.08,
+          "seconds_since_previous_point": 60.00311275,
+          "cpu_seconds_per_60_seconds_normalized": 20.078958320374802,
+          "average_cpu_cores_since_previous_point": 0.33464930533958004,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 241,
+          "fd_count": 9,
+          "io": {
+            "rchar": 6178059,
+            "wchar": 478816,
+            "syscr": 60512,
+            "syscw": 59852,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 59,
+              "name": "python3",
+              "cpu_seconds": 13.85,
+              "delta_cpu_seconds": 13.72,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 174,
+              "name": "event_engine",
+              "cpu_seconds": 0.43,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 175,
+              "name": "event_engine",
+              "cpu_seconds": 0.43,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 179,
+              "name": "event_engine",
+              "cpu_seconds": 0.43,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 186,
+              "name": "event_engine",
+              "cpu_seconds": 0.43,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 176,
+              "name": "event_engine",
+              "cpu_seconds": 0.42,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 177,
+              "name": "event_engine",
+              "cpu_seconds": 0.42,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 180,
+              "name": "event_engine",
+              "cpu_seconds": 0.42,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 188,
+              "name": "event_engine",
+              "cpu_seconds": 0.41,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 164,
+              "name": "event_engine",
+              "cpu_seconds": 0.4,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 168,
+              "name": "event_engine",
+              "cpu_seconds": 0.39,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 187,
+              "name": "event_engine",
+              "cpu_seconds": 0.39,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            }
+          ]
+        },
+        "background": {
+          "pid": 60,
+          "rss_mib": 94.0078125,
+          "anonymous_mib": 43.40234375,
+          "file_mib": 50.60546875,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 4.82,
+          "cpu_seconds_since_previous_point": 4.67,
+          "seconds_since_previous_point": 60.00311275,
+          "cpu_seconds_per_60_seconds_normalized": 4.669757736860077,
+          "average_cpu_cores_since_previous_point": 0.07782929561433462,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 235,
+          "fd_count": 9,
+          "io": {
+            "rchar": 5746331,
+            "wchar": 47936,
+            "syscr": 6599,
+            "syscw": 5992,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 60,
+              "name": "python3",
+              "cpu_seconds": 3.71,
+              "delta_cpu_seconds": 3.58,
+              "delta_wall_seconds": 60.00311275
+            },
+            {
+              "tid": 154,
+              "name": "event_engine",
+              "cpu_seconds": 0.07,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 167,
+              "name": "event_engine",
+              "cpu_seconds": 0.07,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 171,
+              "name": "event_engine",
+              "cpu_seconds": 0.07,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 172,
+              "name": "event_engine",
+              "cpu_seconds": 0.07,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 152,
+              "name": "event_engine",
+              "cpu_seconds": 0.06,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 153,
+              "name": "event_engine",
+              "cpu_seconds": 0.06,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 155,
+              "name": "event_engine",
+              "cpu_seconds": 0.06,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 156,
+              "name": "event_engine",
+              "cpu_seconds": 0.06,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 157,
+              "name": "event_engine",
+              "cpu_seconds": 0.06,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 160,
+              "name": "event_engine",
+              "cpu_seconds": 0.06,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            },
+            {
+              "tid": 162,
+              "name": "event_engine",
+              "cpu_seconds": 0.06,
+              "delta_cpu_seconds": null,
+              "delta_wall_seconds": null
+            }
+          ]
+        }
+      },
+      "catalog_tables": [
+        {
+          "name": "ticks",
+          "snapshot_version": 58,
+          "persisted_log_offset": 59214,
+          "persisted_log_rows": 59215,
+          "snapshot_count": 58,
+          "file_counts_by_state": {
+            "committed": 57
+          },
+          "lineage_count": 57
+        },
+        {
+          "name": "background",
+          "snapshot_version": 58,
+          "persisted_log_offset": 5921999,
+          "persisted_log_rows": 5922000,
+          "snapshot_count": 58,
+          "file_counts_by_state": {
+            "committed": 57
+          },
+          "lineage_count": 113
+        }
+      ],
+      "catalog_database_bytes": {
+        "main": 4096,
+        "-wal": 9995152,
+        "-shm": 32768
+      },
+      "catalog_query_millis": 1.454994,
+      "catalog_errors": [],
+      "files": {
+        "parquet_count": 114,
+        "parquet_bytes": 36873748,
+        "segment_count": 2,
+        "segment_bytes": 7930128,
+        "complete": true,
+        "errors": [],
+        "duration_ns": 1085587
+      }
+    },
+    {
+      "offset_from_first_measured_send_seconds": 117.78904448,
+      "final": false,
+      "snapshot_duration_millis": 5.86983,
+      "processes": {
+        "server": {
+          "pid": 17,
+          "rss_mib": 91.1171875,
+          "anonymous_mib": 68.04296875,
+          "file_mib": 23.07421875,
+          "shmem_mib": 0.0,
+          "threads": 20,
+          "cpu_seconds_cumulative": 136.49,
+          "cpu_seconds_since_previous_point": 76.79,
+          "seconds_since_previous_point": 60.004288141,
+          "cpu_seconds_per_60_seconds_normalized": 76.78451228641167,
+          "average_cpu_cores_since_previous_point": 1.2797418714401945,
+          "mapped_segment_files": 2,
+          "mapped_segment_mib": 18.92578125,
+          "vma_count": 169,
+          "fd_count": 36,
+          "io": {
+            "rchar": 1027272751,
+            "wchar": 1694799073,
+            "syscr": 218071,
+            "syscw": 1627113,
+            "read_bytes": 12288,
+            "write_bytes": 2033737728,
+            "cancelled_write_bytes": 471150592
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 22,
+              "name": "zippy-catalog-s",
+              "cpu_seconds": 48.09,
+              "delta_cpu_seconds": 30.95,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 33,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 46.09,
+              "delta_cpu_seconds": 24.75,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 18,
+              "name": "zippy-native-st",
+              "cpu_seconds": 13.06,
+              "delta_cpu_seconds": 6.13,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 191,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 8.01,
+              "delta_cpu_seconds": 4.19,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 57,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 7.97,
+              "delta_cpu_seconds": 4.17,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 21,
+              "name": "zippy-catalog-c",
+              "cpu_seconds": 7.4,
+              "delta_cpu_seconds": 3.52,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 27,
+              "name": "zippy-master-li",
+              "cpu_seconds": 1.57,
+              "delta_cpu_seconds": 0.79,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 194,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 1.18,
+              "delta_cpu_seconds": 0.7,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 192,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.89,
+              "delta_cpu_seconds": 0.55,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 193,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.89,
+              "delta_cpu_seconds": 0.5,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 23,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.67,
+              "delta_cpu_seconds": 0.24,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 29,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.17,
+              "delta_cpu_seconds": 0.08,
+              "delta_wall_seconds": 60.004288141
+            }
+          ]
+        },
+        "subscriber": {
+          "pid": 58,
+          "rss_mib": 103.28125,
+          "anonymous_mib": 52.28515625,
+          "file_mib": 50.99609375,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 26.68,
+          "cpu_seconds_since_previous_point": 13.07,
+          "seconds_since_previous_point": 60.004288141,
+          "cpu_seconds_per_60_seconds_normalized": 13.069065966706608,
+          "average_cpu_cores_since_previous_point": 0.2178177661117768,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 245,
+          "fd_count": 9,
+          "io": {
+            "rchar": 6654583,
+            "wchar": 922216,
+            "syscr": 115879,
+            "syscw": 115277,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 58,
+              "name": "python3",
+              "cpu_seconds": 14.16,
+              "delta_cpu_seconds": 6.99,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 130,
+              "name": "event_engine",
+              "cpu_seconds": 0.82,
+              "delta_cpu_seconds": 0.44,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 134,
+              "name": "event_engine",
+              "cpu_seconds": 0.78,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 135,
+              "name": "event_engine",
+              "cpu_seconds": 0.83,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 144,
+              "name": "event_engine",
+              "cpu_seconds": 0.83,
+              "delta_cpu_seconds": 0.41,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 136,
+              "name": "event_engine",
+              "cpu_seconds": 0.82,
+              "delta_cpu_seconds": 0.4,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 137,
+              "name": "event_engine",
+              "cpu_seconds": 0.84,
+              "delta_cpu_seconds": 0.4,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 138,
+              "name": "event_engine",
+              "cpu_seconds": 0.71,
+              "delta_cpu_seconds": 0.4,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 139,
+              "name": "event_engine",
+              "cpu_seconds": 0.82,
+              "delta_cpu_seconds": 0.4,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 131,
+              "name": "event_engine",
+              "cpu_seconds": 0.74,
+              "delta_cpu_seconds": 0.39,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 143,
+              "name": "event_engine",
+              "cpu_seconds": 0.76,
+              "delta_cpu_seconds": 0.39,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 142,
+              "name": "event_engine",
+              "cpu_seconds": 0.77,
+              "delta_cpu_seconds": 0.38,
+              "delta_wall_seconds": 60.004288141
+            }
+          ]
+        },
+        "writer": {
+          "pid": 59,
+          "rss_mib": 112.59765625,
+          "anonymous_mib": 61.65625,
+          "file_mib": 50.94140625,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 39.99,
+          "cpu_seconds_since_previous_point": 19.78,
+          "seconds_since_previous_point": 60.004288141,
+          "cpu_seconds_per_60_seconds_normalized": 19.778586443875803,
+          "average_cpu_cores_since_previous_point": 0.32964310739793007,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 246,
+          "fd_count": 9,
+          "io": {
+            "rchar": 6658835,
+            "wchar": 958664,
+            "syscr": 120551,
+            "syscw": 119833,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 59,
+              "name": "python3",
+              "cpu_seconds": 27.2,
+              "delta_cpu_seconds": 13.35,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 180,
+              "name": "event_engine",
+              "cpu_seconds": 0.86,
+              "delta_cpu_seconds": 0.44,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 164,
+              "name": "event_engine",
+              "cpu_seconds": 0.83,
+              "delta_cpu_seconds": 0.43,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 177,
+              "name": "event_engine",
+              "cpu_seconds": 0.85,
+              "delta_cpu_seconds": 0.43,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 175,
+              "name": "event_engine",
+              "cpu_seconds": 0.85,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 178,
+              "name": "event_engine",
+              "cpu_seconds": 0.79,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 179,
+              "name": "event_engine",
+              "cpu_seconds": 0.85,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 184,
+              "name": "event_engine",
+              "cpu_seconds": 0.78,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 185,
+              "name": "event_engine",
+              "cpu_seconds": 0.79,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 187,
+              "name": "event_engine",
+              "cpu_seconds": 0.81,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 168,
+              "name": "event_engine",
+              "cpu_seconds": 0.8,
+              "delta_cpu_seconds": 0.41,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 188,
+              "name": "event_engine",
+              "cpu_seconds": 0.82,
+              "delta_cpu_seconds": 0.41,
+              "delta_wall_seconds": 60.004288141
+            }
+          ]
+        },
+        "background": {
+          "pid": 60,
+          "rss_mib": 93.96875,
+          "anonymous_mib": 43.36328125,
+          "file_mib": 50.60546875,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 9.54,
+          "cpu_seconds_since_previous_point": 4.72,
+          "seconds_since_previous_point": 60.004288141,
+          "cpu_seconds_per_60_seconds_normalized": 4.719662690348522,
+          "average_cpu_cores_since_previous_point": 0.07866104483914203,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 235,
+          "fd_count": 9,
+          "io": {
+            "rchar": 5794483,
+            "wchar": 95992,
+            "syscr": 12612,
+            "syscw": 11999,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 60,
+              "name": "python3",
+              "cpu_seconds": 7.33,
+              "delta_cpu_seconds": 3.62,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 155,
+              "name": "event_engine",
+              "cpu_seconds": 0.14,
+              "delta_cpu_seconds": 0.08,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 153,
+              "name": "event_engine",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 157,
+              "name": "event_engine",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 158,
+              "name": "event_engine",
+              "cpu_seconds": 0.12,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 162,
+              "name": "event_engine",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 166,
+              "name": "event_engine",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 167,
+              "name": "event_engine",
+              "cpu_seconds": 0.14,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 170,
+              "name": "event_engine",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 171,
+              "name": "event_engine",
+              "cpu_seconds": 0.14,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 172,
+              "name": "event_engine",
+              "cpu_seconds": 0.14,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            },
+            {
+              "tid": 173,
+              "name": "event_engine",
+              "cpu_seconds": 0.13,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.004288141
+            }
+          ]
+        }
+      },
+      "catalog_tables": [
+        {
+          "name": "ticks",
+          "snapshot_version": 115,
+          "persisted_log_offset": 119238,
+          "persisted_log_rows": 119239,
+          "snapshot_count": 115,
+          "file_counts_by_state": {
+            "committed": 114
+          },
+          "lineage_count": 114
+        },
+        {
+          "name": "background",
+          "snapshot_version": 115,
+          "persisted_log_offset": 11925999,
+          "persisted_log_rows": 11926000,
+          "snapshot_count": 115,
+          "file_counts_by_state": {
+            "committed": 114
+          },
+          "lineage_count": 227
+        }
+      ],
+      "catalog_database_bytes": {
+        "main": 4096,
+        "-wal": 19961432,
+        "-shm": 65536
+      },
+      "catalog_query_millis": 1.264924,
+      "catalog_errors": [],
+      "files": {
+        "parquet_count": 228,
+        "parquet_bytes": 74262487,
+        "segment_count": 2,
+        "segment_bytes": 7930128,
+        "complete": true,
+        "errors": [],
+        "duration_ns": 1760505
+      }
+    },
+    {
+      "offset_from_first_measured_send_seconds": 177.792772068,
+      "final": false,
+      "snapshot_duration_millis": 6.709869,
+      "processes": {
+        "server": {
+          "pid": 17,
+          "rss_mib": 94.78515625,
+          "anonymous_mib": 72.5390625,
+          "file_mib": 22.24609375,
+          "shmem_mib": 0.0,
+          "threads": 20,
+          "cpu_seconds_cumulative": 216.09,
+          "cpu_seconds_since_previous_point": 79.6,
+          "seconds_since_previous_point": 60.003727588,
+          "cpu_seconds_per_60_seconds_normalized": 79.5950550404662,
+          "average_cpu_cores_since_previous_point": 1.3265842506744367,
+          "mapped_segment_files": 2,
+          "mapped_segment_mib": 18.92578125,
+          "vma_count": 169,
+          "fd_count": 36,
+          "io": {
+            "rchar": 2600453924,
+            "wchar": 2784583240,
+            "syscr": 585460,
+            "syscw": 2491164,
+            "read_bytes": 16384,
+            "write_bytes": 3292631040,
+            "cancelled_write_bytes": 708767744
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 22,
+              "name": "zippy-catalog-s",
+              "cpu_seconds": 83.06,
+              "delta_cpu_seconds": 34.97,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 33,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 70.42,
+              "delta_cpu_seconds": 24.33,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 18,
+              "name": "zippy-native-st",
+              "cpu_seconds": 18.86,
+              "delta_cpu_seconds": 5.8,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 191,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 12.37,
+              "delta_cpu_seconds": 4.36,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 57,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 12.29,
+              "delta_cpu_seconds": 4.32,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 21,
+              "name": "zippy-catalog-c",
+              "cpu_seconds": 10.06,
+              "delta_cpu_seconds": 2.66,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 27,
+              "name": "zippy-master-li",
+              "cpu_seconds": 2.37,
+              "delta_cpu_seconds": 0.8,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 193,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 1.57,
+              "delta_cpu_seconds": 0.68,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 194,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 1.85,
+              "delta_cpu_seconds": 0.67,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 192,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 1.34,
+              "delta_cpu_seconds": 0.45,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 23,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.94,
+              "delta_cpu_seconds": 0.27,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 29,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.26,
+              "delta_cpu_seconds": 0.09,
+              "delta_wall_seconds": 60.003727588
+            }
+          ]
+        },
+        "subscriber": {
+          "pid": 58,
+          "rss_mib": 110.078125,
+          "anonymous_mib": 59.08203125,
+          "file_mib": 50.99609375,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 37.51,
+          "cpu_seconds_since_previous_point": 10.83,
+          "seconds_since_previous_point": 60.003727588,
+          "cpu_seconds_per_60_seconds_normalized": 10.82932721216393,
+          "average_cpu_cores_since_previous_point": 0.18048878686939884,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 248,
+          "fd_count": 9,
+          "io": {
+            "rchar": 6991871,
+            "wchar": 1259504,
+            "syscr": 158040,
+            "syscw": 157438,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 58,
+              "name": "python3",
+              "cpu_seconds": 20.21,
+              "delta_cpu_seconds": 6.05,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 136,
+              "name": "event_engine",
+              "cpu_seconds": 1.17,
+              "delta_cpu_seconds": 0.35,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 143,
+              "name": "event_engine",
+              "cpu_seconds": 1.1,
+              "delta_cpu_seconds": 0.34,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 134,
+              "name": "event_engine",
+              "cpu_seconds": 1.11,
+              "delta_cpu_seconds": 0.33,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 144,
+              "name": "event_engine",
+              "cpu_seconds": 1.16,
+              "delta_cpu_seconds": 0.33,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 130,
+              "name": "event_engine",
+              "cpu_seconds": 1.13,
+              "delta_cpu_seconds": 0.31,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 133,
+              "name": "event_engine",
+              "cpu_seconds": 1.07,
+              "delta_cpu_seconds": 0.31,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 139,
+              "name": "event_engine",
+              "cpu_seconds": 1.13,
+              "delta_cpu_seconds": 0.31,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 140,
+              "name": "event_engine",
+              "cpu_seconds": 1.01,
+              "delta_cpu_seconds": 0.31,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 135,
+              "name": "event_engine",
+              "cpu_seconds": 1.13,
+              "delta_cpu_seconds": 0.3,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 138,
+              "name": "event_engine",
+              "cpu_seconds": 1.01,
+              "delta_cpu_seconds": 0.3,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 141,
+              "name": "event_engine",
+              "cpu_seconds": 0.95,
+              "delta_cpu_seconds": 0.29,
+              "delta_wall_seconds": 60.003727588
+            }
+          ]
+        },
+        "writer": {
+          "pid": 59,
+          "rss_mib": 121.5703125,
+          "anonymous_mib": 70.62890625,
+          "file_mib": 50.94140625,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 59.51,
+          "cpu_seconds_since_previous_point": 19.52,
+          "seconds_since_previous_point": 60.003727588,
+          "cpu_seconds_per_60_seconds_normalized": 19.51878736670729,
+          "average_cpu_cores_since_previous_point": 0.3253131227784548,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 252,
+          "fd_count": 9,
+          "io": {
+            "rchar": 7140955,
+            "wchar": 1439840,
+            "syscr": 180757,
+            "syscw": 179980,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 59,
+              "name": "python3",
+              "cpu_seconds": 40.31,
+              "delta_cpu_seconds": 13.11,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 175,
+              "name": "event_engine",
+              "cpu_seconds": 1.29,
+              "delta_cpu_seconds": 0.44,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 185,
+              "name": "event_engine",
+              "cpu_seconds": 1.22,
+              "delta_cpu_seconds": 0.43,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 165,
+              "name": "event_engine",
+              "cpu_seconds": 1.19,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 169,
+              "name": "event_engine",
+              "cpu_seconds": 0.94,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 180,
+              "name": "event_engine",
+              "cpu_seconds": 1.28,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 184,
+              "name": "event_engine",
+              "cpu_seconds": 1.2,
+              "delta_cpu_seconds": 0.42,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 164,
+              "name": "event_engine",
+              "cpu_seconds": 1.24,
+              "delta_cpu_seconds": 0.41,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 186,
+              "name": "event_engine",
+              "cpu_seconds": 1.18,
+              "delta_cpu_seconds": 0.41,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 174,
+              "name": "event_engine",
+              "cpu_seconds": 1.21,
+              "delta_cpu_seconds": 0.4,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 177,
+              "name": "event_engine",
+              "cpu_seconds": 1.25,
+              "delta_cpu_seconds": 0.4,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 168,
+              "name": "event_engine",
+              "cpu_seconds": 1.19,
+              "delta_cpu_seconds": 0.39,
+              "delta_wall_seconds": 60.003727588
+            }
+          ]
+        },
+        "background": {
+          "pid": 60,
+          "rss_mib": 93.96875,
+          "anonymous_mib": 43.36328125,
+          "file_mib": 50.60546875,
+          "shmem_mib": 0.0,
+          "threads": 23,
+          "cpu_seconds_cumulative": 14.25,
+          "cpu_seconds_since_previous_point": 4.71,
+          "seconds_since_previous_point": 60.003727588,
+          "cpu_seconds_per_60_seconds_normalized": 4.709707402520048,
+          "average_cpu_cores_since_previous_point": 0.07849512337533414,
+          "mapped_segment_files": 0,
+          "mapped_segment_mib": 0.0,
+          "vma_count": 235,
+          "fd_count": 9,
+          "io": {
+            "rchar": 5842635,
+            "wchar": 144048,
+            "syscr": 18625,
+            "syscw": 18006,
+            "read_bytes": 0,
+            "write_bytes": 0,
+            "cancelled_write_bytes": 0
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 60,
+              "name": "python3",
+              "cpu_seconds": 10.93,
+              "delta_cpu_seconds": 3.6,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 157,
+              "name": "event_engine",
+              "cpu_seconds": 0.21,
+              "delta_cpu_seconds": 0.08,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 162,
+              "name": "event_engine",
+              "cpu_seconds": 0.21,
+              "delta_cpu_seconds": 0.08,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 181,
+              "name": "event_engine",
+              "cpu_seconds": 0.21,
+              "delta_cpu_seconds": 0.08,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 152,
+              "name": "event_engine",
+              "cpu_seconds": 0.19,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 153,
+              "name": "event_engine",
+              "cpu_seconds": 0.2,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 154,
+              "name": "event_engine",
+              "cpu_seconds": 0.2,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 156,
+              "name": "event_engine",
+              "cpu_seconds": 0.19,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 158,
+              "name": "event_engine",
+              "cpu_seconds": 0.19,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 167,
+              "name": "event_engine",
+              "cpu_seconds": 0.21,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 170,
+              "name": "event_engine",
+              "cpu_seconds": 0.2,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            },
+            {
+              "tid": 171,
+              "name": "event_engine",
+              "cpu_seconds": 0.21,
+              "delta_cpu_seconds": 0.07,
+              "delta_wall_seconds": 60.003727588
+            }
+          ]
+        }
+      },
+      "catalog_tables": [
+        {
+          "name": "ticks",
+          "snapshot_version": 172,
+          "persisted_log_offset": 179404,
+          "persisted_log_rows": 179405,
+          "snapshot_count": 172,
+          "file_counts_by_state": {
+            "committed": 171
+          },
+          "lineage_count": 171
+        },
+        {
+          "name": "background",
+          "snapshot_version": 172,
+          "persisted_log_offset": 17940999,
+          "persisted_log_rows": 17941000,
+          "snapshot_count": 172,
+          "file_counts_by_state": {
+            "committed": 171
+          },
+          "lineage_count": 341
+        }
+      ],
+      "catalog_database_bytes": {
+        "main": 4096,
+        "-wal": 30475672,
+        "-shm": 65536
+      },
+      "catalog_query_millis": 1.727458,
+      "catalog_errors": [],
+      "files": {
+        "parquet_count": 342,
+        "parquet_bytes": 111720828,
+        "segment_count": 2,
+        "segment_bytes": 7930128,
+        "complete": true,
+        "errors": [],
+        "duration_ns": 2591272
+      }
+    },
+    {
+      "offset_from_first_measured_send_seconds": 180.415141604,
+      "final": true,
+      "snapshot_duration_millis": 5.303936,
+      "processes": {
+        "server": {
+          "pid": 17,
+          "rss_mib": 96.50390625,
+          "anonymous_mib": 72.69921875,
+          "file_mib": 23.8046875,
+          "shmem_mib": 0.0,
+          "threads": 20,
+          "cpu_seconds_cumulative": 219.19,
+          "cpu_seconds_since_previous_point": 3.1,
+          "seconds_since_previous_point": 2.622369536,
+          "cpu_seconds_per_60_seconds_normalized": 70.92821871463352,
+          "average_cpu_cores_since_previous_point": 1.1821369785772253,
+          "mapped_segment_files": 3,
+          "mapped_segment_mib": 22.7109375,
+          "vma_count": 170,
+          "fd_count": 33,
+          "io": {
+            "rchar": 2682618748,
+            "wchar": 2825453304,
+            "syscr": 604934,
+            "syscw": 2523110,
+            "read_bytes": 16384,
+            "write_bytes": 3341107200,
+            "cancelled_write_bytes": 717103104
+          },
+          "errors": [],
+          "top_threads": [
+            {
+              "tid": 22,
+              "name": "zippy-catalog-s",
+              "cpu_seconds": 84.46,
+              "delta_cpu_seconds": 1.4,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 33,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 71.32,
+              "delta_cpu_seconds": 0.9,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 18,
+              "name": "zippy-native-st",
+              "cpu_seconds": 19.08,
+              "delta_cpu_seconds": 0.22,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 57,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 12.47,
+              "delta_cpu_seconds": 0.18,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 191,
+              "name": "zippy-flight-wo",
+              "cpu_seconds": 12.55,
+              "delta_cpu_seconds": 0.18,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 21,
+              "name": "zippy-catalog-c",
+              "cpu_seconds": 10.15,
+              "delta_cpu_seconds": 0.09,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 192,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 1.37,
+              "delta_cpu_seconds": 0.03,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 194,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 1.88,
+              "delta_cpu_seconds": 0.03,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 27,
+              "name": "zippy-master-li",
+              "cpu_seconds": 2.39,
+              "delta_cpu_seconds": 0.02,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 193,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 1.59,
+              "delta_cpu_seconds": 0.02,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 19,
+              "name": "zippy-catalog-s",
+              "cpu_seconds": 0.2,
+              "delta_cpu_seconds": 0.01,
+              "delta_wall_seconds": 2.622369536
+            },
+            {
+              "tid": 29,
+              "name": "tokio-rt-worker",
+              "cpu_seconds": 0.27,
+              "delta_cpu_seconds": 0.01,
+              "delta_wall_seconds": 2.622369536
+            }
+          ]
+        },
+        "subscriber": {
+          "pid": 58,
+          "rss_mib": null,
+          "anonymous_mib": null,
+          "file_mib": null,
+          "shmem_mib": null,
+          "threads": null,
+          "cpu_seconds_cumulative": null,
+          "cpu_seconds_since_previous_point": null,
+          "seconds_since_previous_point": null,
+          "cpu_seconds_per_60_seconds_normalized": null,
+          "average_cpu_cores_since_previous_point": null,
+          "mapped_segment_files": null,
+          "mapped_segment_mib": null,
+          "vma_count": null,
+          "fd_count": null,
+          "io": null,
+          "errors": [
+            "FileNotFoundError(2, 'No such file or directory')"
+          ],
+          "top_threads": []
+        },
+        "writer": {
+          "pid": 59,
+          "rss_mib": null,
+          "anonymous_mib": null,
+          "file_mib": null,
+          "shmem_mib": null,
+          "threads": null,
+          "cpu_seconds_cumulative": null,
+          "cpu_seconds_since_previous_point": null,
+          "seconds_since_previous_point": null,
+          "cpu_seconds_per_60_seconds_normalized": null,
+          "average_cpu_cores_since_previous_point": null,
+          "mapped_segment_files": null,
+          "mapped_segment_mib": null,
+          "vma_count": null,
+          "fd_count": null,
+          "io": null,
+          "errors": [
+            "FileNotFoundError(2, 'No such file or directory')"
+          ],
+          "top_threads": []
+        },
+        "background": {
+          "pid": 60,
+          "rss_mib": null,
+          "anonymous_mib": null,
+          "file_mib": null,
+          "shmem_mib": null,
+          "threads": null,
+          "cpu_seconds_cumulative": null,
+          "cpu_seconds_since_previous_point": null,
+          "seconds_since_previous_point": null,
+          "cpu_seconds_per_60_seconds_normalized": null,
+          "average_cpu_cores_since_previous_point": null,
+          "mapped_segment_files": null,
+          "mapped_segment_mib": null,
+          "vma_count": null,
+          "fd_count": null,
+          "io": null,
+          "errors": [
+            "FileNotFoundError(2, 'No such file or directory')"
+          ],
+          "top_threads": []
+        }
+      },
+      "catalog_tables": [
+        {
+          "name": "ticks",
+          "snapshot_version": 174,
+          "persisted_log_offset": 181517,
+          "persisted_log_rows": 181518,
+          "snapshot_count": 174,
+          "file_counts_by_state": {
+            "committed": 173
+          },
+          "lineage_count": 173
+        },
+        {
+          "name": "background",
+          "snapshot_version": 174,
+          "persisted_log_offset": 18151999,
+          "persisted_log_rows": 18152000,
+          "snapshot_count": 174,
+          "file_counts_by_state": {
+            "committed": 173
+          },
+          "lineage_count": 345
+        }
+      ],
+      "catalog_database_bytes": {
+        "main": 4096,
+        "-wal": 30842352,
+        "-shm": 65536
+      },
+      "catalog_query_millis": 1.538706,
+      "catalog_errors": [],
+      "files": {
+        "parquet_count": 346,
+        "parquet_bytes": 113034853,
+        "segment_count": 3,
+        "segment_bytes": 11895192,
+        "complete": true,
+        "errors": [],
+        "duration_ns": 2940871
+      }
+    }
+  ],
+  "resource_rss_trends": {
+    "background": {
+      "observations": 4,
+      "rss_mib_per_minute": 2.8834049333047735
+    },
+    "server": {
+      "observations": 5,
+      "rss_mib_per_minute": 20.391416553191846
+    },
+    "subscriber": {
+      "observations": 4,
+      "rss_mib_per_minute": 8.227995452469969
+    },
+    "writer": {
+      "observations": 4,
+      "rss_mib_per_minute": 11.942992657673473
+    }
+  },
+  "monitor_errors": [],
+  "interpretation_limits": [
+    "sent to read_chunk return includes server processing/wait, local transport, and client C++ Arrow decoding. It is not an observed server-send timestamp.",
+    "read_chunk to next return isolates the Python log metadata validation/event construction suffix. Flat values exclude growth only in that measured suffix.",
+    "Use Catalog/file/lineage/snapshot/segment counts and server CPU/RSS alongside code evidence before attributing upstream growth to the server.",
+    "Boundary samples are one event per sample_every rows; sparse per-minute p99 is descriptive and cannot replace the full benchmark p99 acceptance test.",
+    "Minute origin/warmup matches the original benchmark. Partial final minutes are displayed but excluded from signed OLS slopes and first/last ratios.",
+    "Resource points have their actual timestamps, including negative startup offsets. CPU per 60 seconds is a normalization over observed intervals, not exact minute data.",
+    "RSS for writer/subscriber includes retained raw sample integer lists, which grow linearly with sample count; increasing RSS alone does not establish a leak.",
+    "Catalog counters are independent read-only index queries with a 50 ms progress budget, not an atomic cross-table snapshot. Errors and incomplete walks are retained.",
+    "Sampling wraps both reader methods on every event; sampled events add two clock reads and a dictionary insertion. Main sample values and thresholds are unchanged."
+  ],
+  "inputs": [
+    {
+      "path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/control-b-before.json",
+      "sha256": "ff2089ec9d77dbda2529ddd9596c05c2c742eca3f9a81b49802168344add67ec"
+    },
+    {
+      "path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/control-b-before-boundary.jsonl",
+      "sha256": "75230508dbaf24011b40e0d5afdde648903baba7a39b826c74fba8bc78a22323"
+    },
+    {
+      "path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/control-b-before-resources.jsonl",
+      "sha256": "50dab6fb3f4c0b268ed7eceb2113e7d984e50ac3688f4f25167af886be4e0161"
+    },
+    {
+      "path": "/home/jiangda/develop/zippy/scripts/bench_public_e2e.py",
+      "sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015"
+    },
+    {
+      "path": "/tmp/zippy-growth-diagnostic-analyze.py",
+      "sha256": "1c70c0874c62957a090dea2d69a018a243df04049a1fde2098d9c272eb881a1a"
+    }
+  ]
+}

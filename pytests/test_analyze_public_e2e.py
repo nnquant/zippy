@@ -180,3 +180,167 @@ def test_recomputed_raw_statistics_must_match_original(analysis):
     report["cells"][0]["raw_samples"]["writer"]["ack_ns"][-1] += 1
     with pytest.raises(ValueError, match="recomputed evidence differs"):
         analysis["analyze_reports"](report, copy.deepcopy(report))
+
+
+def _trend_from_medians(analysis, medians_micros, tail_micros=999_999):
+    minute_ns = 60_000_000_000
+    sent = [index * minute_ns for index in range(len(medians_micros) + 1)]
+    ends = [start + value * 1000 for start, value in zip(sent, [*medians_micros, tail_micros])]
+    return analysis["minute_latency_trends"](sent, ends, sent, ends, measurement_complete=True)
+
+
+@pytest.mark.parametrize("medians", [[1000, 1020, 1040], [100, 115]])
+def test_trend_gates_include_exact_slope_and_ratio_boundaries(analysis, medians):
+    """The exact <=20us/min and <=1.15 limits remain passing boundaries."""
+    result = _trend_from_medians(analysis, medians)
+    for stats in result["p50_trends"].values():
+        assert stats["eligible"] is True
+        assert stats["passed"] is True
+        assert stats["slope_micros_per_minute"] <= 20
+        assert stats["last_to_first_p50_ratio"] <= 1.15
+
+
+@pytest.mark.parametrize(
+    "medians,slope,ratio,failed_text",
+    [([1000, 1021], 21, 1.021, "slope"), ([100, 120], 20, 1.2, "ratio")],
+)
+def test_slope_and_first_last_ratio_are_independent_gates(
+    analysis, medians, slope, ratio, failed_text
+):
+    """One acceptable trend metric cannot conceal failure of the other metric."""
+    stats = _trend_from_medians(analysis, medians)["p50_trends"]["visible_latency"]
+    assert stats["eligible"] is True
+    assert stats["passed"] is False
+    assert stats["slope_micros_per_minute"] == slope
+    assert stats["last_to_first_p50_ratio"] == ratio
+    assert len(stats["failures"]) == 1
+    assert failed_text in stats["failures"][0]
+
+
+def test_ols_uses_all_complete_minutes_instead_of_endpoint_slope(analysis):
+    """A non-linear sequence distinguishes OLS from simply comparing endpoints."""
+    stats = _trend_from_medians(analysis, [1000, 1400, 1100, 1200])["p50_trends"]["visible_latency"]
+    assert stats["slope_micros_per_minute"] == 30
+    assert stats["last_to_first_p50_ratio"] == 1.2
+
+
+def test_extreme_partial_tail_is_shown_but_does_not_change_gate(analysis):
+    """An unstable short tail must not overwhelm the two comparable full minutes."""
+    sent = [0, 60_000_000_000, 120_000_000_000, 120_020_000_000]
+    ends = [sent[0] + 1_000_000, sent[1] + 1_000_000, sent[2] + 50_000_000, sent[3] + 50_000_000]
+    result = analysis["minute_latency_trends"](sent, ends, sent, ends, measurement_complete=True)
+    tail = result["buckets"][-1]
+    assert tail["send_coverage_seconds"] == 0.02
+    assert tail["complete_minute"] is False
+    assert tail["visible_latency"]["over_10ms_count"] == 2
+    assert tail["visible_latency"]["p50_micros"] == 50_000
+    stats = result["p50_trends"]["visible_latency"]
+    assert stats["complete_minute_count"] == 2
+    assert stats["slope_micros_per_minute"] == 0
+    assert stats["last_to_first_p50_ratio"] == 1
+    assert stats["passed"] is True
+
+
+def test_exact_final_send_boundary_has_zero_coverage_tail(analysis):
+    """A sample at minute two starts a tail and cannot create a third full minute."""
+    result = _trend_from_medians(analysis, [1000, 1000])
+    assert len(result["buckets"]) == 3
+    assert result["buckets"][-1]["send_coverage_seconds"] == 0
+    assert result["buckets"][-1]["complete_minute"] is False
+    assert result["p50_trends"]["visible_latency"]["complete_minute_count"] == 2
+
+
+def test_send_buckets_do_not_move_slow_samples_to_receive_minute(analysis):
+    """Cross-boundary responses retain their send cohort while old receipt buckets stay valid."""
+    sent = [0, 59_999_000_000, 60_000_000_000, 120_000_000_000]
+    received = [1000, 60_019_000_000, 60_030_000_000, 120_000_001_000]
+    result = analysis["minute_latency_trends"](
+        sent, [stamp + 1000 for stamp in sent], sent, received, measurement_complete=True
+    )
+    old = analysis["spike_statistics"](sent, received, 10_000_000, 10_000_000)
+    assert result["buckets"][0]["visible_latency"]["over_10ms_count"] == 1
+    assert result["buckets"][1]["visible_latency"]["over_10ms_count"] == 1
+    assert old["minute_buckets"][0]["count"] == 0
+    assert old["minute_buckets"][1]["count"] == 2
+    assert sum(b["visible_latency"]["over_10ms_count"] for b in result["buckets"]) == old["count"]
+
+
+def test_empty_full_minute_is_not_compressed_out_of_ols_time_axis(analysis):
+    """A missing minute retains its elapsed time and prevents a passing assessment."""
+    sent = [0, 120_000_000_000, 180_000_000_000]
+    ends = [sent[0] + 1_000_000, sent[1] + 1_040_000, sent[2] + 1_000_000]
+    stats = analysis["minute_latency_trends"](sent, ends, sent, ends, measurement_complete=True)[
+        "p50_trends"
+    ]["visible_latency"]
+    assert stats["slope_micros_per_minute"] == 20
+    assert stats["complete_minute_count"] == 3
+    assert stats["sampled_complete_minute_count"] == 2
+    assert stats["eligible"] is False
+    assert stats["passed"] is False
+    assert any("no samples" in failure for failure in stats["failures"])
+
+
+@pytest.mark.parametrize("sent", [[], [0], [0, 60_000_000_000, 119_999_999_999]])
+def test_fewer_than_two_complete_minutes_cannot_estimate_or_pass(analysis, sent):
+    """No sample-count substitution or delayed receives can fabricate full-minute coverage."""
+    ends = [stamp + 500_000_000_000 for stamp in sent]
+    stats = analysis["minute_latency_trends"](sent, ends, sent, ends, measurement_complete=True)[
+        "p50_trends"
+    ]["visible_latency"]
+    assert stats["slope_micros_per_minute"] is None
+    assert stats["last_to_first_p50_ratio"] is None
+    assert stats["eligible"] is False
+    assert stats["passed"] is False
+
+
+def test_incomplete_run_cannot_pass_even_with_flat_complete_minutes(analysis):
+    """A failed run can show descriptive slopes without becoming successful evidence."""
+    sent = [0, 60_000_000_000, 120_000_000_000]
+    ends = [stamp + 1_000_000 for stamp in sent]
+    stats = analysis["minute_latency_trends"](sent, ends, sent, ends, measurement_complete=False)[
+        "p50_trends"
+    ]["visible_latency"]
+    assert stats["slope_micros_per_minute"] == 0
+    assert stats["eligible"] is False
+    assert stats["passed"] is False
+
+
+def test_zero_first_p50_keeps_ratio_undefined(analysis):
+    """A zero denominator must not generate infinity or an invented passing ratio."""
+    stats = _trend_from_medians(analysis, [0, 0])["p50_trends"]["visible_latency"]
+    assert stats["last_to_first_p50_ratio"] is None
+    assert stats["passed"] is False
+
+
+def test_minute_trend_integration_reuses_original_warmup_mask(analysis):
+    """Warmup's slow sample does not enter either the trend origin or per-minute statistics."""
+    report = _report(analysis)
+    result = analysis["analyze_reports"](report, copy.deepcopy(report))[0]["minute_trends"]
+    assert result["origin_sent_ns"] == 1_000_000_000
+    assert result["buckets"][0]["ack_latency"] == {
+        "count": 2,
+        "p50_micros": 1000,
+        "p99_micros": 1000,
+        "over_10ms_count": 0,
+    }
+    assert result["buckets"][0]["visible_latency"]["p50_micros"] == 3000
+
+
+@pytest.mark.parametrize(
+    "writer_sent,ack,visible_sent,received",
+    [
+        ([0], [], [], []),
+        ([1], [0], [], []),
+        ([1, 0], [2, 2], [], []),
+        ([1], [2], [0], [2]),
+        ([], [], [0], [1]),
+    ],
+)
+def test_minute_trends_reject_invalid_raw_timestamp_pairs(
+    analysis, writer_sent, ack, visible_sent, received
+):
+    """Malformed array lengths or time domains cannot yield plausible trend gates."""
+    with pytest.raises(ValueError):
+        analysis["minute_latency_trends"](
+            writer_sent, ack, visible_sent, received, measurement_complete=True
+        )

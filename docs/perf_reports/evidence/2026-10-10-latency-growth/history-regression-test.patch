@@ -1,0 +1,221 @@
+diff --git a/crates/zippy-server/src/native_query_canary.rs b/crates/zippy-server/src/native_query_canary.rs
+index b821bbd..742b2ba 100644
+--- a/crates/zippy-server/src/native_query_canary.rs
++++ b/crates/zippy-server/src/native_query_canary.rs
+@@ -2120,6 +2120,216 @@ mod tests {
+         start_runtime_with_limits(canary_limits(max_rows)).await
+     }
+ 
++    async fn grow_log_history(runtime: &NativeStorageRuntime, table: u128, files: usize) {
++        assert!(files >= 1);
++        if files == 1 {
++            return;
++        }
++        let actor = runtime
++            .table_actor(table_id(table))
++            .expect("history table actor");
++        let snapshot = actor.snapshot().await.expect("history snapshot");
++        let first = snapshot
++            .committed_log_offset
++            .known()
++            .and_then(LogOffset::checked_next)
++            .expect("seed history has a next offset");
++        let candidates = (0..files - 1)
++            .map(|index| {
++                let offset = LogOffset::new(first.get() + index as u64);
++                let offsets = OffsetRange::new(offset, offset).expect("one history row");
++                let provenance = NativeDataFileProvenance::new(
++                    offsets,
++                    SourceSegmentLineages::new(vec![SourceSegmentLineage {
++                        source: SourceSegmentIdentity {
++                            segment_id: 10_000 + table as u64 * 1_000 + index as u64,
++                            generation: 1,
++                            writer_epoch: snapshot.writer_epoch,
++                        },
++                        offsets,
++                    }])
++                    .expect("one history lineage"),
++                )
++                .expect("history provenance");
++                let schema = schema();
++                let batch = RecordBatch::try_new(
++                    Arc::clone(&schema),
++                    vec![Arc::new(Int64Array::from(vec![offset.get() as i64]))],
++                )
++                .expect("history batch");
++                PersistCandidateInput::new(
++                    ParquetCandidateSpec {
++                        file_id: FileId::from_u128(10_000 + table * 1_000 + index as u128)
++                            .expect("history file ID"),
++                        table_id: table_id(table),
++                        schema_version: snapshot.schema_version,
++                        schema,
++                        provenance,
++                        partition: MetadataMap::new(),
++                        metadata: MetadataMap::new(),
++                        created_at_ns: 1_752_492_600_000_000_100,
++                    },
++                    vec![batch],
++                )
++                .expect("history candidate")
++            })
++            .collect();
++        // One commit grows the manifest without growing the snapshot-version chain per file.
++        actor
++            .persist(
++                PersistRequest::new(
++                    request_id(20_000 + table),
++                    table_id(table),
++                    snapshot.persisted_snapshot_version,
++                    snapshot.writer_epoch,
++                    candidates,
++                    OffsetWatermark::Known(LogOffset::new(first.get() + files as u64 - 2)),
++                )
++                .expect("history persist request"),
++            )
++            .await
++            .expect("persist history files");
++    }
++
++    async fn single_live_refresh_snapshot_bytes(history_files: usize, other_files: usize) -> u64 {
++        use std::num::NonZeroU32;
++
++        use futures::StreamExt;
++        use zippy_ingest::{
++            TableActorLiveSegmentPublication, TableActorLiveSegmentRole,
++            TableActorLiveSegmentsPublication,
++        };
++        use zippy_segment_store::{
++            compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan,
++        };
++
++        let mut test = start_runtime(100).await;
++        grow_log_history(&test.runtime, TABLE, history_files).await;
++        grow_log_history(&test.runtime, OTHER_TABLE, other_files).await;
++        let actor = test
++            .runtime
++            .table_actor(table_id(TABLE))
++            .expect("log actor");
++        let snapshot = actor.snapshot().await.expect("persisted boundary");
++        let offset = snapshot
++            .committed_log_offset
++            .known()
++            .and_then(LogOffset::checked_next)
++            .expect("next live offset");
++        let engine = test.runtime.query_engine();
++        let owner = engine.owner(session_id(7_000));
++        let subscription = engine
++            .subscribe_log(
++                owner.as_ref(),
++                crate::NativeLogRequest {
++                    query_id: query_id(7_001),
++                    table: TableRef::Id {
++                        table_id: table_id(TABLE),
++                    },
++                    start: None,
++                    deadline_ns: None,
++                    memory_limit_bytes: ResourceLimit::ServerDefault,
++                    batch_rows: NonZeroU32::new(1),
++                },
++            )
++            .await
++            .expect("subscribe at latest boundary");
++        let instance = subscription.instance_id();
++        let mut stream = subscription.into_stream();
++        let compiled =
++            compile_schema(&[ColumnSpec::new("price", ColumnType::Int64)]).expect("live schema");
++        let layout = LayoutPlan::for_schema(&compiled, 2).expect("live layout");
++        let mut writer = ActiveSegmentWriter::new_for_runtime_with_epoch(
++            compiled,
++            layout,
++            999_999,
++            1,
++            snapshot.writer_epoch,
++            2,
++        )
++        .expect("live writer");
++        writer.begin_row().expect("begin live row");
++        writer.write_i64("price", 777).expect("write live row");
++        writer.commit_row().expect("commit live row");
++        let offsets = OffsetRange::new(offset, offset).expect("one live row");
++        actor
++            .publish_live_segments(TableActorLiveSegmentsPublication::new(
++                table_id(TABLE),
++                vec![TableActorLiveSegmentPublication::new(
++                    TableActorLiveSegmentRole::Active,
++                    SourceSegmentIdentity {
++                        segment_id: 999_999,
++                        generation: 1,
++                        writer_epoch: snapshot.writer_epoch,
++                    },
++                    snapshot.schema_version,
++                    offsets,
++                    writer.active_descriptor(),
++                    0,
++                    1,
++                )],
++            ))
++            .await
++            .expect("publish the new live row");
++        // The timeout only detects a stalled subscription; the regression assertion is a
++        // deterministic resource count, independent of scheduler and filesystem latency.
++        let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
++            .await
++            .expect("live refresh must complete")
++            .expect("subscription must remain open")
++            .expect("live refresh must succeed");
++        assert_eq!(item.offsets, offsets);
++        assert_eq!(item.batch.record_batch().num_rows(), 1);
++        assert_eq!(
++            item.batch
++                .record_batch()
++                .column(0)
++                .as_any()
++                .downcast_ref::<Int64Array>()
++                .expect("live Int64 column")
++                .value(0),
++            777
++        );
++        let resources = test.runtime.query_resource_coordinator();
++        let bytes = resources
++            .status_owned(owner.as_ref(), instance)
++            .expect("live query ledger")
++            .active_snapshot_memory_bytes;
++        assert!(bytes > 0, "the sampled window must still own its snapshot");
++        eprintln!(
++            "live refresh history_files=[{history_files}] other_files=[{other_files}] \
++             active_snapshot_memory_bytes=[{bytes}]"
++        );
++        drop(item);
++        drop(stream);
++        assert_eq!(resources.status().active_snapshot_memory_bytes, 0);
++        drop(writer);
++        test.shutdown();
++        bytes
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn live_log_refresh_memory_does_not_grow_with_persisted_history() {
++        let small = single_live_refresh_snapshot_bytes(1, 1).await;
++        let large = single_live_refresh_snapshot_bytes(256, 1).await;
++        // Allow fixed schema/lease overhead and wider offset/version numbers, but not a
++        // retained historical manifest or a source vector sized to the entire history.
++        assert!(
++            large <= small + 64 * 1024,
++            "one-row live refresh retained history: small=[{small}] large=[{large}]"
++        );
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn live_log_refresh_memory_excludes_same_namespace_background_history() {
++        let small = single_live_refresh_snapshot_bytes(1, 1).await;
++        let background = single_live_refresh_snapshot_bytes(1, 256).await;
++        assert!(
++            background <= small + 64 * 1024,
++            "live refresh retained another table: small=[{small}] background=[{background}]"
++        );
++    }
++
+     fn request(value: u128) -> NativeQueryCanaryRequest {
+         NativeQueryCanaryRequest::new(
+             query_id(value),

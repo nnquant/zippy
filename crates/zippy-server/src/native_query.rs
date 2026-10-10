@@ -414,6 +414,7 @@ impl NativeQueryEngine {
             execution,
             coordinator: self.inner.snapshots.clone(),
             batch_rows: policy.batch_size(),
+            live_only: false,
         })
     }
 

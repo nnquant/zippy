@@ -3465,13 +3465,32 @@ impl QueryExecutionScope {
         &mut self,
         snapshot: crate::query_snapshot::NativeQueryReadSnapshot,
     ) -> Result<QueryPlanInfo> {
+        let descriptor = snapshot.memory_lease_descriptor();
+        let draft = snapshot.plan_draft();
+        self.replace_event_snapshot(snapshot.into_opaque(), descriptor, draft)
+    }
+
+    /// Installs a live-only event owner through the same generation and budget checks.
+    pub(crate) fn replace_live_log_snapshot(
+        &mut self,
+        snapshot: crate::query_snapshot::LiveLogSnapshot,
+    ) -> Result<QueryPlanInfo> {
+        let descriptor = snapshot.memory_lease_descriptor();
+        let draft = snapshot.plan_draft();
+        self.replace_event_snapshot(Box::new(snapshot), descriptor, draft)
+    }
+
+    fn replace_event_snapshot(
+        &mut self,
+        snapshot: OpaqueQueryReadSnapshot,
+        descriptor: CatalogSnapshotMemoryLeaseDescriptor,
+        draft: QueryPlanDraft,
+    ) -> Result<QueryPlanInfo> {
         let owner = self
             .control
             .owner
             .upgrade()
             .ok_or_else(|| unavailable(self.query_id()))?;
-        let descriptor = snapshot.memory_lease_descriptor();
-        let draft = snapshot.plan_draft();
         let mut global = owner.state.lock().unwrap();
         let mut query = self.control.state.lock().unwrap();
         ensure_refresh_running(&query, self.query_id())?;
@@ -3526,7 +3545,7 @@ impl QueryExecutionScope {
                 "snapshot refresh owner admission is exhausted",
             ));
         }
-        *current = Some(snapshot.into_opaque());
+        *current = Some(snapshot);
         global.active_snapshot_owners += 1;
         plan.catalog_revision = draft.catalog_revision;
         plan.snapshots = draft.snapshots;

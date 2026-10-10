@@ -1,0 +1,189 @@
+{
+  "environment": {
+    "PYO3_PYTHON": "/home/jiangda/develop/zippy/.venv/bin/python",
+    "UV_CACHE_DIR": "/tmp/zippy-uv-cache"
+  },
+  "commands": [
+    {
+      "name": "final-fmt",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791632972.1433425,
+      "elapsed_seconds": 1.1049880981445312,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "final-clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791632973.248679,
+      "elapsed_seconds": 2.3981637954711914,
+      "log_sha256": "fa783bed1d006960c5e1b5e29731f0545287295ae04389a7cb28ff00be0394e0"
+    },
+    {
+      "name": "final-cargo-test-workspace",
+      "argv": [
+        "cargo",
+        "test",
+        "--workspace",
+        "-j",
+        "4"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791632975.6472025,
+      "elapsed_seconds": 81.38435673713684,
+      "log_sha256": "15b1bfb48354a10a9857d2ebfe945215631e1f2c14685e46170e50ee8faaf360"
+    },
+    {
+      "name": "final-build-server",
+      "argv": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "zippy-server",
+        "--bin",
+        "zippy-server"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633057.032547,
+      "elapsed_seconds": 30.533361434936523,
+      "log_sha256": "f9ec005b814cecf3ece01246e69535b5d6b9d31b79012068d0e067169c3f53e3"
+    },
+    {
+      "name": "final-build-extension",
+      "argv": [
+        "uv",
+        "run",
+        "--no-sync",
+        "maturin",
+        "develop",
+        "--release"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633087.5663514,
+      "elapsed_seconds": 19.70327401161194,
+      "log_sha256": "60c9b2769abaf009f915d972561976cf0daaa816524259e0fc7d8a29e841f8cd"
+    },
+    {
+      "name": "final-pytest-root",
+      "argv": [
+        "uv",
+        "run",
+        "--no-sync",
+        "pytest",
+        "pytests",
+        "-q"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633107.270049,
+      "elapsed_seconds": 5.13389253616333,
+      "log_sha256": "cd1b01d4e1d7c0876ceed32e62396f8b4ab44548170acc18fca8494a6d4a7a1b"
+    },
+    {
+      "name": "final-pytest-client",
+      "argv": [
+        "uv",
+        "run",
+        "--no-sync",
+        "pytest",
+        "clients/python/tests",
+        "-q"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633112.404393,
+      "elapsed_seconds": 3.306643009185791,
+      "log_sha256": "7ecdd6c677b29a410b7f217aa257bef515c7050d735b5b9ed68e9fc2e0f8c6d4"
+    },
+    {
+      "name": "final-ruff",
+      "argv": [
+        "uv",
+        "run",
+        "--no-sync",
+        "ruff",
+        "check",
+        "scripts/analyze_public_e2e.py",
+        "pytests/test_analyze_public_e2e.py"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633115.711419,
+      "elapsed_seconds": 0.08182787895202637,
+      "log_sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    {
+      "name": "final-black-script",
+      "argv": [
+        "uv",
+        "run",
+        "--no-sync",
+        "black",
+        "--check",
+        "-l",
+        "100",
+        "scripts/analyze_public_e2e.py"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633115.793653,
+      "elapsed_seconds": 0.1739649772644043,
+      "log_sha256": "1a56c7cd8457fd05d978cfbd139d7bfd86e86acaa9b57668e718ef8bccc0cf48"
+    },
+    {
+      "name": "final-black-test",
+      "argv": [
+        "uv",
+        "run",
+        "--no-sync",
+        "black",
+        "--check",
+        "-l",
+        "100",
+        "pytests/test_analyze_public_e2e.py"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633115.9681294,
+      "elapsed_seconds": 0.14844155311584473,
+      "log_sha256": "1a56c7cd8457fd05d978cfbd139d7bfd86e86acaa9b57668e718ef8bccc0cf48"
+    },
+    {
+      "name": "final-mypy",
+      "argv": [
+        "uv",
+        "run",
+        "--no-sync",
+        "mypy",
+        "scripts/analyze_public_e2e.py",
+        "pytests/test_analyze_public_e2e.py"
+      ],
+      "cwd": "/home/jiangda/develop/zippy",
+      "exit_code": 0,
+      "started_at_unix_seconds": 1791633116.1170697,
+      "elapsed_seconds": 0.12880587577819824,
+      "log_sha256": "f9b031e5c45aa702cd4fef028d465551cb20a2c4698e0913c7b00766b20ac4d8"
+    }
+  ]
+}

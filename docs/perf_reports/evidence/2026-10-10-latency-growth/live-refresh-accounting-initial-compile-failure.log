@@ -1,0 +1,15 @@
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+error[E0432]: unresolved import `zippy_engines`
+   --> crates/zippy-server/src/live_log_snapshot.rs:349:9
+    |
+349 |     use zippy_engines::StreamTableMaterializer;
+    |         ^^^^^^^^^^^^^ use of unresolved module or unlinked crate `zippy_engines`
+    |
+help: there is a crate or module with a similar name
+    |
+349 -     use zippy_engines::StreamTableMaterializer;
+349 +     use zippy_ingest::StreamTableMaterializer;
+    |
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `zippy-server` (lib test) due to 1 previous error

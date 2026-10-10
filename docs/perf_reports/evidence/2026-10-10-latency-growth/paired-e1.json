@@ -1,0 +1,241 @@
+{
+  "schema_version": 2,
+  "config": {
+    "samples": 20000,
+    "durability": [
+      "memory"
+    ],
+    "rate": 1000.0,
+    "background_rate": [
+      0.0
+    ],
+    "background_batch_rows": 1000,
+    "warmup_seconds": 2.0,
+    "warmup_samples": 1000,
+    "timeout_seconds": 600.0,
+    "server_bin": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/server-e1e67b5",
+    "max_visible_p50_micros": 1000.0,
+    "max_visible_p99_micros": 3000.0,
+    "max_visible_p99_9_micros": 10000.0,
+    "max_wal_ack_p50_micros": 2000.0,
+    "max_wal_ack_p99_micros": 5000.0,
+    "thresholds": {
+      "visible_p50_micros": 1000.0,
+      "visible_p99_micros": 3000.0,
+      "visible_p99_9_micros": 10000.0,
+      "wal_ack_p50_micros": 2000.0,
+      "wal_ack_p99_micros": 5000.0
+    }
+  },
+  "metadata": {
+    "git_sha": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+    "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+    "git_dirty": true,
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "is_wsl": true,
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpu_count": 32,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "python_version": "3.11.14",
+    "versions": {
+      "pyarrow": "23.0.1",
+      "zippy": "0.5.0",
+      "zippy-client": "0.1.0"
+    },
+    "started_at_utc": "2026-10-10T11:29:05.790025+00:00",
+    "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+    "server_binary": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/server-e1e67b5",
+    "server_sha256": "ea5f6452398b8ffb720e1878f425d38ebfd8997d6a423bc79a4d6d77a948f6eb",
+    "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+    "extension_sha256": "74c32f8d66409865dc892fd76624d4df79c4f9f74b22121d4e14861a2469678a",
+    "build_requirement": "release server/extension; commands in baseline report",
+    "command_argv": [
+      "/home/jiangda/develop/zippy/.venv/bin/python3",
+      "scripts/bench_public_e2e.py",
+      "--server-bin",
+      "/tmp/zippy-perf-raw/2026-10-10-latency-growth/server-e1e67b5",
+      "--durability",
+      "memory",
+      "--background-rate",
+      "0",
+      "--rate",
+      "1000",
+      "--samples",
+      "20000",
+      "--warmup-seconds",
+      "2",
+      "--warmup-samples",
+      "1000",
+      "--background-batch-rows",
+      "1000",
+      "--timeout-seconds",
+      "600",
+      "--report-json",
+      "docs/perf_reports/evidence/2026-10-10-latency-growth/paired-e1.json",
+      "--raw-samples-json",
+      "/tmp/zippy-perf-raw/2026-10-10-latency-growth/paired-e1.json"
+    ],
+    "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+    "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+    "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+    "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+    "background_scope": "separate append table in the same namespace and server"
+  },
+  "cells": [
+    {
+      "durability": "memory",
+      "background_target_rows_per_second": 0.0,
+      "subscription_api": "Client.open_log(batch_rows=1)",
+      "write_api": "Client.get_writer(batch_size=1, flush_interval_ms=None).write(row)",
+      "ack_latency": {
+        "count": 20000,
+        "p50_micros": 856.262,
+        "p95_micros": 1184.673,
+        "p99_micros": 2474.306,
+        "p99_9_micros": 6370.34,
+        "max_micros": 17102.335,
+        "mean_micros": 923.49653545,
+        "p99_9_unavailable_reason": null
+      },
+      "visible_latency": {
+        "count": 20000,
+        "p50_micros": 1410.006,
+        "p95_micros": 1873.768,
+        "p99_micros": 3120.534,
+        "p99_9_micros": 7052.39,
+        "max_micros": 18096.914,
+        "mean_micros": 1489.2335134,
+        "p99_9_unavailable_reason": null
+      },
+      "integrity": {
+        "passed": true,
+        "expected_count": 21730,
+        "received_count": 21730,
+        "missing_count": 0,
+        "missing_seq_first_20": [],
+        "duplicate_count": 0,
+        "out_of_order_count": 0,
+        "unexpected_count": 0
+      },
+      "warmup_rows": 1730,
+      "achieved_probe_rows_per_second": 1009.5585128717407,
+      "background": {
+        "rows": 0,
+        "achieved_rows_per_second": 0.0
+      },
+      "schedule_lag": {
+        "count": 20000,
+        "p50_micros": 16721.2,
+        "p95_micros": 281283.819,
+        "p99_micros": 299124.22,
+        "p99_9_micros": 301459.785,
+        "max_micros": 301752.141,
+        "mean_micros": 84730.74148074999,
+        "p99_9_unavailable_reason": null
+      },
+      "tier_b_comparison": {
+        "measurement": "open_log delivery proxy; subscribe callback wrapper is not measured",
+        "p50_ratio": 28.200120000000002,
+        "p99_ratio": 10.40178,
+        "p99_9_ratio": 7.05239
+      },
+      "passed": false,
+      "failures": [
+        "visible_p50_micros=[1410.006] exceeds limit=[1000.000]",
+        "visible_p99_micros=[3120.534] exceeds limit=[3000.000]"
+      ],
+      "skipped_thresholds": [],
+      "process_exit_codes": {
+        "server": 0,
+        "subscriber": 0,
+        "writer": 0
+      },
+      "interrupted": false,
+      "workers": {
+        "writer": {
+          "pid": 76,
+          "role": "writer",
+          "started_ns": 971450270877906,
+          "finished_ns": 971472082185823,
+          "end_sent": true,
+          "recorded_samples": {
+            "seq": 21730,
+            "sent_ns": 21730,
+            "ack_ns": 21730,
+            "schedule_lag_ns": 21730
+          }
+        },
+        "subscriber": {
+          "pid": 75,
+          "role": "subscriber",
+          "end_seq": 21730,
+          "finished_ns": 971472084664154,
+          "recorded_samples": {
+            "seq": 21730,
+            "sent_ns": 21730,
+            "received_ns": 21730
+          }
+        }
+      },
+      "diagnostic_summary": {
+        "writer.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "server.log": {
+          "captured_bytes": 2344,
+          "error_lines": [
+            "2026-10-10T11:29:28.435816979Z  INFO zippy server runtime stopped component=[server] event=[server_stopped] status=[stopped] timed_out_processes=[[]] flight_error=[None] flight_outcome=[Some(FlightShutdownOutcome { released_pending_tickets: 0 })] native_storage_outcome=[Some(Complete)] master_error=[None]"
+          ],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "subscriber.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        }
+      }
+    }
+  ],
+  "passed": false,
+  "exit_code": 1,
+  "finished_at_utc": "2026-10-10T11:29:28.557196+00:00",
+  "artifact_kind": "summary"
+}

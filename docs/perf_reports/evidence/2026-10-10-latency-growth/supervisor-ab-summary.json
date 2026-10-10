@@ -1,0 +1,276 @@
+{
+ "artifact_kind": "supervisor_ab_summary",
+ "runs": [
+  {
+   "label": "run1-e1",
+   "server_binary": "server-e1 (e1e67b5)",
+   "raw_path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/supervisor-ab/run1-e1.json",
+   "raw_sha256": "c0bf42a93ae18018929fdf51fc877e534ba1d95dee98d6e83a1f3ee92e6dcb1e",
+   "integrity": {
+    "passed": true,
+    "expected_count": 182100,
+    "received_count": 182100,
+    "missing_count": 0,
+    "duplicate_count": 0,
+    "out_of_order_count": 0,
+    "unexpected_count": 0
+   },
+   "minutes": [
+    {
+     "minute": 0,
+     "samples": 60001,
+     "p50_us": 1532.7,
+     "p99_us": 3152.1,
+     "p99_9_us": 9722.3,
+     "over_10ms": 58
+    },
+    {
+     "minute": 1,
+     "samples": 59824,
+     "p50_us": 2269.1,
+     "p99_us": 4450.4,
+     "p99_9_us": 11274.2,
+     "over_10ms": 69
+    },
+    {
+     "minute": 2,
+     "samples": 59126,
+     "p50_us": 3003.3,
+     "p99_us": 5540.7,
+     "p99_9_us": 18364.5,
+     "over_10ms": 148
+    }
+   ],
+   "p50_slope_us_per_min": 735.3,
+   "last_over_first": 1.959
+  },
+  {
+   "label": "run2-final",
+   "server_binary": "server-final (phase 1.7)",
+   "raw_path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/supervisor-ab/run2-final.json",
+   "raw_sha256": "683e372fa4da2863daa3196558183350bf7e9210e4b8e538278834dad2fca34c",
+   "integrity": {
+    "passed": true,
+    "expected_count": 182100,
+    "received_count": 182100,
+    "missing_count": 0,
+    "duplicate_count": 0,
+    "out_of_order_count": 0,
+    "unexpected_count": 0
+   },
+   "minutes": [
+    {
+     "minute": 0,
+     "samples": 60001,
+     "p50_us": 1127.3,
+     "p99_us": 1688.6,
+     "p99_9_us": 8754.0,
+     "over_10ms": 39
+    },
+    {
+     "minute": 1,
+     "samples": 60000,
+     "p50_us": 1101.5,
+     "p99_us": 1596.2,
+     "p99_9_us": 9172.2,
+     "over_10ms": 59
+    },
+    {
+     "minute": 2,
+     "samples": 60000,
+     "p50_us": 1125.4,
+     "p99_us": 1928.0,
+     "p99_9_us": 12483.4,
+     "over_10ms": 63
+    }
+   ],
+   "p50_slope_us_per_min": -0.95,
+   "last_over_first": 0.998
+  },
+  {
+   "label": "run3-final",
+   "server_binary": "server-final (phase 1.7)",
+   "raw_path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/supervisor-ab/run3-final.json",
+   "raw_sha256": "d970a664d4c698fb9c0e5b09afc4d9aa2616a573951eb94d43f38988eec9fce1",
+   "integrity": {
+    "passed": true,
+    "expected_count": 182100,
+    "received_count": 182100,
+    "missing_count": 0,
+    "duplicate_count": 0,
+    "out_of_order_count": 0,
+    "unexpected_count": 0
+   },
+   "minutes": [
+    {
+     "minute": 0,
+     "samples": 60001,
+     "p50_us": 1077.5,
+     "p99_us": 1486.6,
+     "p99_9_us": 8198.9,
+     "over_10ms": 38
+    },
+    {
+     "minute": 1,
+     "samples": 60000,
+     "p50_us": 1120.9,
+     "p99_us": 1860.3,
+     "p99_9_us": 9513.9,
+     "over_10ms": 60
+    },
+    {
+     "minute": 2,
+     "samples": 60000,
+     "p50_us": 1087.1,
+     "p99_us": 1680.1,
+     "p99_9_us": 9635.1,
+     "over_10ms": 59
+    }
+   ],
+   "p50_slope_us_per_min": 4.8,
+   "last_over_first": 1.009
+  },
+  {
+   "label": "run4-e1",
+   "server_binary": "server-e1 (e1e67b5)",
+   "raw_path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/supervisor-ab/run4-e1.json",
+   "raw_sha256": "9eaca47d2bc91b5c81b17ede49698b38806f3c94cd448fa7440ff4565606506b",
+   "integrity": {
+    "passed": true,
+    "expected_count": 182100,
+    "received_count": 182100,
+    "missing_count": 0,
+    "duplicate_count": 0,
+    "out_of_order_count": 0,
+    "unexpected_count": 0
+   },
+   "minutes": [
+    {
+     "minute": 0,
+     "samples": 60001,
+     "p50_us": 1415.4,
+     "p99_us": 2265.0,
+     "p99_9_us": 8901.8,
+     "over_10ms": 40
+    },
+    {
+     "minute": 1,
+     "samples": 58309,
+     "p50_us": 2313.5,
+     "p99_us": 4664.7,
+     "p99_9_us": 12368.4,
+     "over_10ms": 79
+    },
+    {
+     "minute": 2,
+     "samples": 58972,
+     "p50_us": 3103.6,
+     "p99_us": 5578.2,
+     "p99_9_us": 13690.2,
+     "over_10ms": 119
+    }
+   ],
+   "p50_slope_us_per_min": 844.1,
+   "last_over_first": 2.193
+  },
+  {
+   "label": "soak10-final",
+   "server_binary": "server-final (phase 1.7)",
+   "raw_path": "/tmp/zippy-perf-raw/2026-10-10-latency-growth/supervisor-ab/soak10-final.json",
+   "raw_sha256": "b843b1af75daf88b3ea48dae758b4f1a93f334d7cb7940de9d6b8c99bdd14ad4",
+   "integrity": {
+    "passed": true,
+    "expected_count": 602100,
+    "received_count": 602100,
+    "missing_count": 0,
+    "duplicate_count": 0,
+    "out_of_order_count": 0,
+    "unexpected_count": 0
+   },
+   "minutes": [
+    {
+     "minute": 0,
+     "samples": 58161,
+     "p50_us": 1092.8,
+     "p99_us": 1973.8,
+     "p99_9_us": 10457.6,
+     "over_10ms": 60
+    },
+    {
+     "minute": 1,
+     "samples": 61840,
+     "p50_us": 1088.8,
+     "p99_us": 1733.1,
+     "p99_9_us": 9759.9,
+     "over_10ms": 62
+    },
+    {
+     "minute": 2,
+     "samples": 60000,
+     "p50_us": 1089.2,
+     "p99_us": 1752.4,
+     "p99_9_us": 9827.1,
+     "over_10ms": 58
+    },
+    {
+     "minute": 3,
+     "samples": 60000,
+     "p50_us": 1104.5,
+     "p99_us": 1918.8,
+     "p99_9_us": 16588.2,
+     "over_10ms": 70
+    },
+    {
+     "minute": 4,
+     "samples": 59967,
+     "p50_us": 1081.2,
+     "p99_us": 1599.8,
+     "p99_9_us": 12004.0,
+     "over_10ms": 61
+    },
+    {
+     "minute": 5,
+     "samples": 60033,
+     "p50_us": 1076.3,
+     "p99_us": 1434.3,
+     "p99_9_us": 9094.9,
+     "over_10ms": 60
+    },
+    {
+     "minute": 6,
+     "samples": 59994,
+     "p50_us": 1111.5,
+     "p99_us": 1914.3,
+     "p99_9_us": 10482.9,
+     "over_10ms": 62
+    },
+    {
+     "minute": 7,
+     "samples": 59989,
+     "p50_us": 1127.3,
+     "p99_us": 1992.3,
+     "p99_9_us": 11185.6,
+     "over_10ms": 63
+    },
+    {
+     "minute": 8,
+     "samples": 60017,
+     "p50_us": 1083.9,
+     "p99_us": 1549.5,
+     "p99_9_us": 10417.5,
+     "over_10ms": 63
+    },
+    {
+     "minute": 9,
+     "samples": 59975,
+     "p50_us": 1133.3,
+     "p99_us": 1956.3,
+     "p99_9_us": 9893.8,
+     "over_10ms": 60
+    }
+   ],
+   "p50_slope_us_per_min": 3.25,
+   "last_over_first": 1.037
+  }
+ ]
+}

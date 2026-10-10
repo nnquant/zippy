@@ -24,7 +24,9 @@ use crate::query_execution::result_batch_memory_bytes;
 use crate::query_service::{
     QueryExecutionScope, QueryResultCharge, QueryTaskCharge, QueryTaskPermit,
 };
-use crate::query_snapshot::{NativeQueryReadSnapshot, NativeQuerySnapshotCoordinator};
+use crate::query_snapshot::{
+    LiveLogSnapshot, NativeQueryReadSnapshot, NativeQuerySnapshotCoordinator,
+};
 
 /// A finite event-log window, using the query service's ownership, deadline and memory ledger.
 #[derive(Debug, Clone)]
@@ -116,6 +118,7 @@ pub struct NativeLogWindow {
     pub(crate) execution: QueryExecutionScope,
     pub(crate) coordinator: NativeQuerySnapshotCoordinator,
     pub(crate) batch_rows: NonZeroUsize,
+    pub(crate) live_only: bool,
 }
 
 impl NativeLogWindow {
@@ -147,6 +150,27 @@ impl NativeLogWindow {
     async fn refresh(&mut self, start: Option<LogOffset>) -> Result<()> {
         let planning = self.execution.snapshot_refresh_token()?;
         let _admission = self.coordinator.admit_event_window(&planning).await?;
+        if let Some(start) = start {
+            if let Some((snapshot, plan)) = self
+                .coordinator
+                .pin_live_log(
+                    &planning,
+                    self.info.snapshots[0],
+                    start,
+                    &self.plan.schema,
+                    self.plan.kind,
+                )
+                .await?
+            {
+                if self.plan.watermark.known() > plan.watermark.known() {
+                    return Err(log_error("event subscription watermark regressed"));
+                }
+                self.info = self.execution.replace_live_log_snapshot(snapshot)?;
+                self.plan = plan;
+                self.live_only = true;
+                return Ok(());
+            }
+        }
         let table = TableRef::Id {
             table_id: self.info.snapshots[0].table_id,
         };
@@ -163,6 +187,7 @@ impl NativeLogWindow {
         }
         self.info = self.execution.replace_native_snapshot(snapshot)?;
         self.plan = plan;
+        self.live_only = false;
         Ok(())
     }
 
@@ -430,17 +455,29 @@ impl WindowReader {
                     cpu_slots: NonZeroU32::new(1).unwrap(),
                     memory_bytes: admission.active_decode_memory_bytes().map_err(plan_error)?,
                 };
-                let reader = self
-                    .window
-                    .execution
-                    .admit_snapshot_task::<NativeQueryReadSnapshot, _>(charge, |snapshot| {
-                        snapshot
-                            .log_span(index, source.physical)?
-                            .slice_rows(start, start + rows)
-                            .map_err(log_error)?
-                            .batch_reader(self.window.batch_rows.get(), None)
-                            .map_err(log_error)
-                    })?;
+                let reader = if self.window.live_only {
+                    self.window
+                        .execution
+                        .admit_snapshot_task::<LiveLogSnapshot, _>(charge, |snapshot| {
+                            snapshot
+                                .log_span(index, source.physical)?
+                                .slice_rows(start, start + rows)
+                                .map_err(log_error)?
+                                .batch_reader(self.window.batch_rows.get(), None)
+                                .map_err(log_error)
+                        })?
+                } else {
+                    self.window
+                        .execution
+                        .admit_snapshot_task::<NativeQueryReadSnapshot, _>(charge, |snapshot| {
+                            snapshot
+                                .log_span(index, source.physical)?
+                                .slice_rows(start, start + rows)
+                                .map_err(log_error)?
+                                .batch_reader(self.window.batch_rows.get(), None)
+                                .map_err(log_error)
+                        })?
+                };
                 Ok(SourceReader::Live(reader))
             }
         }
@@ -483,7 +520,20 @@ pub(crate) fn select_sources(
     start: Option<LogOffset>,
 ) -> Result<()> {
     sources.sort_unstable_by_key(|source| source.selected.first());
-    let mut expected = Some(LogOffset::new(0));
+    select_sources_after(sources, watermark, start, OffsetWatermark::Empty)
+}
+
+/// Checks a complete live suffix after an already-persisted boundary, then clips its cursor.
+pub(crate) fn select_sources_after(
+    sources: &mut Vec<NativeLogSource>,
+    watermark: OffsetWatermark,
+    start: Option<LogOffset>,
+    persisted: OffsetWatermark,
+) -> Result<()> {
+    let mut expected = match persisted {
+        OffsetWatermark::Empty => Some(LogOffset::new(0)),
+        OffsetWatermark::Known(offset) => offset.checked_next(),
+    };
     for source in sources.iter() {
         if Some(source.selected.first()) != expected {
             return Err(log_error(
@@ -492,7 +542,7 @@ pub(crate) fn select_sources(
         }
         expected = source.selected.last().checked_next();
     }
-    let observed = sources.last().map_or(OffsetWatermark::Empty, |source| {
+    let observed = sources.last().map_or(persisted, |source| {
         OffsetWatermark::Known(source.selected.last())
     });
     if observed != watermark {
@@ -579,6 +629,55 @@ mod tests {
             }),
         }
     }
+
+    #[test]
+    fn live_suffix_keeps_coverage_frame_and_future_cursor_validation() {
+        let persisted = OffsetWatermark::Known(LogOffset::new(9));
+        let watermark = OffsetWatermark::Known(LogOffset::new(13));
+        let frames = || vec![source(10, 11, Some(1)), source(12, 13, Some(2))];
+        let mut selected = frames();
+        select_sources_after(
+            &mut selected,
+            watermark,
+            Some(LogOffset::new(12)),
+            persisted,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].frame, Some(range(12, 13)));
+        for cursor in [13, 15] {
+            assert_eq!(
+                select_sources_after(
+                    &mut frames(),
+                    watermark,
+                    Some(LogOffset::new(cursor)),
+                    persisted,
+                )
+                .unwrap_err()
+                .code(),
+                ErrorCode::InvalidArgument
+            );
+        }
+        assert_eq!(
+            select_sources_after(
+                &mut vec![source(11, 13, None)],
+                watermark,
+                Some(LogOffset::new(12)),
+                persisted,
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::DataCorruption
+        );
+        select_sources_after(
+            &mut Vec::new(),
+            persisted,
+            Some(LogOffset::new(10)),
+            persisted,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn replay_orders_and_clips_without_skipping_gaps_or_accepting_future_cursors() {
         let mut sources = vec![source(3, 5, None), source(0, 2, None)];

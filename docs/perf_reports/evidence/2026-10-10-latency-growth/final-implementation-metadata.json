@@ -1,0 +1,83 @@
+{
+  "metadata": {
+    "git_sha": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+    "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+    "git_dirty": true,
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "is_wsl": true,
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpu_count": 32,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "python_version": "3.11.14",
+    "versions": {
+      "pyarrow": "23.0.1",
+      "zippy": "0.5.0",
+      "zippy-client": "0.1.0"
+    },
+    "started_at_utc": "2026-10-10T11:51:56.367960+00:00",
+    "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+    "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+    "server_sha256": "4313a31a58eaf41edebfa115789f99567afd2aa852f26f7898b3dbe7cb064604",
+    "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+    "extension_sha256": "9298888be7c8a5b003dcd568c009470f2aacf3b4c01e2c351d73ff293e27f730",
+    "build_requirement": "release server/extension; commands in baseline report",
+    "command_argv": [
+      "/home/jiangda/develop/zippy/.venv/bin/python3",
+      "/tmp/zippy-growth-final-validate.py"
+    ],
+    "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+    "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+    "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+    "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+    "background_scope": "separate append table in the same namespace and server"
+  },
+  "source_sha256": {
+    "crates/zippy-server/src/native_log.rs": "34550cd89cf73017588600d0d7f7ace25211c10d54321417abed4ee7252d0635",
+    "crates/zippy-server/src/native_query.rs": "42a281a5983d287db82bdbc4cbf3207e09cd21a56ddf2fb13222855fbcb0cf60",
+    "crates/zippy-server/src/native_query_canary.rs": "8f320ca619227c25aa6e5ba5b62e18405a1d7816c386f024d7ad3919a264e414",
+    "crates/zippy-server/src/query_service.rs": "892dba9e868781c18e83c3062bb6110593ca34c42a40997b2b16a2dcfe769cd6",
+    "crates/zippy-server/src/query_snapshot.rs": "fa7b6cf05fe4336c1c357c947adffad034deb9fb9bb0da104368148a26cd1660",
+    "crates/zippy-server/tests/native_storage_runtime.rs": "0fa43344b37352e4301dea1d7305d8cd371aa1ba2be84451d2ef1fc1457bc284",
+    "pytests/test_analyze_public_e2e.py": "a8d61b45ca1780628c4ab0c51a4763ab31cd476abacb150d602a5ab72d48f76b",
+    "scripts/analyze_public_e2e.py": "d9dcda7bcfef11dff2d59cc69197a7ea31aba6f5634c0efdef9fae784f7b1813",
+    "crates/zippy-server/src/live_log_snapshot.rs": "ea18765936bcdc7622a6d53b7e76be2b3c828e19b34d4aebb037839339d7c3db"
+  },
+  "base_commit": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+  "notes": [
+    "final candidate includes per-span owned layout and SHM locator accounting",
+    "no branch switch, commit or push; benchmark source and thresholds unchanged"
+  ]
+}

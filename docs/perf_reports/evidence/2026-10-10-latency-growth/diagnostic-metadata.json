@@ -1,0 +1,20 @@
+{
+  "base_commit": "e1e67b569d1f5ffb48f6a093c242f271608a8265",
+  "platform": "Linux-5.15.153.1-microsoft-standard-WSL2-x86_64-with-glibc2.31",
+  "temporary_diagnostics": {
+    "/tmp/zippy-growth-diagnostic-runner.py": {
+      "sha256": "e5a77296783183b8f8ae72878a0122a1d3b90fe505b14963fec1c861959a629b",
+      "bytes": 18946
+    },
+    "/tmp/zippy-growth-diagnostic-analyze.py": {
+      "sha256": "1c70c0874c62957a090dea2d69a018a243df04049a1fde2098d9c272eb881a1a",
+      "bytes": 14455
+    }
+  },
+  "notes": [
+    "control-a used unmodified benchmark",
+    "control-b wraps subscriber methods and samples every 1000th row; monitor every 60 seconds",
+    "diagnostic Python code is outside the repository; production Rust had no instrumentation",
+    "no Cargo build, full test suite or concurrent benchmark during either control; lightweight diagnostic script validation/analysis could run"
+  ]
+}
