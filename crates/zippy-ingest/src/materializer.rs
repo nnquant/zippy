@@ -1,6 +1,8 @@
 //! Native table materialization and serialized TableActor publication.
 
 #[cfg(test)]
+mod prepared_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -8,7 +10,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
 use zippy_core::{Engine, SegmentTableView, ZippyError};
-use zippy_engines::{StreamTableLiveSegment, StreamTableMaterializer};
+use zippy_engines::{StreamTableLiveSegment, StreamTableMaterializer, StreamTableRetiredSegments};
 use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
 use zippy_types::table::{
     MetadataMap, NativeDataFileProvenance, SourceSegmentIdentity, SourceSegmentLineage,
@@ -170,6 +172,8 @@ impl NativeTableMaterializerSink {
             actor: actors.table(table_id)?,
             #[cfg(test)]
             checkpoint_pause: Mutex::new(None),
+            #[cfg(test)]
+            prepared_pause: Mutex::new(None),
             state: Mutex::new(NativeMaterializedTableState {
                 actor_writer_epoch: bootstrap.writer_epoch(),
                 key_value_version: bootstrap.persisted_state_version(),
@@ -225,6 +229,8 @@ struct NativeMaterializedTable {
     actor: TableActorHandle,
     #[cfg(test)]
     checkpoint_pause: Mutex<Option<tests::CheckpointPause>>,
+    #[cfg(test)]
+    prepared_pause: Mutex<Option<prepared_tests::PreparedCheckpointPause>>,
     state: Mutex<NativeMaterializedTableState>,
 }
 
@@ -604,22 +610,58 @@ async fn persist_checkpoint_prefix(
         None
     };
     drop(snapshot);
-    let runtime = tokio::runtime::Handle::current();
-    // Exclude publication construction before the actor can advance its persisted watermark,
-    // through local prefix reclamation. An admission must see both old boundaries or both new
-    // boundaries. Keep the mutex and persistence wait off the async executor; once started,
-    // this blocking task also finishes reclamation if the checkpoint waiter is cancelled.
-    tokio::task::spawn_blocking(move || {
-        let mut state = table.state.lock().unwrap();
-        if let Some(request) = request {
-            runtime.block_on(table.actor.persist(request))?;
-        }
+    // An owned async task keeps the prepared receipt alive if the caller cancels. File I/O
+    // finishes before a blocking worker takes the materializer lock, so persistence never
+    // waits for another blocking worker while holding this hot-path mutex.
+    tokio::spawn(async move {
+        let prepared = match request {
+            Some(request) => Some(table.actor.prepare_persist(request).await?),
+            None => None,
+        };
         #[cfg(test)]
-        if let Some(pause) = table.checkpoint_pause.lock().unwrap().take() {
-            pause.wait();
+        {
+            let pause = table.prepared_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.wait().await;
+            }
         }
-        state.persisted_log_offset = watermark;
-        reclaim_materialized_prefix(&table, &mut state)
+        tokio::task::spawn_blocking(move || {
+            let mut retired_segments = Vec::new();
+            let mut retired_epochs = Vec::new();
+            let mut publication = None;
+            let mut state = table.state.lock().unwrap();
+            let result = (|| {
+                // Only this reserved in-memory actor turn is awaited under the state lock.
+                // Its permits exclude persistence and retirement through prefix reclamation.
+                publication = prepared
+                    .map(|pending| pending.publish_blocking())
+                    .transpose()?;
+                #[cfg(test)]
+                if let Some(pause) = table.checkpoint_pause.lock().unwrap().take() {
+                    pause.wait();
+                }
+                state.persisted_log_offset = watermark;
+                reclaim_materialized_prefix(
+                    &table,
+                    &mut state,
+                    &mut retired_segments,
+                    &mut retired_epochs,
+                )
+            })();
+            drop(state);
+            // Destructors may close/unmap/unlink segment files. Even error paths release
+            // those resources only after the write hot-path mutex has been unlocked.
+            drop(retired_segments);
+            drop(retired_epochs);
+            drop(publication);
+            result
+        })
+        .await
+        .map_err(|error| {
+            invalid(format!(
+                "checkpoint reclamation task failed error=[{error}]"
+            ))
+        })?
     })
     .await
     .map_err(|error| {
@@ -633,16 +675,19 @@ async fn persist_checkpoint_prefix(
 fn reclaim_materialized_prefix(
     table: &NativeMaterializedTable,
     state: &mut NativeMaterializedTableState,
+    retired_segments: &mut Vec<StreamTableRetiredSegments>,
+    retired_epochs: &mut Vec<EpochMaterializer>,
 ) -> Result<()> {
     let end = next_offset(table.table_id, state.persisted_log_offset)?;
     let mut budget = end.saturating_sub(state.retained_start);
     let mut reclaimed = 0_u64;
     for epoch in &mut state.epochs {
-        let rows = epoch
+        let (rows, retired) = epoch
             .materializer
-            .retire_persisted_prefix(usize::try_from(budget).unwrap_or(usize::MAX))
-            .map_err(|error| materializer_error("retire persisted append prefix", error))?
-            as u64;
+            .retire_persisted_prefix_deferred(usize::try_from(budget).unwrap_or(usize::MAX))
+            .map_err(|error| materializer_error("retire persisted append prefix", error))?;
+        retired_segments.push(retired);
+        let rows = rows as u64;
         budget -= rows;
         reclaimed += rows;
         if epoch
@@ -672,12 +717,10 @@ fn reclaim_materialized_prefix(
         {
             break;
         }
-        state.epochs.remove(0);
+        retired_epochs.push(state.epochs.remove(0));
     }
-    table
-        .actor
-        .try_publish_live_segments(build_publication(table, state, state.live_rows)?)?
-        .wait_blocking()?;
+    // The actor already trimmed its mapped live spans at the visibility switch. Rebuilding
+    // publication here would reopen descriptor files while holding the materializer lock.
     Ok(())
 }
 

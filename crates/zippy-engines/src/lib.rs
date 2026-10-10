@@ -21,7 +21,8 @@ pub use key_value_state::KeyValueState;
 pub use reactive::{ReactiveInvalidValuePolicy, ReactiveStateEngine, ReactiveStateFailurePolicy};
 pub use reactive_latest::ReactiveLatestEngine;
 pub use stream_table::{
-    StreamTableLiveSegment, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+    StreamTableLiveSegment, StreamTableMaterializer, StreamTableRetiredSegments,
+    DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
 pub use testing::hash_record_batches;
 pub use timeseries::TimeSeriesEngine;

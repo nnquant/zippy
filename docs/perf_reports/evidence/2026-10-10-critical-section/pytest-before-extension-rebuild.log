@@ -1,0 +1,23 @@
+........................................................................ [ 17%]
+........................................................................ [ 34%]
+........................................................................ [ 52%]
+...................................F.................................... [ 69%]
+........................................................................ [ 86%]
+......................................................                   [100%]
+=================================== FAILURES ===================================
+____________ test_python_package_release_version_and_build_revision ____________
+
+    def test_python_package_release_version_and_build_revision() -> None:
+        pyproject = tomllib.loads((WORKSPACE_ROOT / "pyproject.toml").read_text())
+        base_version = pyproject["project"]["version"]
+        expected = base_version
+>       assert zippy.__build_revision__ == git_output("rev-parse", "HEAD")
+E       AssertionError: assert '7c6b6a978433...0bccfda15d501' == 'b5bf6d3e10bc...db3091e4ab30e'
+E         
+E         - b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e
+E         + 7c6b6a9784336827c7239a872e50bccfda15d501
+
+pytests/test_python_api.py:260: AssertionError
+=========================== short test summary info ============================
+FAILED pytests/test_python_api.py::test_python_package_release_version_and_build_revision
+1 failed, 413 passed in 5.27s

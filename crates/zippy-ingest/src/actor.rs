@@ -347,6 +347,35 @@ impl TableActorPersistRequest {
     }
 }
 
+/// Reserved checkpoint publication; only the materializer's visibility critical section uses it.
+pub(crate) struct TableActorPreparedPersist {
+    table_id: TableId,
+    publication: oneshot::Sender<oneshot::Sender<Result<TableActorPersistPublication>>>,
+}
+
+/// Keep persistence and retirement excluded until the materializer has reclaimed its prefix.
+pub(crate) struct TableActorPersistPublication {
+    _persist_permit: OwnedSemaphorePermit,
+    _global_permit: OwnedSemaphorePermit,
+    _retired_live_segments: Arc<[TableActorLiveSegmentSnapshot]>,
+}
+
+impl TableActorPreparedPersist {
+    /// Wait only for an in-memory actor turn, even after ordinary mailbox admission closes.
+    pub(crate) fn publish_blocking(self) -> Result<TableActorPersistPublication> {
+        let (response, receiver) = oneshot::channel();
+        self.publication
+            .send(response)
+            .map_err(|_| actor_closed(self.table_id))?;
+        receiver
+            .blocking_recv()
+            .unwrap_or_else(|_| Err(actor_closed(self.table_id)))
+    }
+}
+
+type PersistPublicationRequest =
+    oneshot::Receiver<oneshot::Sender<Result<TableActorPersistPublication>>>;
+
 /// Cloneable admission handle for one server-owned table actor.
 #[derive(Clone, Debug)]
 pub struct TableActorHandle {
@@ -592,6 +621,14 @@ impl TableActorHandle {
     /// A second operation for the same table therefore returns retryable
     /// [`ErrorCode::ResourceExhausted`] before any candidate file can be written.
     pub fn try_persist(&self, request: PersistRequest) -> Result<TableActorPersistRequest> {
+        self.try_persist_with_publication(request, None)
+    }
+
+    fn try_persist_with_publication(
+        &self,
+        request: PersistRequest,
+        publication: Option<PersistPublicationRequest>,
+    ) -> Result<TableActorPersistRequest> {
         let request_id = request.request_id();
         if request.table_id() != self.table_id {
             return Err(persist_table_mismatch(
@@ -615,6 +652,7 @@ impl TableActorHandle {
         let command = TableActorCommand::Persist {
             request,
             response: response_sender,
+            publication,
             _persist_permit: persist_permit,
             _global_permit: global_permit,
         };
@@ -636,6 +674,22 @@ impl TableActorHandle {
     /// Admits and waits for one actor-validated native persist operation.
     pub async fn persist(&self, request: PersistRequest) -> Result<CommitDataFilesReceipt> {
         self.try_persist(request)?.wait().await
+    }
+
+    /// Persist without advancing query visibility, retaining single-flight until prefix reclaim.
+    /// The checkpoint owner must survive cancellation and eventually publish or fail the actor.
+    pub(crate) async fn prepare_persist(
+        &self,
+        request: PersistRequest,
+    ) -> Result<TableActorPreparedPersist> {
+        let (publication, receiver) = oneshot::channel();
+        self.try_persist_with_publication(request, Some(receiver))?
+            .wait()
+            .await?;
+        Ok(TableActorPreparedPersist {
+            table_id: self.table_id,
+            publication,
+        })
     }
 }
 
@@ -1067,6 +1121,7 @@ enum TableActorCommand {
     Persist {
         request: PersistRequest,
         response: oneshot::Sender<Result<CommitDataFilesReceipt>>,
+        publication: Option<PersistPublicationRequest>,
         _persist_permit: OwnedSemaphorePermit,
         _global_permit: OwnedSemaphorePermit,
     },
@@ -1086,6 +1141,18 @@ enum TableActorCommand {
 
 type PersistCompletion = Pin<Box<dyn Future<Output = PersistCompletionResult> + Send + 'static>>;
 type PersistSubmissionResult = std::result::Result<PersistCompletion, PersistCompletionFailure>;
+
+enum ActorPersistEvent {
+    Durable(PersistCompletionResult),
+    Publish(
+        std::result::Result<
+            oneshot::Sender<Result<TableActorPersistPublication>>,
+            oneshot::error::RecvError,
+        >,
+    ),
+}
+
+type ActorPersistCompletion = Pin<Box<dyn Future<Output = ActorPersistEvent> + Send + 'static>>;
 
 trait PersistSubmitter: Send + Sync {
     fn submit(&self, request: PersistRequest, mode: PersistMode) -> PersistSubmissionResult;
@@ -1124,6 +1191,15 @@ struct InFlightPersist {
     committed_log_offset: OffsetWatermark,
     disposition: PersistDisposition,
     response: oneshot::Sender<Result<CommitDataFilesReceipt>>,
+    publication: Option<PersistPublicationRequest>,
+    _persist_permit: OwnedSemaphorePermit,
+    _global_permit: OwnedSemaphorePermit,
+}
+
+struct PreparedPersist {
+    request_id: RequestId,
+    receipt: CommitDataFilesReceipt,
+    disposition: PersistDisposition,
     _persist_permit: OwnedSemaphorePermit,
     _global_permit: OwnedSemaphorePermit,
 }
@@ -1136,6 +1212,7 @@ struct PersistFailure {
 enum ActorPersistenceState {
     Idle,
     InFlight(InFlightPersist),
+    Prepared(PreparedPersist),
     Failed(PersistFailure),
 }
 
@@ -1495,6 +1572,9 @@ impl TableActorState {
             ActorPersistenceState::InFlight(active) => TablePersistenceStatus::InFlight {
                 request_id: active.request_id,
             },
+            ActorPersistenceState::Prepared(active) => TablePersistenceStatus::InFlight {
+                request_id: active.request_id,
+            },
             ActorPersistenceState::Failed(failure) => TablePersistenceStatus::Failed {
                 request_id: failure.request_id,
                 code: failure.error.code(),
@@ -1505,7 +1585,9 @@ impl TableActorState {
     fn terminal_persistence_error(&self) -> Option<ServerError> {
         match &self.persistence {
             ActorPersistenceState::Failed(failure) => Some(failure.error.clone()),
-            ActorPersistenceState::Idle | ActorPersistenceState::InFlight(_) => None,
+            ActorPersistenceState::Idle
+            | ActorPersistenceState::InFlight(_)
+            | ActorPersistenceState::Prepared(_) => None,
         }
     }
 }
@@ -1626,7 +1708,7 @@ async fn run_table_actor(
     } = signals;
     let mut retirement_observed = false;
     let mut state = TableActorState::new(&runtime);
-    let mut completion: Option<PersistCompletion> = None;
+    let mut completion: Option<ActorPersistCompletion> = None;
     let mut shutdown_observed = false;
     let mut mailbox_closed = false;
 
@@ -1635,7 +1717,7 @@ async fn run_table_actor(
             return match &state.persistence {
                 ActorPersistenceState::Failed(failure) => Err(failure.error.clone()),
                 ActorPersistenceState::Idle => Ok(()),
-                ActorPersistenceState::InFlight(_) => {
+                ActorPersistenceState::InFlight(_) | ActorPersistenceState::Prepared(_) => {
                     unreachable!("mailbox cannot finish while a persist completion is active")
                 }
             };
@@ -1645,9 +1727,16 @@ async fn run_table_actor(
             tokio::select! {
                 biased;
                 outcome = active_completion.as_mut() => {
-                    completion = None;
                     let previous_version = state.current_snapshot.snapshot_version;
-                    complete_persist(&mut state, outcome, &accepting, &failure)?;
+                    completion = match outcome {
+                        ActorPersistEvent::Durable(outcome) => {
+                            complete_persist(&mut state, outcome, &accepting, &failure)?
+                        }
+                        ActorPersistEvent::Publish(request) => {
+                            complete_persist_publication(&mut state, request, &accepting, &failure)?;
+                            None
+                        }
+                    };
                     if state.current_snapshot.snapshot_version != previous_version {
                         changes.send_replace(());
                     }
@@ -1725,7 +1814,7 @@ fn process_command(
     accepting: &Arc<AtomicBool>,
     failure: &watch::Sender<Option<ServerError>>,
     changes: &watch::Sender<()>,
-) -> Option<PersistCompletion> {
+) -> Option<ActorPersistCompletion> {
     match command {
         TableActorCommand::Snapshot { response, _permit } => {
             let result = state.snapshot();
@@ -1736,6 +1825,7 @@ fn process_command(
         TableActorCommand::Persist {
             request,
             response,
+            publication,
             _persist_permit,
             _global_permit,
         } => {
@@ -1764,11 +1854,14 @@ fn process_command(
                         committed_log_offset,
                         disposition,
                         response,
+                        publication,
                         _persist_permit,
                         _global_permit,
                     };
                     state.persistence = ActorPersistenceState::InFlight(active);
-                    Some(completion)
+                    Some(Box::pin(async move {
+                        ActorPersistEvent::Durable(completion.await)
+                    }))
                 }
                 Err(PersistCompletionFailure::Rejected(error)) => {
                     drop(_persist_permit);
@@ -1809,9 +1902,19 @@ fn process_command(
             response,
             _permit,
         } => {
-            let result = state
-                .advance_command()
-                .and_then(|()| state.update_writer_epoch(writer_epoch));
+            let result = state.advance_command().and_then(|()| {
+                let pending = match &state.persistence {
+                    ActorPersistenceState::InFlight(active) if active.publication.is_some() => {
+                        Some(active.request_id)
+                    }
+                    ActorPersistenceState::Prepared(active) => Some(active.request_id),
+                    _ => None,
+                };
+                match pending {
+                    Some(request_id) => Err(table_persist_inflight(state.table_id, request_id)),
+                    None => state.update_writer_epoch(writer_epoch),
+                }
+            });
             if result.is_ok() {
                 changes.send_replace(());
             }
@@ -1836,6 +1939,9 @@ fn validate_persist_request(
                 .with_retryable(true)
                 .with_request_id(request_id)
                 .with_table_id(active.table_id));
+        }
+        ActorPersistenceState::Prepared(_) => {
+            return Err(table_persist_inflight(state.table_id, request_id));
         }
         ActorPersistenceState::Failed(failure) => {
             return Err(ServerError::new(
@@ -2031,11 +2137,13 @@ fn complete_persist(
     outcome: PersistCompletionResult,
     accepting: &Arc<AtomicBool>,
     failure: &watch::Sender<Option<ServerError>>,
-) -> Result<()> {
+) -> Result<Option<ActorPersistCompletion>> {
     let previous = std::mem::replace(&mut state.persistence, ActorPersistenceState::Idle);
     let active = match previous {
         ActorPersistenceState::InFlight(active) => active,
-        ActorPersistenceState::Idle | ActorPersistenceState::Failed(_) => {
+        ActorPersistenceState::Idle
+        | ActorPersistenceState::Prepared(_)
+        | ActorPersistenceState::Failed(_) => {
             unreachable!("persist completion requires an in-flight actor operation")
         }
     };
@@ -2058,25 +2166,39 @@ fn complete_persist(
     let InFlightPersist {
         request_id,
         response,
+        publication,
         _persist_permit: persist_permit,
         _global_permit: global_permit,
         ..
     } = active;
     match classified {
         Ok(receipt) => {
+            if let Some(publication) = publication {
+                state.persistence = ActorPersistenceState::Prepared(PreparedPersist {
+                    request_id,
+                    receipt: receipt.clone(),
+                    disposition,
+                    _persist_permit: persist_permit,
+                    _global_permit: global_permit,
+                });
+                let _ = response.send(Ok(receipt));
+                return Ok(Some(Box::pin(async move {
+                    ActorPersistEvent::Publish(publication.await)
+                })));
+            }
             if disposition == PersistDisposition::Advance {
                 state.current_snapshot = receipt.snapshot.clone();
             }
             drop(persist_permit);
             drop(global_permit);
             let _ = response.send(Ok(receipt));
-            Ok(())
+            Ok(None)
         }
         Err(PersistCompletionFailure::Rejected(error)) => {
             drop(persist_permit);
             drop(global_permit);
             let _ = response.send(Err(error));
-            Ok(())
+            Ok(None)
         }
         Err(PersistCompletionFailure::Fatal(error)) => {
             let response_error = error.clone();
@@ -2091,6 +2213,49 @@ fn complete_persist(
             Err(error)
         }
     }
+}
+
+fn complete_persist_publication(
+    state: &mut TableActorState,
+    request: std::result::Result<
+        oneshot::Sender<Result<TableActorPersistPublication>>,
+        oneshot::error::RecvError,
+    >,
+    accepting: &Arc<AtomicBool>,
+    failure: &watch::Sender<Option<ServerError>>,
+) -> Result<()> {
+    let previous = std::mem::replace(&mut state.persistence, ActorPersistenceState::Idle);
+    let ActorPersistenceState::Prepared(prepared) = previous else {
+        unreachable!("publication requires a prepared durable receipt")
+    };
+    let response = match request {
+        Ok(response) => response,
+        Err(_) => {
+            // Losing the private checkpoint owner cannot silently discard a committed receipt
+            // or publish it outside the materializer lock. Stop admission and recover from Catalog.
+            let error = actor_closed(state.table_id).with_request_id(prepared.request_id);
+            state.persistence = ActorPersistenceState::Failed(PersistFailure {
+                request_id: prepared.request_id,
+                error: error.clone(),
+            });
+            publish_actor_failure(error.clone(), accepting, failure);
+            return Err(error);
+        }
+    };
+    state.advance_command()?;
+    if prepared.disposition == PersistDisposition::Advance {
+        state.current_snapshot = prepared.receipt.snapshot;
+    }
+    let (visible, _) = state.visible_live_segments()?;
+    let retired_live_segments = std::mem::replace(&mut state.live_segments, visible);
+    // The owner keeps these permits through local prefix reclamation. The actor itself does
+    // no file work here; ordinary writes and snapshots were served during the durable stage.
+    let _ = response.send(Ok(TableActorPersistPublication {
+        _persist_permit: prepared._persist_permit,
+        _global_permit: prepared._global_permit,
+        _retired_live_segments: retired_live_segments,
+    }));
+    Ok(())
 }
 
 fn validate_persist_receipt(
@@ -3609,4 +3774,6 @@ mod tests {
             .expect("starting actors without a runtime must fail structurally");
         assert_eq!(error.code(), ErrorCode::Unavailable);
     }
+
+    include!("actor/checkpoint_tests.rs");
 }

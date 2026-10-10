@@ -17,6 +17,7 @@ zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
+parquet.workspace = true
 tempfile = "3"
 zippy-catalog = { path = "../zippy-catalog" }
 

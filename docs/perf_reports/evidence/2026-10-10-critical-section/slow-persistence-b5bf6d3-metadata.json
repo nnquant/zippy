@@ -1,0 +1,18 @@
+{
+  "production_base_commit": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e",
+  "production_state_at_test_build": "b5bf6d3 unchanged; only materializer/tests.rs and evidence directory modified",
+  "command": "PYO3_PYTHON=\"$PWD/.venv/bin/python\" cargo test -p zippy-ingest checkpoint_slow_persistence -- --nocapture",
+  "exit_code": 101,
+  "result": {
+    "passed": 0,
+    "failed": 3
+  },
+  "pause_boundary": "real CatalogPersistence.command_with_publication_permit before Catalog mutation",
+  "ordering": "oneshot reached before write start; resume only after write completes or 2-second failure timeout",
+  "hook_scope": "materializer/tests.rs is compiled only under #[cfg(test)]; no production API or source changes required",
+  "artifacts": {
+    "docs/perf_reports/evidence/2026-10-10-critical-section/slow-persistence-b5bf6d3-failure.log": "6c97f6dc545ad58733ffdd888d9a37e7e88f23fc4decc31bdc16dead71f9a85b",
+    "target/debug/deps/zippy_ingest-2e8dbdc569a63fee": "6e1b25839bd30c6422e3770620287833a9b8bf4dc2c68e8bb994f13f472050fd",
+    "crates/zippy-ingest/src/materializer/tests.rs": "90382ed7d4db18b897b94361fdd4e54387121b55d89ebfd431723d8403dd0757"
+  }
+}

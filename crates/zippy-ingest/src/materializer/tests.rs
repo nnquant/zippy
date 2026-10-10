@@ -1,11 +1,13 @@
 //! Deterministic checkpoint/publication interleavings using real persistence and table actors.
 
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use tokio::sync::oneshot;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::OwnedDataDirectory;
 use zippy_storage::{
@@ -13,16 +15,23 @@ use zippy_storage::{
     PersistController, PersistControllerConfig,
 };
 use zippy_types::catalog::{
-    CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogPersistence,
-    CatalogRead, CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, CreateTableCommand,
+    CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
+    CatalogCommandV1, CatalogDataFileReferenceSnapshot, CatalogFileRead, CatalogIdempotencyRead,
+    CatalogPersistence, CatalogPublicationControl, CatalogPublicationExclusion,
+    CatalogPublicationPermit, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
+    CatalogWrite, CreateNamespaceCommand, CreateTableCommand, ListNamespacesRequest,
+    ListNamespacesResponse, ListTablesRequest, ListTablesResponse, ManagedDataFileProbe,
+    NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::ingest::{Durability, KeyValueMutation, TableMutation, WriteReceipt};
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, ColumnName, ColumnSet, FrameTableDefinition,
-    KeyValueTableDefinition, SchemaIpcPayload, TableDefinition, TableKind,
+    KeyValueTableDefinition, NamespaceDescriptor, SchemaIpcPayload, TableDefinition,
+    TableDescriptor, TableKind, TableRef,
 };
 use zippy_types::{
-    ErrorCode, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, ProducerId, RequestId, TableId,
+    BoxFuture, ErrorCode, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, ProducerId,
+    RequestId, Result, TableId,
 };
 
 use crate::{
@@ -48,15 +57,124 @@ impl CheckpointPause {
     }
 }
 
-struct Fixture {
-    sink: Arc<NativeTableMaterializerSink>,
-    actors: TableActorRegistry,
-    persistence: PersistController,
-    _catalog: Arc<SqliteCatalog>,
-    _root: tempfile::TempDir,
+/// Suspends the real persistence pipeline immediately before its Catalog commit.
+struct CatalogCommitPause {
+    reached: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
 }
 
-fn table_id() -> TableId {
+/// Keeps all storage real while making one slow persistence boundary deterministic.
+struct PausableCatalog {
+    inner: Arc<SqliteCatalog>,
+    pause: Arc<Mutex<Option<CatalogCommitPause>>>,
+}
+
+impl CatalogRead for PausableCatalog {
+    fn revision(&self) -> BoxFuture<'_, Result<u64>> {
+        self.inner.revision()
+    }
+
+    fn get_namespace(&self, namespace: NamespaceRef) -> BoxFuture<'_, Result<NamespaceDescriptor>> {
+        self.inner.get_namespace(namespace)
+    }
+
+    fn list_namespaces(
+        &self,
+        request: ListNamespacesRequest,
+    ) -> BoxFuture<'_, Result<ListNamespacesResponse>> {
+        self.inner.list_namespaces(request)
+    }
+
+    fn get_table(&self, table: TableRef) -> BoxFuture<'_, Result<TableDescriptor>> {
+        self.inner.get_table(table)
+    }
+
+    fn list_tables(&self, request: ListTablesRequest) -> BoxFuture<'_, Result<ListTablesResponse>> {
+        self.inner.list_tables(request)
+    }
+
+    fn resolve_tables<'a>(
+        &'a self,
+        tables: &'a [TableRef],
+    ) -> BoxFuture<'a, Result<Vec<TableDescriptor>>> {
+        self.inner.resolve_tables(tables)
+    }
+
+    fn read_snapshot_at<'a>(
+        &'a self,
+        selectors: &'a [CatalogSnapshotSelector],
+    ) -> BoxFuture<'a, Result<CatalogQuerySnapshot>> {
+        self.inner.read_snapshot_at(selectors)
+    }
+}
+
+impl CatalogFileRead for PausableCatalog {
+    fn inspect_data_file_references<'a>(
+        &'a self,
+        probes: &'a [ManagedDataFileProbe],
+    ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>> {
+        self.inner.inspect_data_file_references(probes)
+    }
+}
+
+impl CatalogIdempotencyRead for PausableCatalog {
+    fn probe_command_replay<'a>(
+        &'a self,
+        command: &'a VersionedCatalogCommand,
+    ) -> BoxFuture<'a, Result<CatalogCommandReplayProbe>> {
+        self.inner.probe_command_replay(command)
+    }
+}
+
+impl CatalogWrite for PausableCatalog {
+    fn command(
+        &self,
+        command: VersionedCatalogCommand,
+    ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
+        self.inner.command(command)
+    }
+}
+
+impl CatalogPublicationControl for PausableCatalog {
+    fn acquire_publication_permit(&self) -> BoxFuture<'_, Result<CatalogPublicationPermit>> {
+        self.inner.acquire_publication_permit()
+    }
+
+    fn command_with_publication_permit(
+        &self,
+        permit: CatalogPublicationPermit,
+        command: VersionedCatalogCommand,
+    ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
+        Box::pin(async move {
+            let pause = self.pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause
+                    .reached
+                    .send(())
+                    .expect("announce paused Catalog commit");
+                pause.resume.await.expect("resume paused Catalog commit");
+            }
+            self.inner
+                .command_with_publication_permit(permit, command)
+                .await
+        })
+    }
+
+    fn acquire_publication_exclusion(&self) -> BoxFuture<'_, Result<CatalogPublicationExclusion>> {
+        self.inner.acquire_publication_exclusion()
+    }
+}
+
+pub(super) struct Fixture {
+    pub(super) sink: Arc<NativeTableMaterializerSink>,
+    pub(super) actors: TableActorRegistry,
+    pub(super) persistence: PersistController,
+    persist_pause: Arc<Mutex<Option<CatalogCommitPause>>>,
+    pub(super) _catalog: Arc<SqliteCatalog>,
+    pub(super) _root: tempfile::TempDir,
+}
+
+pub(super) fn table_id() -> TableId {
     TableId::from_u128(10).unwrap()
 }
 
@@ -75,7 +193,7 @@ fn server_actor() -> CatalogActor {
 }
 
 impl Fixture {
-    async fn start(kind: TableKind) -> Self {
+    pub(super) async fn start(kind: TableKind) -> Self {
         let root = tempfile::TempDir::new().unwrap();
         let owned =
             Arc::new(OwnedDataDirectory::acquire_or_initialize(root.path().join("data")).unwrap());
@@ -154,10 +272,15 @@ impl Fixture {
             current.snapshot().clone(),
         )
         .unwrap();
+        let persist_pause = Arc::new(Mutex::new(None));
+        let persistence_catalog = Arc::new(PausableCatalog {
+            inner: Arc::clone(&catalog),
+            pause: Arc::clone(&persist_pause),
+        });
         let coordinator = CatalogCommitCoordinator::start(
             CatalogCommitCoordinatorConfig::new(),
             Arc::clone(&owned),
-            Arc::clone(&catalog) as Arc<dyn CatalogPersistence>,
+            persistence_catalog as Arc<dyn CatalogPersistence>,
             server_actor(),
         )
         .await
@@ -188,18 +311,19 @@ impl Fixture {
             sink,
             actors,
             persistence,
+            persist_pause,
             _catalog: catalog,
             _root: root,
         }
     }
 
-    async fn drain(self) {
+    pub(super) async fn drain(self) {
         self.actors.drain().await.unwrap();
         self.persistence.drain().await.unwrap();
     }
 }
 
-fn apply_one(
+pub(super) fn apply_one(
     sink: &NativeTableMaterializerSink,
     kind: TableKind,
     offset: u64,
@@ -358,6 +482,109 @@ async fn checkpoint_publication_interleaving_frame() {
     checkpoint_interleaving(TableKind::Frame).await;
 }
 
+async fn writes_progress_during_slow_checkpoint(kind: TableKind) {
+    let fixture = Fixture::start(kind).await;
+    let sink = Arc::clone(&fixture.sink);
+    tokio::task::spawn_blocking(move || apply_one(&sink, kind, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    let table = fixture.sink.table(table_id()).unwrap();
+    let (reached, paused) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    *fixture.persist_pause.lock().unwrap() = Some(CatalogCommitPause {
+        reached,
+        resume: resumed,
+    });
+    let sink = Arc::clone(&fixture.sink);
+    let checkpoint = tokio::task::spawn_blocking(move || {
+        sink.prepare_checkpoint(table_id(), OffsetWatermark::Known(LogOffset::new(0)))
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let checkpoint = tokio::spawn(checkpoint);
+    tokio::time::timeout(Duration::from_secs(10), paused)
+        .await
+        .expect("checkpoint reaches its paused Catalog commit")
+        .unwrap();
+
+    let before = table.actor.snapshot().await.unwrap();
+    assert_eq!(before.committed_log_offset, OffsetWatermark::Empty);
+    let (started, start_receiver) = oneshot::channel();
+    let sink = Arc::clone(&fixture.sink);
+    let mut write = tokio::task::spawn_blocking(move || {
+        started.send(()).unwrap();
+        apply_one(&sink, kind, 1)
+    });
+    start_receiver.await.unwrap();
+    // The channel proves persistence is paused before the competing write starts. This
+    // timeout is only a deadlock/failure bound, not a delay used to manufacture an ordering.
+    let completion = tokio::time::timeout(Duration::from_secs(2), &mut write).await;
+    let write_finished_while_paused = completion.is_ok();
+    let during = if write_finished_while_paused {
+        Some(table.actor.snapshot().await.unwrap())
+    } else {
+        None
+    };
+
+    // Always unblock and drain the real pipeline before failing the old implementation.
+    resume.send(()).unwrap();
+    let write_result = match completion {
+        Ok(result) => result.unwrap(),
+        Err(_) => write.await.unwrap(),
+    };
+    let checkpoint_result = checkpoint.await.unwrap();
+    let after = table.actor.snapshot().await.unwrap();
+    fixture.drain().await;
+
+    assert!(
+        write_finished_while_paused,
+        "same-table write must complete while checkpoint Catalog persistence is paused kind=[{kind:?}]"
+    );
+    write_result.expect("write completes successfully during slow persistence");
+    checkpoint_result.unwrap();
+    let during = during.unwrap();
+    assert_eq!(during.committed_log_offset, OffsetWatermark::Empty);
+    assert_eq!(
+        during.max_log_offset,
+        OffsetWatermark::Known(LogOffset::new(1))
+    );
+    let during_offsets = during
+        .live_segments
+        .iter()
+        .flat_map(|segment| segment.offsets().first().get()..=segment.offsets().last().get())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        during_offsets,
+        vec![0, 1],
+        "paused persistence leaves a continuous live prefix"
+    );
+    assert_eq!(
+        after.committed_log_offset,
+        OffsetWatermark::Known(LogOffset::new(0))
+    );
+    assert_eq!(after.live_segments.len(), 1);
+    assert_eq!(after.live_segments[0].offsets().first(), LogOffset::new(1));
+    assert_eq!(after.live_segments[0].offsets().last(), LogOffset::new(1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_slow_persistence_allows_append_writes() {
+    writes_progress_during_slow_checkpoint(TableKind::Append).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_slow_persistence_allows_frame_writes() {
+    writes_progress_during_slow_checkpoint(TableKind::Frame).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_slow_persistence_allows_key_value_writes() {
+    writes_progress_during_slow_checkpoint(TableKind::KeyValue).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_rejection_preserves_snapshot_but_leaves_unpublished_physical_rows() {
     let mut fixture = Fixture::start(TableKind::Append).await;
@@ -416,4 +643,25 @@ async fn publication_rejection_preserves_snapshot_but_leaves_unpublished_physica
     );
     assert_eq!(published.live_segments[0].span().row_count(), 1);
     fixture.drain().await;
+}
+
+#[test]
+fn checkpoint_persistence_progresses_with_one_blocking_thread() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            writes_progress_during_slow_checkpoint(TableKind::Append),
+        )
+        .await
+    });
+    // A regression may leave a nested spawn_blocking worker waiting forever. A bounded
+    // shutdown preserves a deterministic failure instead of hanging the complete test run.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result.expect("checkpoint must progress without nesting a blocked pool worker");
 }

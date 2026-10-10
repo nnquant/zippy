@@ -1,0 +1,8 @@
+
+running 3 tests
+test materializer::tests::checkpoint_publication_interleaving_key_value ... ok
+test materializer::tests::checkpoint_publication_interleaving_frame ... ok
+test materializer::tests::checkpoint_publication_interleaving_append ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 0.08s
+

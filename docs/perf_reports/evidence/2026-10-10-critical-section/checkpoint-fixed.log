@@ -1,0 +1,87 @@
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.22s
+     Running unittests src/lib.rs (target/debug/deps/zippy_ingest-b7864db371808802)
+
+running 75 tests
+
+thread 'actor::tests::actor_panic_closes_global_admission_and_is_reported_immediately' panicked at crates/zippy-ingest/src/actor.rs:1926:37:
+injected table actor panic
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test actor::tests::actor_registry_requires_an_explicit_tokio_runtime ... ok
+test actor::tests::checkpoint_publication::fatal_preparation_preserves_terminal_error_instead_of_creating_an_owner ... ok
+test actor::tests::change_notifications_coalesce_without_losing_snapshot_races ... ok
+test actor::tests::actor_snapshot_removes_persisted_prefix_without_copying_live_rows ... ok
+test actor::tests::actor_serializes_observations_and_drains_cleanly ... ok
+test actor::tests::checkpoint_publication::abandoned_prepared_owner_fails_closed_and_reports_the_committed_request ... ok
+test actor::tests::actor_rechecks_every_persist_state_precondition ... ok
+test actor::tests::actor_publishes_fixed_active_prefix_and_rejects_rewrite ... ok
+test actor::tests::actor_panic_closes_global_admission_and_is_reported_immediately ... ok
+test actor::tests::actor_publishes_retained_sealed_then_active_segments_in_offset_order ... ok
+test actor::tests::actor_keeps_monotonic_live_prefix_across_writer_epochs ... ok
+test actor::tests::dropped_waiter_and_historical_replay_never_roll_back_current_snapshot ... ok
+test actor::tests::invalid_actor_budget_fails_before_spawning_tasks ... ok
+test actor::tests::definitive_rejection_with_current_parent_keeps_actor_available ... ok
+test actor::tests::checkpoint_publication::rejected_preparation_releases_single_flight_and_keeps_original_snapshot ... ok
+test actor::tests::failed_retirement_admission_leaves_actor_usable ... ok
+test actor::tests::checkpoint_publication::pending_publication_rejects_persist_epoch_and_retirement_without_losing_receipt ... ok
+test actor::tests::online_actor_registration_is_visible_and_drained_by_original_owner ... ok
+test actor::tests::checkpoint_publication::shutdown_keeps_private_publication_available_after_ordinary_admission_closes ... ok
+test actor::tests::invalid_receipt_fails_table_and_is_reported_during_drain ... ok
+test actor::tests::checkpoint_publication::prepared_receipt_keeps_old_snapshot_and_accepts_continuous_live_writes ... ok
+test actor::tests::retirement_quiesces_commands_rolls_back_and_stops_only_its_actor ... ok
+test actor::tests::per_table_and_global_admission_are_strictly_bounded ... ok
+test actor::tests::shutdown_drains_requests_accepted_before_admission_closed ... ok
+test actor::tests::unavailable_submit_failure_is_retained_but_backpressure_keeps_actor_idle ... ok
+test actor::tests::persist_is_single_flight_and_snapshot_observes_actor_owned_state ... ok
+test native::tests::native_ingest_memory_and_wal_performance_baseline ... ignored, manual release benchmark; run with --ignored --test-threads=1
+test native::tests::key_value_delete_accepts_only_full_rows_or_ordered_key_tombstones ... ok
+test native::tests::schema_checkpoint_requires_covered_watermark_and_strictly_newer_epoch ... ok
+test registry::tests::bootstrap_rejects_cross_table_descriptors ... ok
+test registry::tests::registry_is_published_in_table_id_order_with_exact_watermarks ... ok
+test registry::tests::registry_rejects_unsorted_or_duplicate_bootstraps_atomically ... ok
+test wal::tests::arrow_payload_rejects_trailing_noncanonical_bytes ... ok
+test actor::tests::shutdown_waits_for_inflight_persist_after_external_waiter_is_dropped ... ok
+test wal::tests::committed_records_recover_and_complete_uncommitted_tail_is_truncated ... ok
+test wal::tests::checkpoint_recovery_skips_leftover_prefix_and_validates_the_tail_anchor ... ok
+test wal::tests::crc32c_throughput_benchmark ... ignored, release-mode WAL checksum benchmark
+test native::tests::admitted_online_registration_survives_closed_admission_and_delays_shutdown ... ok
+test wal::tests::fingerprint_distinguishes_schema_and_mutation_kind ... ok
+test native::tests::admitted_table_drop_delays_shutdown_until_catalog_outcome_is_resolved ... ok
+test wal::tests::fingerprint_is_independent_from_schema_metadata_map_order ... ok
+test wal::tests::prepared_fingerprint_payload_is_reused_by_wal_encoding ... ok
+test native::tests::cancelled_open_does_not_cancel_the_server_owned_producer_transition ... ok
+test wal::tests::wal_watermark_rejects_removed_legacy_tag ... ok
+test wal::tests::partial_tail_is_truncated_but_checksum_corruption_fails_closed ... ok
+test wal::tests::exact_epoch_reconnect_uses_the_next_segment_and_recovers_one_sequence ... ok
+test wal::tests::rejected_sink_append_rolls_back_only_the_current_uncommitted_tail ... ok
+test native::tests::durable_retry_is_idempotent_and_sequence_conflicts_fail_closed ... ok
+test native::tests::table_drop_fence_rolls_back_or_permanently_retires_existing_writers ... ok
+test native::tests::zero_record_commit_receipt_promotes_an_already_durable_group_out_of_order ... ok
+test native::tests::persisted_unsupported_sink_rejects_before_applying_a_write ... ok
+test native::tests::consumer_checkpoint_persists_prior_epoch_before_new_writer_first_batch ... ok
+test native::tests::shared_operation_budget_rejects_before_applying_the_mutation ... ok
+test native::tests::same_logical_connection_resumes_without_reacquiring_producer_epoch ... ok
+test native::tests::producer_reacquire_fences_old_connections_without_resetting_offsets ... ok
+test native::tests::pending_durable_ack_budget_rejects_before_applying_the_mutation ... ok
+test checkpoint::tests::archive_conflicts_are_atomic_and_checkpoint_survives_reopen ... ok
+test native::tests::crash_discards_uncommitted_memory_tail_before_exact_retry ... ok
+test native::tests::atomic_sink_rejection_rolls_back_wal_and_allows_exact_retry ... ok
+test native::tests::restart_replays_only_committed_wal_and_resumes_exact_acquire ... ok
+test native::tests::restart_resumes_current_epoch_without_reacquiring_or_resetting_sequence ... ok
+test native::tests::retained_schema_wal_requires_full_manifest_coverage_and_a_fenced_epoch ... ok
+test wal::tests::crc32c_matches_the_castagnoli_check_vector ... ok
+test native::tests::persisted_ack_survives_cancellation_and_checks_manifest_coverage ... ok
+test materializer::tests::checkpoint_persistence_progresses_with_one_blocking_thread ... ok
+test materializer::tests::publication_rejection_preserves_snapshot_but_leaves_unpublished_physical_rows ... ok
+test materializer::tests::checkpoint_slow_persistence_allows_frame_writes ... ok
+test materializer::tests::checkpoint_publication_interleaving_append ... ok
+test materializer::tests::checkpoint_publication_interleaving_key_value ... ok
+test materializer::tests::checkpoint_slow_persistence_allows_key_value_writes ... ok
+test materializer::tests::checkpoint_slow_persistence_allows_append_writes ... ok
+test materializer::tests::checkpoint_publication_interleaving_frame ... ok
+test materializer::prepared_tests::prepared_catalog_snapshot_and_restart_frame ... ok
+test materializer::prepared_tests::prepared_catalog_snapshot_and_restart_append ... ok
+test materializer::prepared_tests::prepared_catalog_snapshot_and_restart_key_value ... ok
+
+test result: ok. 73 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.32s
+

@@ -1,0 +1,119 @@
+{
+  "branch": "feature/public-path-latency-bench",
+  "head": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e",
+  "committed_or_pushed": false,
+  "rust_workspace": {
+    "command": "PYO3_PYTHON=$PWD/.venv/bin/python cargo test --workspace -j 4",
+    "exit_code": 0,
+    "groups": 91,
+    "passed": 1221,
+    "failed": 0,
+    "ignored": 7
+  },
+  "checks": [
+    {
+      "command": "PYO3_PYTHON=$PWD/.venv/bin/python cargo fmt --all -- --check",
+      "exit_code": 0,
+      "log": "fmt.log"
+    },
+    {
+      "command": "PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "log": "clippy.log"
+    },
+    {
+      "command": "PYO3_PYTHON=$PWD/.venv/bin/python cargo test -p zippy-ingest --lib -- --nocapture",
+      "exit_code": 0,
+      "log": "checkpoint-fixed.log"
+    },
+    {
+      "command": "UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync pytest pytests -q",
+      "exit_code": 0,
+      "log": "pytest-root.log"
+    },
+    {
+      "command": "UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync pytest clients/python/tests -q",
+      "exit_code": 0,
+      "log": "pytest-client.log"
+    },
+    {
+      "command": "PYO3_PYTHON=$PWD/.venv/bin/python cargo build --release -p zippy-server --bin zippy-server",
+      "exit_code": 0,
+      "log": "build-server.log"
+    },
+    {
+      "command": "UV_CACHE_DIR=/tmp/zippy-uv-cache PYO3_PYTHON=$PWD/.venv/bin/python uv run --no-sync maturin develop --release",
+      "exit_code": 0,
+      "log": "build-extension.log"
+    },
+    {
+      "command": "scripts/analyze_public_e2e.py --run [five immutable raw/summary pairs]; full command in report",
+      "exit_code": 0,
+      "log": "analysis.log"
+    },
+    {
+      "command": "scripts/bench_public_e2e.py --durability memory wal --background-rate 0 100000 --samples 20000; full command in report",
+      "exit_code": 1,
+      "log": "baseline.log"
+    },
+    {
+      "command": "scripts/bench_public_e2e.py --durability memory --background-rate 100000 --samples 300000; full command in report",
+      "exit_code": 1,
+      "log": "soak.log"
+    },
+    {
+      "command": "UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync ruff check scripts/analyze_public_e2e.py pytests/test_analyze_public_e2e.py",
+      "exit_code": 0,
+      "log": "python-static.log"
+    },
+    {
+      "command": "UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync black --check --line-length 100 scripts/analyze_public_e2e.py",
+      "exit_code": 0,
+      "log": "python-static.log"
+    },
+    {
+      "command": "UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync black --check --line-length 100 pytests/test_analyze_public_e2e.py",
+      "exit_code": 0,
+      "log": "python-static.log"
+    },
+    {
+      "command": "UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync mypy scripts/analyze_public_e2e.py pytests/test_analyze_public_e2e.py",
+      "exit_code": 0,
+      "log": "python-static.log"
+    }
+  ],
+  "baseline_failure_at_b5bf6d3": {
+    "exit_code": 101,
+    "passed": 0,
+    "failed": 3,
+    "metadata": "slow-persistence-b5bf6d3-metadata.json",
+    "current_tests_patch": "slow-persistence-tests.patch"
+  },
+  "initial_test_harness_failure": {
+    "exit_code": 101,
+    "cause": "Tokio timeout constructed outside runtime; corrected and final checks passed",
+    "log": "checkpoint-test-harness-initial-failure.log"
+  },
+  "initial_python_failure": {
+    "exit_code": 1,
+    "passed": 413,
+    "failed": 1,
+    "cause": "extension build revision from prior commit; release rebuilt",
+    "log": "pytest-before-extension-rebuild.log"
+  },
+  "current_source_sha256": {
+    "Cargo.lock": "73d22367a415de6727aef6e2b08ae4eb3643b4fc050dd7d4318b4eca1f0e9a8a",
+    "crates/zippy-engines/src/lib.rs": "c5d71d96364ecf05b554282a6e07782b757c620e3dc23bc1cd7e3d78271c0fd6",
+    "crates/zippy-engines/src/stream_table.rs": "bb4a56cdef8d32955494f513494ee29061416a62e9ecf8e644b29e7308aff9c6",
+    "crates/zippy-ingest/Cargo.toml": "432ba72163e4133b7e76192ea19a36eef2461066a66cf82f76caec92ffe10f05",
+    "crates/zippy-ingest/src/actor.rs": "8e6edb3307c470d321c75a9e57cb92ff076a8828a82dc2cdcad0a3c1c7f15d2e",
+    "crates/zippy-ingest/src/actor/checkpoint_tests.rs": "520eb5b8d0ec07b8dd7ab30a09e2b5b9daa02422e2712d1fe27be891fa9cd526",
+    "crates/zippy-ingest/src/materializer.rs": "4a7156a189684f8de3021f0afc1c13a484c43407bb420c39a5f4f6af74546367",
+    "crates/zippy-ingest/src/materializer/prepared_tests.rs": "d8b7b0d2ac06aba9e8cf325e1e05b780399455070c271f5f13b3c8670d0f3a15",
+    "crates/zippy-ingest/src/materializer/tests.rs": "22e15b85e271462284afea1266910ea7c7ff33a2a565f9be8398df90651d6d35",
+    "crates/zippy-segment-store/src/catalog.rs": "b51cabbbf244ea869249651397866769e248c3b3bdc991c570371f79cec8d447",
+    "crates/zippy-segment-store/src/lib.rs": "15ed11b5cd12ed9e4bff5f7c11e0a674e3ccf46e6c97435ff105c47e723f5f9a",
+    "pytests/test_analyze_public_e2e.py": "d73e004f112a51634bab4d4082d67fe3e63898d6df740383a4d8bac4aca93ced",
+    "scripts/analyze_public_e2e.py": "87c0274a783bb618fbbe6c183de5e1b326a7997fd8cf323708cdb19b261bbe5e"
+  }
+}

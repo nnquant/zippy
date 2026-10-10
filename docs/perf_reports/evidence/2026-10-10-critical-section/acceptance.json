@@ -1,0 +1,91 @@
+{
+  "overall_performance_acceptance_passed": false,
+  "baseline": [
+    {
+      "durability": "memory",
+      "background_target_rows_per_second": 0.0,
+      "reference_over_10ms_per_minute": 10.190935570142054,
+      "reference_censored": true,
+      "reference_note": "memory/0 exposure <1s; borrow memory/100000 truncated observation",
+      "current_over_10ms_per_minute": 14.99968513260957,
+      "over_10ms_passed": false,
+      "b5_visible_p99_9_micros": 10156.88,
+      "current_visible_p99_9_micros": 6157.364,
+      "p99_9_passed": true,
+      "measurement_complete": true,
+      "integrity_passed": true
+    },
+    {
+      "durability": "memory",
+      "background_target_rows_per_second": 100000.0,
+      "reference_over_10ms_per_minute": 10.190935570142054,
+      "reference_censored": true,
+      "reference_note": "own pre-fix observed exposure; preserve censoring caveat",
+      "current_over_10ms_per_minute": 23.99983046399761,
+      "over_10ms_passed": false,
+      "b5_visible_p99_9_micros": 10379.701,
+      "current_visible_p99_9_micros": 8475.353,
+      "p99_9_passed": true,
+      "measurement_complete": true,
+      "integrity_passed": true
+    },
+    {
+      "durability": "wal",
+      "background_target_rows_per_second": 0.0,
+      "reference_over_10ms_per_minute": 10.93248218228147,
+      "reference_censored": true,
+      "reference_note": "own pre-fix observed exposure; preserve censoring caveat",
+      "current_over_10ms_per_minute": 11.450913329834298,
+      "over_10ms_passed": false,
+      "b5_visible_p99_9_micros": 9404.951,
+      "current_visible_p99_9_micros": 5178.351,
+      "p99_9_passed": true,
+      "measurement_complete": true,
+      "integrity_passed": true
+    },
+    {
+      "durability": "wal",
+      "background_target_rows_per_second": 100000.0,
+      "reference_over_10ms_per_minute": 8.070192162559536,
+      "reference_censored": false,
+      "reference_note": "own pre-fix observed exposure; preserve censoring caveat",
+      "current_over_10ms_per_minute": 6.984790207592867,
+      "over_10ms_passed": true,
+      "b5_visible_p99_9_micros": 10070.166,
+      "current_visible_p99_9_micros": 5235.842,
+      "p99_9_passed": true,
+      "measurement_complete": true,
+      "integrity_passed": true
+    }
+  ],
+  "soak": {
+    "pre_fix_soak_available": false,
+    "borrowed_reference_over_10ms_per_minute": 10.190935570142054,
+    "current_over_10ms_per_minute": 74.59175875240905,
+    "over_10ms_passed": false,
+    "b5_visible_p99_9_micros": 20766.074,
+    "current_visible_p99_9_micros": 10906.406,
+    "p99_9_passed": true,
+    "measurement_complete": true,
+    "integrity_passed": true
+  },
+  "raw_scan": [
+    {
+      "raw_path": "/tmp/zippy-perf-raw/2026-10-10-critical-section/baseline.json",
+      "bytes": 15060015,
+      "sha256": "0f446725df388dca5e4e9a32fe6eb281041a3e540f79712fd3d0a95652f624f2",
+      "sequence_gap_occurrences": 0
+    },
+    {
+      "raw_path": "/tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json",
+      "bytes": 53034031,
+      "sha256": "4a8bf0b0e083ddd23a2531df38c0a8266ee80a0ac91c31ad84ecca18a6f2dcce",
+      "sequence_gap_occurrences": 0
+    }
+  ],
+  "limitations": [
+    "pre-fix baseline contains failed truncated exposures; no pre-fix soak",
+    "no literal zero-extension claim for hidden cross-crate Rust pub helpers",
+    "no independent server process kill/restart at Prepared boundary"
+  ]
+}

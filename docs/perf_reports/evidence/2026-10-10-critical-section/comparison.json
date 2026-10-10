@@ -1,0 +1,3987 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "public_e2e_comparison",
+  "analysis_script_sha256": "87c0274a783bb618fbbe6c183de5e1b326a7997fd8cf323708cdb19b261bbe5e",
+  "rules": {
+    "latency": "original dual-condition warmup; nearest-rank; p99.9 null below 10000 samples",
+    "exceedances": "strict visible latency > threshold; equality excluded",
+    "exposure": "first measured actual sent_ns through last measured received_ns",
+    "frequency": "count / observed exposure minutes; final minute uses actual exposure",
+    "minute_buckets": "left-closed/right-open, except final observed endpoint is included",
+    "cluster": "adjacent exceedance receive gaps <= configured gap form one cluster",
+    "cluster_gap_milliseconds": 10.0,
+    "cluster_intervals": "successive cluster-start receive times; fewer than 5 yields null",
+    "interpretation": "descriptive only; truncated runs are censored; no periodicity claim"
+  },
+  "runs": [
+    {
+      "label": "pre-fix",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/baseline.json",
+        "sha256": "296ffd9cf39e0ccd62c8a2f193ad5e99f34b57d6e38a5ec1e3443671709e1804",
+        "bytes": 8620725
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-08-public-path-e2e/pre-fix-baseline.json",
+        "sha256": "b71bc0801a70ce8530a50b0ee36d5873080ce1d2b580fae08cbf3a0ba1b9bf3b",
+        "bytes": 50099
+      },
+      "raw_sha256_verified_against_prior_identity": true,
+      "metadata": {
+        "git_sha": "ff0f95055c0e16df64b1b3c455f3b53755c8dbc6",
+        "benchmark_script_sha256": "0cdaeca9ebf5d32a1c68ce0c5a009b9266837a29dfa195f5bb908790a8eb730d",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T09:22:26.005828+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "58a2335a7cde4dea2a8f6c862d7681e840d46f2eabb7bb5935023f7ad65ec79b",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "2dff6cf9eaa134383fbffe7227960eeb91658ac5a09a8feb6a9659d8c08cfd6f",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--durability",
+          "memory",
+          "wal",
+          "--background-rate",
+          "0",
+          "100000",
+          "--rate",
+          "1000",
+          "--samples",
+          "20000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "600",
+          "--report-json",
+          "docs/perf_reports/evidence/2026-10-08-public-path-e2e/baseline.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 20000,
+        "durability": [
+          "memory",
+          "wal"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          0.0,
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 600.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 0.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 597,
+            "p50_micros": 749.14,
+            "p95_micros": 909.322,
+            "p99_micros": 1070.345,
+            "p99_9_micros": null,
+            "max_micros": 4987.368,
+            "mean_micros": 770.3854304857622,
+            "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+          },
+          "visible_latency": {
+            "count": 597,
+            "p50_micros": 1198.608,
+            "p95_micros": 1440.867,
+            "p99_micros": 1623.041,
+            "p99_9_micros": null,
+            "max_micros": 5354.688,
+            "mean_micros": 1225.8148324958124,
+            "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 2597,
+            "received_count": 2597,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": false,
+          "ordered_end_marker": false,
+          "measurement_complete": false,
+          "censored_or_incomplete": true,
+          "comparison_caveat": "failed or truncated exposure; not a completed-run latency estimate",
+          "original_gate_passed": false,
+          "original_failures": [
+            "RuntimeError: worker failed role=[writer] status=[1]",
+            "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+            "subscriber: ZippyConnectionError: Flight endpoint is unavailable operation=[DoExchange.log]",
+            "ordered end marker missing or inconsistent",
+            "ack sample count=[597] expected=[20000]",
+            "visible sample count=[597] expected=[20000]",
+            "visible_p50_micros=[1198.608] exceeds limit=[1000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 1,
+            "subscriber": 1,
+            "writer": 1
+          },
+          "worker_errors": {
+            "writer": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+            "subscriber": "ZippyConnectionError: Flight endpoint is unavailable operation=[DoExchange.log]"
+          },
+          "achieved_probe_rows_per_second": 994.7432501355185,
+          "background_achieved_rows_per_second": 0.0,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 2,
+              "frequency_per_minute": 200.8009615688713,
+              "exposure_start_sent_ns": 963851981331430,
+              "exposure_end_received_ns": 963852578938130,
+              "exposure_seconds": 0.5976067,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 0.5976067,
+                  "count": 2,
+                  "frequency_per_minute": 200.8009615688713
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 2,
+              "cluster_frequency_per_minute": 200.8009615688713,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 1,
+              "cluster_start_intervals_micros": null,
+              "cluster_interval_unavailable_reason": "fewer than 5 observed cluster-start intervals",
+              "cluster_first_20_start_offsets_seconds": [
+                0.050024559,
+                0.582347901
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 1,
+              "frequency_per_minute": 100.40048078443564,
+              "exposure_start_sent_ns": 963851981331430,
+              "exposure_end_received_ns": 963852578938130,
+              "exposure_seconds": 0.5976067,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 0.5976067,
+                  "count": 1,
+                  "frequency_per_minute": 100.40048078443564
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 1,
+              "cluster_frequency_per_minute": 100.40048078443564,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 0,
+              "cluster_start_intervals_micros": null,
+              "cluster_interval_unavailable_reason": "fewer than 5 observed cluster-start intervals",
+              "cluster_first_20_start_offsets_seconds": [
+                0.582347901
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 0,
+              "frequency_per_minute": 0.0,
+              "exposure_start_sent_ns": 963851981331430,
+              "exposure_end_received_ns": 963852578938130,
+              "exposure_seconds": 0.5976067,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 0.5976067,
+                  "count": 0,
+                  "frequency_per_minute": 0.0
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 0,
+              "cluster_frequency_per_minute": 0.0,
+              "cluster_sizes_rows": {
+                "max": null,
+                "mean": null
+              },
+              "cluster_start_interval_count": 0,
+              "cluster_start_intervals_micros": null,
+              "cluster_interval_unavailable_reason": "fewer than 5 observed cluster-start intervals",
+              "cluster_first_20_start_offsets_seconds": []
+            }
+          }
+        },
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 5870,
+            "p50_micros": 805.133,
+            "p95_micros": 1014.335,
+            "p99_micros": 1397.089,
+            "p99_9_micros": null,
+            "max_micros": 11779.93,
+            "mean_micros": 840.9261962521296,
+            "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+          },
+          "visible_latency": {
+            "count": 5870,
+            "p50_micros": 1284.721,
+            "p95_micros": 1588.82,
+            "p99_micros": 2177.713,
+            "p99_9_micros": null,
+            "max_micros": 12526.676,
+            "mean_micros": 1327.5180473594548,
+            "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 7870,
+            "received_count": 7870,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": false,
+          "ordered_end_marker": false,
+          "measurement_complete": false,
+          "censored_or_incomplete": true,
+          "comparison_caveat": "failed or truncated exposure; not a completed-run latency estimate",
+          "original_gate_passed": false,
+          "original_failures": [
+            "RuntimeError: worker failed role=[writer] status=[1]",
+            "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+            "subscriber: ZippyConnectionError: Flight endpoint is unavailable operation=[DoExchange.log]",
+            "background: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+            "ordered end marker missing or inconsistent",
+            "ack sample count=[5870] expected=[20000]",
+            "visible sample count=[5870] expected=[20000]",
+            "visible_p50_micros=[1284.721] exceeds limit=[1000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 1,
+            "subscriber": 1,
+            "writer": 1,
+            "background": 1
+          },
+          "worker_errors": {
+            "writer": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+            "subscriber": "ZippyConnectionError: Flight endpoint is unavailable operation=[DoExchange.log]",
+            "background": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly"
+          },
+          "achieved_probe_rows_per_second": 996.5883255358048,
+          "background_achieved_rows_per_second": 99943.42065060351,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 80,
+              "frequency_per_minute": 815.2748456113643,
+              "exposure_start_sent_ns": 963855188162819,
+              "exposure_end_received_ns": 963861075747878,
+              "exposure_seconds": 5.887585059,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 5.887585059,
+                  "count": 80,
+                  "frequency_per_minute": 815.2748456113643
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 26,
+              "cluster_frequency_per_minute": 264.9643248236934,
+              "cluster_sizes_rows": {
+                "max": 31,
+                "mean": 3.076923076923077
+              },
+              "cluster_start_interval_count": 25,
+              "cluster_start_intervals_micros": {
+                "count": 25,
+                "p50_micros": 179333.184,
+                "p95_micros": 537416.424,
+                "p99_micros": 1015701.199,
+                "p99_9_micros": null,
+                "max_micros": 1015701.199,
+                "mean_micros": 232813.05916,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.050206465,
+                0.229539649,
+                0.602863142,
+                1.074078665,
+                1.393909267,
+                1.485731802,
+                1.542953042,
+                1.623640929,
+                1.646559836,
+                2.098162575,
+                2.156235923,
+                2.693652347,
+                2.719504384,
+                2.730263057,
+                3.122075877,
+                3.319440427,
+                3.742174225,
+                3.798543495,
+                3.809821975,
+                3.850066063
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 9,
+              "frequency_per_minute": 91.71842013127848,
+              "exposure_start_sent_ns": 963855188162819,
+              "exposure_end_received_ns": 963861075747878,
+              "exposure_seconds": 5.887585059,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 5.887585059,
+                  "count": 9,
+                  "frequency_per_minute": 91.71842013127848
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 6,
+              "cluster_frequency_per_minute": 61.14561342085232,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.5
+              },
+              "cluster_start_interval_count": 5,
+              "cluster_start_intervals_micros": {
+                "count": 5,
+                "p50_micros": 1047744.808,
+                "p95_micros": 1080613.911,
+                "p99_micros": 1080613.911,
+                "p99_9_micros": null,
+                "max_micros": 1080613.911,
+                "mean_micros": 1053533.9604,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.602863142,
+                1.646559836,
+                2.693652347,
+                3.742174225,
+                4.822788136,
+                5.870532944
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 1,
+              "frequency_per_minute": 10.190935570142054,
+              "exposure_start_sent_ns": 963855188162819,
+              "exposure_end_received_ns": 963861075747878,
+              "exposure_seconds": 5.887585059,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 5.887585059,
+                  "count": 1,
+                  "frequency_per_minute": 10.190935570142054
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 1,
+              "cluster_frequency_per_minute": 10.190935570142054,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 0,
+              "cluster_start_intervals_micros": null,
+              "cluster_interval_unavailable_reason": "fewer than 5 observed cluster-start intervals",
+              "cluster_first_20_start_offsets_seconds": [
+                5.870532944
+              ]
+            }
+          }
+        },
+        {
+          "durability": "wal",
+          "background_target_rows_per_second": 0.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 1000,
+          "ack_latency": {
+            "count": 16209,
+            "p50_micros": 2250.871,
+            "p95_micros": 2981.771,
+            "p99_micros": 4754.791,
+            "p99_9_micros": 10800.811,
+            "max_micros": 21375.236,
+            "mean_micros": 2362.393899623666,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 16209,
+            "p50_micros": 1506.708,
+            "p95_micros": 2113.368,
+            "p99_micros": 2943.924,
+            "p99_9_micros": 5174.738,
+            "max_micros": 17777.358,
+            "mean_micros": 1582.1074071811956,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 17209,
+            "received_count": 17209,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": false,
+          "ordered_end_marker": false,
+          "measurement_complete": false,
+          "censored_or_incomplete": true,
+          "comparison_caveat": "failed or truncated exposure; not a completed-run latency estimate",
+          "original_gate_passed": false,
+          "original_failures": [
+            "RuntimeError: worker failed role=[writer] status=[1]",
+            "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+            "subscriber: ZippyConnectionError: Flight endpoint is unavailable operation=[DoExchange.log]",
+            "ordered end marker missing or inconsistent",
+            "ack sample count=[16209] expected=[20000]",
+            "visible sample count=[16209] expected=[20000]",
+            "visible_p50_micros=[1506.708] exceeds limit=[1000.000]",
+            "wal_ack_p50_micros=[2250.871] exceeds limit=[2000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 1,
+            "subscriber": 1,
+            "writer": 1
+          },
+          "worker_errors": {
+            "writer": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+            "subscriber": "ZippyConnectionError: Flight endpoint is unavailable operation=[DoExchange.log]"
+          },
+          "achieved_probe_rows_per_second": 421.84513716025117,
+          "background_achieved_rows_per_second": 0.0,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 1184,
+              "frequency_per_minute": 1849.151271974466,
+              "exposure_start_sent_ns": 963863894488730,
+              "exposure_end_received_ns": 963902312113657,
+              "exposure_seconds": 38.417624927,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 38.417624927,
+                  "count": 1184,
+                  "frequency_per_minute": 1849.151271974466
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 286,
+              "cluster_frequency_per_minute": 446.669986304643,
+              "cluster_sizes_rows": {
+                "max": 166,
+                "mean": 4.13986013986014
+              },
+              "cluster_start_interval_count": 285,
+              "cluster_start_intervals_micros": {
+                "count": 285,
+                "p50_micros": 56449.194,
+                "p95_micros": 526357.608,
+                "p99_micros": 1026837.703,
+                "p99_9_micros": null,
+                "max_micros": 1642653.414,
+                "mean_micros": 134575.99747719296,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.052080641,
+                0.957068519,
+                1.464018435,
+                2.304007601,
+                2.380199279,
+                2.821381077,
+                3.073792572,
+                4.716445986,
+                5.770851657,
+                6.255892927,
+                6.534984726,
+                7.204077585,
+                7.291788661,
+                7.383068702,
+                7.431492564,
+                7.448841993,
+                7.480142244,
+                7.50965279,
+                7.525880282,
+                7.536214728
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 19,
+              "frequency_per_minute": 29.673880209049706,
+              "exposure_start_sent_ns": 963863894488730,
+              "exposure_end_received_ns": 963902312113657,
+              "exposure_seconds": 38.417624927,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 38.417624927,
+                  "count": 19,
+                  "frequency_per_minute": 29.673880209049706
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 19,
+              "cluster_frequency_per_minute": 29.673880209049706,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 18,
+              "cluster_start_intervals_micros": {
+                "count": 18,
+                "p50_micros": 1025257.266,
+                "p95_micros": 4100496.006,
+                "p99_micros": 4100496.006,
+                "p99_9_micros": null,
+                "max_micros": 4100496.006,
+                "mean_micros": 1425637.4702222224,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                12.744765458,
+                14.790452235,
+                17.87196692,
+                20.947511538,
+                21.976641419,
+                26.077137425,
+                27.102443465,
+                29.147456111,
+                30.175001895,
+                31.199223289,
+                32.224480555,
+                33.243760191,
+                33.262367211,
+                34.282438144,
+                35.306912778,
+                36.328616633,
+                37.363501073,
+                37.676396247,
+                38.406239922
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 7,
+              "frequency_per_minute": 10.93248218228147,
+              "exposure_start_sent_ns": 963863894488730,
+              "exposure_end_received_ns": 963902312113657,
+              "exposure_seconds": 38.417624927,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 38.417624927,
+                  "count": 7,
+                  "frequency_per_minute": 10.93248218228147
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 7,
+              "cluster_frequency_per_minute": 10.93248218228147,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 6,
+              "cluster_start_intervals_micros": {
+                "count": 6,
+                "p50_micros": 4097864.47,
+                "p95_micros": 4123801.778,
+                "p99_micros": 4123801.778,
+                "p99_9_micros": null,
+                "max_micros": 4123801.778,
+                "mean_micros": 3422378.8336666664,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                17.87196692,
+                21.976641419,
+                26.077137425,
+                30.175001895,
+                33.262367211,
+                34.282438144,
+                38.406239922
+              ]
+            }
+          }
+        },
+        {
+          "durability": "wal",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 1000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 2142.489,
+            "p95_micros": 2788.733,
+            "p99_micros": 3343.207,
+            "p99_9_micros": 7226.061,
+            "max_micros": 19171.089,
+            "mean_micros": 2224.32380625,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1434.116,
+            "p95_micros": 1828.495,
+            "p99_micros": 2140.156,
+            "p99_9_micros": 5605.399,
+            "max_micros": 18142.31,
+            "mean_micros": 1474.6357025500001,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 21000,
+            "received_count": 21000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1434.116] exceeds limit=[1000.000]",
+            "wal_ack_p50_micros=[2142.489] exceeds limit=[2000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 448.33694154825434,
+          "background_achieved_rows_per_second": 100014.35099036545,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 370,
+              "frequency_per_minute": 497.66185002450476,
+              "exposure_start_sent_ns": 963905531188419,
+              "exposure_end_received_ns": 963950139791628,
+              "exposure_seconds": 44.608603209,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 44.608603209,
+                  "count": 370,
+                  "frequency_per_minute": 497.66185002450476
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 221,
+              "cluster_frequency_per_minute": 297.2520779876096,
+              "cluster_sizes_rows": {
+                "max": 39,
+                "mean": 1.6742081447963801
+              },
+              "cluster_start_interval_count": 220,
+              "cluster_start_intervals_micros": {
+                "count": 220,
+                "p50_micros": 71051.723,
+                "p95_micros": 838445.143,
+                "p99_micros": 1054149.539,
+                "p99_9_micros": null,
+                "max_micros": 1793482.785,
+                "mean_micros": 201047.52922272726,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.052700139,
+                1.291900072,
+                1.800579194,
+                1.843258331,
+                1.863594052,
+                2.328631825,
+                2.377169401,
+                3.220139321,
+                3.369684208,
+                4.423833747,
+                4.861904594,
+                5.464087971,
+                5.519657528,
+                6.520519933,
+                6.81325104,
+                8.606733825,
+                9.649242992,
+                9.662282289,
+                10.355991602,
+                10.685401051
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 35,
+              "frequency_per_minute": 47.07612094826396,
+              "exposure_start_sent_ns": 963905531188419,
+              "exposure_end_received_ns": 963950139791628,
+              "exposure_seconds": 44.608603209,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 44.608603209,
+                  "count": 35,
+                  "frequency_per_minute": 47.07612094826396
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 34,
+              "cluster_frequency_per_minute": 45.73108892117071,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.0294117647058822
+              },
+              "cluster_start_interval_count": 33,
+              "cluster_start_intervals_micros": {
+                "count": 33,
+                "p50_micros": 1041595.197,
+                "p95_micros": 4179832.573,
+                "p99_micros": 8368523.67,
+                "p99_9_micros": null,
+                "max_micros": 8368523.67,
+                "mean_micros": 1267314.2905757574,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                2.328631825,
+                10.697155495,
+                11.736206817,
+                12.792752989,
+                13.826258495,
+                15.919199029,
+                16.960794226,
+                18.009576004,
+                18.019902627,
+                22.1997352,
+                23.250230521,
+                24.291847203,
+                25.333183592,
+                26.392758584,
+                27.431413689,
+                28.47139612,
+                29.527389034,
+                30.548622027,
+                30.560436589,
+                30.583526587
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 6,
+              "frequency_per_minute": 8.070192162559536,
+              "exposure_start_sent_ns": 963905531188419,
+              "exposure_end_received_ns": 963950139791628,
+              "exposure_seconds": 44.608603209,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 44.608603209,
+                  "count": 6,
+                  "frequency_per_minute": 8.070192162559536
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 6,
+              "cluster_frequency_per_minute": 8.070192162559536,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 5,
+              "cluster_start_intervals_micros": {
+                "count": 5,
+                "p50_micros": 3117234.375,
+                "p95_micros": 6269037.022,
+                "p99_micros": 6269037.022,
+                "p99_9_micros": null,
+                "max_micros": 6269037.022,
+                "mean_micros": 2717679.8128000004,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                29.527389034,
+                30.560436589,
+                30.583526587,
+                33.700760962,
+                39.969797984,
+                43.115788098
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "b5bf6d3-baseline",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-baseline.json",
+        "sha256": "4688d307480d33ada02c85b70b3f2cc62d1c21f665c45130b7821f4207bc140c",
+        "bytes": 15067260
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-08-public-path-e2e/baseline.json",
+        "sha256": "5505de0fd2b33fcb856e28939c08b22feb9ba9558c5b25114871ce6fc0622ca2",
+        "bytes": 19939
+      },
+      "raw_sha256_verified_against_prior_identity": false,
+      "metadata": {
+        "git_sha": "7c6b6a9784336827c7239a872e50bccfda15d501",
+        "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T10:06:29.032039+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "19c886769cb064aed6e848ebe38669e5ee4e3269e58cdd14dfc921d15f8fad56",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "e557c394bb4b2bd3750db959f71d916bc0dbc56da1c37cc319b7f3ff3a7442bb",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--durability",
+          "memory",
+          "wal",
+          "--background-rate",
+          "0",
+          "100000",
+          "--rate",
+          "1000",
+          "--samples",
+          "20000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "600",
+          "--report-json",
+          "docs/perf_reports/evidence/2026-10-08-public-path-e2e/baseline.json",
+          "--raw-samples-json",
+          "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-baseline.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 20000,
+        "durability": [
+          "memory",
+          "wal"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          0.0,
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 600.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 0.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 793.202,
+            "p95_micros": 1001.364,
+            "p99_micros": 1333.606,
+            "p99_9_micros": 9496.564,
+            "max_micros": 15021.962,
+            "mean_micros": 832.1364185499999,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1291.368,
+            "p95_micros": 1620.997,
+            "p99_micros": 2039.929,
+            "p99_9_micros": 10156.88,
+            "max_micros": 15663.592,
+            "mean_micros": 1336.8096368499998,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 22000,
+            "received_count": 22000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1291.368] exceeds limit=[1000.000]",
+            "visible_p99_9_micros=[10156.880] exceeds limit=[10000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 1000.0074012047775,
+          "background_achieved_rows_per_second": 0.0,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 228,
+              "frequency_per_minute": 683.9919862130911,
+              "exposure_start_sent_ns": 966495106365709,
+              "exposure_end_received_ns": 966515106600033,
+              "exposure_seconds": 20.000234324,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000234324,
+                  "count": 228,
+                  "frequency_per_minute": 683.9919862130911
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 87,
+              "cluster_frequency_per_minute": 260.99694210762686,
+              "cluster_sizes_rows": {
+                "max": 45,
+                "mean": 2.6206896551724137
+              },
+              "cluster_start_interval_count": 86,
+              "cluster_start_intervals_micros": {
+                "count": 86,
+                "p50_micros": 111705.394,
+                "p95_micros": 760248.291,
+                "p99_micros": 1024519.444,
+                "p99_9_micros": null,
+                "max_micros": 1024519.444,
+                "mean_micros": 224047.12731395348,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.592360366,
+                0.608663304,
+                1.059011856,
+                1.164817611,
+                1.61636996,
+                1.632370575,
+                1.994052574,
+                2.019773777,
+                2.073691905,
+                2.100776074,
+                2.640294137,
+                2.661462353,
+                3.122006952,
+                3.670539534,
+                4.695058978,
+                5.636394674,
+                5.718050871,
+                5.733882627,
+                6.194062731,
+                6.630869449
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 54,
+              "frequency_per_minute": 161.99810199783738,
+              "exposure_start_sent_ns": 966495106365709,
+              "exposure_end_received_ns": 966515106600033,
+              "exposure_seconds": 20.000234324,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000234324,
+                  "count": 54,
+                  "frequency_per_minute": 161.99810199783738
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 37,
+              "cluster_frequency_per_minute": 110.99869951703671,
+              "cluster_sizes_rows": {
+                "max": 3,
+                "mean": 1.4594594594594594
+              },
+              "cluster_start_interval_count": 36,
+              "cluster_start_intervals_micros": {
+                "count": 36,
+                "p50_micros": 21168.216,
+                "p95_micros": 1024693.414,
+                "p99_micros": 1024855.925,
+                "p99_9_micros": null,
+                "max_micros": 1024855.925,
+                "mean_micros": 514362.40983333334,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.592360366,
+                0.608663304,
+                1.61636996,
+                1.632370575,
+                2.640294137,
+                2.661462353,
+                3.670539534,
+                4.695058978,
+                5.718050871,
+                5.733882627,
+                6.742574843,
+                6.754482785,
+                7.773877972,
+                8.798571386,
+                8.815376419,
+                9.823828871,
+                9.836753375,
+                9.846832688,
+                10.85672626,
+                10.876785549
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 24,
+              "frequency_per_minute": 71.99915644348327,
+              "exposure_start_sent_ns": 966495106365709,
+              "exposure_end_received_ns": 966515106600033,
+              "exposure_seconds": 20.000234324,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000234324,
+                  "count": 24,
+                  "frequency_per_minute": 71.99915644348327
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 22,
+              "cluster_frequency_per_minute": 65.99922673985967,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.0909090909090908
+              },
+              "cluster_start_interval_count": 21,
+              "cluster_start_intervals_micros": {
+                "count": 21,
+                "p50_micros": 1024462.747,
+                "p95_micros": 1035295.63,
+                "p99_micros": 1035720.622,
+                "p99_9_micros": null,
+                "max_micros": 1035720.622,
+                "mean_micros": 880987.8007619047,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.608663304,
+                1.632370575,
+                2.661462353,
+                3.686711691,
+                4.710421389,
+                5.733882627,
+                6.754482785,
+                7.789778415,
+                8.815376419,
+                9.836753375,
+                9.846832688,
+                10.876785549,
+                11.904023399,
+                12.926001254,
+                12.937863813,
+                13.963668119,
+                14.988203911,
+                16.012089815,
+                17.047810437,
+                18.072273184
+              ]
+            }
+          }
+        },
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 764.595,
+            "p95_micros": 930.794,
+            "p99_micros": 1096.021,
+            "p99_9_micros": 9520.726,
+            "max_micros": 17327.426,
+            "mean_micros": 801.0702173,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1266.27,
+            "p95_micros": 1523.945,
+            "p99_micros": 1792.898,
+            "p99_9_micros": 10379.701,
+            "max_micros": 18161.96,
+            "mean_micros": 1306.4521601,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 22000,
+            "received_count": 22000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1266.270] exceeds limit=[1000.000]",
+            "visible_p99_9_micros=[10379.701] exceeds limit=[10000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 1000.0110455720032,
+          "background_achieved_rows_per_second": 99999.29490755427,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 111,
+              "frequency_per_minute": 332.99221828820123,
+              "exposure_start_sent_ns": 966517825775495,
+              "exposure_end_received_ns": 966537826242876,
+              "exposure_seconds": 20.000467381,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000467381,
+                  "count": 111,
+                  "frequency_per_minute": 332.99221828820123
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 68,
+              "cluster_frequency_per_minute": 203.99523282520434,
+              "cluster_sizes_rows": {
+                "max": 5,
+                "mean": 1.6323529411764706
+              },
+              "cluster_start_interval_count": 67,
+              "cluster_start_intervals_micros": {
+                "count": 67,
+                "p50_micros": 199389.337,
+                "p95_micros": 794826.968,
+                "p99_micros": 1023570.773,
+                "p99_9_micros": null,
+                "max_micros": 1023570.773,
+                "mean_micros": 282040.0916865672,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.616388131,
+                0.63314076,
+                1.074270823,
+                1.653997496,
+                1.672591915,
+                1.686581927,
+                2.201012621,
+                2.698381982,
+                2.720652896,
+                3.744223669,
+                4.146114788,
+                4.793872577,
+                4.81067537,
+                5.170163124,
+                5.522113579,
+                5.634707394,
+                5.834096731,
+                6.194147494,
+                6.822024259,
+                6.87558403
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 54,
+              "frequency_per_minute": 161.99621430236814,
+              "exposure_start_sent_ns": 966517825775495,
+              "exposure_end_received_ns": 966537826242876,
+              "exposure_seconds": 20.000467381,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000467381,
+                  "count": 54,
+                  "frequency_per_minute": 161.99621430236814
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 39,
+              "cluster_frequency_per_minute": 116.99726588504367,
+              "cluster_sizes_rows": {
+                "max": 3,
+                "mean": 1.3846153846153846
+              },
+              "cluster_start_interval_count": 38,
+              "cluster_start_intervals_micros": {
+                "count": 38,
+                "p50_micros": 18594.419,
+                "p95_micros": 1045279.077,
+                "p99_micros": 1049648.908,
+                "p99_9_micros": null,
+                "max_micros": 1049648.908,
+                "mean_micros": 495157.32605263154,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.616388131,
+                0.63314076,
+                1.653997496,
+                1.672591915,
+                2.698381982,
+                2.720652896,
+                3.744223669,
+                4.793872577,
+                4.81067537,
+                5.834096731,
+                6.87558403,
+                6.888536156,
+                6.899807324,
+                7.922938816,
+                7.940471177,
+                8.962925262,
+                8.980370829,
+                10.003754318,
+                10.016570201,
+                11.049985765
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 25,
+              "frequency_per_minute": 74.99824736220748,
+              "exposure_start_sent_ns": 966517825775495,
+              "exposure_end_received_ns": 966537826242876,
+              "exposure_seconds": 20.000467381,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000467381,
+                  "count": 25,
+                  "frequency_per_minute": 74.99824736220748
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 24,
+              "cluster_frequency_per_minute": 71.99831746771918,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.0416666666666667
+              },
+              "cluster_start_interval_count": 23,
+              "cluster_start_intervals_micros": {
+                "count": 23,
+                "p50_micros": 1039899.652,
+                "p95_micros": 1048060.981,
+                "p99_micros": 1051537.593,
+                "p99_9_micros": null,
+                "max_micros": 1051537.593,
+                "mean_micros": 817357.6417826087,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.63314076,
+                1.672591915,
+                2.720652896,
+                3.760802345,
+                4.793872577,
+                4.81067537,
+                5.849895425,
+                6.888536156,
+                6.899807324,
+                7.940471177,
+                8.980370829,
+                10.016570201,
+                11.068107794,
+                12.110046166,
+                13.146562861,
+                13.157196505,
+                14.199241074,
+                15.241454945,
+                16.281965535,
+                16.292517902
+              ]
+            }
+          }
+        },
+        {
+          "durability": "wal",
+          "background_target_rows_per_second": 0.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 1000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 2069.097,
+            "p95_micros": 2492.275,
+            "p99_micros": 3257.505,
+            "p99_9_micros": 10303.669,
+            "max_micros": 13842.603,
+            "mean_micros": 2144.63575755,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1380.531,
+            "p95_micros": 1801.439,
+            "p99_micros": 2390.524,
+            "p99_9_micros": 9404.951,
+            "max_micros": 13836.502,
+            "mean_micros": 1446.2615554,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 21000,
+            "received_count": 21000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1380.531] exceeds limit=[1000.000]",
+            "wal_ack_p50_micros=[2069.097] exceeds limit=[2000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 464.8464847861104,
+          "background_achieved_rows_per_second": 0.0,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 442,
+              "frequency_per_minute": 616.3950309017729,
+              "exposure_start_sent_ns": 966540874198467,
+              "exposure_end_received_ns": 966583898555690,
+              "exposure_seconds": 43.024357223,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 43.024357223,
+                  "count": 442,
+                  "frequency_per_minute": 616.3950309017729
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 184,
+              "cluster_frequency_per_minute": 256.59883639349823,
+              "cluster_sizes_rows": {
+                "max": 68,
+                "mean": 2.402173913043478
+              },
+              "cluster_start_interval_count": 183,
+              "cluster_start_intervals_micros": {
+                "count": 183,
+                "p50_micros": 89968.147,
+                "p95_micros": 983223.629,
+                "p99_micros": 1018624.208,
+                "p99_9_micros": null,
+                "max_micros": 1020455.377,
+                "mean_micros": 234459.95529508198,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.057856144,
+                0.07398709,
+                0.229939615,
+                0.394129539,
+                0.407056518,
+                0.547173954,
+                1.427367105,
+                2.215937363,
+                2.447957707,
+                2.516936347,
+                3.453231644,
+                3.46786165,
+                3.664275661,
+                3.799291573,
+                4.428186929,
+                4.488868458,
+                5.509323835,
+                6.514685365,
+                6.531690838,
+                7.538306858
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 58,
+              "frequency_per_minute": 80.88441581968965,
+              "exposure_start_sent_ns": 966540874198467,
+              "exposure_end_received_ns": 966583898555690,
+              "exposure_seconds": 43.024357223,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 43.024357223,
+                  "count": 58,
+                  "frequency_per_minute": 80.88441581968965
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 47,
+              "cluster_frequency_per_minute": 65.54426799181748,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.2340425531914894
+              },
+              "cluster_start_interval_count": 46,
+              "cluster_start_intervals_micros": {
+                "count": 46,
+                "p50_micros": 1019459.188,
+                "p95_micros": 1029365.572,
+                "p99_micros": 1033094.824,
+                "p99_9_micros": null,
+                "max_micros": 1033094.824,
+                "mean_micros": 910496.252826087,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.407056518,
+                1.427367105,
+                2.447957707,
+                3.46786165,
+                4.488868458,
+                5.509323835,
+                6.531690838,
+                7.552171613,
+                8.574683993,
+                9.594821037,
+                10.616495064,
+                11.634733748,
+                12.649828797,
+                13.682923621,
+                14.703114331,
+                15.724657997,
+                16.745835946,
+                17.7601673,
+                18.791957177,
+                19.811267279
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 9,
+              "frequency_per_minute": 12.551030040986326,
+              "exposure_start_sent_ns": 966540874198467,
+              "exposure_end_received_ns": 966583898555690,
+              "exposure_seconds": 43.024357223,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 43.024357223,
+                  "count": 9,
+                  "frequency_per_minute": 12.551030040986326
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 9,
+              "cluster_frequency_per_minute": 12.551030040986326,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 8,
+              "cluster_start_intervals_micros": {
+                "count": 8,
+                "p50_micros": 3064055.131,
+                "p95_micros": 9195564.488,
+                "p99_micros": 9195564.488,
+                "p99_9_micros": null,
+                "max_micros": 9195564.488,
+                "mean_micros": 3449090.63625,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                8.574683993,
+                13.682923621,
+                15.724657997,
+                18.791957177,
+                27.987521665,
+                31.057524399,
+                33.09283798,
+                36.156893111,
+                36.167409083
+              ]
+            }
+          }
+        },
+        {
+          "durability": "wal",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 1000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 2068.292,
+            "p95_micros": 2762.401,
+            "p99_micros": 3529.735,
+            "p99_9_micros": 10695.38,
+            "max_micros": 14637.698,
+            "mean_micros": 2174.40283115,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1366.84,
+            "p95_micros": 1812.097,
+            "p99_micros": 2428.947,
+            "p99_9_micros": 10070.166,
+            "max_micros": 14048.511,
+            "mean_micros": 1435.3457489,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 21000,
+            "received_count": 21000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1366.840] exceeds limit=[1000.000]",
+            "visible_p99_9_micros=[10070.166] exceeds limit=[10000.000]",
+            "wal_ack_p50_micros=[2068.292] exceeds limit=[2000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 458.64020246605327,
+          "background_achieved_rows_per_second": 99999.65033499229,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 521,
+              "frequency_per_minute": 716.8626005739058,
+              "exposure_start_sent_ns": 966586836659930,
+              "exposure_end_received_ns": 966630443342682,
+              "exposure_seconds": 43.606682752,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 43.606682752,
+                  "count": 521,
+                  "frequency_per_minute": 716.8626005739058
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 195,
+              "cluster_frequency_per_minute": 268.30749925510867,
+              "cluster_sizes_rows": {
+                "max": 97,
+                "mean": 2.6717948717948716
+              },
+              "cluster_start_interval_count": 194,
+              "cluster_start_intervals_micros": {
+                "count": 194,
+                "p50_micros": 79667.603,
+                "p95_micros": 985439.274,
+                "p99_micros": 1048895.411,
+                "p99_9_micros": null,
+                "max_micros": 1057353.047,
+                "mean_micros": 221015.82973195877,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.489567556,
+                1.538462967,
+                2.576976502,
+                3.602497729,
+                3.61614974,
+                3.673134365,
+                3.857852482,
+                4.654528039,
+                5.65519773,
+                5.680132801,
+                5.692480079,
+                5.708071106,
+                6.765424153,
+                7.788017112,
+                7.79816226,
+                7.903095215,
+                8.261446859,
+                8.82729082,
+                8.837367583,
+                8.91193978
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 67,
+              "frequency_per_minute": 92.1877048722681,
+              "exposure_start_sent_ns": 966586836659930,
+              "exposure_end_received_ns": 966630443342682,
+              "exposure_seconds": 43.606682752,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 43.606682752,
+                  "count": 67,
+                  "frequency_per_minute": 92.1877048722681
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 62,
+              "cluster_frequency_per_minute": 85.3080254041884,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.0806451612903225
+              },
+              "cluster_start_interval_count": 61,
+              "cluster_start_intervals_micros": {
+                "count": 61,
+                "p50_micros": 1033290.292,
+                "p95_micros": 1048068.861,
+                "p99_micros": 1057353.047,
+                "p99_9_micros": null,
+                "max_micros": 1057353.047,
+                "mean_micros": 701645.3634590164,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.489567556,
+                1.538462967,
+                2.576976502,
+                3.61614974,
+                4.654528039,
+                5.692480079,
+                5.708071106,
+                6.765424153,
+                7.79816226,
+                8.837367583,
+                9.878572831,
+                10.911295597,
+                10.921956209,
+                11.957900593,
+                12.997072922,
+                13.009718744,
+                13.022283571,
+                14.063598632,
+                15.106581379,
+                16.145275339
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 23,
+              "frequency_per_minute": 31.646525553166665,
+              "exposure_start_sent_ns": 966586836659930,
+              "exposure_end_received_ns": 966630443342682,
+              "exposure_seconds": 43.606682752,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 43.606682752,
+                  "count": 23,
+                  "frequency_per_minute": 31.646525553166665
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 23,
+              "cluster_frequency_per_minute": 31.646525553166665,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 22,
+              "cluster_start_intervals_micros": {
+                "count": 22,
+                "p50_micros": 1048196.922,
+                "p95_micros": 4171333.711,
+                "p99_micros": 4179360.149,
+                "p99_9_micros": null,
+                "max_micros": 4179360.149,
+                "mean_micros": 1850589.0102272728,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                2.576976502,
+                5.708071106,
+                6.765424153,
+                10.921956209,
+                13.009718744,
+                13.022283571,
+                14.063598632,
+                15.106581379,
+                18.245778808,
+                22.417112519,
+                22.428147411,
+                26.582622834,
+                27.630691695,
+                29.707830556,
+                30.752595847,
+                31.800792769,
+                33.875662378,
+                34.923653833,
+                35.9648797,
+                40.144239849
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "b5bf6d3-soak",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json",
+        "sha256": "2ed2de9a8b2248fef6f22652caa42ba988ffeec03c9874319cb7297ea661550d",
+        "bytes": 53055717
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-08-public-path-e2e/soak.json",
+        "sha256": "238e95fffdc1ec8cce62c03239079f4f19cb87cfffddbd1f4700d0755fafd64e",
+        "bytes": 7927
+      },
+      "raw_sha256_verified_against_prior_identity": false,
+      "metadata": {
+        "git_sha": "7c6b6a9784336827c7239a872e50bccfda15d501",
+        "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T10:10:08.246199+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "19c886769cb064aed6e848ebe38669e5ee4e3269e58cdd14dfc921d15f8fad56",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "e557c394bb4b2bd3750db959f71d916bc0dbc56da1c37cc319b7f3ff3a7442bb",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--durability",
+          "memory",
+          "--background-rate",
+          "100000",
+          "--rate",
+          "1000",
+          "--samples",
+          "300000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "900",
+          "--report-json",
+          "docs/perf_reports/evidence/2026-10-08-public-path-e2e/soak.json",
+          "--raw-samples-json",
+          "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 300000,
+        "durability": [
+          "memory"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 900.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 300000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 300000,
+            "p50_micros": 812.747,
+            "p95_micros": 1203.339,
+            "p99_micros": 1482.741,
+            "p99_9_micros": 18246.198,
+            "max_micros": 41827.315,
+            "mean_micros": 905.5442282066666,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 300000,
+            "p50_micros": 2842.847,
+            "p95_micros": 4832.509,
+            "p99_micros": 5693.982,
+            "p99_9_micros": 20766.074,
+            "max_micros": 44185.003,
+            "mean_micros": 2907.1372570666667,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 302000,
+            "received_count": 302000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[2842.847] exceeds limit=[1000.000]",
+            "visible_p99_micros=[5693.982] exceeds limit=[3000.000]",
+            "visible_p99_9_micros=[20766.074] exceeds limit=[10000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 999.86782879487,
+          "background_achieved_rows_per_second": 99999.9616921342,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 217717,
+              "frequency_per_minute": 43537.227188891055,
+              "exposure_start_sent_ns": 966714356283213,
+              "exposure_end_received_ns": 967014398817923,
+              "exposure_seconds": 300.04253471,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 1476,
+                  "frequency_per_minute": 1476.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 36545,
+                  "frequency_per_minute": 36545.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 59692,
+                  "frequency_per_minute": 59692.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 60001,
+                  "frequency_per_minute": 60001.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 59956,
+                  "frequency_per_minute": 59956.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.04253471,
+                  "count": 47,
+                  "frequency_per_minute": 66298.79456095974
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 1347,
+              "cluster_frequency_per_minute": 269.3618092451956,
+              "cluster_sizes_rows": {
+                "max": 1151,
+                "mean": 161.63103192279138
+              },
+              "cluster_start_interval_count": 1346,
+              "cluster_start_intervals_micros": {
+                "count": 1346,
+                "p50_micros": 44042.202,
+                "p95_micros": 1037785.228,
+                "p99_micros": 1041506.679,
+                "p99_9_micros": null,
+                "max_micros": 1051492.979,
+                "mean_micros": 222014.09965230312,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.597986104,
+                0.615391799,
+                1.637886745,
+                1.653704108,
+                2.676587155,
+                2.698443575,
+                2.711225082,
+                3.122033526,
+                3.72246731,
+                4.762022071,
+                4.779348414,
+                5.398524893,
+                5.802699872,
+                5.831010114,
+                5.878021101,
+                6.332033257,
+                6.398234809,
+                6.692000082,
+                6.841722991,
+                6.854581817
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 11222,
+              "frequency_per_minute": 2244.0818287673237,
+              "exposure_start_sent_ns": 966714356283213,
+              "exposure_end_received_ns": 967014398817923,
+              "exposure_seconds": 300.04253471,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 169,
+                  "frequency_per_minute": 169.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 176,
+                  "frequency_per_minute": 176.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 377,
+                  "frequency_per_minute": 377.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 1295,
+                  "frequency_per_minute": 1295.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 9191,
+                  "frequency_per_minute": 9191.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.04253471,
+                  "count": 14,
+                  "frequency_per_minute": 19748.577103264604
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 2708,
+              "cluster_frequency_per_minute": 541.5232215560428,
+              "cluster_sizes_rows": {
+                "max": 260,
+                "mean": 4.144017725258493
+              },
+              "cluster_start_interval_count": 2707,
+              "cluster_start_intervals_micros": {
+                "count": 2707,
+                "p50_micros": 28784.749,
+                "p95_micros": 1009339.932,
+                "p99_micros": 1023813.576,
+                "p99_9_micros": null,
+                "max_micros": 1042969.477,
+                "mean_micros": 110590.96309420023,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.597986104,
+                0.615391799,
+                1.637886745,
+                1.653704108,
+                2.676587155,
+                2.698443575,
+                3.72246731,
+                4.762022071,
+                4.779348414,
+                5.802699872,
+                6.398234809,
+                6.841722991,
+                6.854581817,
+                6.865046903,
+                7.888672856,
+                7.907452625,
+                8.931291865,
+                8.948455258,
+                9.971521027,
+                9.983104305
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 642,
+              "frequency_per_minute": 128.38179772488164,
+              "exposure_start_sent_ns": 966714356283213,
+              "exposure_end_received_ns": 967014398817923,
+              "exposure_seconds": 300.04253471,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 90,
+                  "frequency_per_minute": 90.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 119,
+                  "frequency_per_minute": 119.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 129,
+                  "frequency_per_minute": 129.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 140,
+                  "frequency_per_minute": 140.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 164,
+                  "frequency_per_minute": 164.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.04253471,
+                  "count": 0,
+                  "frequency_per_minute": 0.0
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 633,
+              "cluster_frequency_per_minute": 126.58205289696275,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.014218009478673
+              },
+              "cluster_start_interval_count": 632,
+              "cluster_start_intervals_micros": {
+                "count": 632,
+                "p50_micros": 29100.374,
+                "p95_micros": 1041069.464,
+                "p99_micros": 1049415.655,
+                "p99_9_micros": null,
+                "max_micros": 2080904.839,
+                "mean_micros": 472806.28550158226,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.615391799,
+                1.653704108,
+                2.698443575,
+                4.779348414,
+                5.818428048,
+                6.854581817,
+                6.865046903,
+                7.907452625,
+                8.948455258,
+                9.983104305,
+                11.029460991,
+                12.070392974,
+                13.108897825,
+                13.119030453,
+                14.157505355,
+                15.196187532,
+                16.235097418,
+                16.24562853,
+                17.28537458,
+                18.323302365
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "current-baseline",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-10-critical-section/baseline.json",
+        "sha256": "0f446725df388dca5e4e9a32fe6eb281041a3e540f79712fd3d0a95652f624f2",
+        "bytes": 15060015
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-10-critical-section/baseline.json",
+        "sha256": "91246ddb2246705f3abe26142398135c051b46199a749f1591bde3a3ba66db15",
+        "bytes": 19696
+      },
+      "raw_sha256_verified_against_prior_identity": false,
+      "metadata": {
+        "git_sha": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e",
+        "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T10:38:34.904725+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "49f9e1c924200ee23d2c741da6cfca693c5a6149f08e6bc7dd857ef99dff2736",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "8aa8431af472f5adadc7f03324b840fde66dc18ac0a3c62e13eaeb3dd606e7d5",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--durability",
+          "memory",
+          "wal",
+          "--background-rate",
+          "0",
+          "100000",
+          "--rate",
+          "1000",
+          "--samples",
+          "20000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "600",
+          "--report-json",
+          "docs/perf_reports/evidence/2026-10-10-critical-section/baseline.json",
+          "--raw-samples-json",
+          "/tmp/zippy-perf-raw/2026-10-10-critical-section/baseline.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 20000,
+        "durability": [
+          "memory",
+          "wal"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          0.0,
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 600.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 0.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 766.404,
+            "p95_micros": 943.313,
+            "p99_micros": 1102.931,
+            "p99_9_micros": 5534.27,
+            "max_micros": 14051.882,
+            "mean_micros": 794.5278367,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1235.225,
+            "p95_micros": 1512.45,
+            "p99_micros": 1748.249,
+            "p99_9_micros": 6157.364,
+            "max_micros": 14533.116,
+            "mean_micros": 1273.2638314,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 22000,
+            "received_count": 22000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1235.225] exceeds limit=[1000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 1000.0106774640071,
+          "background_achieved_rows_per_second": 0.0,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 91,
+              "frequency_per_minute": 272.9942694134942,
+              "exposure_start_sent_ns": 968421120180653,
+              "exposure_end_received_ns": 968441120600485,
+              "exposure_seconds": 20.000419832,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000419832,
+                  "count": 91,
+                  "frequency_per_minute": 272.9942694134942
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 69,
+              "cluster_frequency_per_minute": 206.99565483001206,
+              "cluster_sizes_rows": {
+                "max": 7,
+                "mean": 1.318840579710145
+              },
+              "cluster_start_interval_count": 68,
+              "cluster_start_intervals_micros": {
+                "count": 68,
+                "p50_micros": 211067.047,
+                "p95_micros": 1006950.604,
+                "p99_micros": 1023962.23,
+                "p99_9_micros": null,
+                "max_micros": 1023962.23,
+                "mean_micros": 289220.63267647056,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.050063922,
+                0.586123914,
+                1.610030251,
+                2.098035746,
+                2.634616511,
+                2.655815004,
+                3.122186456,
+                3.662278295,
+                3.679204309,
+                4.686526393,
+                4.703694539,
+                5.170167681,
+                5.710570751,
+                6.734532981,
+                6.746306309,
+                6.758319092,
+                7.765269696,
+                7.782794655,
+                8.242148091,
+                8.789536451
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 35,
+              "frequency_per_minute": 104.997795928267,
+              "exposure_start_sent_ns": 968421120180653,
+              "exposure_end_received_ns": 968441120600485,
+              "exposure_seconds": 20.000419832,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000419832,
+                  "count": 35,
+                  "frequency_per_minute": 104.997795928267
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 24,
+              "cluster_frequency_per_minute": 71.99848863652593,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.4583333333333333
+              },
+              "cluster_start_interval_count": 23,
+              "cluster_start_intervals_micros": {
+                "count": 23,
+                "p50_micros": 1023962.23,
+                "p95_micros": 1025658.901,
+                "p99_micros": 1027661.784,
+                "p99_9_micros": null,
+                "max_micros": 1027661.784,
+                "mean_micros": 803349.7603913044,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.586123914,
+                1.610030251,
+                2.634616511,
+                3.662278295,
+                4.686526393,
+                5.710570751,
+                6.734532981,
+                6.746306309,
+                7.765269696,
+                8.789536451,
+                9.814263168,
+                9.826099396,
+                10.844756357,
+                11.870415258,
+                12.895002228,
+                12.90781388,
+                13.926964028,
+                14.951540568,
+                15.975828207,
+                15.98900484
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 5,
+              "frequency_per_minute": 14.99968513260957,
+              "exposure_start_sent_ns": 968421120180653,
+              "exposure_end_received_ns": 968441120600485,
+              "exposure_seconds": 20.000419832,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000419832,
+                  "count": 5,
+                  "frequency_per_minute": 14.99968513260957
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 5,
+              "cluster_frequency_per_minute": 14.99968513260957,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 4,
+              "cluster_start_intervals_micros": null,
+              "cluster_interval_unavailable_reason": "fewer than 5 observed cluster-start intervals",
+              "cluster_first_20_start_offsets_seconds": [
+                6.746306309,
+                9.826099396,
+                12.90781388,
+                15.98900484,
+                18.045031473
+              ]
+            }
+          }
+        },
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 765.001,
+            "p95_micros": 970.628,
+            "p99_micros": 1220.421,
+            "p99_9_micros": 7745.233,
+            "max_micros": 15416.948,
+            "mean_micros": 801.3563239,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1250.6,
+            "p95_micros": 1566.517,
+            "p99_micros": 1956.124,
+            "p99_9_micros": 8475.353,
+            "max_micros": 16042.638,
+            "mean_micros": 1298.8075973,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 22000,
+            "received_count": 22000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1250.600] exceeds limit=[1000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 1000.0180855770822,
+          "background_achieved_rows_per_second": 99999.28421183254,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 176,
+              "frequency_per_minute": 527.9962702079474,
+              "exposure_start_sent_ns": 968443837606232,
+              "exposure_end_received_ns": 968463837747513,
+              "exposure_seconds": 20.000141281,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000141281,
+                  "count": 176,
+                  "frequency_per_minute": 527.9962702079474
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 69,
+              "cluster_frequency_per_minute": 206.9985377519794,
+              "cluster_sizes_rows": {
+                "max": 58,
+                "mean": 2.550724637681159
+              },
+              "cluster_start_interval_count": 68,
+              "cluster_start_intervals_micros": {
+                "count": 68,
+                "p50_micros": 113973.396,
+                "p95_micros": 1022715.81,
+                "p99_micros": 1046662.171,
+                "p99_9_micros": null,
+                "max_micros": 1046662.171,
+                "mean_micros": 284048.62425,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.190711745,
+                0.613860496,
+                1.345028775,
+                1.658137991,
+                2.704800162,
+                2.731049642,
+                3.453050845,
+                3.514086844,
+                3.593071186,
+                3.607510959,
+                3.625440535,
+                3.756969476,
+                3.777589789,
+                4.158683078,
+                4.647060523,
+                4.805466944,
+                4.82399618,
+                5.84671199,
+                5.865151331,
+                6.892434879
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 39,
+              "frequency_per_minute": 116.99917351198835,
+              "exposure_start_sent_ns": 968443837606232,
+              "exposure_end_received_ns": 968463837747513,
+              "exposure_seconds": 20.000141281,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000141281,
+                  "count": 39,
+                  "frequency_per_minute": 116.99917351198835
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 27,
+              "cluster_frequency_per_minute": 80.99942781599194,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.4444444444444444
+              },
+              "cluster_start_interval_count": 26,
+              "cluster_start_intervals_micros": {
+                "count": 26,
+                "p50_micros": 1034235.701,
+                "p95_micros": 1046662.171,
+                "p99_micros": 1048497.468,
+                "p99_9_micros": null,
+                "max_micros": 1048497.468,
+                "mean_micros": 723705.301,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.613860496,
+                1.658137991,
+                2.704800162,
+                3.521830902,
+                3.534188469,
+                3.756969476,
+                4.805466944,
+                5.84671199,
+                6.892434879,
+                6.906826286,
+                7.939754445,
+                8.979934406,
+                8.993381359,
+                10.024664905,
+                10.03624512,
+                11.067708626,
+                12.109181238,
+                13.150365066,
+                13.163577288,
+                14.197812989
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 8,
+              "frequency_per_minute": 23.99983046399761,
+              "exposure_start_sent_ns": 968443837606232,
+              "exposure_end_received_ns": 968463837747513,
+              "exposure_seconds": 20.000141281,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 20.000141281,
+                  "count": 8,
+                  "frequency_per_minute": 23.99983046399761
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 8,
+              "cluster_frequency_per_minute": 23.99983046399761,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 7,
+              "cluster_start_intervals_micros": {
+                "count": 7,
+                "p50_micros": 2095876.131,
+                "p95_micros": 3135890.438,
+                "p99_micros": 3135890.438,
+                "p99_9_micros": null,
+                "max_micros": 3135890.438,
+                "mean_micros": 2091196.340142857,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                3.756969476,
+                6.892434879,
+                6.906826286,
+                8.993381359,
+                10.03624512,
+                13.163577288,
+                16.299467726,
+                18.395343857
+              ]
+            }
+          }
+        },
+        {
+          "durability": "wal",
+          "background_target_rows_per_second": 0.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 1000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 2012.409,
+            "p95_micros": 2506.219,
+            "p99_micros": 3467.674,
+            "p99_9_micros": 6485.029,
+            "max_micros": 13484.12,
+            "mean_micros": 2089.99241975,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1332.277,
+            "p95_micros": 1772.693,
+            "p99_micros": 2321.517,
+            "p99_9_micros": 5178.351,
+            "max_micros": 14788.946,
+            "mean_micros": 1387.787898,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 21000,
+            "received_count": 21000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1332.277] exceeds limit=[1000.000]",
+            "wal_ack_p50_micros=[2012.409] exceeds limit=[2000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 477.1154970264519,
+          "background_achieved_rows_per_second": 0.0,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 449,
+              "frequency_per_minute": 642.68251063695,
+              "exposure_start_sent_ns": 968466704073033,
+              "exposure_end_received_ns": 968508622126744,
+              "exposure_seconds": 41.918053711,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 41.918053711,
+                  "count": 449,
+                  "frequency_per_minute": 642.68251063695
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 170,
+              "cluster_frequency_per_minute": 243.33190825897884,
+              "cluster_sizes_rows": {
+                "max": 76,
+                "mean": 2.6411764705882352
+              },
+              "cluster_start_interval_count": 169,
+              "cluster_start_intervals_micros": {
+                "count": 169,
+                "p50_micros": 105696.941,
+                "p95_micros": 1010148.442,
+                "p99_micros": 1718913.0,
+                "p99_9_micros": null,
+                "max_micros": 2111029.694,
+                "mean_micros": 246504.04312426035,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.047631698,
+                1.554851129,
+                2.576444729,
+                4.295357729,
+                6.406387423,
+                6.694159787,
+                6.804211315,
+                6.830193722,
+                7.559332412,
+                7.703321317,
+                8.410488914,
+                8.72449374,
+                9.742026755,
+                10.671721483,
+                10.801432007,
+                11.136216528,
+                11.181224012,
+                11.223727015,
+                11.382439549,
+                11.394537678
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 23,
+              "frequency_per_minute": 32.92137582327361,
+              "exposure_start_sent_ns": 968466704073033,
+              "exposure_end_received_ns": 968508622126744,
+              "exposure_seconds": 41.918053711,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 41.918053711,
+                  "count": 23,
+                  "frequency_per_minute": 32.92137582327361
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 22,
+              "cluster_frequency_per_minute": 31.49001165704432,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.0454545454545454
+              },
+              "cluster_start_interval_count": 21,
+              "cluster_start_intervals_micros": {
+                "count": 21,
+                "p50_micros": 1023578.807,
+                "p95_micros": 3075375.031,
+                "p99_micros": 4101817.852,
+                "p99_9_micros": null,
+                "max_micros": 4101817.852,
+                "mean_micros": 1473437.7827142857,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                10.764621549,
+                11.796674701,
+                11.875431241,
+                12.82694848,
+                14.875089741,
+                17.944760402,
+                19.999647619,
+                21.021378257,
+                22.042184949,
+                26.144002801,
+                28.19843279,
+                30.250959879,
+                31.274538686,
+                32.296062236,
+                33.323715289,
+                36.39909032,
+                37.422406636,
+                38.443755803,
+                39.472350405,
+                40.493937178
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 8,
+              "frequency_per_minute": 11.450913329834298,
+              "exposure_start_sent_ns": 968466704073033,
+              "exposure_end_received_ns": 968508622126744,
+              "exposure_seconds": 41.918053711,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 41.918053711,
+                  "count": 8,
+                  "frequency_per_minute": 11.450913329834298
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 8,
+              "cluster_frequency_per_minute": 11.450913329834298,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 7,
+              "cluster_start_intervals_micros": {
+                "count": 7,
+                "p50_micros": 3073260.085,
+                "p95_micros": 8124216.378,
+                "p99_micros": 8124216.378,
+                "p99_9_micros": null,
+                "max_micros": 8124216.378,
+                "mean_micros": 3942417.0234285714,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                11.875431241,
+                19.999647619,
+                26.144002801,
+                28.19843279,
+                30.250959879,
+                33.323715289,
+                36.39909032,
+                39.472350405
+              ]
+            }
+          }
+        },
+        {
+          "durability": "wal",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 20000,
+          "warmup_rows": 1000,
+          "ack_latency": {
+            "count": 20000,
+            "p50_micros": 2052.186,
+            "p95_micros": 2697.026,
+            "p99_micros": 3425.499,
+            "p99_9_micros": 6894.838,
+            "max_micros": 12486.548,
+            "mean_micros": 2141.92888005,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 20000,
+            "p50_micros": 1349.946,
+            "p95_micros": 1787.115,
+            "p99_micros": 2235.049,
+            "p99_9_micros": 5235.842,
+            "max_micros": 12153.181,
+            "mean_micros": 1399.84839895,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 21000,
+            "received_count": 21000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[1349.946] exceeds limit=[1000.000]",
+            "wal_ack_p50_micros=[2052.186] exceeds limit=[2000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 465.6482690273733,
+          "background_achieved_rows_per_second": 100014.1296820378,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 391,
+              "frequency_per_minute": 546.2105942337622,
+              "exposure_start_sent_ns": 968511644778133,
+              "exposure_end_received_ns": 968554595244945,
+              "exposure_seconds": 42.950466812,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 42.950466812,
+                  "count": 391,
+                  "frequency_per_minute": 546.2105942337622
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 169,
+              "cluster_frequency_per_minute": 236.08590901663888,
+              "cluster_sizes_rows": {
+                "max": 91,
+                "mean": 2.3136094674556213
+              },
+              "cluster_start_interval_count": 168,
+              "cluster_start_intervals_micros": {
+                "count": 168,
+                "p50_micros": 100542.375,
+                "p95_micros": 940644.407,
+                "p99_micros": 2149678.881,
+                "p99_9_micros": null,
+                "max_micros": 2807999.101,
+                "mean_micros": 246230.84254166664,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                1.479829846,
+                4.287828947,
+                6.437507828,
+                6.529116738,
+                6.685094311,
+                7.024744878,
+                7.714485831,
+                7.730431088,
+                7.742972638,
+                8.347227793,
+                8.635160141,
+                8.785644285,
+                8.799531523,
+                9.330294869,
+                9.62674859,
+                9.822394733,
+                9.840822726,
+                9.894064922,
+                9.904784931,
+                9.936266401
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 22,
+              "frequency_per_minute": 30.733076913408613,
+              "exposure_start_sent_ns": 968511644778133,
+              "exposure_end_received_ns": 968554595244945,
+              "exposure_seconds": 42.950466812,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 42.950466812,
+                  "count": 22,
+                  "frequency_per_minute": 30.733076913408613
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 22,
+              "cluster_frequency_per_minute": 30.733076913408613,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 21,
+              "cluster_start_intervals_micros": {
+                "count": 21,
+                "p50_micros": 1047705.283,
+                "p95_micros": 3143218.447,
+                "p99_micros": 4176412.374,
+                "p99_9_micros": null,
+                "max_micros": 4176412.374,
+                "mean_micros": 1623989.6215714286,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                7.024744878,
+                8.785644285,
+                12.962056659,
+                16.105275106,
+                18.195460923,
+                20.272198921,
+                22.384778524,
+                24.468252117,
+                25.509335049,
+                26.551047306,
+                27.59065363,
+                28.630720903,
+                29.669319739,
+                30.717025022,
+                31.757835863,
+                33.8409728,
+                34.878541123,
+                35.910656741,
+                36.971851126,
+                39.044189262
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 5,
+              "frequency_per_minute": 6.984790207592867,
+              "exposure_start_sent_ns": 968511644778133,
+              "exposure_end_received_ns": 968554595244945,
+              "exposure_seconds": 42.950466812,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 42.950466812,
+                  "count": 5,
+                  "frequency_per_minute": 6.984790207592867
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 5,
+              "cluster_frequency_per_minute": 6.984790207592867,
+              "cluster_sizes_rows": {
+                "max": 1,
+                "mean": 1.0
+              },
+              "cluster_start_interval_count": 4,
+              "cluster_start_intervals_micros": null,
+              "cluster_interval_unavailable_reason": "fewer than 5 observed cluster-start intervals",
+              "cluster_first_20_start_offsets_seconds": [
+                12.962056659,
+                30.717025022,
+                33.8409728,
+                36.971851126,
+                40.091688971
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "label": "current-soak",
+      "raw_artifact": {
+        "path": "/tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json",
+        "sha256": "4a8bf0b0e083ddd23a2531df38c0a8266ee80a0ac91c31ad84ecca18a6f2dcce",
+        "bytes": 53034031
+      },
+      "summary_artifact": {
+        "path": "/home/jiangda/develop/zippy/docs/perf_reports/evidence/2026-10-10-critical-section/soak.json",
+        "sha256": "d89cddb11d906770ed96d7d758f96d82f7306e75b43aefd66377c71fcd2656fe",
+        "bytes": 7937
+      },
+      "raw_sha256_verified_against_prior_identity": false,
+      "metadata": {
+        "git_sha": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e",
+        "benchmark_script_sha256": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+        "git_dirty": true,
+        "kernel": "5.15.153.1-microsoft-standard-WSL2",
+        "is_wsl": true,
+        "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+        "logical_cpu_count": 32,
+        "cpu_affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "python_version": "3.11.14",
+        "versions": {
+          "pyarrow": "23.0.1",
+          "zippy": "0.5.0",
+          "zippy-client": "0.1.0"
+        },
+        "started_at_utc": "2026-10-10T10:41:14.777951+00:00",
+        "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+        "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "server_sha256": "49f9e1c924200ee23d2c741da6cfca693c5a6149f08e6bc7dd857ef99dff2736",
+        "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+        "extension_sha256": "8aa8431af472f5adadc7f03324b840fde66dc18ac0a3c62e13eaeb3dd606e7d5",
+        "build_requirement": "release server/extension; commands in baseline report",
+        "command_argv": [
+          "/home/jiangda/develop/zippy/.venv/bin/python3",
+          "scripts/bench_public_e2e.py",
+          "--durability",
+          "memory",
+          "--background-rate",
+          "100000",
+          "--rate",
+          "1000",
+          "--samples",
+          "300000",
+          "--warmup-seconds",
+          "2",
+          "--warmup-samples",
+          "1000",
+          "--background-batch-rows",
+          "1000",
+          "--timeout-seconds",
+          "900",
+          "--report-json",
+          "docs/perf_reports/evidence/2026-10-10-critical-section/soak.json",
+          "--raw-samples-json",
+          "/tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json"
+        ],
+        "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+        "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+        "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+        "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+        "background_scope": "separate append table in the same namespace and server"
+      },
+      "config": {
+        "samples": 300000,
+        "durability": [
+          "memory"
+        ],
+        "rate": 1000.0,
+        "background_rate": [
+          100000.0
+        ],
+        "background_batch_rows": 1000,
+        "warmup_seconds": 2.0,
+        "warmup_samples": 1000,
+        "timeout_seconds": 900.0,
+        "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+        "max_visible_p50_micros": 1000.0,
+        "max_visible_p99_micros": 3000.0,
+        "max_visible_p99_9_micros": 10000.0,
+        "max_wal_ack_p50_micros": 2000.0,
+        "max_wal_ack_p99_micros": 5000.0,
+        "thresholds": {
+          "visible_p50_micros": 1000.0,
+          "visible_p99_micros": 3000.0,
+          "visible_p99_9_micros": 10000.0,
+          "wal_ack_p50_micros": 2000.0,
+          "wal_ack_p99_micros": 5000.0
+        }
+      },
+      "cells": [
+        {
+          "durability": "memory",
+          "background_target_rows_per_second": 100000.0,
+          "expected_measured_samples": 300000,
+          "warmup_rows": 2000,
+          "ack_latency": {
+            "count": 300000,
+            "p50_micros": 830.995,
+            "p95_micros": 1229.486,
+            "p99_micros": 1485.417,
+            "p99_9_micros": 8391.969,
+            "max_micros": 45757.37,
+            "mean_micros": 912.82219042,
+            "p99_9_unavailable_reason": null
+          },
+          "visible_latency": {
+            "count": 300000,
+            "p50_micros": 2879.595,
+            "p95_micros": 4870.871,
+            "p99_micros": 5711.784,
+            "p99_9_micros": 10906.406,
+            "max_micros": 49040.372,
+            "mean_micros": 2923.8518506200003,
+            "p99_9_unavailable_reason": null
+          },
+          "integrity": {
+            "passed": true,
+            "expected_count": 302000,
+            "received_count": 302000,
+            "missing_count": 0,
+            "missing_seq_first_20": [],
+            "duplicate_count": 0,
+            "out_of_order_count": 0,
+            "unexpected_count": 0
+          },
+          "sample_count_complete": true,
+          "ordered_end_marker": true,
+          "measurement_complete": true,
+          "censored_or_incomplete": false,
+          "comparison_caveat": null,
+          "original_gate_passed": false,
+          "original_failures": [
+            "visible_p50_micros=[2879.595] exceeds limit=[1000.000]",
+            "visible_p99_micros=[5711.784] exceeds limit=[3000.000]",
+            "visible_p99_9_micros=[10906.406] exceeds limit=[10000.000]"
+          ],
+          "process_exit_codes": {
+            "server": 0,
+            "subscriber": 0,
+            "writer": 0,
+            "background": 0
+          },
+          "worker_errors": {},
+          "achieved_probe_rows_per_second": 999.8976050924575,
+          "background_achieved_rows_per_second": 99999.94095312423,
+          "visible_spikes": {
+            "over_2ms": {
+              "threshold_milliseconds": 2.0,
+              "count": 218803,
+              "frequency_per_minute": 43755.76565764975,
+              "exposure_start_sent_ns": 968580986802037,
+              "exposure_end_received_ns": 968881019947445,
+              "exposure_seconds": 300.033145408,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 1850,
+                  "frequency_per_minute": 1850.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 37218,
+                  "frequency_per_minute": 37218.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 59606,
+                  "frequency_per_minute": 59606.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 60090,
+                  "frequency_per_minute": 60090.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 60002,
+                  "frequency_per_minute": 60002.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.033145408,
+                  "count": 37,
+                  "frequency_per_minute": 66977.60365478077
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 1217,
+              "cluster_frequency_per_minute": 243.37311099646598,
+              "cluster_sizes_rows": {
+                "max": 1131,
+                "mean": 179.78882497945767
+              },
+              "cluster_start_interval_count": 1216,
+              "cluster_start_intervals_micros": {
+                "count": 1216,
+                "p50_micros": 47095.825,
+                "p95_micros": 1056724.797,
+                "p99_micros": 1061466.072,
+                "p99_9_micros": null,
+                "max_micros": 1071486.916,
+                "mean_micros": 246509.33281167762,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.049995526,
+                0.600713158,
+                0.78747684,
+                1.641312555,
+                1.730450045,
+                1.882175637,
+                2.683003875,
+                2.707367203,
+                3.728021663,
+                3.746444793,
+                4.768617439,
+                4.787410121,
+                5.810433574,
+                5.82871251,
+                6.850313208,
+                6.863121934,
+                6.876784506,
+                7.895974061,
+                7.914266061,
+                8.936728594
+              ]
+            },
+            "over_5ms": {
+              "threshold_milliseconds": 5.0,
+              "count": 11946,
+              "frequency_per_minute": 2388.9360591321138,
+              "exposure_start_sent_ns": 968580986802037,
+              "exposure_end_received_ns": 968881019947445,
+              "exposure_seconds": 300.033145408,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 111,
+                  "frequency_per_minute": 111.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 130,
+                  "frequency_per_minute": 130.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 387,
+                  "frequency_per_minute": 387.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 1119,
+                  "frequency_per_minute": 1119.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 10190,
+                  "frequency_per_minute": 10190.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.033145408,
+                  "count": 9,
+                  "frequency_per_minute": 16291.849537649377
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 2381,
+              "cluster_frequency_per_minute": 476.14739300130276,
+              "cluster_sizes_rows": {
+                "max": 397,
+                "mean": 5.017219655606888
+              },
+              "cluster_start_interval_count": 2380,
+              "cluster_start_intervals_micros": {
+                "count": 2380,
+                "p50_micros": 32133.681,
+                "p95_micros": 1027977.195,
+                "p99_micros": 1041691.32,
+                "p99_9_micros": null,
+                "max_micros": 1061961.805,
+                "mean_micros": 125773.33229705882,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                0.600713158,
+                1.641312555,
+                2.683003875,
+                3.728021663,
+                4.768617439,
+                5.810433574,
+                6.850313208,
+                6.863121934,
+                7.895974061,
+                8.936728594,
+                9.978227251,
+                9.989907147,
+                11.022182487,
+                12.071650673,
+                13.113591836,
+                13.12651241,
+                14.160115629,
+                15.201855441,
+                16.244782043,
+                16.259323792
+              ]
+            },
+            "over_10ms": {
+              "threshold_milliseconds": 10.0,
+              "count": 373,
+              "frequency_per_minute": 74.59175875240905,
+              "exposure_start_sent_ns": 968580986802037,
+              "exposure_end_received_ns": 968881019947445,
+              "exposure_seconds": 300.033145408,
+              "minute_buckets": [
+                {
+                  "minute_index": 0,
+                  "exposure_seconds": 60.0,
+                  "count": 38,
+                  "frequency_per_minute": 38.0
+                },
+                {
+                  "minute_index": 1,
+                  "exposure_seconds": 60.0,
+                  "count": 67,
+                  "frequency_per_minute": 67.0
+                },
+                {
+                  "minute_index": 2,
+                  "exposure_seconds": 60.0,
+                  "count": 72,
+                  "frequency_per_minute": 72.0
+                },
+                {
+                  "minute_index": 3,
+                  "exposure_seconds": 60.0,
+                  "count": 87,
+                  "frequency_per_minute": 87.0
+                },
+                {
+                  "minute_index": 4,
+                  "exposure_seconds": 60.0,
+                  "count": 109,
+                  "frequency_per_minute": 109.0
+                },
+                {
+                  "minute_index": 5,
+                  "exposure_seconds": 0.033145408,
+                  "count": 0,
+                  "frequency_per_minute": 0.0
+                }
+              ],
+              "cluster_gap_milliseconds": 10.0,
+              "cluster_count": 369,
+              "cluster_frequency_per_minute": 73.7918471303993,
+              "cluster_sizes_rows": {
+                "max": 2,
+                "mean": 1.010840108401084
+              },
+              "cluster_start_interval_count": 368,
+              "cluster_start_intervals_micros": {
+                "count": 368,
+                "p50_micros": 1031316.502,
+                "p95_micros": 1061856.636,
+                "p99_micros": 2099412.195,
+                "p99_9_micros": null,
+                "max_micros": 3132811.382,
+                "mean_micros": 796038.6475298912,
+                "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+              },
+              "cluster_interval_unavailable_reason": null,
+              "cluster_first_20_start_offsets_seconds": [
+                6.863121934,
+                9.989907147,
+                12.071650673,
+                13.12651241,
+                16.259323792,
+                18.351365844,
+                20.443436908,
+                22.547744273,
+                23.587511195,
+                24.638143849,
+                26.725548545,
+                28.811214385,
+                30.904567797,
+                32.997584227,
+                35.092911164,
+                36.134730439,
+                37.188562017,
+                38.230491342,
+                39.283783617,
+                40.318059806
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "metadata_differences": {
+    "benchmark_script_sha256": {
+      "pre-fix": "0cdaeca9ebf5d32a1c68ce0c5a009b9266837a29dfa195f5bb908790a8eb730d",
+      "b5bf6d3-baseline": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+      "b5bf6d3-soak": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+      "current-baseline": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015",
+      "current-soak": "bec0a8a5b9a8abf930f5a423eb0d48eb4b37d59edc77aa3dbe89f7b235d72015"
+    },
+    "command_argv": {
+      "pre-fix": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--durability",
+        "memory",
+        "wal",
+        "--background-rate",
+        "0",
+        "100000",
+        "--rate",
+        "1000",
+        "--samples",
+        "20000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "600",
+        "--report-json",
+        "docs/perf_reports/evidence/2026-10-08-public-path-e2e/baseline.json"
+      ],
+      "b5bf6d3-baseline": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--durability",
+        "memory",
+        "wal",
+        "--background-rate",
+        "0",
+        "100000",
+        "--rate",
+        "1000",
+        "--samples",
+        "20000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "600",
+        "--report-json",
+        "docs/perf_reports/evidence/2026-10-08-public-path-e2e/baseline.json",
+        "--raw-samples-json",
+        "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-baseline.json"
+      ],
+      "b5bf6d3-soak": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--durability",
+        "memory",
+        "--background-rate",
+        "100000",
+        "--rate",
+        "1000",
+        "--samples",
+        "300000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "900",
+        "--report-json",
+        "docs/perf_reports/evidence/2026-10-08-public-path-e2e/soak.json",
+        "--raw-samples-json",
+        "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json"
+      ],
+      "current-baseline": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--durability",
+        "memory",
+        "wal",
+        "--background-rate",
+        "0",
+        "100000",
+        "--rate",
+        "1000",
+        "--samples",
+        "20000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "600",
+        "--report-json",
+        "docs/perf_reports/evidence/2026-10-10-critical-section/baseline.json",
+        "--raw-samples-json",
+        "/tmp/zippy-perf-raw/2026-10-10-critical-section/baseline.json"
+      ],
+      "current-soak": [
+        "/home/jiangda/develop/zippy/.venv/bin/python3",
+        "scripts/bench_public_e2e.py",
+        "--durability",
+        "memory",
+        "--background-rate",
+        "100000",
+        "--rate",
+        "1000",
+        "--samples",
+        "300000",
+        "--warmup-seconds",
+        "2",
+        "--warmup-samples",
+        "1000",
+        "--background-batch-rows",
+        "1000",
+        "--timeout-seconds",
+        "900",
+        "--report-json",
+        "docs/perf_reports/evidence/2026-10-10-critical-section/soak.json",
+        "--raw-samples-json",
+        "/tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json"
+      ]
+    },
+    "extension_sha256": {
+      "pre-fix": "2dff6cf9eaa134383fbffe7227960eeb91658ac5a09a8feb6a9659d8c08cfd6f",
+      "b5bf6d3-baseline": "e557c394bb4b2bd3750db959f71d916bc0dbc56da1c37cc319b7f3ff3a7442bb",
+      "b5bf6d3-soak": "e557c394bb4b2bd3750db959f71d916bc0dbc56da1c37cc319b7f3ff3a7442bb",
+      "current-baseline": "8aa8431af472f5adadc7f03324b840fde66dc18ac0a3c62e13eaeb3dd606e7d5",
+      "current-soak": "8aa8431af472f5adadc7f03324b840fde66dc18ac0a3c62e13eaeb3dd606e7d5"
+    },
+    "git_sha": {
+      "pre-fix": "ff0f95055c0e16df64b1b3c455f3b53755c8dbc6",
+      "b5bf6d3-baseline": "7c6b6a9784336827c7239a872e50bccfda15d501",
+      "b5bf6d3-soak": "7c6b6a9784336827c7239a872e50bccfda15d501",
+      "current-baseline": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e",
+      "current-soak": "b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e"
+    },
+    "server_sha256": {
+      "pre-fix": "58a2335a7cde4dea2a8f6c862d7681e840d46f2eabb7bb5935023f7ad65ec79b",
+      "b5bf6d3-baseline": "19c886769cb064aed6e848ebe38669e5ee4e3269e58cdd14dfc921d15f8fad56",
+      "b5bf6d3-soak": "19c886769cb064aed6e848ebe38669e5ee4e3269e58cdd14dfc921d15f8fad56",
+      "current-baseline": "49f9e1c924200ee23d2c741da6cfca693c5a6149f08e6bc7dd857ef99dff2736",
+      "current-soak": "49f9e1c924200ee23d2c741da6cfca693c5a6149f08e6bc7dd857ef99dff2736"
+    },
+    "started_at_utc": {
+      "pre-fix": "2026-10-10T09:22:26.005828+00:00",
+      "b5bf6d3-baseline": "2026-10-10T10:06:29.032039+00:00",
+      "b5bf6d3-soak": "2026-10-10T10:10:08.246199+00:00",
+      "current-baseline": "2026-10-10T10:38:34.904725+00:00",
+      "current-soak": "2026-10-10T10:41:14.777951+00:00"
+    }
+  }
+}

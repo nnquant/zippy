@@ -407,14 +407,32 @@ impl PartitionHandle {
 
     /// Release one retired segment after the owner has decided it is no longer readable.
     pub fn release_retired_segment(&self, segment_id: u64, generation: u64) -> bool {
+        self.release_retired_segment_deferred(segment_id, generation)
+            .is_some()
+    }
+
+    /// Remove a retired segment while deferring resource teardown to the returned owner.
+    ///
+    /// :param segment_id: Retired segment identity.
+    /// :param generation: Expected segment generation.
+    /// :returns: Resources to drop after the caller releases its publication lock, if found.
+    #[doc(hidden)]
+    pub fn release_retired_segment_deferred(
+        &self,
+        segment_id: u64,
+        generation: u64,
+    ) -> Option<RetiredSegmentRelease> {
         let mut state = self.inner.state.lock().unwrap();
-        let Some(retained) = state.retired_segments.get(&segment_id) else {
-            return false;
-        };
+        let retained = state.retired_segments.get(&segment_id)?;
         if retained.generation != generation {
-            return false;
+            return None;
         }
-        state.retired_segments.remove(&segment_id).is_some()
+        state
+            .retired_segments
+            .remove(&segment_id)
+            .map(|retained| RetiredSegmentRelease {
+                _retained: retained,
+            })
     }
 
     fn collect_garbage(&self, store: &SegmentStore) {
@@ -453,6 +471,16 @@ struct RetainedSegment {
     generation: u64,
     _sealed: SealedSegmentHandle,
     _shm_region: ShmRegion,
+}
+
+/// Owns retired segment resources until a publication critical section has ended.
+///
+/// Dropping this guard may unmap memory, close a file, and unlink its backing path.
+#[doc(hidden)]
+#[must_use = "drop retired resources after releasing the publication lock"]
+#[derive(Debug)]
+pub struct RetiredSegmentRelease {
+    _retained: RetainedSegment,
 }
 
 /// 分区写入句柄。

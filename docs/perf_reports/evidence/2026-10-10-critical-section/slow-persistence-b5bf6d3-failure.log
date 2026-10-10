@@ -1,0 +1,34 @@
+   Compiling zippy-core v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-core)
+   Compiling zippy-catalog v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-catalog)
+   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)
+   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)
+   Compiling zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.53s
+     Running unittests src/lib.rs (target/debug/deps/zippy_ingest-2e8dbdc569a63fee)
+
+running 3 tests
+
+thread 'materializer::tests::checkpoint_slow_persistence_allows_frame_writes' panicked at crates/zippy-ingest/src/materializer/tests.rs:542:5:
+same-table write must complete while checkpoint Catalog persistence is paused kind=[Frame]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test materializer::tests::checkpoint_slow_persistence_allows_frame_writes ... FAILED
+
+thread 'materializer::tests::checkpoint_slow_persistence_allows_append_writes' panicked at crates/zippy-ingest/src/materializer/tests.rs:542:5:
+same-table write must complete while checkpoint Catalog persistence is paused kind=[Append]
+test materializer::tests::checkpoint_slow_persistence_allows_append_writes ... FAILED
+
+thread 'materializer::tests::checkpoint_slow_persistence_allows_key_value_writes' panicked at crates/zippy-ingest/src/materializer/tests.rs:542:5:
+same-table write must complete while checkpoint Catalog persistence is paused kind=[KeyValue]
+test materializer::tests::checkpoint_slow_persistence_allows_key_value_writes ... FAILED
+
+failures:
+
+failures:
+    materializer::tests::checkpoint_slow_persistence_allows_append_writes
+    materializer::tests::checkpoint_slow_persistence_allows_frame_writes
+    materializer::tests::checkpoint_slow_persistence_allows_key_value_writes
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 62 filtered out; finished in 2.08s
+
+error: test failed, to rerun pass `-p zippy-ingest --lib`

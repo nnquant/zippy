@@ -1,0 +1,112 @@
+   Compiling zippy-segment-store v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-segment-store)
+   Compiling zippy-core v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-core)
+   Compiling zippy-catalog v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-catalog)
+   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)
+   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)
+   Compiling zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+warning: unused import: `std::sync::Arc`
+ --> crates/zippy-ingest/src/materializer/prepared_tests.rs:3:5
+  |
+3 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `std::time::Duration`
+ --> crates/zippy-ingest/src/materializer/prepared_tests.rs:4:5
+  |
+4 | use std::time::Duration;
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `arrow::array::Int64Array`
+ --> crates/zippy-ingest/src/materializer/prepared_tests.rs:6:5
+  |
+6 | use arrow::array::Int64Array;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `arrow::record_batch::RecordBatch`
+ --> crates/zippy-ingest/src/materializer/prepared_tests.rs:7:5
+  |
+7 | use arrow::record_batch::RecordBatch;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder`
+ --> crates/zippy-ingest/src/materializer/prepared_tests.rs:8:5
+  |
+8 | use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CatalogRead`, `CatalogSnapshotSelector`, and `CatalogTableSnapshot`
+  --> crates/zippy-ingest/src/materializer/prepared_tests.rs:10:28
+   |
+10 | use zippy_types::catalog::{CatalogRead, CatalogSnapshotSelector, CatalogTableSnapshot};
+   |                            ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `DataFileLocation` and `TableKind`
+  --> crates/zippy-ingest/src/materializer/prepared_tests.rs:11:26
+   |
+11 | use zippy_types::table::{DataFileLocation, TableKind};
+   |                          ^^^^^^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused imports: `LogOffset` and `OffsetWatermark`
+  --> crates/zippy-ingest/src/materializer/prepared_tests.rs:12:19
+   |
+12 | use zippy_types::{LogOffset, OffsetWatermark};
+   |                   ^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `NativeIngestSink`, `NativeIngestTableBootstrap`, `TableActorRegistryConfig`, `TableActorRegistry`, `TableActorSnapshot`, `TableRuntimeBootstrap`, and `TableRuntimeRegistry`
+  --> crates/zippy-ingest/src/materializer/prepared_tests.rs:15:5
+   |
+15 |     NativeIngestSink, NativeIngestTableBootstrap, TableActorRegistry, TableActorRegistryConfig,
+   |     ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^
+16 |     TableActorSnapshot, TableRuntimeBootstrap, TableRuntimeRegistry,
+   |     ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Fixture`, `apply_one`, and `table_id`
+  --> crates/zippy-ingest/src/materializer/prepared_tests.rs:19:20
+   |
+19 | use super::tests::{apply_one, table_id, Fixture};
+   |                    ^^^^^^^^^  ^^^^^^^^  ^^^^^^^
+
+warning: unused imports: `NativeTableMaterializerConfig` and `NativeTableMaterializerSink`
+  --> crates/zippy-ingest/src/materializer/prepared_tests.rs:20:13
+   |
+20 | use super::{NativeTableMaterializerConfig, NativeTableMaterializerSink};
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `zippy-ingest` (lib test) generated 11 warnings (run `cargo fix --lib -p zippy-ingest --tests` to apply 11 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.37s
+     Running unittests src/lib.rs (target/debug/deps/zippy_ingest-b7864db371808802)
+
+running 17 tests
+
+thread 'materializer::tests::checkpoint_persistence_progresses_with_one_blocking_thread' panicked at crates/zippy-ingest/src/materializer/tests.rs:656:35:
+there is no reactor running, must be called from the context of a Tokio 1.x runtime
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test actor::tests::checkpoint_publication::abandoned_prepared_owner_fails_closed_and_reports_the_committed_request ... ok
+test actor::tests::checkpoint_publication::fatal_preparation_preserves_terminal_error_instead_of_creating_an_owner ... ok
+test actor::tests::checkpoint_publication::rejected_preparation_releases_single_flight_and_keeps_original_snapshot ... ok
+test native::tests::schema_checkpoint_requires_covered_watermark_and_strictly_newer_epoch ... ok
+test actor::tests::checkpoint_publication::pending_publication_rejects_persist_epoch_and_retirement_without_losing_receipt ... ok
+test actor::tests::checkpoint_publication::shutdown_keeps_private_publication_available_after_ordinary_admission_closes ... ok
+test materializer::tests::checkpoint_persistence_progresses_with_one_blocking_thread ... FAILED
+test actor::tests::checkpoint_publication::prepared_receipt_keeps_old_snapshot_and_accepts_continuous_live_writes ... ok
+test wal::tests::checkpoint_recovery_skips_leftover_prefix_and_validates_the_tail_anchor ... ok
+test native::tests::consumer_checkpoint_persists_prior_epoch_before_new_writer_first_batch ... ok
+test checkpoint::tests::archive_conflicts_are_atomic_and_checkpoint_survives_reopen ... ok
+test materializer::tests::checkpoint_publication_interleaving_key_value ... ok
+test materializer::tests::checkpoint_slow_persistence_allows_append_writes ... ok
+test materializer::tests::checkpoint_slow_persistence_allows_key_value_writes ... ok
+test materializer::tests::checkpoint_slow_persistence_allows_frame_writes ... ok
+test materializer::tests::checkpoint_publication_interleaving_frame ... ok
+test materializer::tests::checkpoint_publication_interleaving_append ... ok
+
+failures:
+
+failures:
+    materializer::tests::checkpoint_persistence_progresses_with_one_blocking_thread
+
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p zippy-ingest --lib`

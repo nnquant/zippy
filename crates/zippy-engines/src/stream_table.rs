@@ -9,8 +9,9 @@ use arrow::{
 use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, ZippyError};
 use zippy_segment_store::{
     compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, PartitionColumnWriter,
-    PartitionHandle, PartitionRowWriter, PartitionWriterHandle, ReaderSession, RowSpanView,
-    SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
+    PartitionHandle, PartitionRowWriter, PartitionWriterHandle, ReaderSession,
+    RetiredSegmentRelease, RowSpanView, SegmentLease, SegmentStore, SegmentStoreConfig,
+    ZippySegmentStoreError,
 };
 
 const STREAM_TABLE_PARTITION: &str = "all";
@@ -36,10 +37,22 @@ pub struct StreamTableLiveSegment {
     sealed: bool,
 }
 
+#[derive(Debug)]
 struct RetainedSegmentDescriptor {
     envelope: serde_json::Value,
     // Sealed prefixes are immutable; the cache is dropped with the retained descriptor.
     append_segment: OnceLock<StreamTableLiveSegment>,
+}
+
+/// Owns retired descriptors and mappings until the publication lock has been released.
+///
+/// Dropping this guard may unmap memory, close files, and unlink their backing paths.
+#[doc(hidden)]
+#[must_use = "drop retired resources after releasing the publication lock"]
+#[derive(Debug, Default)]
+pub struct StreamTableRetiredSegments {
+    _descriptors: Vec<RetainedSegmentDescriptor>,
+    _segments: Vec<RetiredSegmentRelease>,
 }
 
 impl From<serde_json::Value> for RetainedSegmentDescriptor {
@@ -288,23 +301,72 @@ impl StreamTableMaterializer {
     /// :returns: Rows actually retired; pinned segments can stop reclamation early.
     /// :raises ZippyError: Descriptor validation failure.
     pub fn retire_persisted_prefix(&mut self, max_rows: usize) -> Result<usize> {
-        let segments = self.live_segments()?;
+        // Preserve descriptor validation and support callers that have not published yet.
+        self.live_segments()?;
+        let (rows, retired) = self.retire_persisted_prefix_deferred(max_rows)?;
+        drop(retired);
+        Ok(rows)
+    }
+
+    /// Retires a published durable prefix without attaching or destroying mappings.
+    ///
+    /// The caller must first populate immutable descriptor caches with `live_segments`.
+    /// All fallible validation precedes mutation so errors cannot destroy retired resources
+    /// while the caller still holds its publication lock.
+    ///
+    /// :param max_rows: Prefix rows already covered by the authoritative manifest.
+    /// :returns: Retired row count and resources to drop after releasing the publication lock.
+    /// :raises ZippyError: A retained descriptor has not been published and cached.
+    #[doc(hidden)]
+    pub fn retire_persisted_prefix_deferred(
+        &mut self,
+        max_rows: usize,
+    ) -> Result<(usize, StreamTableRetiredSegments)> {
+        let segments = self
+            .sealed_segment_descriptors
+            .iter()
+            .map(|retained| {
+                let segment = retained
+                    .append_segment
+                    .get()
+                    .ok_or(ZippyError::InvalidState {
+                        status: "retained append descriptor is not cached before retirement",
+                    })?;
+                Ok((
+                    segment.row_count,
+                    descriptor_segment_identity(&retained.envelope),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut rows = 0_usize;
-        let mut count = 0;
-        for segment in &segments {
-            if !segment.sealed || segment.row_count > max_rows - rows {
+        let mut retired = StreamTableRetiredSegments::default();
+        for (row_count, identity) in segments {
+            if row_count > max_rows - rows {
                 break;
             }
-            rows += segment.row_count;
-            count += 1;
+            let Some((segment_id, generation)) = identity else {
+                break;
+            };
+            if self
+                .store
+                .pin_count_for_segment(&self.partition, segment_id, generation)
+                > 0
+            {
+                break;
+            }
+            retired
+                ._descriptors
+                .push(self.sealed_segment_descriptors.pop_front().unwrap());
+            if let Some(segment) = self
+                .partition
+                .release_retired_segment_deferred(segment_id, generation)
+            {
+                retired._segments.push(segment);
+            }
+            rows += row_count;
         }
-        let before = self.sealed_segment_descriptors.len();
-        self.trim_durable_retained_segments(before - count);
-        let removed = before - self.sealed_segment_descriptors.len();
-        Ok(segments[..removed]
-            .iter()
-            .map(|segment| segment.row_count)
-            .sum())
+        Ok((rows, retired))
     }
 
     /// Seals a non-empty prefix before ownership moves to another writer epoch.
@@ -662,26 +724,6 @@ impl StreamTableMaterializer {
             reason: error.to_string(),
         })
     }
-
-    fn trim_durable_retained_segments(&mut self, retention_segments: usize) {
-        while self.sealed_segment_descriptors.len() > retention_segments {
-            let Some(identity) = descriptor_segment_identity(
-                &self.sealed_segment_descriptors.front().unwrap().envelope,
-            ) else {
-                break;
-            };
-            if self
-                .store
-                .pin_count_for_segment(&self.partition, identity.0, identity.1)
-                > 0
-            {
-                break;
-            }
-            self.sealed_segment_descriptors.pop_front();
-            self.partition
-                .release_retired_segment(identity.0, identity.1);
-        }
-    }
 }
 
 fn descriptor_segment_identity(descriptor: &serde_json::Value) -> Option<SegmentIdentity> {
@@ -771,7 +813,111 @@ mod native_materializer_tests {
     use super::{Arc, ArrayRef, DataType, Engine, Int64Array, RecordBatch, SegmentTableView};
     use arrow::datatypes::{Field, Schema};
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
     use std::time::Instant;
+
+    fn retention_materializer() -> (StreamTableMaterializer, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..5)) as ArrayRef],
+        )
+        .unwrap();
+        (
+            StreamTableMaterializer::new_with_row_capacity("deferred_retention", schema, 2)
+                .unwrap(),
+            batch,
+        )
+    }
+
+    #[test]
+    fn deferred_retirement_waits_for_pins_and_keeps_resources_until_guard_drop() {
+        let (mut materializer, batch) = retention_materializer();
+        let descriptor = materializer.partition.active_descriptor();
+        let path = PathBuf::from(descriptor.shm_os_id().strip_prefix("file:").unwrap());
+        let lease = materializer.pin_active_segment_for_test().unwrap();
+        materializer
+            .on_data(SegmentTableView::from_record_batch(batch))
+            .unwrap();
+        materializer.live_segments().unwrap();
+
+        let identity = descriptor_segment_identity(
+            &materializer
+                .sealed_segment_descriptors
+                .front()
+                .unwrap()
+                .envelope,
+        )
+        .unwrap();
+        assert!(materializer
+            .partition
+            .release_retired_segment_deferred(identity.0, identity.1 + 1)
+            .is_none());
+        assert!(materializer
+            .partition
+            .release_retired_segment_deferred(u64::MAX, identity.1)
+            .is_none());
+        assert_eq!(
+            materializer.retire_persisted_prefix_deferred(4).unwrap().0,
+            0
+        );
+        assert_eq!(materializer.live_segment_count().unwrap(), 3);
+        drop(lease);
+        for rows in [0, 1] {
+            assert_eq!(
+                materializer
+                    .retire_persisted_prefix_deferred(rows)
+                    .unwrap()
+                    .0,
+                0
+            );
+        }
+
+        let (rows, retired) = materializer.retire_persisted_prefix_deferred(3).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(materializer.live_segment_count().unwrap(), 2);
+        assert!(path.exists());
+        let reader =
+            zippy_segment_store::RowSpanView::from_active_descriptor(descriptor, 0, 2).unwrap();
+        assert_eq!(
+            reader.active_segment_committed_row_count().unwrap(),
+            Some(2)
+        );
+        drop(reader);
+        drop(retired);
+        assert!(!path.exists());
+        assert_eq!(
+            materializer.retire_persisted_prefix_deferred(2).unwrap().0,
+            2
+        );
+        assert_eq!(materializer.active_record_batch().unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn deferred_retirement_validates_all_caches_before_removing_any_segment() {
+        let (mut materializer, batch) = retention_materializer();
+        let descriptor = materializer.partition.active_descriptor();
+        let path = PathBuf::from(descriptor.shm_os_id().strip_prefix("file:").unwrap());
+        materializer
+            .on_data(SegmentTableView::from_record_batch(batch))
+            .unwrap();
+        materializer.live_segments().unwrap();
+        // A later uncached descriptor must not let an earlier prefix be released on error.
+        materializer
+            .sealed_segment_descriptors
+            .back_mut()
+            .unwrap()
+            .append_segment
+            .take();
+
+        assert!(materializer.retire_persisted_prefix_deferred(4).is_err());
+        assert_eq!(materializer.live_segment_count().unwrap(), 3);
+        assert!(path.exists());
+        // The existing public method still accepts a cold cache and releases immediately.
+        assert_eq!(materializer.retire_persisted_prefix(4).unwrap(), 4);
+        assert_eq!(materializer.live_segment_count().unwrap(), 1);
+        assert!(!path.exists());
+    }
 
     #[test]
     #[ignore = "manual release benchmark for retained append descriptor publication"]

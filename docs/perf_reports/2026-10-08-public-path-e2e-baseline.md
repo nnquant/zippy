@@ -454,3 +454,434 @@ CI 短版 visible p99=1576.935µs ≤3000µs，但 p50=1142.435µs >1000µs，�
   本次不通过改批量/并发口径伪装目标吞吐已经达到。
 - CI 是否移除 `continue-on-error` 依据本次完整门限结果，见上方决策；所有原有门限不放宽。
 - 四格、浸泡、检查命令的实际失败或运行限制均以上表为准，不用历史结果替代本次验收。
+
+## 临界区缩小（阶段 1.6，2026-10-10）
+
+本节追加记录阶段 1.5 正确性修复之后的临界区缩小，不改写前文历史结果。阶段 1.5 用同一把 materializer state 锁覆盖 Actor 持久水位推进与本地前缀回收，消除了两套边界交错的问题，但该锁也覆盖了持久化等待。阶段 1.6 保留边界切换的互斥关系，把 Parquet/Catalog 持久提交放到锁外；Catalog 已提交而 Actor 尚未推进时，查询继续使用旧 Actor 指定的 Catalog 版本与旧 live 前缀。性能结果及运行命令由本节后续表格单独记录，以下论证不以延迟指标代替正确性证据。
+
+### 两阶段实现与锁的准确范围
+
+checkpoint 内部现在分成两个阶段：
+
+1. **完成持久提交，暂不切换查询可见性。** `persist_checkpoint_prefix` 在独立异步 owner 中调用内部 `prepare_persist`；此时没有取得 materializer state 锁，也不占用一个 blocking worker 等待另一个 blocking worker 完成文件工作。Actor 仍调用原 receipt 校验，成功后把 receipt、Advance/Replay disposition、单表 permit 和全局 permit 留在新增的私有 `Prepared` 状态。外部既有 `TablePersistenceStatus` 仍映射为 `InFlight`，没有新增公开状态枚举项。证据：`crates/zippy-ingest/src/materializer.rs:616`、`crates/zippy-ingest/src/materializer.rs:618`、`crates/zippy-ingest/src/actor.rs:681`、`crates/zippy-ingest/src/actor.rs:2151`、`crates/zippy-ingest/src/actor.rs:2177`、`crates/zippy-ingest/src/actor.rs:1575`。
+
+2. **在短临界区内切换可见边界并移交回收资源。** 持久准备完成后，blocking worker 取得 materializer state 锁，通过预留 oneshot 通道请求 Actor 推进 snapshot；随后更新 materializer 持久水位、移除完整持久前缀、更新行数与字节预算，再解锁。锁内同步等待的是一次内存 Actor 发布操作，不再等待 Parquet/Catalog 提交。证据：`crates/zippy-ingest/src/materializer.rs:628`、`crates/zippy-ingest/src/materializer.rs:632`、`crates/zippy-ingest/src/materializer.rs:636`、`crates/zippy-ingest/src/materializer.rs:643`、`crates/zippy-ingest/src/materializer.rs:651`、`crates/zippy-ingest/src/actor.rs:365`、`crates/zippy-ingest/src/actor.rs:2245`。
+
+真正切换 Actor snapshot 时仍发出既有 changes 通知；仅持久准备完成不会提前通知 snapshot 已推进。公开 `try_persist`/`persist` 保留原完成语义，仅 materializer 使用 crate 内部两阶段入口。证据：`crates/zippy-ingest/src/actor.rs:1740`、`crates/zippy-ingest/src/actor.rs:623`、`crates/zippy-ingest/src/actor.rs:675`、`crates/zippy-ingest/src/actor.rs:2175`、`crates/zippy-ingest/src/actor.rs:2189`。
+
+### Catalog 领先于 Actor 时，查询为什么不会重复读前缀
+
+查询首先取得 Actor 边界，然后把 **Actor 的 persisted_snapshot_version** 放入 Catalog selector；它没有把 Catalog 当前最新文件集合直接拼到旧 live 集合上。Catalog selector 允许选择历史版本，文件 SQL 按 `added_snapshot_version <= selected` 与 `removed_snapshot_version > selected` 或尚未移除过滤。因此 Prepared 期间新增文件虽然已在 Catalog 最新版本中，旧 Actor 对应的 selector 不会把它加入持久文件集。证据：`crates/zippy-server/src/query_snapshot.rs:923`、`crates/zippy-server/src/query_snapshot.rs:929`、`crates/zippy-server/src/query_snapshot.rs:931`、`crates/zippy-server/src/query_snapshot.rs:942`、`crates/zippy-catalog/src/snapshot_domain.rs:705`、`crates/zippy-catalog/src/snapshot_domain.rs:69`。
+
+查询校验允许 Catalog 当前 snapshot 领先于 Actor，但不允许 Catalog 落后、writer epoch 不一致；完成 pin 后还会再次核验 selector 等于 Actor 观察值，以及所选 snapshot 的 committed_log_offset 等于 Actor 持久水位。证据：`crates/zippy-server/src/query_snapshot.rs:1696`、`crates/zippy-server/src/query_snapshot.rs:1698`、`crates/zippy-server/src/query_snapshot.rs:1008`、`crates/zippy-server/src/query_snapshot.rs:1020`。
+
+最终发布只对 Actor 已安装、已校验的 live spans 按新持久水位裁剪。`RowSpanView::slice_rows` 检查相对行界限并克隆既有 backing，底层共享内存是 `Arc<ShmRegion>`；这里不重新打开 descriptor 文件。旧 live Arc 被移入 publication guard，已取得的查询 span 也继续持有自己的映射。证据：`crates/zippy-ingest/src/actor.rs:1269`、`crates/zippy-ingest/src/actor.rs:1312`、`crates/zippy-ingest/src/actor.rs:2249`、`crates/zippy-ingest/src/actor.rs:2250`、`crates/zippy-segment-store/src/view.rs:31`、`crates/zippy-segment-store/src/view.rs:219`。
+
+这里的历史快照安全有明确范围：Actor 存活本身不等于持有 Catalog GC pin。查询 pin 在 Catalog 查询接口中取得；普通 checkpoint 的 CommitDataFiles 只插入 snapshot/输出文件并推进表版本，不把旧文件标记为 removed，GC 只选择已标记移除的 managed 文件。因此本次普通 checkpoint 的 Prepared 窗口不会单独使旧文件成为 GC 候选；不能据此推广成“任意并发 Catalog compaction/drop 下，旧 Actor 自然保护所有历史文件”。证据：`crates/zippy-catalog/src/service.rs:764`、`crates/zippy-catalog/src/manifest_domain.rs:940`、`crates/zippy-catalog/src/manifest_domain.rs:951`、`crates/zippy-catalog/src/manifest_domain.rs:957`、`crates/zippy-catalog/src/gc_domain.rs:255`、`crates/zippy-catalog/src/gc_domain.rs:257`。
+
+### 回收不能把文件析构藏在锁内
+
+仅把显式持久化 await 移出锁还不够：旧 segment 最后一个 owner 的析构会解除映射、关闭文件，owner 还会删除 backing path。证据：`crates/zippy-segment-store/src/shm.rs:562`、`crates/zippy-segment-store/src/shm.rs:567`、`crates/zippy-segment-store/src/shm.rs:584`、`crates/zippy-segment-store/src/shm.rs:586`。
+
+因此这次同时把三类资源移到锁外释放：
+
+- **retired segment owner 与 descriptor。** `retire_persisted_prefix_deferred` 先检查所有 sealed descriptor 已有缓存，然后只按缓存行数、完整段边界与 pin 条件移除拥有者。底层 partition 只从 retired map 中 move 出资源，不在锁内销毁。缓存缺失会在任何移除之前返回错误，避免“前段已经移出、后段失败”导致局部 guard 在调用者锁内析构。证据：`crates/zippy-engines/src/stream_table.rs:321`、`crates/zippy-engines/src/stream_table.rs:325`、`crates/zippy-engines/src/stream_table.rs:344`、`crates/zippy-engines/src/stream_table.rs:351`、`crates/zippy-engines/src/stream_table.rs:358`、`crates/zippy-segment-store/src/catalog.rs:420`、`crates/zippy-segment-store/src/catalog.rs:430`。
+- **已经没有 live 数据的旧 epoch materializer。** 从 epochs 中移出后先存入 retired_epochs，空 active segment 等仍由它持有的资源也到解锁后才析构。证据：`crates/zippy-ingest/src/materializer.rs:711`、`crates/zippy-ingest/src/materializer.rs:720`、`crates/zippy-ingest/src/materializer.rs:655`。
+- **Actor 发布前的旧 live Arc。** 快发布把旧 Arc 和两个 permit 一起交回 materializer；permit 因而继续排除另一次 persist 与表退休，直到本地回收完成。证据：`crates/zippy-ingest/src/actor.rs:357`、`crates/zippy-ingest/src/actor.rs:2250`、`crates/zippy-ingest/src/actor.rs:2253`、`crates/zippy-ingest/src/materializer.rs:656`。
+
+materializer 把可失败的收尾工作放在内部结果闭包中，随后显式先 `drop(state)`，再 drop 三类资源；跨 epoch 回收若后续返回普通错误，之前收集的资源也在解锁后释放。回收结尾不再重新 `build_publication → reopen descriptor → install`；Actor 已按水位裁剪 live 集合，下一次正常 apply 仍执行原完整 publication 校验。证据：`crates/zippy-ingest/src/materializer.rs:633`、`crates/zippy-ingest/src/materializer.rs:651`、`crates/zippy-ingest/src/materializer.rs:654`、`crates/zippy-ingest/src/materializer.rs:675`、`crates/zippy-ingest/src/materializer.rs:722`、`crates/zippy-ingest/src/materializer.rs:491`、`crates/zippy-ingest/src/actor.rs:1341`。
+
+### 其他 persist、schema/drop、关闭与取消
+
+| 边界 | 当前行为及证据 |
+| --- | --- |
+| 另一次 persist | admission 在进入 mailbox 前占单表 permit 和全局预算。Prepared 保留它们，快发布后交给 materializer guard；回收完成前第二个 persist 仍按既有 ResourceExhausted 拒绝。`crates/zippy-ingest/src/actor.rs:643`、`crates/zippy-ingest/src/actor.rs:646`、`crates/zippy-ingest/src/actor.rs:2181`、`crates/zippy-ingest/src/actor.rs:2254`、`crates/zippy-ingest/src/materializer.rs:656`。 |
+| schema 变更 | Native transition 先取得 open_gate；schema 路径先完成 ingest checkpoint，再取得 Actor retirement guard，之后才提交 Catalog schema 命令。Actor retirement 也必须取得同一单表 permit。`crates/zippy-ingest/src/native.rs:753`、`crates/zippy-server/src/table_admin.rs:295`、`crates/zippy-server/src/table_admin.rs:296`、`crates/zippy-server/src/table_admin.rs:297`、`crates/zippy-server/src/table_admin.rs:298`、`crates/zippy-ingest/src/actor.rs:813`。 |
+| drop | drop 同样先建立 Native transition，再准备 Actor retirement，然后才提交 Catalog 命令和移除运行时。已有 checkpoint 占 gate 或 permit 时不会穿过该窗口。`crates/zippy-server/src/table_admin.rs:143`、`crates/zippy-server/src/table_admin.rs:149`、`crates/zippy-server/src/table_admin.rs:153`、`crates/zippy-ingest/src/native.rs:753`。 |
+| 正常 Native fencing | open writer 与 checkpoint 共用 open_gate；正常公开 fencing 不会在未结束的 checkpoint 中途切换 epoch。Actor 另对内部 staged InFlight/Prepared 拒绝 raw epoch 更新。`crates/zippy-ingest/src/native.rs:1268`、`crates/zippy-ingest/src/native.rs:2353`、`crates/zippy-ingest/src/actor.rs:1905`。 |
+| Actor 关闭 | 普通 mailbox 关闭不会丢弃已接受操作的 continuation。Prepared 对应的 publication receiver 仍属于 completion；退出条件要求 mailbox_closed 且 completion 为空。快发布用预留 oneshot，不需要重新通过已关闭的 admission。`crates/zippy-ingest/src/actor.rs:685`、`crates/zippy-ingest/src/actor.rs:2185`、`crates/zippy-ingest/src/actor.rs:1716`、`crates/zippy-ingest/src/actor.rs:1749`、`crates/zippy-ingest/src/actor.rs:365`。 |
+| 整体服务 shutdown | 先等 Native ingest/checkpoint 完整 drain，再关闭 Actor admission；后续依次 drain Actor、persistence，最后关闭 Catalog。不能只用“Actor 发布消息已完成”替代整个 checkpoint job 的结束。`crates/zippy-server/src/native_storage.rs:844`、`crates/zippy-server/src/native_storage.rs:849`、`crates/zippy-server/src/native_storage.rs:1495`、`crates/zippy-server/src/native_storage.rs:1499`、`crates/zippy-server/src/native_storage.rs:1503`。 |
+| 调用者取消 | 公共 checkpoint 的独立任务持 operation permit 和 open_gate；materializer 内部另有独立 owner 持 prepared token，并把收尾交给 blocking worker。丢弃外部 waiter 不会取消已接纳的持久操作或遗漏本地回收。`crates/zippy-ingest/src/native.rs:810`、`crates/zippy-ingest/src/native.rs:813`、`crates/zippy-ingest/src/native.rs:816`、`crates/zippy-ingest/src/materializer.rs:616`、`crates/zippy-ingest/src/materializer.rs:628`。 |
+
+需要精确区分 **Actor 已发布** 和 **materializer 已完成回收**：快发布会把 Actor 内部状态恢复为 Idle，permit 此时仍在 materializer guard 中。因此这段时间内另一次 persist、schema/drop 仍受 permit 阻止，但 raw `TableActorHandle::update_writer_epoch` 的状态检查已经不再命中 Prepared，可能成功。正常 Native fencing 仍由上述 open_gate 和 state mutex 排除；本次没有把 raw Actor epoch 接口改成“直到 guard 析构都拒绝”。不能把更强的 raw Actor 排他语义写成本次保证。证据：`crates/zippy-ingest/src/actor.rs:2227`、`crates/zippy-ingest/src/actor.rs:1905`、`crates/zippy-ingest/src/actor.rs:1915`、`crates/zippy-ingest/src/materializer.rs:651`、`crates/zippy-ingest/src/materializer.rs:656`。
+
+### 失败与恢复
+
+普通持久提交 rejection 保留旧 snapshot 并释放预算；fatal 或无效 receipt 继续走已有 terminal failure。request/table identity、parent、snapshot version、operation、commit LSN 和 watermark 校验仍在原校验函数中，未因拆阶段被删除。Prepared 私有 owner 异常丢失时不会自动在无 materializer 锁的情况下发布，而是关闭 admission 并报告失败。证据：`crates/zippy-ingest/src/actor.rs:2197`、`crates/zippy-ingest/src/actor.rs:2203`、`crates/zippy-ingest/src/actor.rs:2261`、`crates/zippy-ingest/src/actor.rs:2233`。
+
+durable 已成功后若 finalization/reclaim 返回错误，Catalog 提交不能回滚；正常 Native checkpoint 路径把非可重试 ResourceExhausted 错误记录为表 terminal error。代码没有承诺跨 Catalog、Actor、segment 的事务回滚，也没有把独立 apply publication 失败后可能遗留的物理行问题扩展宣称为已修复。证据：`crates/zippy-ingest/src/native.rs:2360`、`crates/zippy-ingest/src/native.rs:2366`、`crates/zippy-ingest/src/materializer.rs:636`、`crates/zippy-ingest/src/materializer.rs:644`。
+
+如果进程恰在 Catalog 已提交、Actor 尚未发布时退出，重启以 Catalog bootstrap 构建 runtime 与 Native bootstrap；恢复 visible_watermark 从 Catalog persisted_log_offset 开始。WAL 恢复跳过完全被该水位覆盖的原子 mutation，仅重放后缀；如果持久水位切开一个原子 mutation，仍按既有 DataCorruption 拒绝。证据：`crates/zippy-server/src/native_storage.rs:1130`、`crates/zippy-server/src/native_storage.rs:1148`、`crates/zippy-ingest/src/actor.rs:1239`、`crates/zippy-ingest/src/native.rs:2218`、`crates/zippy-ingest/src/native.rs:2242`、`crates/zippy-ingest/src/native.rs:2263`、`crates/zippy-ingest/src/native.rs:2597`、`crates/zippy-ingest/src/native.rs:2598`。
+
+WAL archive checkpoint 提交和文件回收仍在完整 materializer job 返回之后，不能因 prepare receipt 已可用而提前执行。证据：`crates/zippy-ingest/src/native.rs:2492`、`crates/zippy-ingest/src/native.rs:2514`、`crates/zippy-ingest/src/native.rs:2515`。
+
+### 保留的 I/O 边界与接口披露
+
+“锁内不做文件 I/O”限定于本次改造的 **持久准备完成后的 finalization 临界区**。原 `prepare_checkpoint` 仍在 state 锁内 seal/rollover 活跃段并进行普通 publication；rollover 分配新映射文件，普通 publication 会 attach descriptor。普通 apply 的物化与发布也仍在其原临界区内。此阶段没有重构这些已有路径，不能写成“全部 materializer 临界区已无 I/O”。证据：`crates/zippy-ingest/src/materializer.rs:270`、`crates/zippy-ingest/src/materializer.rs:279`、`crates/zippy-ingest/src/materializer.rs:284`、`crates/zippy-segment-store/src/catalog.rs:1230`、`crates/zippy-segment-store/src/builder.rs:186`、`crates/zippy-segment-store/src/shm.rs:71`、`crates/zippy-ingest/src/materializer.rs:353`、`crates/zippy-ingest/src/materializer.rs:491`、`crates/zippy-ingest/src/actor.rs:1479`。
+
+客户端 API、wire 协议、磁盘格式、原有 Rust 方法签名及公开状态枚举保持不变。Actor 两阶段入口与 token 使用 `pub(crate)`。为了在 engines、segment-store、ingest 三个 crate 之间移交资源所有权，新增了两个 `#[doc(hidden)]` helper 方法和两个 guard 类型；**它们技术上仍是 Rust `pub`，doc(hidden) 不等于私有**。这是隐藏实现接口的增量，不能表述为“完全没有新增 Rust 公开表面”。证据：`crates/zippy-ingest/src/actor.rs:351`、`crates/zippy-ingest/src/actor.rs:681`、`crates/zippy-engines/src/stream_table.rs:50`、`crates/zippy-engines/src/stream_table.rs:321`、`crates/zippy-segment-store/src/catalog.rs:419`、`crates/zippy-segment-store/src/catalog.rs:482`、`crates/zippy-engines/src/lib.rs:23`、`crates/zippy-segment-store/src/lib.rs:19`。
+
+原 `retire_persisted_prefix` 先调用原 `live_segments()` 做校验并填缓存，再使用新 helper 并立即释放 guard；原 `release_retired_segment` 也仍在返回前释放资源，所以既有调用者不需要改变生命周期管理。新 helper 才要求 caller 已填好缓存并在解锁后 drop 返回资源。证据：`crates/zippy-engines/src/stream_table.rs:303`、`crates/zippy-engines/src/stream_table.rs:305`、`crates/zippy-engines/src/stream_table.rs:307`、`crates/zippy-segment-store/src/catalog.rs:409`。
+
+### 当前验证证据及其限度
+
+`docs/perf_reports/evidence/2026-10-10-critical-section/checkpoint-fixed.log:86` 记录 zippy-ingest 本次测试结果为 **73 passed、0 failed、2 ignored**。其中包含：append/frame/key-value 的既有 publication 交错回归；三个表类型在 Catalog 持久提交暂停时继续写入；单 blocking worker 不被嵌套持久化等待耗尽；Prepared 期间其他 persist、epoch 更新及 retirement 的拒绝；关闭 admission 后完成预留发布；私有 owner 丢失、rejection 与 fatal 分支。该数字是这份日志的测试范围，不是所有 crate 的累计测试总数。
+
+新增真实 Catalog Prepared 测试覆盖三个表类型：提交新 snapshot 后暂停可见发布，验证旧 Actor selector 的持久文件与 live 行合并不缺不重；测试还故意把 Catalog 最新版本与旧 Actor live 混合，确认会产生重复，从反面验证 selector 约束的必要性。随后从该真实 Catalog 状态新建 runtime、Actor 和 materializer，验证恢复采用新水位，再显式应用未持久后缀。证据：`crates/zippy-ingest/src/materializer/prepared_tests.rs:85`、`crates/zippy-ingest/src/materializer/prepared_tests.rs:140`、`crates/zippy-ingest/src/materializer/prepared_tests.rs:178`、`crates/zippy-ingest/src/materializer/prepared_tests.rs:181`、`crates/zippy-ingest/src/materializer/prepared_tests.rs:195`、`crates/zippy-ingest/src/materializer/prepared_tests.rs:245`。
+
+上述恢复测试是从真实 Catalog 中间状态重建运行时的确定性测试，**没有杀死独立 server 进程并执行完整 WAL 重放**；WAL 跳过持久前缀的结论由生产代码与已有 WAL recovery 回归共同支持。延迟析构单元测试另外验证了 reader pin、零/部分段预算、generation/id 不匹配、guard 存活时文件仍可 attach、guard 释放后 unlink，以及后段缓存缺失不会提前释放前段。证据：`crates/zippy-engines/src/stream_table.rs:834`、`crates/zippy-engines/src/stream_table.rs:897`、`docs/perf_reports/evidence/2026-10-10-critical-section/checkpoint-fixed.log:45`。
+
+当前独立源码审查没有发现正常公开 checkpoint 路径新增的数据一致性阻塞问题。这个结论限定于上述实现和验证范围，不扩大为所有崩溃点、任意内部 API 交错、所有 apply 失败路径或任意并发 Catalog 管理操作均已被端到端验证。
+
+### 四格基准对比
+
+本次四格均完成 20,000 个计量样本，完整性无缺口、重复或乱序。相对 b5bf6d3 收录的历史基线，四格 visible p99.9 均下降；按本节采用的修复前 >10ms 频次目标，前三格未通过，只有 wal / 背景 100,000 通过。不能以改善幅度替代该门限，也不能把截断历史观测当作稳定 SLA。
+
+所有时长单位均明确标注。延迟为 nearest-rank；单格样本少于 10,000 时 p99.9 记为 null。各列均直接来自指定原始 JSON 并与其对应摘要及重算统计核对一致，没有修改历史数据。
+
+#### 身份与观测范围
+
+“b5bf6d3”表示该提交收录的历史证据；这些数据实际 metadata 为 `7c6b6a9784336827c7239a872e50bccfda15d501` 且 `git_dirty=true`，不能称为 clean b5bf6d3 的实测。本次 metadata 为 `b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e` 且 `git_dirty=true`。pre-fix 为 `ff0f95055c0e16df64b1b3c455f3b53755c8dbc6` 且 dirty。
+
+三列均为 WSL2（5.15.153.1-microsoft-standard-WSL2），AMD Ryzen 9 9950X、32 逻辑核、affinity 0–31，Python 3.11.14 / PyArrow 23.0.1 / zippy 0.5.0 / zippy-client 0.1.0。前景目标 1,000 行/秒、一次一行且只有一个 outstanding write；背景目标 100,000 行/秒按 1,000 行一批写另一张表。预热至少 2 秒且至少剔除前 1,000 行。
+
+| 路径 / 背景目标行每秒 | pre-fix：样本 / visible 暴露秒 / 完成性 | b5 历史：样本 / 暴露秒 | 本次：样本 / 暴露秒 |
+| --- | --- | --- | --- |
+| memory / 0 | 597 / 0.597607 / 失败截断 | 20,000 / 20.000234 | 20,000 / 20.000420 |
+| memory / 100,000 | 5,870 / 5.887585 / 失败截断 | 20,000 / 20.000467 | 20,000 / 20.000141 |
+| wal / 0 | 16,209 / 38.417625 / 失败截断 | 20,000 / 43.024357 | 20,000 / 41.918054 |
+| wal / 100,000 | 20,000 / 44.608603 / 完整 | 20,000 / 43.606683 | 20,000 / 42.950467 |
+
+暴露窗口严格取首个计量样本实际 sent_ns 至最后一个计量样本 received_ns；不使用“样本数÷目标速率”。WAL 同步确认使实际前景速率低于目标，因而两格的真实计量暴露约 42–45 秒。pre-fix 前三格失败截断；虽然已收到的序列没有缺口，其运行仍不完整。
+
+#### visible 延迟（µs）
+
+| 路径 / 背景目标行每秒 | pre-fix：p50 / p99 / p99.9 / max | b5 历史：p50 / p99 / p99.9 / max | 本次：p50 / p99 / p99.9 / max |
+| --- | --- | --- | --- |
+| memory / 0 | 1,198.608 / 1,623.041 / null / 5,354.688 | 1,291.368 / 2,039.929 / 10,156.880 / 15,663.592 | 1,235.225 / 1,748.249 / 6,157.364 / 14,533.116 |
+| memory / 100,000 | 1,284.721 / 2,177.713 / null / 12,526.676 | 1,266.270 / 1,792.898 / 10,379.701 / 18,161.960 | 1,250.600 / 1,956.124 / 8,475.353 / 16,042.638 |
+| wal / 0 | 1,506.708 / 2,943.924 / 5,174.738 / 17,777.358 | 1,380.531 / 2,390.524 / 9,404.951 / 13,836.502 | 1,332.277 / 2,321.517 / 5,178.351 / 14,788.946 |
+| wal / 100,000 | 1,434.116 / 2,140.156 / 5,605.399 / 18,142.310 | 1,366.840 / 2,428.947 / 10,070.166 / 14,048.511 | 1,349.946 / 2,235.049 / 5,235.842 / 12,153.181 |
+
+#### ack 延迟（µs）
+
+| 路径 / 背景目标行每秒 | pre-fix：p50 / p99 / p99.9 / max | b5 历史：p50 / p99 / p99.9 / max | 本次：p50 / p99 / p99.9 / max |
+| --- | --- | --- | --- |
+| memory / 0 | 749.140 / 1,070.345 / null / 4,987.368 | 793.202 / 1,333.606 / 9,496.564 / 15,021.962 | 766.404 / 1,102.931 / 5,534.270 / 14,051.882 |
+| memory / 100,000 | 805.133 / 1,397.089 / null / 11,779.930 | 764.595 / 1,096.021 / 9,520.726 / 17,327.426 | 765.001 / 1,220.421 / 7,745.233 / 15,416.948 |
+| wal / 0 | 2,250.871 / 4,754.791 / 10,800.811 / 21,375.236 | 2,069.097 / 3,257.505 / 10,303.669 / 13,842.603 | 2,012.409 / 3,467.674 / 6,485.029 / 13,484.120 |
+| wal / 100,000 | 2,142.489 / 3,343.207 / 7,226.061 / 19,171.089 | 2,068.292 / 3,529.735 / 10,695.380 / 14,637.698 | 2,052.186 / 3,425.499 / 6,894.838 / 12,486.548 |
+
+四格 visible p99.9 相对 b5 历史的变化：memory / 0 下降 39.38%；memory / 100,000 下降 18.35%；wal / 0 下降 44.94%；wal / 100,000 下降 48.01%。这一改善结论的比较对象是 b5 历史；与 pre-fix 的 wal / 0 相比，本次 p99.9 5,178.351µs 略高于 5,174.738µs，不能泛化为对所有旧数据均改善。
+
+#### visible 严格超限次数与每分钟频次
+
+判定为 latency > 门限；等于门限不计入。每个单元为“次数 / 次每分钟”，频次使用该格真实暴露秒数归一化。
+
+| 路径 / 背景目标行每秒 | 阈值 | pre-fix：次数 / 每分钟 | b5 历史：次数 / 每分钟 | 本次：次数 / 每分钟 |
+| --- | --- | --- | --- | --- |
+| memory / 0 | >2ms | 2 / 200.801 | 228 / 683.992 | 91 / 272.994 |
+| memory / 0 | >5ms | 1 / 100.400 | 54 / 161.998 | 35 / 104.998 |
+| memory / 0 | >10ms | 0 / 0.000 | 24 / 71.999 | 5 / 15.000 |
+| memory / 100,000 | >2ms | 80 / 815.275 | 111 / 332.992 | 176 / 527.996 |
+| memory / 100,000 | >5ms | 9 / 91.718 | 54 / 161.996 | 39 / 116.999 |
+| memory / 100,000 | >10ms | 1 / 10.191 | 25 / 74.998 | 8 / 24.000 |
+| wal / 0 | >2ms | 1,184 / 1849.151 | 442 / 616.395 | 449 / 642.683 |
+| wal / 0 | >5ms | 19 / 29.674 | 58 / 80.884 | 23 / 32.921 |
+| wal / 0 | >10ms | 7 / 10.932 | 9 / 12.551 | 8 / 11.451 |
+| wal / 100,000 | >2ms | 370 / 497.662 | 521 / 716.863 | 391 / 546.211 |
+| wal / 100,000 | >5ms | 35 / 47.076 | 67 / 92.188 | 22 / 30.733 |
+| wal / 100,000 | >10ms | 6 / 8.070 | 23 / 31.647 | 5 / 6.985 |
+
+#### >10ms 频次目标与诚实判定
+
+pre-fix memory / 0 仅暴露 0.597607 秒且观察到 0 次 >10ms；该数据不足以估计稳定频次，不能把“0 次”解释为可靠的零频次目标。本次借用同为 memory 的背景 100,000 格：1 次 / 5.887585 秒 = 10.190936 次每分钟。这个借用跨了背景负载，且原格本身失败截断、仅 1 个事件，统计不确定性很大；它只是本阶段明确采用的临时比较目标，不是测得的等价无背景基线或置信上限。memory / 100,000 同样使用其自身截断观测。WAL 两格使用各自 pre-fix 原始观测，wal / 0 也须保留失败截断说明。
+
+| 路径 / 背景目标行每秒 | 目标：本次 >10ms 频次不得高于（次/分钟） | 本次（次/分钟） | 判定 |
+| --- | ---: | ---: | --- |
+| memory / 0 | 10.190936 | 14.999685 | **未通过** |
+| memory / 100,000 | 10.190936 | 23.999830 | **未通过** |
+| wal / 0 | 10.932482 | 11.450913 | **未通过** |
+| wal / 100,000 | 8.070192 | 6.984790 | 通过 |
+
+不能改用较高的 b5 历史尖峰频次作为通过门限，不能扩大到任意同类格的最大值，也不能加入额外的误差容忍区间把前三格改判通过。以上是本阶段相对频次目标；原始 C 层 visible 1,000 / 3,000 / 10,000µs（p50 / p99 / p99.9）和 D 层 WAL ack 2,000 / 5,000µs（p50 / p99）保持不变。
+
+#### 尖峰簇与簇起点间隔
+
+对每个 >2/5/10ms 阈值分别聚类。按 received_ns 顺序，相邻超限样本间隔 ≤10ms 属于同簇，>10ms 开始新簇；不以 seq 连续性代替时间条件。间隔取相邻簇第一个超限样本的接收时刻之差，仅包含暴露窗口内观测到的完整间隔。至少 5 个间隔（即至少 6 簇）才报告间隔分布，否则为 null 并列明数量。该规则得到的是描述统计，不证明周期或因果。
+
+下表单位：簇数；起点间隔 p50 / p95 / max 均为 ms。频次与暴露窗见上表；末尾未观测到下一簇的等待时间不作为一个间隔。
+
+| 路径 / 背景目标行每秒 | 阈值 | pre-fix：簇数；间隔 p50 / p95 / max ms | b5 历史：簇数；间隔 p50 / p95 / max ms | 本次：簇数；间隔 p50 / p95 / max ms |
+| --- | --- | --- | --- | --- |
+| memory / 0 | >2ms | 2 簇；null（仅 1 个间隔） | 87 簇；111.705 / 760.248 / 1,024.519 | 69 簇；211.067 / 1,006.951 / 1,023.962 |
+| memory / 0 | >5ms | 1 簇；null（仅 0 个间隔） | 37 簇；21.168 / 1,024.693 / 1,024.856 | 24 簇；1,023.962 / 1,025.659 / 1,027.662 |
+| memory / 0 | >10ms | 0 簇；null（仅 0 个间隔） | 22 簇；1,024.463 / 1,035.296 / 1,035.721 | 5 簇；null（仅 4 个间隔） |
+| memory / 100,000 | >2ms | 26 簇；179.333 / 537.416 / 1,015.701 | 68 簇；199.389 / 794.827 / 1,023.571 | 69 簇；113.973 / 1,022.716 / 1,046.662 |
+| memory / 100,000 | >5ms | 6 簇；1,047.745 / 1,080.614 / 1,080.614 | 39 簇；18.594 / 1,045.279 / 1,049.649 | 27 簇；1,034.236 / 1,046.662 / 1,048.497 |
+| memory / 100,000 | >10ms | 1 簇；null（仅 0 个间隔） | 24 簇；1,039.900 / 1,048.061 / 1,051.538 | 8 簇；2,095.876 / 3,135.890 / 3,135.890 |
+| wal / 0 | >2ms | 286 簇；56.449 / 526.358 / 1,642.653 | 184 簇；89.968 / 983.224 / 1,020.455 | 170 簇；105.697 / 1,010.148 / 2,111.030 |
+| wal / 0 | >5ms | 19 簇；1,025.257 / 4,100.496 / 4,100.496 | 47 簇；1,019.459 / 1,029.366 / 1,033.095 | 22 簇；1,023.579 / 3,075.375 / 4,101.818 |
+| wal / 0 | >10ms | 7 簇；4,097.864 / 4,123.802 / 4,123.802 | 9 簇；3,064.055 / 9,195.564 / 9,195.564 | 8 簇；3,073.260 / 8,124.216 / 8,124.216 |
+| wal / 100,000 | >2ms | 221 簇；71.052 / 838.445 / 1,793.483 | 195 簇；79.668 / 985.439 / 1,057.353 | 169 簇；100.542 / 940.644 / 2,807.999 |
+| wal / 100,000 | >5ms | 34 簇；1,041.595 / 4,179.833 / 8,368.524 | 62 簇；1,033.290 / 1,048.069 / 1,057.353 | 22 簇；1,047.705 / 3,143.218 / 4,176.412 |
+| wal / 100,000 | >10ms | 6 簇；3,117.234 / 6,269.037 / 6,269.037 | 23 簇；1,048.197 / 4,171.334 / 4,179.360 | 5 簇；null（仅 4 个间隔） |
+
+本次 memory / 0 与 wal / 100,000 的 >10ms 都只有 5 簇、4 个间隔，依规则不估计间隔分布。memory / 100,000 为 8 簇、7 个间隔，中位数约 2.096 秒；wal / 0 为 8 簇、7 个间隔，中位数约 3.073 秒。样本稀少且区间宽，不应宣称残余尖峰存在稳定周期。
+
+### 300,000 样本浸泡对比：memory / 背景 100,000 行每秒
+
+本次浸泡完整完成，计量 ack 和 visible 各 300,000 个样本，含预热共收到 302,000 行，缺口、重复、乱序和意外序号均为 0；所有工作进程及服务端退出码为 0。基准主脚本退出 1，原因是原始 C 层 visible p50、p99、p99.9 全部超过门限。相对 b5 历史，p99.9 和 >10ms 频次明显改善，但 p50/p99 未改善，最大值变大；本阶段临时 >10ms 频次目标仍未通过。
+
+pre-fix **没有同配置、同样本规模的浸泡数据**，因此下表该列均标记缺失。不能把 pre-fix 20,000 目标样本基线或其截断观测当成 pre-fix soak，也不能据此给出浸泡改进百分比。
+
+#### 完成性、暴露时长与实际负载
+
+| 指标 | pre-fix soak | b5 历史 soak | 本次 soak |
+| --- | --- | ---: | ---: |
+| 计量 ack / visible 样本 | 缺数据 | 300,000 / 300,000 | 300,000 / 300,000 |
+| 含预热收到 / 应收行数 | 缺数据 | 302,000 / 302,000 | 302,000 / 302,000 |
+| 预热剔除行数 | 缺数据 | 2000 | 2000 |
+| visible 暴露秒 | 缺数据 | 300.042534710 | 300.033145408 |
+| 实际前景行/秒 | 缺数据 | 999.867829 | 999.897605 |
+| 实际背景行/秒 | 缺数据 | 99999.961692 | 99999.940953 |
+| 缺口 / 重复 / 乱序 / 意外序号 | 缺数据 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| ordered end marker | 缺数据 | 完整 | 完整 |
+| worker / server 错误 | 缺数据 | 0 / 0 | 0 / 0 |
+| 基准主脚本退出码 | 缺数据 | 1（延迟门限） | 1（延迟门限） |
+
+两次均为 Linux CLOCK_MONOTONIC、WSL2、独立 Python 写入/订阅/背景子进程；前景目标 1,000 行/秒，一次一行、同步等待 ack；背景向另一张表以 1,000 行一批写入，目标 100,000 行/秒。预热至少 2 秒且至少 1,000 行，两次实际剔除 2,000 行。visible 的真实暴露窗口为首个计量样本实际 sent_ns 至最后一个计量样本 received_ns。
+
+“b5 历史”指 b5bf6d3 收录的证据，原 metadata 是 `7c6b6a9784336827c7239a872e50bccfda15d501`、dirty=true；本次是 `b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e`、dirty=true。不能把前者称为 clean b5bf6d3 的现场测试。输入路径、实际元数据和 raw SHA-256 均保留在 `docs/perf_reports/evidence/2026-10-10-critical-section/comparison.json`，这里不重复抄写哈希。
+
+#### 延迟（µs，nearest-rank）
+
+| 指标 | pre-fix soak | b5 历史：p50 / p99 / p99.9 / max | 本次：p50 / p99 / p99.9 / max |
+| --- | --- | --- | --- |
+| visible | 缺数据 | 2,842.847 / 5,693.982 / 20,766.074 / 44,185.003 | 2,879.595 / 5,711.784 / 10,906.406 / 49,040.372 |
+| ack | 缺数据 | 812.747 / 1,482.741 / 18,246.198 / 41,827.315 | 830.995 / 1,485.417 / 8,391.969 / 45,757.370 |
+
+相对 b5 历史：visible p99.9 下降 47.48%；ack p99.9 下降 54.01%。visible p50 增加 1.29%、p99 增加 0.31%，visible max 从 44,185.003µs 增至 49,040.372µs，ack max 从 41,827.315µs 增至 45,757.370µs。没有重复运行形成置信区间，因此这些微小中位/尾部分位差异仅描述本次观测，不作统计显著性判断。
+
+#### visible 严格超限次数与每分钟频次
+
+仅 latency > 阈值计数；等于阈值不计入。频次 = 超限次数 / 实际暴露分钟数。
+
+| 阈值 | pre-fix soak | b5 历史：次数 / 次每分钟 | 本次：次数 / 次每分钟 |
+| --- | --- | ---: | ---: |
+| >2ms | 缺数据 | 217,717 / 43537.227189 | 218,803 / 43755.765658 |
+| >5ms | 缺数据 | 11,222 / 2244.081829 | 11,946 / 2388.936059 |
+| >10ms | 缺数据 | 642 / 128.381798 | 373 / 74.591759 |
+
+>10ms 频次从 128.381798 降至 74.591759 次每分钟，下降 41.90%。本阶段临时门限沿用 pre-fix memory / 背景 100,000 基线失败前的同类估计：1 次 / 5.887585059 秒 = 10.190936 次每分钟。该样本只有 1 个事件、5.888 秒且被失败截断，不是 pre-fix soak 测量，更不是可靠的稳定频率或置信上界。本次 74.591759 > 10.190936，约为临时目标 7.32 倍，**未通过**。不改用较宽松的 b5 soak 128.381798 次每分钟作为通过门限。
+
+#### 尖峰簇间隔
+
+每个阈值独立按 received_ns 聚类：相邻超限样本间隔 ≤10ms 归同簇，>10ms 新开一簇。间隔是相邻簇的第一个超限样本接收时刻之差；至少 5 个完整间隔才输出分布，否则 null。簇之前/之后的未完整观测等待不计入间隔。这些是描述统计，不证明固定周期或 checkpoint 的因果归属。
+
+| 阈值 | pre-fix soak | b5 历史：簇数 / 间隔数；p50 / p95 / max（ms） | 本次：簇数 / 间隔数；p50 / p95 / max（ms） |
+| --- | --- | --- | --- |
+| >2ms | 缺数据 | 1,347 / 1,346；44.042 / 1,037.785 / 1,051.493 | 1,217 / 1,216；47.096 / 1,056.725 / 1,071.487 |
+| >5ms | 缺数据 | 2,708 / 2,707；28.785 / 1,009.340 / 1,042.969 | 2,381 / 2,380；32.134 / 1,027.977 / 1,061.962 |
+| >10ms | 缺数据 | 633 / 632；29.100 / 1,041.069 / 2,080.905 | 369 / 368；1,031.317 / 1,061.857 / 3,132.811 |
+
+本次 >10ms 共 369 簇、368 个间隔，中位间隔 1,031.317ms，p95 1,061.857ms，最大 3,132.811ms；相比 b5 的中位 29.100ms 有明显变化。不过簇分组对 10ms 静默阈值敏感，不能仅据此宣称所有残余尖峰严格每秒发生一次。
+
+#### 分钟桶对比
+
+以下每个单元为“b5 历史次数 → 本次次数”。第 1–5 桶各真实暴露 60 秒，因此次数数值也等于该桶次/分钟；按各运行计量起点对齐，不按墙钟时间对齐。
+
+| 计量时间窗 | >2ms：b5 → 本次 | >5ms：b5 → 本次 | >10ms：b5 → 本次 |
+| --- | ---: | ---: | ---: |
+| [0, 60) 秒 | 1,476 → 1,850 | 169 → 111 | 90 → 38 |
+| [60, 120) 秒 | 36,545 → 37,218 | 176 → 130 | 119 → 67 |
+| [120, 180) 秒 | 59,692 → 59,606 | 377 → 387 | 129 → 72 |
+| [180, 240) 秒 | 60,001 → 60,090 | 1,295 → 1,119 | 140 → 87 |
+| [240, 300) 秒 | 59,956 → 60,002 | 9,191 → 10,190 | 164 → 109 |
+
+两次的 >2ms 都在第 2 分钟明显增加，第 3–5 分钟几乎覆盖全部样本；>5ms 都在最后一分钟大幅增加，本次从第 1 分钟 111 次升至第 5 分钟 10,190 次，历史从 169 次升至 9,191 次。>10ms 在每个完整分钟均低于历史，但本次仍从 38、67、72、87 上升至 109 次。由此可见，本次降低了较大的 >10ms 尖峰频次，长时间运行下更普遍的可见延迟抬升仍存在；这仅是时间分布观察，尚未定位该趋势的根因。
+
+最后不足一分钟的尾桶必须单独看：b5 仅暴露 0.042535 秒，>2/5/10ms 为 47/14/0 次；本次仅暴露 0.033145 秒，为 37/9/0 次。派生 JSON 对尾桶仍按真实暴露计算频次，但该窗口极短，不用于趋势推断或外推 SLA。完整一分钟里个别 >2ms 计数超过 60,000，也不表示统计错误：目标速率是绝对时刻排程，调度落后后可能在局部时间窗追赶。
+
+#### 原始基准退出原因
+
+本次 summary 的整体 `exit_code=1`、`passed=false`，并非运行故障。具体失败项原文：
+
+- `visible_p50_micros=[2879.595] exceeds limit=[1000.000]`
+- `visible_p99_micros=[5711.784] exceeds limit=[3000.000]`
+- `visible_p99_9_micros=[10906.406] exceeds limit=[10000.000]`
+
+即 visible p50=2,879.595µs >1,000µs；p99=5,711.784µs >3,000µs；p99.9=10,906.406µs >10,000µs。memory ack 不适用 D 层持久确认门限，因此没有把 memory ack 改判为 WAL 合格或不合格。>10ms 频次临时目标是另行分析判定，不是上述原脚本退出原因。
+
+### 确定性回归：先在 b5bf6d3 取证，再修复
+
+新增慢持久化测试使用真实 Parquet writer、PersistController 和 SqliteCatalog，只在
+`#[cfg(test)]` 模块中包装 CatalogPersistence：到达 Catalog 提交前通过 oneshot 通知主测试，
+直到主测试放行才继续提交。收到通知后才启动同表写入；写入完成后验证 live offset 连续，
+再释放持久化。2 秒 timeout 仅用于失败兜底，不用 sleep 制造交错。
+见 `crates/zippy-ingest/src/materializer/tests.rs:143`、
+`crates/zippy-ingest/src/materializer/tests.rs:485`。
+
+修改生产代码前，HEAD 为 `b5bf6d3e10bcd51eb7b34decb22db3091e4ab30e`，
+生产文件保持原样，仅加入上述三个测试。实际命令与输出：
+
+```text
+PYO3_PYTHON=$PWD/.venv/bin/python cargo test -p zippy-ingest checkpoint_slow_persistence -- --nocapture
+same-table write must complete while checkpoint Catalog persistence is paused kind=[Frame]
+same-table write must complete while checkpoint Catalog persistence is paused kind=[Append]
+same-table write must complete while checkpoint Catalog persistence is paused kind=[KeyValue]
+test result: FAILED. 0 passed; 3 failed; ... finished in 2.08s
+exit_code=101
+```
+
+失败日志为 `evidence/2026-10-10-critical-section/slow-persistence-b5bf6d3-failure.log`；
+对应 metadata 保存生产提交、当时测试源码、测试二进制和日志的 SHA-256。
+同一旧实现上的原三个 publication 交错测试仍然全部通过，见
+`publication-interleaving-b5bf6d3.log`。
+
+修复后，`cargo test -p zippy-ingest --lib -- --nocapture` 为 73 passed、2 ignored、0 failed。
+三类慢持久化测试、三个旧交错测试、三个真实 Prepared 查询/恢复测试、六个 Actor
+生命周期测试及单 blocking worker 测试均通过，见 `checkpoint-fixed.log`。
+新 Prepared 测试位于独立模块，只有新生产代码引用该模块；慢持久化三测试不依赖新的
+production hook/API，恢复 b5bf6d3 的生产文件后仍可单独编译并复跑上述失败命令。
+
+开发期间新加的单 blocking worker 测试曾因在 Tokio runtime 外构造 timeout 报
+`there is no reactor running`，当次为 16 passed、1 failed。该测试构造错误已修复，
+原输出保存在 `checkpoint-test-harness-initial-failure.log`，没有将其冒充旧实现回归证据。
+Python 扩展重建前也曾出现 413 passed、1 failed：旧扩展 revision 为 `7c6b6a9...`，
+HEAD 已是 `b5bf6d3...`；重建后 414 项全部通过，原失败单独保留。
+
+### 构建、测量与验证命令
+
+所有命令从仓库根目录执行；四格和浸泡顺序运行，其间没有 Cargo 构建或测试任务。
+没有改变任何基准延迟门限、batch 大小、前景并发、checkpoint 周期或 wire 参数。
+
+```bash
+PYO3_PYTHON=$PWD/.venv/bin/python cargo build --release -p zippy-server --bin zippy-server
+UV_CACHE_DIR=/tmp/zippy-uv-cache PYO3_PYTHON=$PWD/.venv/bin/python \
+  uv run --no-sync maturin develop --release
+
+UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync python scripts/bench_public_e2e.py \
+  --durability memory wal --background-rate 0 100000 --rate 1000 --samples 20000 \
+  --warmup-seconds 2 --warmup-samples 1000 --background-batch-rows 1000 \
+  --timeout-seconds 600 \
+  --report-json docs/perf_reports/evidence/2026-10-10-critical-section/baseline.json \
+  --raw-samples-json /tmp/zippy-perf-raw/2026-10-10-critical-section/baseline.json
+
+UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync python scripts/bench_public_e2e.py \
+  --durability memory --background-rate 100000 --rate 1000 --samples 300000 \
+  --warmup-seconds 2 --warmup-samples 1000 --background-batch-rows 1000 \
+  --timeout-seconds 900 \
+  --report-json docs/perf_reports/evidence/2026-10-10-critical-section/soak.json \
+  --raw-samples-json /tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json
+```
+
+| 验证命令 | 结果 |
+| --- | --- |
+| `PYO3_PYTHON=$PWD/.venv/bin/python cargo fmt --all -- --check` | 通过 |
+| `PYO3_PYTHON=$PWD/.venv/bin/python cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
+| `PYO3_PYTHON=$PWD/.venv/bin/python cargo test --workspace -j 4` | 91 组，1221 passed、7 ignored、0 failed |
+| `PYO3_PYTHON=$PWD/.venv/bin/python cargo test -p zippy-ingest --lib -- --nocapture` | 73 passed、2 ignored、0 failed |
+| `UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync pytest pytests -q` | 414 passed |
+| `UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync pytest clients/python/tests -q` | 247 passed，覆盖率 85.45% |
+| 新分析脚本和测试的 ruff、逐文件 black、mypy | 全部通过；分析脚本测试 18 项已包含于 pytests |
+| release server / extension | 均通过，23.07s / 24.68s |
+
+基准脚本的实际退出码及原始门限失败原因保留在各自 JSON / log 中。
+本节的相对频次验收独立于脚本原有延迟门限；不能把完整性通过解释为性能通过。
+
+### 证据、复算与改动范围
+
+证据目录为 `docs/perf_reports/evidence/2026-10-10-critical-section/`。
+`comparison.json`（144,669 字节）同时保留三份历史/两份本次 raw 的身份、真实暴露窗口、
+超限计数、每分钟频次、分钟桶与簇间隔；所有 raw 和原 summary 的 metadata/config/统计
+均核对一致，并从 raw 重算分位数。pre-fix raw 的 SHA 另外与既有摘要中预先记录的
+`raw_artifact.sha256` 相符；其余 SHA 是本次计算，不能冒称早已独立认证的历史哈希。
+
+新增分析脚本拒绝不一致输入、覆盖输入文件以及超过 300,000 字节的输出。
+复算命令如下：
+
+```bash
+UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync python scripts/analyze_public_e2e.py \
+  --run pre-fix \
+    /tmp/zippy-perf-raw/2026-10-08-public-path-e2e/baseline.json \
+    docs/perf_reports/evidence/2026-10-08-public-path-e2e/pre-fix-baseline.json \
+  --run b5bf6d3-baseline \
+    /tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-baseline.json \
+    docs/perf_reports/evidence/2026-10-08-public-path-e2e/baseline.json \
+  --run b5bf6d3-soak \
+    /tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json \
+    docs/perf_reports/evidence/2026-10-08-public-path-e2e/soak.json \
+  --run current-baseline \
+    /tmp/zippy-perf-raw/2026-10-10-critical-section/baseline.json \
+    docs/perf_reports/evidence/2026-10-10-critical-section/baseline.json \
+  --run current-soak \
+    /tmp/zippy-perf-raw/2026-10-10-critical-section/soak.json \
+    docs/perf_reports/evidence/2026-10-10-critical-section/soak.json \
+  --report-json docs/perf_reports/evidence/2026-10-10-critical-section/comparison.json
+```
+
+`acceptance.json` 给出各格逐项判定；`verification.json` 保存命令退出码、测试结果和当前
+改动源码 SHA。`slow-persistence-tests.patch` 可应用到 b5bf6d3 后只运行
+`checkpoint_slow_persistence`，不依赖两阶段生产代码。
+
+本次 raw 文件为 baseline 15,060,015 字节、soak 53,034,031 字节，均留在指定 `/tmp` 目录。
+两份 raw 扫描中 `SEQUENCE_GAP` 字符串出现次数均为 0，所有 worker/server 退出码均为 0，
+端标记和计量样本数完整。完整性和原有延迟门限分别判定，两个基准主脚本实际都退出 1。
+
+每个入库证据文件不超过 300,000 字节，`SHA256SUMS` 覆盖目录内其他所有证据文件；
+`RAW-SHA256SUMS` 另覆盖两份本次原始样本。
+
+```bash
+cd docs/perf_reports/evidence/2026-10-10-critical-section
+sha256sum -c SHA256SUMS
+sha256sum -c RAW-SHA256SUMS
+```
+
+改动文件清单如下；历史 evidence 目录和本报告既有段落未改。
+
+| 文件 | 用途 |
+| --- | --- |
+| `crates/zippy-ingest/src/actor.rs` | 私有两阶段 receipt 状态、预留发布通道、permit 生命周期与内存裁剪 |
+| `crates/zippy-ingest/src/materializer.rs` | 持久等待移至锁外，短发布/前缀回收及锁外析构 |
+| `crates/zippy-engines/src/stream_table.rs` | 缓存专用退役移交及资源生命周期测试 |
+| `crates/zippy-segment-store/src/catalog.rs` | 退役 owner 移交，延迟文件资源析构 |
+| `crates/zippy-engines/src/lib.rs`、`crates/zippy-segment-store/src/lib.rs` | 跨 crate 隐藏实现类型导出 |
+| `crates/zippy-ingest/src/materializer/tests.rs` | b5 可复现失败的三个测试、单 blocking worker 回归 |
+| `crates/zippy-ingest/src/materializer/prepared_tests.rs` | 真实 Catalog/Parquet 中间态查询、retirement 与恢复 bootstrap |
+| `crates/zippy-ingest/src/actor/checkpoint_tests.rs` | 六项两阶段状态及生命周期测试 |
+| `crates/zippy-ingest/Cargo.toml`、`Cargo.lock` | 仅增加测试读取 Parquet 的 workspace dev dependency |
+| `scripts/analyze_public_e2e.py`、`pytests/test_analyze_public_e2e.py` | 可复算尖峰统计与 18 项边界/一致性测试 |
+| `docs/perf_reports/2026-10-08-public-path-e2e-baseline.md` | 仅追加阶段 1.6 记录 |
+| `docs/perf_reports/evidence/2026-10-10-critical-section/` | 本次摘要、检查日志、前后失败/通过证据和哈希 |
+
+
+### 发现、未完成项与结论边界
+
+本次完成了两阶段持久化及 finalization 临界区的缩小，保留 SEQUENCE_GAP、行数、receipt
+校验；四格的 >10ms 频次要求仍有三格未通过，因此**不能宣布阶段 1.6 全部验收通过**。
+没有重复运行后挑选更好的一轮替换这次结果，也没有修改历史数据或提高通过门限。
+
+本次 >5ms 簇的间隔中位数仍约为 1.024 / 1.034 / 1.024 / 1.048 秒，
+与 1 秒 checkpoint 周期相容；>10ms 样本已更稀疏，不能由其中少量间隔证明稳定周期。
+没有加入生产逐阶段 tracing，也没有做因果干预，因此不能把残余尖峰全部归因于以下某一项。
+
+- 初始 `prepare_checkpoint` 仍在 materializer state 锁内 seal/rollover 并做普通 publication，
+  这是原有路径。见 `crates/zippy-ingest/src/materializer.rs:270`。
+- Native checkpoint 在 authority state 锁内执行 WAL commit、准备 materializer checkpoint
+  以及 WAL rotate，仍可能阻塞同表写入；见 `crates/zippy-ingest/src/native.rs:2378`、
+  `crates/zippy-ingest/src/native.rs:2404`、`crates/zippy-ingest/src/native.rs:2426`。
+- ReceiptArchive 使用 SQLite WAL + FULL，同一 archive mutex 还服务请求索引读取。
+  checkpoint archive 与写入侧 archive 查询有共享锁；见
+  `crates/zippy-ingest/src/checkpoint.rs:36`、`crates/zippy-ingest/src/checkpoint.rs:90`、
+  `crates/zippy-ingest/src/native.rs:2467`、`crates/zippy-ingest/src/native.rs:2557`。
+  这是静态识别的后续测量候选，尚未测得它占本轮尖峰的比例。
+- 跨 crate 的两个 hidden helper 和 guard 在 Rust 层技术上是新增 pub 表面；已有 API
+  签名、客户端协议及格式未变。如果“不得改变公开 API”包括禁止一切内部跨 crate pub
+  增量，此项仍需调整接口边界，不能用 `doc(hidden)` 声称满足字面上的零增量。
+- 恢复验证没有执行独立 server kill/restart；本次确定性测试覆盖真实 Catalog 状态重建，
+  完整 WAL 恢复仍由既有测试与源码论证支持。
+- 历史 pre-fix 三格被失败截断，尤其 memory 的频次参考只有 0 / 1 个事件，估计不稳定。
+  WSL2 主机上的结果也不能充当裸机或本机 Rust SHM 100–300µs SLA 的证明。
+
+原有 CI 延迟门限和配置未改；本次没有 commit、push 或切换分支。
