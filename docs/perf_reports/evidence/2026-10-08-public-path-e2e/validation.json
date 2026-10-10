@@ -1,0 +1,142 @@
+{
+  "rust_env": {
+    "PYO3_PYTHON": "$PWD/.venv/bin/python"
+  },
+  "python_env": {
+    "UV_CACHE_DIR": "/tmp/zippy-uv-cache"
+  },
+  "checks": [
+    {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "log": "clippy.log"
+    },
+    {
+      "command": "cargo test --workspace",
+      "exit_code": 0,
+      "passed": 1206,
+      "ignored": 7,
+      "log": "cargo-test.log"
+    },
+    {
+      "command": "uv run --no-sync pytest pytests -q",
+      "exit_code": 0,
+      "passed": 396,
+      "log": "pytest.log"
+    },
+    {
+      "command": "cd clients/python && uv run --no-sync python -m pytest -q",
+      "exit_code": 0,
+      "passed": 247,
+      "coverage_percent": 85.45,
+      "log": "client-tests.log"
+    },
+    {
+      "command": "ruff / black -l 100 / mypy on both changed Python files",
+      "exit_code": 0,
+      "log": "python-static.log"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "deterministic_before": {
+    "exit_code": 101,
+    "passed": 0,
+    "failed": 3,
+    "log": "deterministic-before.log"
+  },
+  "deterministic_after": {
+    "exit_code": 0,
+    "passed": 3,
+    "failed": 0,
+    "log": "deterministic-after.log"
+  },
+  "pre_rebuild_pytests": {
+    "exit_code": 1,
+    "passed": 395,
+    "failed": 1,
+    "reason": "stale extension build revision; resolved by required release rebuild",
+    "log": "pytests-before-rebuild.log"
+  },
+  "runs": {
+    "baseline": {
+      "exit_code": 1,
+      "completed_cells": 4,
+      "integrity_passed": true,
+      "sequence_gap_count": 0,
+      "sample_counts": [
+        20000,
+        20000,
+        20000,
+        20000
+      ]
+    },
+    "soak": {
+      "exit_code": 1,
+      "completed_cells": 1,
+      "integrity_passed": true,
+      "sequence_gap_count": 0,
+      "sample_counts": [
+        300000
+      ]
+    },
+    "ci-smoke": {
+      "exit_code": 1,
+      "completed_cells": 1,
+      "integrity_passed": true,
+      "sequence_gap_count": 0,
+      "sample_counts": [
+        3000
+      ]
+    }
+  },
+  "raw_artifacts_outside_repository": {
+    "baseline.json": {
+      "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/baseline.json",
+      "bytes": 8620725,
+      "sha256": "296ffd9cf39e0ccd62c8a2f193ad5e99f34b57d6e38a5ec1e3443671709e1804"
+    },
+    "ci-smoke.json": {
+      "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/ci-smoke.json",
+      "bytes": 859967,
+      "sha256": "082db029662b9c0b54c173e1150bd26b4ba6d7718f53fc82d06c1070c9c057bc"
+    },
+    "initial-failed-run.json": {
+      "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/initial-failed-run.json",
+      "bytes": 2638254,
+      "sha256": "9c91c4d125630f5da69345f71c4ddb0b1a9c55d6961842ccda2cc72110b34059"
+    },
+    "post-fix-baseline.json": {
+      "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-baseline.json",
+      "bytes": 15067260,
+      "sha256": "4688d307480d33ada02c85b70b3f2cc62d1c21f665c45130b7821f4207bc140c"
+    },
+    "post-fix-ci-smoke.json": {
+      "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-ci-smoke.json",
+      "bytes": 862463,
+      "sha256": "03342149b34197012fed2b4f34758cc78b1e6cb2e9d0e57a5edec2527f264550"
+    },
+    "post-fix-soak.json": {
+      "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/post-fix-soak.json",
+      "bytes": 53055717,
+      "sha256": "2ed2de9a8b2248fef6f22652caa42ba988ffeec03c9874319cb7297ea661550d"
+    }
+  },
+  "branch": "feature/public-path-latency-bench",
+  "committed": false,
+  "pushed": false,
+  "remaining_findings": [
+    "publication rejection may leave unpublished physical rows",
+    "same-runtime undersized or saturated blocking pool may starve nested persistence; static finding only",
+    "original latency gates not all passed"
+  ],
+  "source_reference_bounds_checked": 45,
+  "post_fix_raw_summary_equivalence_checked": true,
+  "post_fix_raw_sequence_gap_and_row_mismatch_count": 0
+}

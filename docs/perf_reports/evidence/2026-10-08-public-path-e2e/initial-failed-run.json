@@ -1,0 +1,641 @@
+{
+  "schema_version": 2,
+  "config": {
+    "samples": 20000,
+    "durability": [
+      "memory",
+      "wal"
+    ],
+    "rate": 1000.0,
+    "background_rate": [
+      0.0,
+      100000.0
+    ],
+    "background_batch_rows": 1000,
+    "warmup_seconds": 2.0,
+    "warmup_samples": 1000,
+    "timeout_seconds": 600.0,
+    "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+    "max_visible_p50_micros": 1000.0,
+    "max_visible_p99_micros": 3000.0,
+    "max_visible_p99_9_micros": 10000.0,
+    "max_wal_ack_p50_micros": 2000.0,
+    "max_wal_ack_p99_micros": 5000.0,
+    "thresholds": {
+      "visible_p50_micros": 1000.0,
+      "visible_p99_micros": 3000.0,
+      "visible_p99_9_micros": 10000.0,
+      "wal_ack_p50_micros": 2000.0,
+      "wal_ack_p99_micros": 5000.0
+    }
+  },
+  "metadata": {
+    "git_sha": "ff0f95055c0e16df64b1b3c455f3b53755c8dbc6",
+    "git_dirty": true,
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "is_wsl": true,
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpu_count": 32,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "python_version": "3.11.14",
+    "versions": {
+      "pyarrow": "23.0.1",
+      "zippy": "0.5.0",
+      "zippy-client": "0.1.0"
+    },
+    "started_at_utc": "2026-10-10T09:19:48.936608+00:00",
+    "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+    "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+    "server_sha256": "58a2335a7cde4dea2a8f6c862d7681e840d46f2eabb7bb5935023f7ad65ec79b",
+    "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+    "extension_sha256": "2dff6cf9eaa134383fbffe7227960eeb91658ac5a09a8feb6a9659d8c08cfd6f",
+    "build_requirement": "release server/extension; commands in baseline report",
+    "command_argv": [
+      "/home/jiangda/develop/zippy/.venv/bin/python3",
+      "scripts/bench_public_e2e.py",
+      "--durability",
+      "memory",
+      "wal",
+      "--background-rate",
+      "0",
+      "100000",
+      "--rate",
+      "1000",
+      "--samples",
+      "20000",
+      "--warmup-seconds",
+      "2",
+      "--warmup-samples",
+      "1000",
+      "--background-batch-rows",
+      "1000",
+      "--timeout-seconds",
+      "600",
+      "--report-json",
+      "docs/perf_reports/evidence/2026-10-08-public-path-e2e/baseline.json"
+    ],
+    "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+    "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+    "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+    "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+    "background_scope": "separate append table in the same namespace and server"
+  },
+  "cells": [
+    {
+      "durability": "memory",
+      "background_target_rows_per_second": 0.0,
+      "subscription_api": "Client.open_log(batch_rows=1)",
+      "write_api": "Client.get_writer(batch_size=1, flush_interval_ms=None).write(row)",
+      "ack_latency": {
+        "count": 4708,
+        "p50_micros": 787.595,
+        "p95_micros": 964.856,
+        "p99_micros": 1110.853,
+        "p99_9_micros": null,
+        "max_micros": 6841.888,
+        "mean_micros": 810.256579226848,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "visible_latency": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "integrity": {
+        "passed": false,
+        "expected_count": 6708,
+        "received_count": 0,
+        "missing_count": 6708,
+        "missing_seq_first_20": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "duplicate_count": 0,
+        "out_of_order_count": 0,
+        "unexpected_count": 0
+      },
+      "warmup_rows": 2000,
+      "achieved_probe_rows_per_second": 0.0,
+      "background": {
+        "rows": 0,
+        "achieved_rows_per_second": 0.0
+      },
+      "schedule_lag": {
+        "count": 4708,
+        "p50_micros": 87.733,
+        "p95_micros": 224.732,
+        "p99_micros": 4838.251,
+        "p99_9_micros": null,
+        "max_micros": 11003.42,
+        "mean_micros": 222.31517480883602,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "tier_b_comparison": {
+        "measurement": "open_log delivery proxy; subscribe callback wrapper is not measured",
+        "p50_ratio": null,
+        "p99_ratio": null,
+        "p99_9_ratio": null
+      },
+      "passed": false,
+      "failures": [
+        "RuntimeError: worker failed role=[writer] status=[1]",
+        "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+        "sequence integrity failed (including warmup)",
+        "ordered end marker missing or inconsistent",
+        "ack sample count=[4708] expected=[20000]",
+        "visible sample count=[0] expected=[20000]",
+        "visible_p50_micros: no measured samples",
+        "visible_p99_micros: no measured samples",
+        "visible_p99_9_micros: no measured samples"
+      ],
+      "skipped_thresholds": [],
+      "workers": {
+        "writer": {
+          "pid": 168780,
+          "role": "writer",
+          "started_ns": 963692922904974,
+          "error": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+          "recorded_samples": {
+            "seq": 6708,
+            "sent_ns": 6708,
+            "ack_ns": 6708,
+            "schedule_lag_ns": 6708
+          }
+        }
+      },
+      "diagnostic_summary": {
+        "writer.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "server.log": {
+          "captured_bytes": 3385,
+          "error_lines": [
+            "2026-10-10T09:19:56.312596183Z  INFO zippy server runtime stopped component=[server] event=[server_stopped] status=[incomplete] timed_out_processes=[[]] flight_error=[None] flight_outcome=[Some(FlightShutdownOutcome { released_pending_tickets: 0 })] native_storage_outcome=[Some(Failed(ServerError { code: Internal, message: \"native table materialized row count mismatch expected=[12] actual=[13]\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\"bb539824-460f-49ab-a32b-fb35b26147f3\")), details: None }))] master_error=[None]",
+            "Error: ServerError { code: Internal, message: \"server shutdown incomplete outcome=[ServerShutdownOutcome { timed_out_processes: [], flight_error: None, flight_outcome: Some(FlightShutdownOutcome { released_pending_tickets: 0 }), master_error: None, native_storage_outcome: Some(Failed(ServerError { code: Internal, message: \\\"native table materialized row count mismatch expected=[12] actual=[13]\\\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\\\"bb539824-460f-49ab-a32b-fb35b26147f3\\\")), details: None })) }]\", retryable: false, request_id: None, query_id: None, table_id: None, details: None }"
+          ],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "subscriber.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        }
+      }
+    },
+    {
+      "durability": "memory",
+      "background_target_rows_per_second": 100000.0,
+      "subscription_api": "Client.open_log(batch_rows=1)",
+      "write_api": "Client.get_writer(batch_size=1, flush_interval_ms=None).write(row)",
+      "ack_latency": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "visible_latency": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "integrity": {
+        "passed": false,
+        "expected_count": 545,
+        "received_count": 0,
+        "missing_count": 545,
+        "missing_seq_first_20": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "duplicate_count": 0,
+        "out_of_order_count": 0,
+        "unexpected_count": 0
+      },
+      "warmup_rows": 545,
+      "achieved_probe_rows_per_second": 0.0,
+      "background": {
+        "rows": 0,
+        "achieved_rows_per_second": 0.0
+      },
+      "schedule_lag": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "tier_b_comparison": {
+        "measurement": "open_log delivery proxy; subscribe callback wrapper is not measured",
+        "p50_ratio": null,
+        "p99_ratio": null,
+        "p99_9_ratio": null
+      },
+      "passed": false,
+      "failures": [
+        "RuntimeError: worker failed role=[writer] status=[1]",
+        "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+        "sequence integrity failed (including warmup)",
+        "ordered end marker missing or inconsistent",
+        "ack sample count=[0] expected=[20000]",
+        "visible sample count=[0] expected=[20000]",
+        "visible_p50_micros: no measured samples",
+        "visible_p99_micros: no measured samples",
+        "visible_p99_9_micros: no measured samples",
+        "ack_latency: no measured samples",
+        "requested background load produced no rows"
+      ],
+      "skipped_thresholds": [],
+      "workers": {
+        "writer": {
+          "pid": 168987,
+          "role": "writer",
+          "started_ns": 963700228960458,
+          "error": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+          "recorded_samples": {
+            "seq": 545,
+            "sent_ns": 545,
+            "ack_ns": 545,
+            "schedule_lag_ns": 545
+          }
+        }
+      },
+      "diagnostic_summary": {
+        "writer.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "server.log": {
+          "captured_bytes": 3385,
+          "error_lines": [
+            "2026-10-10T09:19:57.493659188Z  INFO zippy server runtime stopped component=[server] event=[server_stopped] status=[incomplete] timed_out_processes=[[]] flight_error=[None] flight_outcome=[Some(FlightShutdownOutcome { released_pending_tickets: 0 })] native_storage_outcome=[Some(Failed(ServerError { code: Internal, message: \"native table materialized row count mismatch expected=[21] actual=[22]\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\"72e8eb39-86bd-4d16-8aa8-d025e6e79fcb\")), details: None }))] master_error=[None]",
+            "Error: ServerError { code: Internal, message: \"server shutdown incomplete outcome=[ServerShutdownOutcome { timed_out_processes: [], flight_error: None, flight_outcome: Some(FlightShutdownOutcome { released_pending_tickets: 0 }), master_error: None, native_storage_outcome: Some(Failed(ServerError { code: Internal, message: \\\"native table materialized row count mismatch expected=[21] actual=[22]\\\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\\\"72e8eb39-86bd-4d16-8aa8-d025e6e79fcb\\\")), details: None })) }]\", retryable: false, request_id: None, query_id: None, table_id: None, details: None }"
+          ],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "background.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "subscriber.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        }
+      }
+    },
+    {
+      "durability": "wal",
+      "background_target_rows_per_second": 0.0,
+      "subscription_api": "Client.open_log(batch_rows=1)",
+      "write_api": "Client.get_writer(batch_size=1, flush_interval_ms=None).write(row)",
+      "ack_latency": {
+        "count": 18017,
+        "p50_micros": 2127.007,
+        "p95_micros": 2533.648,
+        "p99_micros": 3149.5,
+        "p99_9_micros": 6156.458,
+        "max_micros": 25490.762,
+        "mean_micros": 2179.617124882056,
+        "p99_9_unavailable_reason": null
+      },
+      "visible_latency": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "integrity": {
+        "passed": false,
+        "expected_count": 19017,
+        "received_count": 0,
+        "missing_count": 19017,
+        "missing_seq_first_20": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "duplicate_count": 0,
+        "out_of_order_count": 0,
+        "unexpected_count": 0
+      },
+      "warmup_rows": 1000,
+      "achieved_probe_rows_per_second": 0.0,
+      "background": {
+        "rows": 0,
+        "achieved_rows_per_second": 0.0
+      },
+      "schedule_lag": {
+        "count": 18017,
+        "p50_micros": 11783302.579,
+        "p95_micros": 21384874.021,
+        "p99_micros": 22301436.451,
+        "p99_9_micros": 22492920.834,
+        "max_micros": 22524853.447,
+        "mean_micros": 11731801.770389965,
+        "p99_9_unavailable_reason": null
+      },
+      "tier_b_comparison": {
+        "measurement": "open_log delivery proxy; subscribe callback wrapper is not measured",
+        "p50_ratio": null,
+        "p99_ratio": null,
+        "p99_9_ratio": null
+      },
+      "passed": false,
+      "failures": [
+        "RuntimeError: worker failed role=[writer] status=[1]",
+        "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+        "sequence integrity failed (including warmup)",
+        "ordered end marker missing or inconsistent",
+        "ack sample count=[18017] expected=[20000]",
+        "visible sample count=[0] expected=[20000]",
+        "visible_p50_micros: no measured samples",
+        "visible_p99_micros: no measured samples",
+        "visible_p99_9_micros: no measured samples",
+        "wal_ack_p50_micros=[2127.007] exceeds limit=[2000.000]"
+      ],
+      "skipped_thresholds": [],
+      "workers": {
+        "writer": {
+          "pid": 169182,
+          "role": "writer",
+          "started_ns": 963701372486112,
+          "error": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+          "recorded_samples": {
+            "seq": 19017,
+            "sent_ns": 19017,
+            "ack_ns": 19017,
+            "schedule_lag_ns": 19017
+          }
+        }
+      },
+      "diagnostic_summary": {
+        "writer.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "server.log": {
+          "captured_bytes": 3381,
+          "error_lines": [
+            "2026-10-10T09:20:39.633289194Z  INFO zippy server runtime stopped component=[server] event=[server_stopped] status=[incomplete] timed_out_processes=[[]] flight_error=[None] flight_outcome=[Some(FlightShutdownOutcome { released_pending_tickets: 0 })] native_storage_outcome=[Some(Failed(ServerError { code: Internal, message: \"native table materialized row count mismatch expected=[6] actual=[7]\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\"3eb1fa8f-8089-4c63-b702-b385970d06c9\")), details: None }))] master_error=[None]",
+            "Error: ServerError { code: Internal, message: \"server shutdown incomplete outcome=[ServerShutdownOutcome { timed_out_processes: [], flight_error: None, flight_outcome: Some(FlightShutdownOutcome { released_pending_tickets: 0 }), master_error: None, native_storage_outcome: Some(Failed(ServerError { code: Internal, message: \\\"native table materialized row count mismatch expected=[6] actual=[7]\\\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\\\"3eb1fa8f-8089-4c63-b702-b385970d06c9\\\")), details: None })) }]\", retryable: false, request_id: None, query_id: None, table_id: None, details: None }"
+          ],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "subscriber.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        }
+      }
+    },
+    {
+      "durability": "wal",
+      "background_target_rows_per_second": 100000.0,
+      "subscription_api": "Client.open_log(batch_rows=1)",
+      "write_api": "Client.get_writer(batch_size=1, flush_interval_ms=None).write(row)",
+      "ack_latency": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "visible_latency": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "integrity": {
+        "passed": true,
+        "expected_count": 0,
+        "received_count": 0,
+        "missing_count": 0,
+        "missing_seq_first_20": [],
+        "duplicate_count": 0,
+        "out_of_order_count": 0,
+        "unexpected_count": 0
+      },
+      "warmup_rows": 0,
+      "achieved_probe_rows_per_second": 0.0,
+      "background": {
+        "pid": 169380,
+        "role": "background",
+        "rows": 161000,
+        "batches": 161,
+        "started_ns": 963743590674098,
+        "error": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly"
+      },
+      "schedule_lag": {
+        "count": 0,
+        "p50_micros": null,
+        "p95_micros": null,
+        "p99_micros": null,
+        "p99_9_micros": null,
+        "max_micros": null,
+        "mean_micros": null,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "tier_b_comparison": {
+        "measurement": "open_log delivery proxy; subscribe callback wrapper is not measured",
+        "p50_ratio": null,
+        "p99_ratio": null,
+        "p99_9_ratio": null
+      },
+      "passed": false,
+      "failures": [
+        "RuntimeError: worker failed role=[background] status=[1]",
+        "background: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+        "ordered end marker missing or inconsistent",
+        "ack sample count=[0] expected=[20000]",
+        "visible sample count=[0] expected=[20000]",
+        "visible_p50_micros: no measured samples",
+        "visible_p99_micros: no measured samples",
+        "visible_p99_9_micros: no measured samples",
+        "wal_ack_p50_micros: no measured samples",
+        "wal_ack_p99_micros: no measured samples",
+        "ack_latency: no measured samples"
+      ],
+      "skipped_thresholds": [],
+      "workers": {
+        "background": {
+          "pid": 169380,
+          "role": "background",
+          "rows": 161000,
+          "batches": 161,
+          "started_ns": 963743590674098,
+          "error": "AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+          "recorded_samples": {}
+        }
+      },
+      "diagnostic_summary": {
+        "writer.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "server.log": {
+          "captured_bytes": 3393,
+          "error_lines": [
+            "2026-10-10T09:20:41.916056387Z  INFO zippy server runtime stopped component=[server] event=[server_stopped] status=[incomplete] timed_out_processes=[[]] flight_error=[None] flight_outcome=[Some(FlightShutdownOutcome { released_pending_tickets: 0 })] native_storage_outcome=[Some(Failed(ServerError { code: Internal, message: \"native table materialized row count mismatch expected=[3000] actual=[4000]\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\"d0cf26f3-8060-4b61-9b5f-3e91a5134caf\")), details: None }))] master_error=[None]",
+            "Error: ServerError { code: Internal, message: \"server shutdown incomplete outcome=[ServerShutdownOutcome { timed_out_processes: [], flight_error: None, flight_outcome: Some(FlightShutdownOutcome { released_pending_tickets: 0 }), master_error: None, native_storage_outcome: Some(Failed(ServerError { code: Internal, message: \\\"native table materialized row count mismatch expected=[3000] actual=[4000]\\\", retryable: false, request_id: None, query_id: None, table_id: Some(TableId(\\\"d0cf26f3-8060-4b61-9b5f-3e91a5134caf\\\")), details: None })) }]\", retryable: false, request_id: None, query_id: None, table_id: None, details: None }"
+          ],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "background.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        },
+        "subscriber.log": {
+          "captured_bytes": 0,
+          "error_lines": [],
+          "omitted_error_lines": 0,
+          "truncated_error_lines": 0
+        }
+      }
+    }
+  ],
+  "passed": false,
+  "exit_code": 1,
+  "finished_at_utc": "2026-10-10T09:20:41.977600+00:00",
+  "artifact_kind": "summary",
+  "raw_artifact": {
+    "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/initial-failed-run.json",
+    "sha256": "9c91c4d125630f5da69345f71c4ddb0b1a9c55d6961842ccda2cc72110b34059",
+    "bytes": 2638254,
+    "description": "unchanged original artifact captured before the checkpoint race fix"
+  }
+}

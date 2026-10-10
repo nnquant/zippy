@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import json
 from pathlib import Path
 import runpy
+import sys
 from typing import Any
 
 import pytest
@@ -404,3 +407,120 @@ def test_analyze_integrity_failure_overrides_complete_measurement_counts(
     assert "sequence integrity failed (including warmup)" in cell["failures"]
     assert len(cell["failures"]) == 1
     assert bench["exit_code"]([{"passed": True}, cell]) == 1
+
+
+def test_summary_preserves_error_chains_without_raw_timestamps_or_full_logs(
+    bench, complete_evidence
+):
+    """Retain failure diagnosis and exact sample counts in the default compact artifact.
+
+    :returns: None.
+    """
+    config, raw = complete_evidence
+    error = "SEQUENCE_GAP: live segment offsets are not contiguous expected=[4] actual=[1]"
+    raw["writer"].update(error="AmbiguousWriteError", error_traceback=f"{error}\ncaused by write")
+    cell = bench["_analyze"](config, raw)
+    mismatch = "ERROR native table materialized row count mismatch expected=[3] actual=[4]"
+    cell["diagnostic_logs"] = {"server.log": f"INFO routine server startup\n{mismatch}\n"}
+    original = copy.deepcopy(cell)
+    summary = bench["_cell_summary"](cell)
+    assert "raw_samples" not in summary
+    assert "diagnostic_logs" not in summary
+    assert summary["ack_latency"] == cell["ack_latency"]
+    assert summary["visible_latency"] == cell["visible_latency"]
+    assert summary["integrity"] == cell["integrity"]
+    assert summary["failures"] == cell["failures"]
+    writer = summary["workers"]["writer"]
+    assert writer["error_traceback"] == raw["writer"]["error_traceback"]
+    assert writer["recorded_samples"] == {
+        "seq": 3,
+        "sent_ns": 3,
+        "ack_ns": 3,
+        "schedule_lag_ns": 3,
+    }
+    assert "sent_ns" not in writer
+    assert "ack_ns" not in writer
+    diagnostics = summary["diagnostic_summary"]["server.log"]
+    assert diagnostics["error_lines"] == [mismatch]
+    assert diagnostics["omitted_error_lines"] == 0
+    assert "routine server startup" not in json.dumps(summary)
+    assert cell == original
+
+
+def test_summary_bounds_repeated_and_long_server_errors(bench):
+    """Repeated server failures cannot grow the summary into a full diagnostic log.
+
+    :returns: None.
+    """
+    long_error = "ERROR " + "x" * 5000
+    lines = [long_error, long_error, *(f"ERROR failure [{index}]" for index in range(30))]
+    summary = bench["_cell_summary"]({"diagnostic_logs": {"server.log": "\n".join(lines)}})
+    diagnostics = summary["diagnostic_summary"]["server.log"]
+    assert len(diagnostics["error_lines"]) == 20
+    assert len(diagnostics["error_lines"][0]) == 2000
+    assert diagnostics["omitted_error_lines"] == 11
+    assert diagnostics["truncated_error_lines"] == 1
+
+
+@pytest.mark.parametrize("include_raw", [False, True])
+def test_report_outputs_separate_summary_and_optional_raw_evidence(
+    bench, complete_evidence, tmp_path, include_raw
+):
+    """Raw output is opt-in and never replaces the default summary's error evidence.
+
+    :returns: None.
+    """
+    config, raw = complete_evidence
+    report = {
+        "schema_version": 2,
+        "config": config,
+        "metadata": {"git_sha": "test-commit"},
+        "cells": [bench["_analyze"](config, raw)],
+        "error": "outer failure",
+        "error_traceback": "complete outer traceback",
+    }
+    report["cells"][0]["diagnostic_logs"] = {"server.log": "INFO full server diagnostic log"}
+    report_path, raw_path = tmp_path / "summary.json", tmp_path / "raw.json"
+    bench["_write_reports"](report_path, raw_path if include_raw else None, report)
+    summary = json.loads(report_path.read_text())
+    assert summary["artifact_kind"] == "summary"
+    for field in ("schema_version", "config", "metadata", "error", "error_traceback"):
+        assert summary[field] == report[field]
+    assert "raw_samples" not in summary["cells"][0]
+    assert "diagnostic_logs" not in summary["cells"][0]
+    assert raw_path.exists() is include_raw
+    if include_raw:
+        saved_raw = json.loads(raw_path.read_text())
+        assert saved_raw["artifact_kind"] == "raw_samples"
+        assert saved_raw["cells"][0]["raw_samples"] == raw
+        assert saved_raw["cells"][0]["diagnostic_logs"] == report["cells"][0]["diagnostic_logs"]
+
+
+@pytest.mark.parametrize("include_raw", [False, True])
+def test_cli_raw_samples_output_is_optional(bench, tmp_path, monkeypatch, include_raw):
+    """The CLI accepts an explicit raw artifact path and otherwise defaults to summaries.
+
+    :returns: None.
+    """
+    server = tmp_path / "zippy-server"
+    server.touch()
+    arguments = ["benchmark", "--server-bin", str(server)]
+    if include_raw:
+        arguments.extend(["--raw-samples-json", str(tmp_path / "raw.json")])
+    monkeypatch.setattr(sys, "argv", arguments)
+    args = bench["_parse_args"]()
+    assert args.raw_samples_json == (tmp_path / "raw.json" if include_raw else None)
+
+
+def test_cli_rejects_shared_summary_and_raw_output_path(bench, tmp_path, monkeypatch):
+    """An output collision must fail before raw timestamps can overwrite the summary.
+
+    :returns: None.
+    """
+    path = str(tmp_path / "evidence.json")
+    monkeypatch.setattr(
+        sys, "argv", ["benchmark", "--report-json", path, "--raw-samples-json", path]
+    )
+    with pytest.raises(SystemExit) as error:
+        bench["_parse_args"]()
+    assert error.value.code == 2

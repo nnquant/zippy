@@ -1,0 +1,43 @@
+[
+  {
+    "mode": "timeout",
+    "exit_code": 1,
+    "elapsed_seconds": 1.469235540018417,
+    "remaining_processes": [],
+    "cell_failures": [
+      "RuntimeError: worker failed role=[subscriber] status=[1]",
+      "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+      "subscriber: QueryError: Flight request timed out operation=[DoExchange.log]",
+      "sequence integrity failed (including warmup)",
+      "ordered end marker missing or inconsistent",
+      "ack sample count=[554] expected=[20000]",
+      "visible sample count=[482] expected=[20000]",
+      "visible_p50_micros=[1195.826] exceeds limit=[1000.000]"
+    ]
+  },
+  {
+    "mode": "interrupt",
+    "exit_code": 130,
+    "elapsed_seconds": 1.2077368199825287,
+    "remaining_processes": [],
+    "cell_failures": [
+      "KeyboardInterrupt: measurement interrupted",
+      "writer: AmbiguousWriteError: Flight write stopped after an ambiguous partial commit; do not retry the original table blindly",
+      "subscriber: ZippyConnectionError: Flight endpoint is unavailable operation=[DoExchange.log]",
+      "sequence integrity failed (including warmup)",
+      "ordered end marker missing or inconsistent",
+      "ack sample count=[405] expected=[20000]",
+      "visible sample count=[404] expected=[20000]",
+      "visible_p50_micros=[1129.750] exceeds limit=[1000.000]"
+    ]
+  },
+  {
+    "mode": "low-background-rate",
+    "exit_code": 1,
+    "elapsed_seconds": 1.0681028499966487,
+    "remaining_processes": [],
+    "cell_failures": [
+      "visible_p50_micros=[1175.017] exceeds limit=[1000.000]"
+    ]
+  }
+]

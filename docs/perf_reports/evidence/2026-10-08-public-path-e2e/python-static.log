@@ -1,0 +1,13 @@
+$ UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync ruff check scripts/bench_public_e2e.py pytests/test_bench_public_e2e.py
+All checks passed!
+exit_code=[0]
+
+$ UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync black --check --line-length 100 scripts/bench_public_e2e.py pytests/test_bench_public_e2e.py
+All done! ✨ 🍰 ✨
+2 files would be left unchanged.
+exit_code=[0]
+
+$ UV_CACHE_DIR=/tmp/zippy-uv-cache uv run --no-sync mypy scripts/bench_public_e2e.py pytests/test_bench_public_e2e.py
+Success: no issues found in 2 source files
+exit_code=[0]
+

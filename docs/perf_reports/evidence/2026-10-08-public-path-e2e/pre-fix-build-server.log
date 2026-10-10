@@ -1,0 +1,13 @@
+   Compiling zippy-core v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-core)
+   Compiling zippy-types v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-types)
+   Compiling zippy-segment-store v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-segment-store)
+   Compiling zippy-query v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-query)
+   Compiling zippy-protocol v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-protocol)
+   Compiling zippy-catalog v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-catalog)
+   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)
+   Compiling zippy-master v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-master)
+   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)
+   Compiling zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+    Finished `release` profile [optimized] target(s) in 28.70s

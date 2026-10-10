@@ -4021,6 +4021,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "zippy-catalog",
  "zippy-core",
  "zippy-engines",
  "zippy-segment-store",

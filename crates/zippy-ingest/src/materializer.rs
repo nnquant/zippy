@@ -1,5 +1,8 @@
 //! Native table materialization and serialized TableActor publication.
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -165,6 +168,8 @@ impl NativeTableMaterializerSink {
             schema_version: bootstrap.schema_version(),
             schema,
             actor: actors.table(table_id)?,
+            #[cfg(test)]
+            checkpoint_pause: Mutex::new(None),
             state: Mutex::new(NativeMaterializedTableState {
                 actor_writer_epoch: bootstrap.writer_epoch(),
                 key_value_version: bootstrap.persisted_state_version(),
@@ -218,6 +223,8 @@ struct NativeMaterializedTable {
     schema_version: u64,
     schema: arrow::datatypes::SchemaRef,
     actor: TableActorHandle,
+    #[cfg(test)]
+    checkpoint_pause: Mutex<Option<tests::CheckpointPause>>,
     state: Mutex<NativeMaterializedTableState>,
 }
 
@@ -499,7 +506,7 @@ async fn persist_checkpoint_prefix(
     watermark: OffsetWatermark,
 ) -> Result<OffsetWatermark> {
     let snapshot = table.actor.snapshot().await?;
-    if snapshot.committed_log_offset != watermark {
+    let request = if snapshot.committed_log_offset != watermark {
         let first = next_offset(table.table_id, snapshot.committed_log_offset)?;
         let OffsetWatermark::Known(last) = watermark else {
             return Err(invalid("empty checkpoint cannot follow persisted rows"));
@@ -592,12 +599,25 @@ async fn persist_checkpoint_prefix(
             vec![candidate],
             watermark,
         )?;
-        table.actor.persist(request).await?;
-    }
+        Some(request)
+    } else {
+        None
+    };
     drop(snapshot);
-    // Keep publication ordered with synchronous admissions without blocking an async executor.
+    let runtime = tokio::runtime::Handle::current();
+    // Exclude publication construction before the actor can advance its persisted watermark,
+    // through local prefix reclamation. An admission must see both old boundaries or both new
+    // boundaries. Keep the mutex and persistence wait off the async executor; once started,
+    // this blocking task also finishes reclamation if the checkpoint waiter is cancelled.
     tokio::task::spawn_blocking(move || {
         let mut state = table.state.lock().unwrap();
+        if let Some(request) = request {
+            runtime.block_on(table.actor.persist(request))?;
+        }
+        #[cfg(test)]
+        if let Some(pause) = table.checkpoint_pause.lock().unwrap().take() {
+            pause.wait();
+        }
         state.persisted_log_offset = watermark;
         reclaim_materialized_prefix(&table, &mut state)
     })

@@ -1,0 +1,66 @@
+{
+  "rust_env": {
+    "PYO3_PYTHON": "$PWD/.venv/bin/python"
+  },
+  "python_env": {
+    "UV_CACHE_DIR": "/tmp/zippy-uv-cache"
+  },
+  "checks": [
+    {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "log": "pre-fix-clippy.log"
+    },
+    {
+      "command": "cargo test -p zippy-perf",
+      "exit_code": 0,
+      "lib_tests": 51,
+      "cli_tests": 2
+    },
+    {
+      "command": "uv run --no-sync pytest pytests -q",
+      "exit_code": 0,
+      "passed": 389,
+      "log": "pre-fix-pytest.log"
+    },
+    {
+      "command": "uv run --no-sync pytest pytests/test_bench_public_e2e.py -q",
+      "exit_code": 0,
+      "passed": 65
+    },
+    {
+      "command": "uv run --no-sync ruff check scripts/bench_public_e2e.py pytests/test_bench_public_e2e.py",
+      "exit_code": 0
+    },
+    {
+      "command": "uv run --no-sync black --check -l 100 scripts/bench_public_e2e.py",
+      "exit_code": 0
+    },
+    {
+      "command": "uv run --no-sync black --check -l 100 pytests/test_bench_public_e2e.py",
+      "exit_code": 0
+    },
+    {
+      "command": "uv run --no-sync mypy scripts/bench_public_e2e.py pytests/test_bench_public_e2e.py",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "source_reference_bounds_checked": 134,
+  "baseline_exit_code": 1,
+  "baseline_complete_cells": 1,
+  "ci_smoke_exit_code": 1,
+  "baseline_incomplete_reason": "production SEQUENCE_GAP interrupted three cells; no production fix allowed",
+  "production_code_changed": false,
+  "branch": "feature/public-path-latency-bench",
+  "committed": false,
+  "pushed": false,
+  "historical_artifact": true
+}

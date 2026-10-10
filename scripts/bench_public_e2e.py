@@ -4,6 +4,8 @@ The public SDK calls a one-row put ``Client.get_writer(...).write(row)``. Both
 latencies include scalar-to-Arrow conversion; visibility ends at the first Python
 instruction after ``next(open_log(...))`` (one row per event), before value decoding.
 This measures tier C, not a SHM path or the ``Client.subscribe`` callback wrapper.
+The default report contains summaries and error tracebacks. Use
+``--raw-samples-json`` to retain per-row timestamps and diagnostic logs separately.
 
 :returns: CLI status 0 on complete, within-budget cells; 1 on failure; 130 on Ctrl-C.
 :raises SystemExit: Invalid CLI arguments or a non-Linux monotonic clock domain.
@@ -186,6 +188,62 @@ def _write_json(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(".pending")
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
     temporary.replace(path)
+
+
+def _cell_summary(cell: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        key: value for key, value in cell.items() if key not in {"raw_samples", "diagnostic_logs"}
+    }
+    sample_fields = {"seq", "sent_ns", "ack_ns", "received_ns", "schedule_lag_ns"}
+    summary["workers"] = {
+        role: {
+            **{key: value for key, value in worker.items() if key not in sample_fields},
+            "recorded_samples": {
+                key: len(value) for key, value in worker.items() if key in sample_fields
+            },
+        }
+        for role, worker in cell.get("raw_samples", {}).items()
+    }
+    diagnostics = {}
+    for name, log in cell.get("diagnostic_logs", {}).items():
+        errors = list(
+            dict.fromkeys(
+                line
+                for line in log.splitlines()
+                if any(
+                    marker in line.lower()
+                    for marker in (
+                        "error",
+                        "exception",
+                        "panic",
+                        "failed",
+                        "mismatch",
+                        "sequence_gap",
+                    )
+                )
+            )
+        )
+        diagnostics[name] = {
+            "captured_bytes": len(log.encode()),
+            "error_lines": [line[:2000] for line in errors[:20]],
+            "omitted_error_lines": max(0, len(errors) - 20),
+            "truncated_error_lines": sum(len(line) > 2000 for line in errors[:20]),
+        }
+    summary["diagnostic_summary"] = diagnostics
+    return summary
+
+
+def _write_reports(report_path: Path, raw_path: Path | None, report: dict[str, Any]) -> None:
+    _write_json(
+        report_path,
+        {
+            **report,
+            "artifact_kind": "summary",
+            "cells": [_cell_summary(cell) for cell in report["cells"]],
+        },
+    )
+    if raw_path is not None:
+        _write_json(raw_path, {**report, "artifact_kind": "raw_samples"})
 
 
 def _schema() -> Any:
@@ -601,6 +659,7 @@ def _run_cell(config: dict[str, Any]) -> dict[str, Any]:
         raw: dict[str, Any] = {}
         processes: dict[str, Any] = {}
         error_text = None
+        error_traceback = None
         interrupted = False
         with ExitStack() as stack:
             try:
@@ -610,6 +669,7 @@ def _run_cell(config: dict[str, Any]) -> dict[str, Any]:
                 interrupted = True
             except Exception as error:
                 error_text = f"{type(error).__name__}: {error}"
+                error_traceback = "".join(traceback.format_exception(error))
             finally:
                 # Stop every owned process before reading evidence or deleting the data directory.
                 stack.close()
@@ -627,10 +687,10 @@ def _run_cell(config: dict[str, Any]) -> dict[str, Any]:
         if error_text:
             cell["passed"] = False
             cell["failures"].insert(0, error_text)
-            cell["diagnostic_logs"] = {
-                path.name: path.read_text(errors="replace")[-12000:]
-                for path in directory.glob("*.log")
-            }
+            cell["error_traceback"] = error_traceback
+        cell["diagnostic_logs"] = {
+            path.name: path.read_text(errors="replace") for path in directory.glob("*.log")
+        }
         return cell
 
 
@@ -700,7 +760,17 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parents[1] / "target/release/zippy-server",
     )
-    parser.add_argument("--report-json", type=Path, default=Path("/tmp/zippy-public-e2e.json"))
+    parser.add_argument(
+        "--report-json",
+        type=Path,
+        default=Path("/tmp/zippy-public-e2e.json"),
+        help="write statistics, integrity, metadata and error summaries (no raw samples)",
+    )
+    parser.add_argument(
+        "--raw-samples-json",
+        type=Path,
+        help="optionally write per-row timestamps and diagnostic logs to a separate file",
+    )
     for name, default in (
         ("visible-p50", 1000),
         ("visible-p99", 3000),
@@ -737,6 +807,8 @@ def _parse_args() -> argparse.Namespace:
             parser.error(f"invalid finite positive limit [{name}]")
     if any(not math.isfinite(value) or value < 0 for value in args.background_rate):
         parser.error("background-rate must be finite and nonnegative")
+    if args.raw_samples_json and args.raw_samples_json.resolve() == args.report_json.resolve():
+        parser.error("raw-samples-json and report-json must use different paths")
     args.server_bin = args.server_bin.resolve()
     if not args.server_bin.is_file():
         parser.error(
@@ -758,19 +830,21 @@ def main() -> int:
     config = {
         key: value
         for key, value in vars(args).items()
-        if key not in {"worker", "worker_config", "report_json"}
+        if key not in {"worker", "worker_config", "report_json", "raw_samples_json"}
     }
     config["server_bin"] = str(args.server_bin)
     config["thresholds"] = {
         key.removeprefix("max_"): value for key, value in config.items() if key.startswith("max_")
     }
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "config": config,
         "metadata": _metadata(Path(__file__).resolve().parents[1], args.server_bin),
         "cells": [],
     }
     args.report_json.parent.mkdir(parents=True, exist_ok=True)
+    if args.raw_samples_json:
+        args.raw_samples_json.parent.mkdir(parents=True, exist_ok=True)
     status = 1
     try:
         for durability in args.durability:
@@ -783,30 +857,22 @@ def main() -> int:
                     {**config, "durability": durability, "background_rate": background_rate}
                 )
                 report["cells"].append(cell)
-                _write_json(args.report_json, report)
+                _write_reports(args.report_json, args.raw_samples_json, report)
                 if cell["interrupted"]:
                     raise KeyboardInterrupt
-                print(
-                    json.dumps(
-                        {
-                            key: value
-                            for key, value in cell.items()
-                            if key not in {"raw_samples", "diagnostic_logs"}
-                        }
-                    ),
-                    flush=True,
-                )
+                print(json.dumps(_cell_summary(cell)), flush=True)
         status = exit_code(report["cells"])
     except KeyboardInterrupt:
         report["error"] = "interrupted by keyboard; owned children and server cleaned up"
         status = 130
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
+        report["error_traceback"] = "".join(traceback.format_exception(error))
     finally:
         report.update(
             passed=status == 0, exit_code=status, finished_at_utc=datetime.now(UTC).isoformat()
         )
-        _write_json(args.report_json, report)
+        _write_reports(args.report_json, args.raw_samples_json, report)
     return status
 
 

@@ -1,0 +1,29 @@
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.18s
+     Running unittests src/lib.rs (target/debug/deps/zippy_ingest-2e8dbdc569a63fee)
+
+running 3 tests
+
+thread 'materializer::tests::checkpoint_publication_interleaving_append' panicked at crates/zippy-ingest/src/materializer/tests.rs:289:9:
+interleaved write must succeed: SEQUENCE_GAP: live segment offsets are not contiguous expected=[1] actual=[0]; checkpoint result: Err(ServerError { code: Internal, message: "native table materialized row count mismatch expected=[0] actual=[1]", retryable: false, request_id: None, query_id: None, table_id: Some(TableId("00000000-0000-0000-0000-00000000000a")), details: None })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test materializer::tests::checkpoint_publication_interleaving_append ... FAILED
+
+thread 'materializer::tests::checkpoint_publication_interleaving_key_value' panicked at crates/zippy-ingest/src/materializer/tests.rs:289:9:
+interleaved write must succeed: SEQUENCE_GAP: live segment offsets are not contiguous expected=[1] actual=[0]; checkpoint result: Err(ServerError { code: Internal, message: "native table materialized row count mismatch expected=[0] actual=[1]", retryable: false, request_id: None, query_id: None, table_id: Some(TableId("00000000-0000-0000-0000-00000000000a")), details: None })
+
+thread 'materializer::tests::checkpoint_publication_interleaving_frame' panicked at crates/zippy-ingest/src/materializer/tests.rs:289:9:
+interleaved write must succeed: SEQUENCE_GAP: live segment offsets are not contiguous expected=[1] actual=[0]; checkpoint result: Err(ServerError { code: Internal, message: "native table materialized row count mismatch expected=[0] actual=[1]", retryable: false, request_id: None, query_id: None, table_id: Some(TableId("00000000-0000-0000-0000-00000000000a")), details: None })
+test materializer::tests::checkpoint_publication_interleaving_key_value ... FAILED
+test materializer::tests::checkpoint_publication_interleaving_frame ... FAILED
+
+failures:
+
+failures:
+    materializer::tests::checkpoint_publication_interleaving_append
+    materializer::tests::checkpoint_publication_interleaving_frame
+    materializer::tests::checkpoint_publication_interleaving_key_value
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p zippy-ingest --lib`

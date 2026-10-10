@@ -74,8 +74,8 @@ jobs:
           uv run --no-sync maturin develop --release
 
       - name: run public Flight write-to-subscribe profile
-        # The 2026-10-10 local run exceeds tier C p50 and encounters a checkpoint
-        # SEQUENCE_GAP before 20,000 samples. Keep the original latency limits.
+        # The checkpoint race is fixed; the 2026-10-10 rerun completes all samples.
+        # CI smoke still exceeds tier C p50. Keep the original latency limits.
         # Evidence: docs/perf_reports/2026-10-08-public-path-e2e-baseline.md
         continue-on-error: true
         run: |

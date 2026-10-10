@@ -1,0 +1,213 @@
+{
+  "schema_version": 2,
+  "config": {
+    "samples": 3000,
+    "durability": [
+      "memory"
+    ],
+    "rate": 1000.0,
+    "background_rate": [
+      0.0
+    ],
+    "background_batch_rows": 1000,
+    "warmup_seconds": 2.0,
+    "warmup_samples": 1000,
+    "timeout_seconds": 600.0,
+    "server_bin": "/home/jiangda/develop/zippy/target/release/zippy-server",
+    "max_visible_p50_micros": 1000.0,
+    "max_visible_p99_micros": 3000.0,
+    "max_visible_p99_9_micros": 10000.0,
+    "max_wal_ack_p50_micros": 2000.0,
+    "max_wal_ack_p99_micros": 5000.0,
+    "thresholds": {
+      "visible_p50_micros": 1000.0,
+      "visible_p99_micros": 3000.0,
+      "visible_p99_9_micros": 10000.0,
+      "wal_ack_p50_micros": 2000.0,
+      "wal_ack_p99_micros": 5000.0
+    }
+  },
+  "metadata": {
+    "git_sha": "ff0f95055c0e16df64b1b3c455f3b53755c8dbc6",
+    "benchmark_script_sha256": "0cdaeca9ebf5d32a1c68ce0c5a009b9266837a29dfa195f5bb908790a8eb730d",
+    "git_dirty": true,
+    "kernel": "5.15.153.1-microsoft-standard-WSL2",
+    "is_wsl": true,
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpu_count": 32,
+    "cpu_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "python_version": "3.11.14",
+    "versions": {
+      "pyarrow": "23.0.1",
+      "zippy": "0.5.0",
+      "zippy-client": "0.1.0"
+    },
+    "started_at_utc": "2026-10-10T09:25:28.800825+00:00",
+    "clock": "Linux CLOCK_MONOTONIC; nanoseconds; common clock domain across child processes",
+    "server_binary": "/home/jiangda/develop/zippy/target/release/zippy-server",
+    "server_sha256": "58a2335a7cde4dea2a8f6c862d7681e840d46f2eabb7bb5935023f7ad65ec79b",
+    "extension_path": "/home/jiangda/develop/zippy/python/zippy/_internal.cpython-311-x86_64-linux-gnu.so",
+    "extension_sha256": "2dff6cf9eaa134383fbffe7227960eeb91658ac5a09a8feb6a9659d8c08cfd6f",
+    "build_requirement": "release server/extension; commands in baseline report",
+    "command_argv": [
+      "/home/jiangda/develop/zippy/.venv/bin/python3",
+      "scripts/bench_public_e2e.py",
+      "--samples",
+      "3000",
+      "--durability",
+      "memory",
+      "--max-visible-p99-micros",
+      "3000",
+      "--report-json",
+      "docs/perf_reports/evidence/2026-10-08-public-path-e2e/ci-smoke.json"
+    ],
+    "pacing": "absolute monotonic deadlines; one write outstanding; no dropped slots",
+    "visibility_endpoint": "immediately after one-row open_log next(), before to_pylist()",
+    "ack_endpoint": "after synchronous one-row FlightWriter.write() returns",
+    "timestamp_boundary": "sent_ns immediately before write; includes Arrow conversion",
+    "background_scope": "separate append table in the same namespace and server"
+  },
+  "cells": [
+    {
+      "durability": "memory",
+      "background_target_rows_per_second": 0.0,
+      "subscription_api": "Client.open_log(batch_rows=1)",
+      "write_api": "Client.get_writer(batch_size=1, flush_interval_ms=None).write(row)",
+      "ack_latency": {
+        "count": 3000,
+        "p50_micros": 760.908,
+        "p95_micros": 975.171,
+        "p99_micros": 1249.768,
+        "p99_9_micros": null,
+        "max_micros": 5792.254,
+        "mean_micros": 789.189522,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "visible_latency": {
+        "count": 3000,
+        "p50_micros": 1198.723,
+        "p95_micros": 1529.318,
+        "p99_micros": 1987.688,
+        "p99_9_micros": null,
+        "max_micros": 6228.579,
+        "mean_micros": 1241.7124426666667,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "integrity": {
+        "passed": true,
+        "expected_count": 5000,
+        "received_count": 5000,
+        "missing_count": 0,
+        "missing_seq_first_20": [],
+        "duplicate_count": 0,
+        "out_of_order_count": 0,
+        "unexpected_count": 0
+      },
+      "warmup_rows": 2000,
+      "achieved_probe_rows_per_second": 1000.0925889052451,
+      "background": {
+        "rows": 0,
+        "achieved_rows_per_second": 0.0
+      },
+      "schedule_lag": {
+        "count": 3000,
+        "p50_micros": 88.251,
+        "p95_micros": 7337.418,
+        "p99_micros": 15991.945,
+        "p99_9_micros": null,
+        "max_micros": 17169.523,
+        "mean_micros": 867.903959,
+        "p99_9_unavailable_reason": "fewer than 10000 measured samples; p99.9 is not estimated"
+      },
+      "tier_b_comparison": {
+        "measurement": "open_log delivery proxy; subscribe callback wrapper is not measured",
+        "p50_ratio": 23.97446,
+        "p99_ratio": 6.625626666666667,
+        "p99_9_ratio": null
+      },
+      "passed": false,
+      "failures": [
+        "visible_p50_micros=[1198.723] exceeds limit=[1000.000]"
+      ],
+      "skipped_thresholds": [
+        "visible_p99_9_micros: fewer than 10000 measured samples; p99.9 is not estimated"
+      ],
+      "process_exit_codes": {
+        "server": 0,
+        "subscriber": 0,
+        "writer": 0
+      },
+      "interrupted": false,
+      "workers": {
+        "writer": {
+          "pid": 172157,
+          "role": "writer",
+          "started_ns": 964032786502096,
+          "finished_ns": 964037786316466,
+          "end_sent": true,
+          "recorded_samples": {
+            "seq": 5000,
+            "sent_ns": 5000,
+            "ack_ns": 5000,
+            "schedule_lag_ns": 5000
+          }
+        },
+        "subscriber": {
+          "pid": 172156,
+          "role": "subscriber",
+          "end_seq": 5000,
+          "finished_ns": 964037788468557,
+          "recorded_samples": {
+            "seq": 5000,
+            "sent_ns": 5000,
+            "received_ns": 5000
+          }
+        }
+      },
+      "diagnostic_summary": {}
+    }
+  ],
+  "passed": false,
+  "exit_code": 1,
+  "finished_at_utc": "2026-10-10T09:25:34.516558+00:00",
+  "artifact_kind": "summary",
+  "raw_artifact": {
+    "path": "/tmp/zippy-perf-raw/2026-10-08-public-path-e2e/ci-smoke.json",
+    "sha256": "082db029662b9c0b54c173e1150bd26b4ba6d7718f53fc82d06c1070c9c057bc",
+    "bytes": 859967,
+    "description": "unchanged original artifact captured before the checkpoint race fix"
+  }
+}

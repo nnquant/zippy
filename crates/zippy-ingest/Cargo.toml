@@ -18,6 +18,7 @@ zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
 tempfile = "3"
+zippy-catalog = { path = "../zippy-catalog" }
 
 [lints]
 workspace = true

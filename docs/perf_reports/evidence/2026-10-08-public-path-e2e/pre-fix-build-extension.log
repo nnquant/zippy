@@ -1,0 +1,64 @@
+🍹 Building a mixed python/rust project
+🔗 Found pyo3 bindings
+🐍 Found CPython 3.11 at /home/jiangda/develop/zippy/.venv/bin/python
+📡 Using build options features from pyproject.toml
+Audited 11 packages in 20ms
+   Compiling once_cell v1.21.4
+   Compiling arrow-schema v53.4.1
+   Compiling memoffset v0.9.1
+   Compiling indoc v2.0.7
+   Compiling unindent v0.2.4
+   Compiling pyo3-build-config v0.22.6
+   Compiling arrow-data v53.4.1
+   Compiling pyo3-macros-backend v0.22.6
+   Compiling pyo3-ffi v0.22.6
+   Compiling pyo3 v0.22.6
+   Compiling zippy-python v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-python)
+   Compiling arrow-array v53.4.1
+   Compiling pyo3-macros v0.22.6
+   Compiling arrow-select v53.4.1
+   Compiling arrow-row v53.4.1
+   Compiling arrow-arith v53.4.1
+   Compiling arrow-cast v53.4.1
+   Compiling arrow-ord v53.4.1
+   Compiling arrow-string v53.4.1
+   Compiling arrow-ipc v53.4.1
+   Compiling arrow-csv v53.4.1
+   Compiling arrow-json v53.4.1
+   Compiling arrow v53.4.1
+   Compiling parquet v53.4.1
+   Compiling arrow-flight v53.4.1
+   Compiling zippy-types v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-types)
+   Compiling zippy-segment-store v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-segment-store)
+   Compiling zippy-core v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-core)
+   Compiling zippy-protocol v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-protocol)
+   Compiling datafusion-common v44.0.0
+   Compiling zippy-catalog v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-catalog)
+   Compiling zippy-operators v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-operators)
+   Compiling zippy-master v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-master)
+   Compiling zippy-engines v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-engines)
+   Compiling datafusion-expr-common v44.0.0
+   Compiling zippy-storage v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-storage)
+   Compiling datafusion-physical-expr-common v44.0.0
+   Compiling datafusion-functions-aggregate-common v44.0.0
+   Compiling datafusion-functions-window-common v44.0.0
+   Compiling zippy-ingest v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-ingest)
+   Compiling datafusion-expr v44.0.0
+   Compiling datafusion-physical-expr v44.0.0
+   Compiling datafusion-execution v44.0.0
+   Compiling datafusion-sql v44.0.0
+   Compiling datafusion-functions v44.0.0
+   Compiling datafusion-physical-plan v44.0.0
+   Compiling datafusion-functions-window v44.0.0
+   Compiling datafusion-optimizer v44.0.0
+   Compiling datafusion-functions-aggregate v44.0.0
+   Compiling datafusion-catalog v44.0.0
+   Compiling datafusion-functions-table v44.0.0
+   Compiling datafusion-physical-optimizer v44.0.0
+   Compiling datafusion v44.0.0
+   Compiling zippy-query v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-query)
+   Compiling zippy-server v0.5.0 (/home/jiangda/develop/zippy/crates/zippy-server)
+    Finished `release` profile [optimized] target(s) in 1m 45s
+📦 Built wheel for CPython 3.11 to /tmp/.tmpH9mcnG/zippy-0.5.0-cp311-cp311-linux_x86_64.whl
+✏️ Setting installed package as editable
+🛠 Installed zippy-0.5.0
